@@ -74,6 +74,14 @@ use crate::heap::{self, Word};
 /// a run.
 pub const TRIGGER: usize = 1024;
 
+/// The most candidates the collector ever waits for, where its runs have been
+/// finding nothing: see [`crate::heap::Heap::paced`].
+pub const TRIGGER_MOST: usize = 1 << 18;
+
+/// Runs in a row that free nothing before the collector waits for twice as
+/// many candidates: what [`TRIGGER`] candidates take, [`BATCH`] at a time.
+pub const FUTILE: u32 = (TRIGGER / BATCH) as u32;
+
 /// Candidates looked at in one run, which is what bounds a pause: the walks
 /// visit what these reach, and nothing else. What is left over waits, still
 /// buffered, and the next run takes the next batch.
@@ -347,6 +355,7 @@ fn run(heap: &mut heap::Heap, batch: usize, budget: usize) {
     let mut marked: Vec<Word> = Vec::new();
     let mut grayed: Vec<(Word, u64)> = Vec::new();
     let mut left = budget;
+    let mut walked = 0usize;
     for (i, &s) in roots.iter().enumerate() {
         // A block that died while it was waiting here is freed now, and never
         // walked: what its count says is one reference, and it has none. This
@@ -367,6 +376,7 @@ fn run(heap: &mut heap::Heap, batch: usize, budget: usize) {
         }
         if heap::colour(s) == heap::PURPLE && refs(s) > 0 {
             grayed.clear();
+            walked += 1;
             let had = left;
             if mark_gray(s, &mut left, &mut work, &mut kids, &mut grayed) {
                 marked.push(s);
@@ -408,6 +418,7 @@ fn run(heap: &mut heap::Heap, batch: usize, budget: usize) {
     for &s in &marked {
         collect_white(s, heap, &mut work, &mut kids);
     }
+    heap.paced(walked, heap.freed() - was);
     heap.reschedule();
 
     if let Some(began) = began {

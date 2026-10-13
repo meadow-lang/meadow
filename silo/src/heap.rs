@@ -258,6 +258,12 @@ pub struct Heap {
     /// without letting cyclic garbage pile up -- the program runs between one
     /// run and the next, since that is where allocation happens.
     draining: bool,
+    /// How many candidates must gather before the collector runs: [`crate::
+    /// cycles::TRIGGER`] to begin with, and more while its runs find nothing
+    /// -- see [`Heap::paced`].
+    trigger: usize,
+    /// Runs in a row that walked from a candidate and freed nothing.
+    futile: u32,
     /// Blocks the collector has freed, for its tally.
     freed: u64,
     /// The memory it has: chunks, and blocks too big for a size class --
@@ -287,6 +293,8 @@ impl Heap {
             oversized_mark: usize::MAX,
             run_at: usize::MAX,
             draining: false,
+            trigger: crate::cycles::TRIGGER,
+            futile: 0,
             freed: 0,
             chunks: Vec::new(),
             large: crate::ctx::ByAddress::default(),
@@ -781,7 +789,7 @@ impl Heap {
     /// than it already was. Never further -- a mark that moved with the heap
     /// would never be reached.
     fn schedule(&mut self) {
-        if self.candidates.len() >= crate::cycles::TRIGGER {
+        if self.candidates.len() >= self.trigger {
             self.run_at = 0;
         } else if self.run_at == usize::MAX {
             self.run_at = (2 * self.live.max(0) as usize).max(FLOOR);
@@ -799,12 +807,39 @@ impl Heap {
         }
         let want = if self.candidates.is_empty() {
             usize::MAX
-        } else if self.draining || self.candidates.len() >= crate::cycles::TRIGGER {
+        } else if self.draining || self.candidates.len() >= self.trigger {
             0
         } else {
             (2 * self.live.max(0) as usize).max(FLOOR)
         };
         self.run_at = want.min(self.oversized_mark);
+    }
+
+    /// A run has just finished, having walked from `walked` candidates and
+    /// freed `freed` blocks of garbage: how many candidates the next round of
+    /// runs waits for.
+    ///
+    /// A program that makes candidates by the million and cycles never -- an
+    /// interpreter, whose every scope is a map of cells shared with the
+    /// scopes made from it -- would otherwise spend most of its time here:
+    /// each candidate walked is everything its cell reaches, and proves
+    /// nothing. So while the runs free nothing the collector waits for twice
+    /// as many candidates as before, up to [`crate::cycles::TRIGGER_MOST`],
+    /// and by then most of them have died where they waited and are freed
+    /// without a walk. The first run that does free a cycle puts it back. A
+    /// doubling of the heap still starts a run whatever this says, so what
+    /// waiting costs is bounded as it always was.
+    pub(crate) fn paced(&mut self, walked: usize, freed: u64) {
+        if freed > 0 {
+            self.trigger = crate::cycles::TRIGGER;
+            self.futile = 0;
+        } else if walked > 0 {
+            self.futile += 1;
+            if self.futile >= crate::cycles::FUTILE {
+                self.futile = 0;
+                self.trigger = (self.trigger * 2).min(crate::cycles::TRIGGER_MOST);
+            }
+        }
     }
 
     pub(crate) fn has_candidates(&self) -> bool {
