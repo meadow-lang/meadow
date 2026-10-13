@@ -80,6 +80,17 @@ def base : Int = 2097152000
 -- And where its binders for what it names of other units start.
 def externs : Int = 2040000000
 
+-- The same two for `numbered`, which walks a unit before `program` does:
+-- the names one makes are names the other is handed, and must not be taken
+-- for its own. Above `Dictionaries`' and below the two above.
+def numberBase : Int = 1990000000
+
+def numberExterns : Int = 1970000000
+
+-- How many binders there are from where a walk's externs start: none of
+-- the ranges above is as near another as this.
+def span : Int = 16000000
+
 -- A function to copy: the type variables it is generic in; its parameters
 -- in order, each with its type; itself, a function; its body; the program
 -- that is in; for one
@@ -88,6 +99,11 @@ def externs : Int = 2040000000
 -- enough to be written out at a call.
 record Body = {
   vars : [Int],
+  -- The variables over number types it is generic in (`numbered`), and
+  -- what each variable over number types where it was written is when
+  -- nothing says: an `Int`, or a `Float`.
+  nums : [Int],
+  settle : HashMap Int Type,
   params : [(Int, Type)],
   whole : CoreTerm,
   body : CoreTerm,
@@ -241,6 +257,8 @@ fun candidates (p : CoreProgram) (traits : HashMap String Bool) (reps : Bool) (g
              coreDefId a d,
              Body {
                vars,
+               nums = [],
+               settle = H.empty,
                params,
                whole = inner,
                body,
@@ -297,7 +315,12 @@ record Shared s = {
   copies : StRef s (HashMap String Int),
   extra : StRef s [CoreDef],
   known : Bool,
-  inlines : Bool
+  inlines : Bool,
+  -- Where this walk's binders for what it names of other units start.
+  madeFrom : Int,
+  -- The definitions generic in a number's type, by symbol: this unit's and
+  -- the ones the units it imports keep for it (`numbered`).
+  numbers : HashMap String Body
 }
 
 -- What a walk carries: whether it is of one of the unit's definitions
@@ -327,16 +350,16 @@ fun binderOf (sh : Shared s) (top : Top) =
        match V.find (\x -> match x with | (_, (t : Top)) -> t.symbol == top.symbol) made with
        | Just (id, _) -> id
        | None ->
-           (let id = externs + V.len made in
+           (let id = sh.madeFrom + V.len made in
             let u = stSetRef sh.made (V.pushBack made (id, top)) in
             id))
 
 -- The symbol binder `id` is, if it is a definition's.
 fun symbolOf (sh : Shared s) (id : Int) =
-  if id >= externs and id < base then
+  if id >= sh.madeFrom and id < sh.madeFrom + span then
     M.map
       (\x -> match x with | (_, (t : Top)) -> t.symbol)
-      (V.get (stGetRef sh.made) (id - externs))
+      (V.get (stGetRef sh.made) (id - sh.madeFrom))
   else H.lookup id sh.symbols
 
 -- The name `id` has where it is being written.
@@ -359,7 +382,7 @@ fun renamed (cx : Cx s) (id : Int) =
 
 -- A type of the function's, at the types the call is at.
 fun at (cx : Cx s) (t : Type) : Type =
-  if cx.own or H.isEmpty cx.types then t
+  if H.isEmpty cx.types then t
   else
     (match t with
      | Var v -> M.unwrapOr t (H.lookup v cx.types)
@@ -470,10 +493,21 @@ fun copied out (cx : Cx s) (f : Int) (b : Body) (given : [(Int, String)]) (tys :
 -- value is, where the function as written asks a descriptor at run time. A
 -- small function is left to be copied to where it is called, and one that
 -- takes dictionaries to be copied for them (`call`).
-fun instantiated out (cx : Cx s) (m : Meta) func tys (t : Type) =
+fun instantiated out (cx : Cx s) (m : Meta) func tys (nums : [Type]) (t : Type) =
   let sh = cx.sh in
-  let plain = \u -> newCoreTermTyApp out m func tys t in
-  if not sh.inlines or cx.deep >= depth or not (V.all closed tys) then plain ()
+  -- The number types a mention is at are gone from what is written, known
+  -- or not: a mention at none of a variable's is the name itself.
+  let plain = \u -> if V.isEmpty tys then func else newCoreTermTyApp out m func tys [] t in
+  match (if wanted nums then numberBody out sh func else None) with
+  | Just (f, (b : Body)) ->
+      (let head = newCoreTermVar out m (numberCopy out cx f b nums) t in
+       if V.isEmpty tys then head else newCoreTermTyApp out m head tys [] t)
+  | None -> represent out cx m func tys t plain
+
+-- `instantiated`, where no copy is made for a number's type.
+fun represent out (cx : Cx s) (m : Meta) func tys (t : Type) plain =
+  let sh = cx.sh in
+  if V.isEmpty tys or not sh.inlines or cx.deep >= depth or not (V.all closed tys) then plain ()
   else
     (match named out func with
      | Just f ->
@@ -484,6 +518,117 @@ fun instantiated out (cx : Cx s) (m : Meta) func tys (t : Type) =
               else plain ()
           | None -> plain ())
      | None -> plain ())
+
+-- Whether a mention at number types `nums` wants a copy of its own: they
+-- are all known, and not all what a literal is anyway -- an `Int`, a
+-- `Float` -- where the definition as it was written is that copy.
+fun wanted (nums : [Type]) : Bool =
+  not (V.isEmpty nums)
+    and V.all
+      (\t ->
+        match t with
+        | Con name [] -> V.elem name numeric
+        | _ -> False)
+      nums
+    and V.any
+      (\t ->
+        match t with
+        | Con name [] -> name != "Int" and name != "Float"
+        | _ -> False)
+      nums
+
+-- The types a number is of.
+def numeric : [String] =
+  [
+    "Int", "BigInt", "Float", "Float32", "Int8", "Int16", "Int32", "UInt8", "UInt16", "UInt32",
+    "UInt64"
+  ]
+
+-- The definition generic in a number's type that `func` names, if it names
+-- one: its binder here, and how it is written.
+fun numberBody out (sh : Shared s) func =
+  match named out func with
+  | None -> None
+  | Just f ->
+      (match M.andThen (\symbol -> H.lookup symbol sh.numbers) (symbolOf sh f) with
+       | Just b -> Just (f, b)
+       | None -> None)
+
+-- The copy of `b`, binder `f` here, for the number types `nums`: the binder
+-- of the definition that is, made if this is the first mention to want it
+-- -- `meadow_core::specialize`. In it each of the function's variables over
+-- a number type is the type, so a literal of one is made as that type and
+-- not as the `Int` it would otherwise be, and what it mentions at one of
+-- them is mentioned at the type, which asks for that one's copy in turn:
+-- the number types are few, so this ends. It is generic still in what the
+-- function is generic in besides.
+fun numberCopy out (cx : Cx s) (f : Int) (b : Body) (nums : [Type]) =
+  let sh = cx.sh in
+  let key = "${M.unwrapOr (show f) (symbolOf sh f)}|#|${S.join "," (V.map (\t -> debug t) nums)}" in
+  match H.lookup key (stGetRef sh.copies) with
+  | Just id -> id
+  | None ->
+      (let id = stGetRef sh.next in
+       let u = stSetRef sh.next (id + 1) in
+       let w = stSetRef sh.copies (H.insert key id (stGetRef sh.copies)) in
+       let inner =
+         {
+           cx | own = False,
+           -- Each of its variables over a number type the type the copy is
+           -- for, and every other such variable where it was written what
+           -- it is when nothing says.
+           types = V.foldl (\h vt -> H.insert (fst vt) (snd vt) h) b.settle (V.zip b.nums nums),
+           tops = b.tops,
+           names = stNewRef H.empty,
+           deep = cx.deep + 1
+         }
+       in
+       let body = copyTerm b.from out inner b.whole in
+       let whole =
+         if V.isEmpty b.vars then body
+         else newCoreTermTyLam out nowhere b.vars [] body (tyCoreTerm out body)
+       in
+       let v =
+         stSetRef sh.extra (V.pushBack (stGetRef sh.extra) (newCoreDef out nowhere id whole))
+       in id)
+
+-- A literal where a copy is made at number types: one of a variable's type
+-- is made again as the type the variable is there, as `Elab.literal` makes
+-- one of a type that is written.
+fun constant out (cx : Cx s) (m : Meta) lit (t : Type) =
+  if cx.own then newCoreTermConst out m lit t
+  else if kindCoreLit out lit == CoreLitKind.LInt then
+    (let n = coreLitLIntValue out lit in
+     match t with
+     | Con "BigInt" [] -> newCoreTermConst out m (newCoreLitLBig out m n) t
+     | Con name [] ->
+         (match sized name with
+          | Just width -> newCoreTermConst out m (newCoreLitLWord out m width n) t
+          | None -> newCoreTermConst out m lit t)
+     | _ -> newCoreTermConst out m lit t)
+  else if kindCoreLit out lit == CoreLitKind.LF64 then
+    (match t with
+     | Con "Float32" [] ->
+         newCoreTermConst out m (newCoreLitLF32 out m (coreLitLF64Value out lit)) t
+     | _ -> newCoreTermConst out m lit t)
+  else newCoreTermConst out m lit t
+
+-- The width a sized integer type's name says, as core writes it:
+-- `Elab.widthOf`.
+fun sized (name : String) : Maybe String =
+  match name with
+  | "Int8" -> Just "I8"
+  | "Int16" -> Just "I16"
+  | "Int32" -> Just "I32"
+  | "UInt8" -> Just "U8"
+  | "UInt16" -> Just "U16"
+  | "UInt32" -> Just "U32"
+  | "UInt64" -> Just "U64"
+  | _ -> None
+
+-- `body` generic in `vars`: itself, in none.
+fun generic out (m : Meta) (vars : [Int]) body (t : Type) =
+  if V.isEmpty vars then body else newCoreTermTyLam out m vars [] body t
 
 -- A type as a copy is made at it: itself where its values are not pointers,
 -- and otherwise one type that stands for every type whose values are. It
@@ -581,9 +726,16 @@ pass! {
     | Var { id, ty } -> Var { id = renamed cx id, ty = at cx ty }
     | Lam { param, paramTy, body, ty } ->
         Lam { param = renamed cx param, paramTy = at cx paramTy, body, ty = at cx ty }
-    | TyLam { vars, body, ty } -> TyLam { vars, body, ty = at cx ty }
-    | TyApp { func, tys, ty } ->
-        instantiated out cx here func (V.map (\x -> at cx x) tys) (at cx ty)
+    | TyLam { vars, nums, body, ty } -> generic out here vars body (at cx ty)
+    | TyApp { func, tys, nums, ty } ->
+        instantiated
+          out
+          cx
+          here
+          func
+          (V.map (\x -> at cx x) tys)
+          (V.map (\x -> at cx x) nums)
+          (at cx ty)
     | App { func, arg, ty } -> call out cx here func arg (at cx ty)
     | Let { id, value, body, ty } -> Let { id = renamed cx id, value, body, ty = at cx ty }
     | LetRec { binds, body, ty } -> LetRec { binds, body, ty = at cx ty }
@@ -600,7 +752,7 @@ pass! {
     | Case { scrutinee, arms, ty } -> Case { scrutinee, arms, ty = at cx ty }
     | Perform { eff, op, arg, ty } -> Perform { eff, op, arg, ty = at cx ty }
     | Ill { ty } -> Ill { ty = at cx ty }
-    | Const { lit, ty } -> Const { lit, ty = at cx ty }
+    | Const { lit, ty } -> constant out cx here lit (at cx ty)
     | PWild { ty } -> PWild { ty = at cx ty }
     | PVar { id, ty } -> PVar { id = renamed cx id, ty = at cx ty }
     | PAs { id, pat, ty } -> PAs { id = renamed cx id, pat, ty = at cx ty }
@@ -651,10 +803,13 @@ pass! {
 -- its binder here, its symbol, and how it is written.
 @pub fun exports (p : CoreProgram) (traits : HashMap String Bool) (reps : Bool) (generous : Bool)
     : CoreProgram =
+  exported p (candidates p traits reps generous)
+
+-- `exports`, of the definitions `bodies`.
+fun exported (p : CoreProgram) (bodies : HashMap Int Body) : CoreProgram =
   let a = coreArena p in
   let file = coreRoot p in
   let pkg = coreFilePackage a file in
-  let bodies = candidates p traits reps generous in
   let own =
     V.foldl
       (\h d ->
@@ -750,6 +905,8 @@ fun imported
                 here
                 (Body {
                    vars,
+                   nums = [],
+                   settle = H.empty,
                    params,
                    whole = inner,
                    body,
@@ -779,6 +936,178 @@ fun imported
     (known : Bool)
     (inlines : Bool)
     (generous : Bool)
+    : CoreProgram =
+  walked
+    p
+    theirs
+    summaries
+    arities
+    traits
+    labels
+    known
+    inlines
+    generous
+    H.empty
+    externs
+    base
+    H.empty
+
+-- `p` with each definition generic in a number's type copied for the number
+-- types it is used at, and nothing left that says which a mention is at:
+-- what is done to every unit before anything else is, at every level, since
+-- it is what a literal in such a definition is right by. `theirs` are the
+-- definitions of that kind the units it imports keep (`numbers`), each with
+-- its variables over number types and whether each is over fractions, as
+-- `own` are `p`'s: a type that is one of them and is not being copied for
+-- is an `Int`, or a `Float`, which is what the definition as it was written
+-- is the copy for.
+@pub fun numbered (p : CoreProgram) (theirs : [(CoreProgram, [(Int, Bool)])]) (own : [(Int, Bool)])
+    : CoreProgram =
+  walked
+    p
+    []
+    []
+    []
+    H.empty
+    []
+    False
+    False
+    False
+    (numberBodies p theirs (settling own))
+    numberExterns
+    numberBase
+    (settling own)
+
+-- What each variable over number types is when nothing says.
+fun settling (vars : [(Int, Bool)]) : HashMap Int Type =
+  V.foldl (\h v -> H.insert (fst v) (if snd v then Con "Float" [] else Con "Int" []) h) H.empty vars
+
+-- A unit's definitions that are generic in a number's type, as they were
+-- written, for the units that import it to copy: `exports`, of those.
+@pub fun numbers (p : CoreProgram) : CoreProgram =
+  let a = coreArena p in
+  exported
+    p
+    (V.foldl
+       (\h d ->
+         if V.isEmpty (numsOf a (coreDefBody a d)) then h
+         else H.insert (coreDefId a d) (bodyOf a None H.empty (coreDefBody a d)) h)
+       H.empty
+       (coreFileDefs a (coreRoot p)))
+
+-- Whether `p` keeps anything: a unit with nothing generic in a number's
+-- type keeps a program of none.
+@pub fun keepsAny (p : CoreProgram) : Bool =
+  not (V.isEmpty (coreFileDefs (coreArena p) (coreRoot p)))
+
+-- The package `p` is of.
+@pub fun packageOf (p : CoreProgram) : String = coreFilePackage (coreArena p) (coreRoot p)
+
+-- The variables over number types a definition written `t` is generic in.
+fun numsOf (a : CoreArena) (t : CoreTerm) : [Int] =
+  match viewCoreTerm a t with
+  | CoreTermView.TyLam r -> r.nums
+  | _ -> []
+
+-- A definition written `t`, as what a copy is made of.
+fun bodyOf
+    (a : CoreArena)
+    (tops : Maybe (HashMap Int Top))
+    (settle : HashMap Int Type)
+    (t : CoreTerm)
+    : Body =
+  let (vars, inner) = peel a t in
+  let (params, body) = lams a inner [] in
+  Body {
+    vars,
+    nums = numsOf a t,
+    settle,
+    params,
+    whole = inner,
+    body,
+    from = a,
+    tops,
+    dicts = 0,
+    small = False
+  }
+
+-- Every definition generic in a number's type in sight, by its symbol:
+-- `p`'s own, and those `theirs` keep, each with what it calls a definition
+-- of its own unit.
+fun numberBodies
+    (p : CoreProgram)
+    (theirs : [(CoreProgram, [(Int, Bool)])])
+    (settle : HashMap Int Type)
+    : HashMap String Body =
+  let a = coreArena p in
+  let pkg = coreFilePackage a (coreRoot p) in
+  let own =
+    V.foldl
+      (\h d ->
+        if V.isEmpty (numsOf a (coreDefBody a d)) then h
+        else H.insert (symbolIn pkg (coreDefId a d)) (bodyOf a None settle (coreDefBody a d)) h)
+      H.empty
+      (coreFileDefs a (coreRoot p))
+  in V.foldl (\h their -> theirNumbers (fst their) (settling (snd their)) h) own theirs
+
+fun theirNumbers (their : CoreProgram) (settle : HashMap Int Type) (h : HashMap String Body)
+    : HashMap String Body =
+  let b = coreArena their in
+  let file = coreRoot their in
+  let from = coreFilePackage b file in
+  let defined =
+    V.foldl
+      (\t d ->
+        (let (vars, inner) = peel b (coreDefBody b d) in
+         H.insert
+           (coreDefId b d)
+           (Top {
+              symbol = symbolIn from (coreDefId b d),
+              types = V.len vars,
+              arity = V.len (fst (lams b inner []))
+            })
+           t))
+      H.empty
+      (coreFileDefs b file)
+  in
+  let tops =
+    V.foldl
+      (\t x ->
+        H.insert
+          (coreExternId b x)
+          (Top {
+             symbol = coreExternSymbol b x,
+             types = coreExternTypes b x,
+             arity = coreExternArity b x
+           })
+          t)
+      defined
+      (coreFileExterns b file)
+  in V.foldl
+       (\g d ->
+         if V.isEmpty (numsOf b (coreDefBody b d)) then g
+         else
+           H.insert
+             (symbolIn from (coreDefId b d))
+             (bodyOf b (Just tops) settle (coreDefBody b d))
+             g)
+       h
+       (coreFileDefs b file)
+
+fun walked
+    (p : CoreProgram)
+    (theirs : [CoreProgram])
+    (summaries : [Summary])
+    (arities : [Entry Int])
+    (traits : HashMap String Bool)
+    (labels : [Entry [String]])
+    (known : Bool)
+    (inlines : Bool)
+    (generous : Bool)
+    (numberOnes : HashMap String Body)
+    (madeFrom : Int)
+    (nextFrom : Int)
+    (settle : HashMap Int Type)
     : CoreProgram =
   let a = coreArena p in
   let file = coreRoot p in
@@ -828,15 +1157,17 @@ fun imported
                H.empty
                all,
            arities = V.foldl (\h (e : Entry Int) -> H.insert e.key e.value h) H.empty arities,
-           next = stNewRef base,
+           next = stNewRef nextFrom,
            copies = stNewRef H.empty,
            extra = stNewRef [],
            known,
-           inlines
+           inlines,
+           madeFrom,
+           numbers = numberOnes
          }
        in
        let cx =
-         Cx { own = True, types = H.empty, tops = None, names = stNewRef H.empty, deep = 0, sh }
+         Cx { own = True, types = settle, tops = None, names = stNewRef H.empty, deep = 0, sh }
        in
        let defs = V.map (\d -> copyDef a out cx d) (coreFileDefs a file) in
        let named = V.map (\n -> copyNamed a out cx n) (coreFileNamed a file) in

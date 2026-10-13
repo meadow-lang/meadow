@@ -114,7 +114,10 @@ fun want (i : Inf s) (p : Pred) (owner : Maybe Int) : Int ! { St s | e } =
   if V.isEmpty sc.quant then instantiate i sc
   else
     let fresh = freshQuantifiers i.ar sc in
-    let types = overTypes sc fresh in
+    -- The types it is at, and after them the number types: what a literal
+    -- in it is to be (`Elab.instance` tells them apart by how many of each
+    -- the scheme has).
+    let types = V.append (overTypes sc fresh) (overNumbers sc fresh) in
     let u0 =
       if V.isEmpty types then () else stSetRef i.instAt (H.insert node types (stGetRef i.instAt))
     in
@@ -131,6 +134,15 @@ fun want (i : Inf s) (p : Pred) (owner : Maybe Int) : Int ! { St s | e } =
 @pub fun overTypes (sc : Scheme) (fresh : [Type]) : [Type] =
   V.concatMap
     (\k -> if V.getOr Plain sc.quant k == Plain then [V.getOr Error fresh k] else [])
+    (V.range 0 (V.len sc.quant))
+
+-- Those of `fresh` that are for variables over number types: an integer's,
+-- or a fraction's.
+@pub fun overNumbers (sc : Scheme) (fresh : [Type]) : [Type] =
+  V.concatMap
+    (\k ->
+      (let kind = V.getOr Plain sc.quant k in
+       if kind == Num or kind == Frac then [V.getOr Error fresh k] else []))
     (V.range 0 (V.len sc.quant))
 
 -- A scheme's `where`, its quantifiers `fresh`.

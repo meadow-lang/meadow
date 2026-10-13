@@ -86,6 +86,8 @@ record Low s = {
   impls : HashMap Int ImplDef,
   generics : HashMap Int Generalized,
   extTypes : HashMap Int Int,
+  -- How many number types a definition of another unit is generic in.
+  extNums : HashMap Int Int,
   shapes : HashMap String TraitShape,
   methods : HashMap String Scheme,
   defaults : HashMap String Int,
@@ -398,20 +400,50 @@ fun typesOf (cx : Low s) (id : Int) : Int =
 -- How many of a scheme's quantifiers are variables over types.
 fun plains (sc : Scheme) : Int = V.len (plainOf sc sc.quant VarKind.Plain)
 
+-- Those of `xs`, one for each of `sc`'s quantifiers, that are for variables
+-- over number types.
+fun numberOf (sc : Scheme) (xs : [a]) (other : a) : [a] =
+  V.concatMap
+    (\k ->
+      (let kind = V.getOr VarKind.Plain sc.quant k in
+       if kind == VarKind.Num or kind == VarKind.Frac then [V.getOr other xs k] else []))
+    (V.range 0 (V.len sc.quant))
+
+-- The variables over number types binder `id` is generic in.
+fun numvarsOf (cx : Low s) (id : Int) : [Int] =
+  match H.lookup id cx.generics with
+  | Just (g : Generalized) -> numberOf g.scheme g.vars 0
+  | None -> []
+
+-- How many number types binder `id` is generic in.
+fun numbersOf (cx : Low s) (id : Int) : Int =
+  match H.lookup id cx.extNums with
+  | Just n -> n
+  | None -> V.len (numvarsOf cx id)
+
 -- A mention of binder `id`, of type `t`, at types `tys`. One of a binding
 -- from inside it is at the binding's own variables, which nothing wrote.
+-- `tys` are the types and then, where inference said, the number types:
+-- a mention it did not say them of is at no number type that is known.
 fun instance out (cx : Low s) (m : Meta) (id : Int) (t : Type) (tys : [Type]) =
   let n = typesOf cx id in
+  let k = numbersOf cx id in
   let head = newCoreTermVar out m id t in
-  if n == 0 then head
-  else if V.len tys == n then newCoreTermTyApp out m head tys t
+  if n == 0 and k == 0 then head
+  else if V.len tys == n + k then newCoreTermTyApp out m head (V.take tys n) (V.drop tys n) t
   else
+    -- Inference said nothing of the number types: a mention from inside the
+    -- binding, which is at the binding's own, so that a copy of it for a
+    -- number type calls that copy and not the binding as it was written.
     (let own = V.map (\v -> Var v) (tyvarsOf cx id) in
-     newCoreTermTyApp out m head (V.map (\k -> V.getOr Error own k) (V.range 0 n)) t)
+     let nums = V.map (\v -> Var v) (numvarsOf cx id) in
+     let plain = if V.len tys == n then tys else V.map (\i -> V.getOr Error own i) (V.range 0 n) in
+     newCoreTermTyApp out m head plain nums t)
 
--- `value`, generic in `vars`.
-fun typeAbs out (vars : [Int]) value =
-  if V.isEmpty vars then value else newCoreTermTyLam out nowhere vars value (tyCoreTerm out value)
+-- `value`, generic in `vars`, and in `nums` over number types.
+fun typeAbs out (vars : [Int]) (nums : [Int]) value =
+  if V.isEmpty vars and V.isEmpty nums then value
+  else newCoreTermTyLam out nowhere vars nums value (tyCoreTerm out value)
 
 -- What each of `pattern`'s quantifiers is where it is `actual`, after `h`.
 fun matchTy (pattern : Type) (actual : Type) (h : HashMap Int Type) : HashMap Int Type =
@@ -475,7 +507,8 @@ fun topBind (a : BareArena) out (cx : Low s) b =
   | (pat, value, isFun) ->
       (let v = stSetRef cx.dicts [] in
        let vars = M.unwrapOr [] (M.map (\id -> tyvarsOf cx id) (boundId a b)) in
-       (pat, typeAbs out vars (abstracted out ds value), isFun))
+       let nums = M.unwrapOr [] (M.map (\id -> numvarsOf cx id) (boundId a b)) in
+       (pat, typeAbs out vars nums (abstracted out ds value), isFun))
 
 -- A method's type, over its trait's parameters.
 fun methodType (cx : Low s) (tr : String) (name : String) : Type =
@@ -675,6 +708,7 @@ fun implDefs out (cx : Low s) (a : BareArena) d (dict : Int) =
            (typeAbs
               out
               typed
+              []
               (abstracted
                  out
                  ds
@@ -761,10 +795,15 @@ fun bound out (cx : Low s) (m : Meta) b body =
   | (p, value, isFun) ->
       if isFun then
         (let id = corePatPVarId out p in
-         newCoreTermLetRec out m [newCoreBind out m id (typeAbs out (tyvarsOf cx id) value)] body t)
+         newCoreTermLetRec
+           out
+           m
+           [newCoreBind out m id (typeAbs out (tyvarsOf cx id) [] value)]
+           body
+           t)
       else if kindCorePat out p == CorePatKind.PVar then
         (let id = corePatPVarId out p in
-         newCoreTermLet out m id (typeAbs out (tyvarsOf cx id) value) body t)
+         newCoreTermLet out m id (typeAbs out (tyvarsOf cx id) [] value) body t)
       else if kindCorePat out p == CorePatKind.PWild then
         newCoreTermLet out m (fresh cx) value body t
       else newCoreTermCase out m value [newCoreArm out m p None body] t
@@ -867,10 +906,26 @@ def nowhere : Meta = spanMeta 0 0
   -- The functions it keeps for a unit that imports it to copy to its calls
   -- (`Inline.exports`).
   bodies : CoreProgram,
+  -- Its definitions that are generic in a number's type, as they were
+  -- written, and those of the units it imports, a program a package: what a
+  -- unit that uses one at a number type makes its copy of
+  -- (`Inline.numbered`). A unit hands on what it was handed, since a
+  -- definition it keeps may mention one of theirs.
+  numbers : [Numbers],
   -- All of it, as it was written and before anything was made of it, where
   -- the build's units are to be optimised as one program
   -- (`Core.joinedUnits`); nothing otherwise.
   whole : CoreProgram
+}
+
+-- A unit's definitions that are generic in a number's type, as they were
+-- written, with each variable over number types they are written with and
+-- whether it is over fractions.
+@derive(Reflect, Debug, PartialEq)
+@pub record Numbers = {
+  program : CoreProgram,
+  vars : [Int],
+  fracs : [Bool]
 }
 
 -- A declared type: its name in core, how many types it takes, and each
@@ -1137,6 +1192,23 @@ def nowhere : Meta = spanMeta 0 0
                    theirDefaults,
                extTypes =
                  V.foldl (\h x -> match x with | (id, _, n) -> H.insert id n h) H.empty externs,
+               extNums =
+                 V.foldl
+                   (\h x ->
+                     match x with
+                     | ((it : Item), (ex : Export), _) ->
+                         if it.kind != "v" or not (S.isEmpty it.owner) then h
+                         else
+                           H.insert
+                             it.id
+                             (M.unwrapOr
+                                0
+                                (M.map
+                                   (\(sc : Scheme) -> V.len (numberOf sc sc.quant VarKind.Plain))
+                                   ex.scheme))
+                             h)
+                   H.empty
+                   theirs,
                shapes = traitShapes,
                methods =
                  V.foldl

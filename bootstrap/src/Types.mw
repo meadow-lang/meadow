@@ -282,10 +282,13 @@ fun innerState (ar : Arena s) (field : Type) (level : Int) : Bool ! { St s | e }
   | RowExtend l f rest -> RowExtend l (zonk ar f) (zonk ar rest)
   | other -> other
 
--- `t` as the tree a program is lowered from holds it: zonked, and a number
--- nothing settled the type of an `Int`, a fraction a `Float` -- which is what
--- one is where nothing says otherwise. A definition generic in its number is
--- so its `Int` copy, and the only one until lowering makes the others.
+-- `t` as the tree a program is lowered from holds it: zonked. A number
+-- nothing settled the type of is an `Int` by now, and a fraction a `Float`
+-- (`defaultNumVars`), but for the variables a binding is generic in, which
+-- are still variables here: a definition generic in its number is lowered
+-- knowing which of its types are the number's, so that a copy can be made
+-- of it for each number type it is used at (`Inline.numbered`) -- its `Int`
+-- copy is the definition itself, with what `numberKind` says of each.
 @pub fun settled (ar : Arena s) (t : Type) : Type ! { St s | e } =
   match prune ar t with
   | Con name args -> Con name (V.map (settled ar) args)
@@ -293,12 +296,18 @@ fun innerState (ar : Arena s) (field : Type) (level : Int) : Bool ! { St s | e }
   | Tuple items -> Tuple (V.map (settled ar) items)
   | Record row -> Record (settled ar row)
   | RowExtend l f rest -> RowExtend l (settled ar f) (settled ar rest)
-  | Var id ->
-      (match slotKind ar id with
-       | Num -> Con "Int" []
-       | Frac -> Con "Float" []
-       | _ -> Var id)
   | other -> other
+
+-- Whether variable `id` is over number types, and if so whether over
+-- fractions: `Just False` an integer's, `Just True` a fraction's.
+@pub fun numberKind (ar : Arena s) (id : Int) : Maybe Bool ! { St s | e } =
+  match prune ar (Var id) with
+  | Var now ->
+      (match slotKind ar now with
+       | Num -> Just False
+       | Frac -> Just True
+       | _ -> None)
+  | _ -> None
 
 -- The unbound variables of `t`, after `out`, each once, in the order met.
 @pub fun freeVars (ar : Arena s) (t : Type) (out : [Int]) : [Int] ! { St s | e } =

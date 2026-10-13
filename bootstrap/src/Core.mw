@@ -215,7 +215,11 @@ type Ty = Type
 -- A value generic in its type says so, `TyLam`, naming the variables its
 -- types are written with, and a mention of one says the types it is at,
 -- `TyApp`: how a value of a variable's type is represented is the type's to
--- say, at run time. A unit names its package, and what its definitions
+-- say, at run time. A value generic in a number's type says that beside
+-- them, `nums`, and a mention the number types it is at: nothing at run time
+-- depends on those but what a literal is, so they are gone -- the value
+-- copied for each number type it is used at, `Inline.numbered` -- before
+-- anything is lowered. A unit names its package, and what its definitions
 -- mention of another's -- `Extern`: the binder it has here, the symbol it
 -- is, how many types it is generic in, and how many arguments it is a
 -- function of where it is written as one.
@@ -244,8 +248,8 @@ type Ty = Type
     + Clause { eff : String, op : String, param : Int, paramTy : Ty, resume : Int, body : Term }
   Term - Lam
   Term + Lam { param : Int, paramTy : Ty, body : Term }
-  Term + TyLam { vars : [Int], body : Term }
-  Term + TyApp { func : Term, tys : [Ty] }
+  Term + TyLam { vars : [Int], nums : [Int], body : Term }
+  Term + TyApp { func : Term, tys : [Ty], nums : [Ty] }
   Term * { ty : Ty }
   Pat * { ty : Ty }
 }

@@ -41,7 +41,7 @@ use MeadowBoot.Ast (AstProgram)
 use MeadowBoot.Rename (mentionsOf, Binder)
 use MeadowBoot.Scopes (Source, Export, Renamed, DepExports, renameUnit, usesOf, macroFuns, saysVis)
 use MeadowBoot.Infer (inferUnit, Inferred)
-use MeadowBoot.Elab (unitCore, defSymbol, Linked, DataSig, DefaultSig, Imported)
+use MeadowBoot.Elab (unitCore, defSymbol, Linked, Numbers, DataSig, DefaultSig, Imported)
 use MeadowBoot.Seq as Seq
 use MeadowBoot.Lint (lint)
 use MeadowBoot.Dictionaries as Dictionaries
@@ -411,8 +411,34 @@ fun checkedOf
         M.map
           (\made ->
             match made with
-            | (plain, dicts, defaults, aliases) ->
-                (let traits =
+            | (written, dicts, defaults, aliases) ->
+                -- A definition generic in a number's type is copied for
+                -- each number type it is used at before anything else is
+                -- made of the unit: what is optimised, kept and lowered
+                -- from here on says nothing of number types.
+                (let theirNumbers =
+                   V.foldl
+                     (\acc (l : Linked) ->
+                       V.foldl
+                         (\acc2 (n : Numbers) ->
+                           if V.any
+                             (\(x : Numbers) ->
+                               Inline.packageOf x.program == Inline.packageOf n.program)
+                             acc2 then acc2
+                           else V.pushBack acc2 n)
+                         acc
+                         l.numbers)
+                     []
+                     linked
+                 in
+                 let ownNumbers = Inline.numbers written in
+                 let plain =
+                   Inline.numbered
+                     written
+                     (V.map (\(n : Numbers) -> (n.program, V.zip n.vars n.fracs)) theirNumbers)
+                     done.numbers
+                 in
+                 let traits =
                    Inline.traitsOf
                      (V.append
                         (V.map (\(e : Entry [String]) -> e.key) labelled)
@@ -478,6 +504,16 @@ fun checkedOf
                         bodies =
                           if (keep and not inlines) or program then Inline.nothing ()
                           else Inline.exports core traits inlines generous,
+                        numbers =
+                          if Inline.keepsAny ownNumbers then
+                            V.pushFront
+                              theirNumbers
+                              (Numbers {
+                                 program = ownNumbers,
+                                 vars = V.map fst done.numbers,
+                                 fracs = V.map snd done.numbers
+                               })
+                          else theirNumbers,
                         whole = if wholly then plain else Inline.nothing ()
                       },
                       Seq.declarations
@@ -511,6 +547,7 @@ fun emptyLinked () : Linked =
     arities = [],
     summary = emptySummary (),
     bodies = Inline.nothing (),
+    numbers = [],
     whole = Inline.nothing ()
   }
 

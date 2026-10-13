@@ -2607,6 +2607,49 @@ fn a_program_with_the_standard_library_lowered_by_meadowboot_answers_as_the_rust
     );
 }
 
+/// Functions written once for any number type, used at several: one that
+/// calls itself, one that calls another, one over fractions, and one that
+/// hands a function generic in its number to the standard library.
+const WITH_NUMBERS: &str = r#"use Std.Collections.Vector as V
+
+fun factorial n = if n == 0 then 1 else n * factorial (n - 1)
+
+fun next n = n + 1
+
+fun twiceNext n = next n + next 10
+
+fun half x = x *. 0.5
+
+fun bumped xs = V.map (\x -> x + 300) xs
+
+def result =
+  (
+    factorial 30,
+    factorial (toBigInt 30),
+    factorial (toUInt8 5),
+    twiceNext (toBigInt 0),
+    half (toFloat32 1.0),
+    half 3.0,
+    bumped [toUInt8 0, toUInt8 1],
+    bumped [toBigInt 0]
+  )
+"#;
+
+/// A definition generic in a number's type is copied for each number type it
+/// is used at, so that a literal in it is of that type -- the `1` of
+/// `factorial` a `BigInt` where its argument is one, and not the `Int` the
+/// definition as it is written makes it. Without the copies the first of
+/// these wraps and is right, and the rest are not numbers at all.
+#[test]
+fn a_function_generic_in_its_number_is_right_at_each_number_type_it_is_used_at() {
+    let want = "(-8764578968847253504, 265252859812191058636308480000000, 120, 12, 0.5, 1.5, \
+                [44, 45], [300])";
+    for opt in ["O1", "O2", "O3"] {
+        let cut = cut_of(&format!("numbers-{opt}"), WITH_NUMBERS, &["--opt", opt]);
+        assert_eq!(axcut_answer(&cut), want, "at {opt}");
+    }
+}
+
 /// A program each level does something to that the level under it does not:
 /// an operator and `show` at a known type, a small function, and a function
 /// that takes a dictionary and is too large to be copied for it below O3 --

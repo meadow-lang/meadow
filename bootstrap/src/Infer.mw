@@ -2393,6 +2393,11 @@ fun inferImpl
   -- Each generalized binding with its scheme and the variable behind each
   -- of its quantifiers, as the typed tree's types have it.
   generics : HashMap Int Generalized,
+  -- The variables over number types that bindings are generic in, each with
+  -- whether it is over fractions: what a type in the typed tree that is one
+  -- of them is where its binding is not copied for another -- an `Int`, or
+  -- a `Float`.
+  numbers : [(Int, Bool)],
   -- What is wrong with the unit's `main`, if it has one: a unit is not
   -- compiled with a `main` that is not `() -> () ! Eff`. Everything else
   -- inference says is in the dumps; it still says of some of the standard
@@ -2561,7 +2566,14 @@ fun inferImpl
                (let g : Generalized = snd kv in
                 if V.isEmpty g.vars then h else H.insert (fst kv) g h))
              H.empty
-             (H.toVec (stGetRef i.generalized))
+             (H.toVec (stGetRef i.generalized)),
+         numbers =
+           V.concatMap
+             (\id ->
+               match numberKind i.ar id with
+               | Just frac -> [(id, frac)]
+               | None -> [])
+             (H.keys quantified)
        })
 
 -- Module `k` as inference wrote it, every type settled.
