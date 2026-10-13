@@ -491,6 +491,9 @@ impl Vm<'_> {
                 }
                 Build::unit()
             }
+            // How much of the program this machine has reached: what a
+            // fuzzer steers by. See `Vm::reached`.
+            "covered" => Build::int(self.covered(matches!(arg, Value::Bool(true))) as i64),
             // Calling C, for `Std.Ffi`: see `meadow_rt::ffi`. Everything is
             // read out of the heap before the call and built after it.
             op if op.starts_with("ffi") => {

@@ -39,6 +39,30 @@ beyond the last release is under _Unreleased_.
 
 ### Added
 
+- Property tests and fuzzing in the standard library. `Std.Test.Property`
+  checks a property on a hundred values a generator makes -- `forAll gen
+  prop`, or `check` where the property draws for itself -- and fails with the
+  smallest case it found. A generator is a function that draws numbers
+  (`between`, `bool`, `vector`, `element`, `oneOf`, `maybe`, `char`, `text`),
+  so one of your own is any function that calls them, and it shrinks as they
+  do: a failing case is run again on fewer and smaller draws. The same cases
+  are checked every run, and `replay draws prop` checks one again.
+  `Std.Test.Fuzz` runs a function on text close to examples it is given:
+  `fuzz corpus words prop` tries a thousand, each some example with pieces
+  taken out, doubled, moved from another, or words dropped in, and shrinks
+  what fails. `fuzzGuided` is the same steered by coverage: it asks the
+  machine after each input how much of the program has been reached, and an
+  input that got somewhere new is kept as an example for later ones -- so it
+  finds a text that starts `fuzz` in a few hundred tries, a character at a
+  time, where `fuzz` would need all four at once. It steers on the bytecode
+  machine, where tests run, and a thread that has asked is interpreted from
+  then on; a native program is told nothing is new. A program that stops the
+  process is not caught by either.
+- `Process.covered afresh` answers how many places in the program the thread
+  has reached since it first asked, or since it last asked with `True`: what
+  `fuzzGuided` steers by.
+- `Std.Test.failure act` runs `act` and says whether it failed an assertion
+  and with what message, where `didFail` says only whether.
 - A natively compiled program can profile itself: run with
   `MEADOW_SILO_PROFILE=<file>` it samples where its time goes, and
   `scripts/silo-profile.py` reads the file against the executable. For a

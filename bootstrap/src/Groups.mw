@@ -376,3 +376,37 @@ use Std.Test (assertEq)
 
 @test fun separateCyclesStaySeparate () =
   assertEq (scc [[1, 2], [0], [3], [2]]) [[2, 3], [0, 1]] "each its own"
+
+-- What holds of every graph, checked on a hundred made up: each node is in
+-- one component and no more, and a node's component is no earlier than the
+-- component of anything it mentions -- what it depends on comes first.
+@test fun everyNodeIsInOneComponentAfterWhatItMentions () =
+  forAll graph (\edges ->
+    let found = scc edges in
+    let u =
+      assertEq (sort (V.concat found)) (V.range 0 (V.len edges)) "each node once, of ${show found}"
+    in V.foldl
+         (\w from ->
+           V.foldl
+             (\w2 to ->
+               assertTrue
+                 (componentOf found to 0 <= componentOf found from 0)
+                 "${show to} before ${show from}, which mentions it, in ${show found}")
+             w
+             (V.getOr [] edges from))
+         u
+         (V.range 0 (V.len edges)))
+
+-- A graph of at most eight nodes, each mentioning at most four of them.
+fun graph () =
+  let n = between 0 9 in
+  V.map (\node -> vector 4 (\() -> between 0 n)) (V.range 0 n)
+
+-- Which of `found` node `x` is in.
+fun componentOf (found : [[Int]]) (x : Int) (i : Int) : Int =
+  match V.get found i with
+  | None -> i
+  | Just c -> if V.elem x c then i else componentOf found x (i + 1)
+
+use Std.Test (assertTrue)
+use Std.Test.Property (forAll, between, vector)

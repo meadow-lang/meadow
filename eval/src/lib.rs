@@ -2259,6 +2259,9 @@ fn native_process(op: &str, arg: Value) -> Result<Value, RuntimeError> {
             Ok(st) => ok(Value::Int(st.code().unwrap_or(-1) as i64)),
             Err(e) => errv(e.to_string()),
         },
+        // The reference machine notes nothing of what it reaches: a fuzzer
+        // that asks is told nothing is new.
+        "covered" => Value::Int(0),
         "exit" => {
             let code = as_int(&arg)?;
             std::process::exit(code as i32);

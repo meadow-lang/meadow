@@ -117,6 +117,17 @@ pub const MODULES: &[(&str, &str)] = &[
         "String.Parse.Lexer",
         include_str!("../../../lib/Std/src/String/Parse/Lexer.mw"),
     ),
+    // After `Random`, `Collections.Vector` and `String`, which a generator is
+    // written with: the one part of the test library that is not first.
+    (
+        "Test.Property",
+        include_str!("../../../lib/Std/src/Test/Property.mw"),
+    ),
+    // After `Test.Property`, whose generators make what it tries.
+    (
+        "Test.Fuzz",
+        include_str!("../../../lib/Std/src/Test/Fuzz.mw"),
+    ),
     ("Path", include_str!("../../../lib/Std/src/Path.mw")),
     ("Json", include_str!("../../../lib/Std/src/Json.mw")),
     // After `String`, whose `join` it writes tokens with.

@@ -21,6 +21,11 @@
   fail : String -> (),
 }
 
+-- Checking a property on many values a generator makes, and on mutated
+-- text: each needs more of the library than this module may.
+@pub mod Property
+@pub mod Fuzz
+
 -- --- assertions --------------------------------------------------------------
 
 @pub fun assert (cond : Bool) (msg : String) : () ! { Test | e } = if cond then () else fail msg
@@ -53,6 +58,12 @@
 -- `Std.Test` test itself.
 @pub fun didFail (act : () -> a ! { Test | e }) : Bool ! e =
   handle act () with { fail msg k -> True, return x -> False }
+
+-- Run `act` and say whether it failed an assertion, and with what message:
+-- `didFail`, for whoever goes on to say more about the failure -- a property
+-- that names the value it failed on.
+@pub fun failure (act : () -> a ! { Test | e }) : (Bool, String) ! e =
+  handle act () with { fail msg k -> (True, msg), return x -> (False, "") }
 
 -- `act` must fail; if it succeeds, *this* is the failure.
 @pub fun assertFails (act : () -> a ! { Test, Test | e }) (msg : String) : () ! { Test | e } =

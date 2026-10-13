@@ -207,6 +207,13 @@ pub struct Vm<'p> {
     /// [`crate::profile`]. Last, because native code reaches the fields above
     /// by fixed offsets and must not be made to care about this one.
     pub profile: Option<Box<crate::profile::Profile>>,
+    /// Which of the program this machine has reached, once the program has
+    /// asked (`Process.covered`): a bit for each pc it has been entered at,
+    /// and how many are set. `None` costs one branch where a sample's does;
+    /// `Some` costs the machine its native code, from then on.
+    /// What a fuzzer steers by: an input that reaches a pc no input before it
+    /// did is one worth making more of. After `profile`, for its reason.
+    pub(crate) reached: Option<Box<Reached>>,
     /// How many of each instruction this machine retired. See
     /// [`crate::profile::Ops`].
     #[cfg(feature = "profile-alloc")]
@@ -215,6 +222,46 @@ pub struct Vm<'p> {
     /// [`crate::profile::Feedback`].
     #[cfg(feature = "profile-alloc")]
     pub feedback: crate::profile::Feedback,
+}
+
+/// The pcs a machine has run an instruction at. See [`Vm::reached`].
+///
+/// A machine that keeps this is interpreted throughout ([`Vm::advance`]), so
+/// every instruction it runs is noted: the count only grows, and grows
+/// exactly when the program gets somewhere it had not been. Trusting native
+/// code to come back at each block was tried first, and lost what a compiled
+/// function reached inside itself: a fuzzer steered by it found its way only
+/// while the function under test was still cold.
+#[derive(Default)]
+pub(crate) struct Reached {
+    seen: Vec<u64>,
+    count: u64,
+}
+
+impl Reached {
+    #[inline]
+    fn note(&mut self, pc: usize) {
+        let (word, bit) = (pc / 64, 1u64 << (pc % 64));
+        if word >= self.seen.len() {
+            self.seen.resize(word + 1, 0);
+        }
+        if self.seen[word] & bit == 0 {
+            self.seen[word] |= bit;
+            self.count += 1;
+        }
+    }
+}
+
+impl Vm<'_> {
+    /// How many pcs this machine has been entered at since the program first
+    /// asked, which is when it starts to be noted -- or, `afresh`, since now:
+    /// what was noted is forgotten, and the answer is nothing.
+    pub(crate) fn covered(&mut self, afresh: bool) -> u64 {
+        if afresh {
+            self.reached = Some(Default::default());
+        }
+        self.reached.get_or_insert_with(Default::default).count
+    }
 }
 
 // The method table pointers point into the `Native` the machine was given,
@@ -318,6 +365,7 @@ impl<'p> Vm<'p> {
             halted: None,
             failure: None,
             profile: None,
+            reached: None,
             #[cfg(feature = "profile-alloc")]
             ops: crate::profile::Ops::default(),
             #[cfg(feature = "profile-alloc")]
@@ -473,6 +521,13 @@ impl<'p> Vm<'p> {
     pub fn advance(&mut self) -> Result<Option<Value>, Error> {
         if self.profile.is_some() {
             self.sample();
+        }
+        // Noting where it goes, a machine is interpreted: native code runs
+        // from one block into the next without coming back here, and what it
+        // got to on the way would not be seen.
+        if let Some(r) = &mut self.reached {
+            r.note(self.pc);
+            return self.step();
         }
         match self.native.and_then(|n| n.at(self.pc)) {
             Some(f) => crate::abi::enter(self, f),

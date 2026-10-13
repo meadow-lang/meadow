@@ -1,0 +1,241 @@
+-- Std.Test.Fuzz: a function run on text nobody would write.
+--
+--   use Std.Test (assertTrue)
+--   use Std.Test.Fuzz (fuzz)
+--
+--   @test fun theParserAnswersWhateverItIsGiven () =
+--     fuzz ["let x = 1 in x + 2", "fun f (a, b) = a"] ["let", "in", "(", ")", "="] (\src ->
+--       assertTrue (answers (parse src)) "an answer, right or wrong")
+--
+-- A property says what holds of every value; a fuzzer goes looking for the
+-- value a program did not expect. What it tries is text close to text that
+-- is right -- a `corpus` of examples, with pieces taken out, doubled, moved
+-- from one example into another, and `words` of the language dropped in
+-- where they do not belong -- since text that is nothing like a program is
+-- turned away by the first thing that reads it, and tests nothing behind
+-- that.
+--
+-- It is `Std.Test.Property` underneath: an input is made by a generator, so
+-- the same inputs are tried every run, and one that fails is shrunk before
+-- the test fails with it -- to the fewest changes that still fail, of the
+-- earliest example they fail on, so put the shortest examples first:
+--
+--   an answer, right or wrong
+--     for "let x = ( in"
+--     after 212 cases, on draws [0, 1, 2, 7, 0]
+--
+-- **Steered by where an input got to.** `fuzz` makes every input from the
+-- examples it was given. `fuzzGuided` asks the machine, after each, how much
+-- of the program has been reached (`Process.covered`), and an input that
+-- reached somewhere no input had is kept as an example to make more from.
+-- So it gets through a door one change at a time -- a text that starts `f`,
+-- then one that starts `fu` -- where `fuzz` would have to make all the
+-- changes at once. A thread that has asked is interpreted from then on,
+-- with none of it compiled, so each input costs more than `fuzz`'s; and it
+-- steers only on the bytecode machine, which is where tests run: a native
+-- program is told nothing is ever new, and `fuzzGuided` is then `fuzz`.
+--
+-- **What it does not do.** It sees a failure only as a test does -- an
+-- assertion that fails. A program that stops the process is not caught
+-- here; the run ends with it.
+
+use Std.Test (Test, failWith, failure)
+use Std.Test.Property (
+  Gen, Config, checkWith, failing, drawing, pick, between, element, vector, anyChar
+)
+use Std.Process (Process, covered)
+use Std.Random (seed)
+use Std.Collections.Vector as V
+-- `[a, b]` desugars to a `vecFromArray` call.
+use Std.Collections.Vector (vecFromArray)
+use Std.String as S
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+
+-- A thousand inputs: a fuzzer finds what it finds by trying many.
+@pub def thorough : Config = Config { runs = 1000, seed = 20261013, shrinks = 4000 }
+
+-- `prop` holds of a thousand inputs made from `corpus` and `words`, or the
+-- test fails with the smallest found that it does not hold of.
+@pub fun fuzz (corpus : [String]) (words : [String]) (prop : String -> () ! { Gen, Test, Test | e })
+    : () ! { Test | e } =
+  fuzzWith thorough corpus words prop
+
+@pub fun fuzzWith
+    (c : Config)
+    (corpus : [String])
+    (words : [String])
+    (prop : String -> () ! { Gen, Test, Test | e })
+    : () ! { Test | e } =
+  checkWith c (\() ->
+    let input = mutated corpus words in
+    match failure (\() -> prop input) with
+    | (True, why) -> failWith "${why}\n  for ${show input}"
+    | _ -> ())
+
+-- `fuzz`, steered: an input that reaches somewhere in the program no input
+-- before it did is kept, and later inputs are made from it as they are from
+-- the examples -- half of them from the one kept last, which is the one that
+-- got furthest.
+@pub fun fuzzGuided
+    (corpus : [String])
+    (words : [String])
+    (prop : String -> () ! { Gen, Test, Test, Process | e })
+    : () ! { Test, Process | e } =
+  fuzzGuidedWith thorough corpus words prop
+
+@pub fun fuzzGuidedWith
+    (c : Config)
+    (corpus : [String])
+    (words : [String])
+    (prop : String -> () ! { Gen, Test, Test, Process | e })
+    : () ! { Test, Process | e } =
+  -- From nothing: what an earlier run reached is no news to this one.
+  guided c words prop 0 corpus (covered True)
+
+-- The cases from `n` on: `kept` are the examples so far, the newest first
+-- after the first of them, and `most` how much of the program had been
+-- reached when the last was kept.
+fun guided (c : Config) (words : [String]) prop (n : Int) (kept : [String]) (most : Int) =
+  if n >= c.runs then ()
+  else
+    match drawing [] True (seed (c.seed + n * 7919)) (\() ->
+      let input = steered kept words in
+      (input, failure (\() -> prop input))) with
+    | ((input, (True, why)), used) ->
+        failing c (\() -> once kept words prop) n used "${why}\n  for ${show input}"
+    | ((input, _), _) ->
+        let now = covered False in
+        if now > most then guided c words prop (n + 1) (V.pushFront kept input) now
+        else guided c words prop (n + 1) kept most
+
+-- One case as `guided` runs it, failing as `fuzz` fails: what a failing
+-- case is run again as while it is made smaller, with the examples as they
+-- were when it failed.
+fun once (kept : [String]) (words : [String]) prop =
+  let input = steered kept words in
+  match failure (\() -> prop input) with
+  | (True, why) -> failWith "${why}\n  for ${show input}"
+  | _ -> ()
+
+-- `mutated`, of examples the newest of which is first: that one half the
+-- time, and any of them the rest.
+fun steered (kept : [String]) (words : [String]) =
+  let from = if pick 2 == 0 then V.take kept 1 else kept in
+  S.fromChars (changes kept words (S.chars (M.unwrapOr "" (element from))) (pick 9))
+
+-- One of `corpus` -- the first when it shrinks, nothing where there are
+-- none -- changed up to eight times: see `changed`.
+@pub fun mutated (corpus : [String]) (words : [String]) : String ! { Gen | e } =
+  let start = S.chars (M.unwrapOr "" (element corpus)) in
+  S.fromChars (changes corpus words start (pick 9))
+
+fun changes (corpus : [String]) (words : [String]) (cs : [Char]) (left : Int) =
+  if left <= 0 then cs else changes corpus words (changed corpus words cs) (left - 1)
+
+-- `cs` changed once: a run of it taken out; a run of it doubled; one of
+-- `words` put in; a run of another of `corpus` put in; a character put in;
+-- or a character made another. Where is drawn, and how long a run -- at
+-- most sixteen characters.
+@pub fun changed (corpus : [String]) (words : [String]) (cs : [Char]) : [Char] ! { Gen | e } =
+  let kind = pick 6 in
+  let at = pick (V.len cs + 1) in
+  let n = between 1 17 in
+  if kind == 0 then V.append (V.take cs at) (V.drop cs (at + n))
+  else if kind == 1 then V.concat [V.take cs (at + n), V.slice cs at (at + n), V.drop cs (at + n)]
+  else if kind == 2 then
+    V.concat [V.take cs at, S.chars (M.unwrapOr "" (element words)), V.drop cs at]
+  else if kind == 3 then
+    (let other = S.chars (M.unwrapOr "" (element corpus)) in
+     let from = pick (V.len other + 1) in
+     V.concat [V.take cs at, V.slice other from (from + n), V.drop cs at])
+  else if kind == 4 then V.concat [V.take cs at, [anyChar ()], V.drop cs at]
+  else if at < V.len cs then V.set cs at (anyChar ())
+  else V.pushBack cs (anyChar ())
+
+-- Any text at all, of at most `most` characters: for what reads bytes off a
+-- wire, where there is no example to start from.
+@pub fun noise (most : Int) : String ! { Gen | e } = S.fromChars (vector most (\() -> anyChar ()))
+
+-- --- tests -------------------------------------------------------------------
+
+use Std.Test (assertTrue, assertFalse, assertEq, didFail)
+use Std.Test.Property (generated, forAll)
+
+-- Whether every `(` of `s` has its `)` after it, and no `)` comes first.
+fun balanced (s : String) : Bool = depthOf (S.chars s) 0 0 >= 0
+
+fun depthOf (cs : [Char]) (i : Int) (depth : Int) : Int =
+  if depth < 0 then depth
+  else
+    match V.get cs i with
+    | None -> if depth == 0 then 0 else 0 - 1
+    | Just c ->
+        depthOf cs (i + 1) (if c == '(' then depth + 1 else if c == ')' then depth - 1 else depth)
+
+@test fun aFunctionThatAnswersAnythingPasses () =
+  fuzz ["(a (b) c)", "()"] ["(", ")"] (\s -> assertTrue (S.byteLength s >= 0) "a length")
+
+@test fun aFuzzerFindsTheInputAFunctionDidNotExpect () =
+  -- Every example is balanced; a change is all it takes to make one that is not.
+  assertTrue
+    (didFail (\() ->
+       fuzz ["(a (b) c)", "()"] ["(", ")"] (\s -> assertTrue (balanced s) "balanced")))
+    "an unbalanced input is found"
+
+@test fun whatItFindsIsShrunk () =
+  match failure (\() ->
+    fuzz ["(a (b) c)", "()"] ["(", ")"] (\s -> assertTrue (balanced s) "balanced")) with
+  | (failed, why) ->
+      let a = assertTrue failed "it fails" in
+      -- One change of the first example: its first bracket taken out.
+      let b =
+        assertTrue (S.contains "for \"a (b) c)\"" why) "the first example less a bracket: ${why}"
+      in assertTrue (S.contains "on draws [0, 1, 0, 0, 0]" why) "the first, changed once: ${why}"
+
+@test fun noChangeIsTheExampleItself () =
+  let a = assertEq (generated [] (\() -> mutated ["abc", "xyz"] [])) "abc" "the first, unchanged" in
+  let b = assertEq (generated [1] (\() -> mutated ["abc", "xyz"] [])) "xyz" "the second" in
+  assertEq (generated [] (\() -> mutated [] [])) "" "nothing of nothing"
+
+@test fun aChangeIsOneOfTheSix () =
+  -- kind, where, how long -- and then whatever the change draws.
+  let cs = S.chars "abcdef" in
+  let made =
+    \draws -> S.fromChars (generated draws (\() -> changed ["abcdef", "XYZ"] ["let"] cs))
+  in
+  let a = assertEq (made [0, 1, 1]) "adef" "two taken out after the first" in
+  let b = assertEq (made [1, 1, 1]) "abcbcdef" "two doubled" in
+  let c = assertEq (made [2, 3, 0, 0]) "abcletdef" "a word put in" in
+  let d = assertEq (made [3, 0, 2, 1, 0]) "XYZabcdef" "a run of another example put in" in
+  assertEq (made [4, 6, 0, 0, 0]) "abcdefa" "a character put in at the end"
+
+-- Whether `s` starts `fuzz`, asked a character at a time: four places a text
+-- may get to, each only past the one before.
+fun startsFuzz (s : String) : Bool =
+  let cs = S.chars s in
+  if V.get cs 0 != Just 'f' then False
+  else if V.get cs 1 != Just 'u' then False
+  else if V.get cs 2 != Just 'z' then False
+  else V.get cs 3 == Just 'z'
+
+@test fun aSteeredFuzzerGetsWhereABlindOneDoesNot () =
+  let prop = \s -> assertFalse (startsFuzz s) "does not start `fuzz`" in
+  let a =
+    assertFalse
+      (didFail (\() -> fuzz ["x"] ["f", "u", "z"] prop))
+      "a thousand tries with nothing to steer by do not find it"
+  in
+  let found = didFail (\() -> fuzzGuided ["x"] ["f", "u", "z"] prop) in
+  -- A machine that notes nothing of where it has been steers nothing.
+  if covered False > 0 then assertTrue found "steered, it is found" else ()
+
+@test fun whatASteeredFuzzerFindsIsShrunk () =
+  match failure (\() ->
+    fuzzGuided ["x"] ["f", "u", "z"] (\s ->
+      assertFalse (startsFuzz s) "does not start `fuzz`")) with
+  | (True, why) -> assertTrue (S.contains "for \"fuzz" why) "a text that starts `fuzz`: ${why}"
+  | _ -> assertTrue (covered False == 0) "it is found wherever there is something to steer by"
+
+@test fun noiseIsAnyText () =
+  forAll (\() -> noise 12) (\s -> assertTrue (V.len (S.chars s) <= 12) "at most twelve characters")
