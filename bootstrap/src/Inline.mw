@@ -55,12 +55,17 @@ use Std.Maybe as M
 use Std.Maybe.Maybe.*
 
 -- The most nodes a function's body may have and still be copied to its
--- calls: `meadow_core::inline::BUDGET`.
+-- calls: `meadow_core::inline::BUDGET`. The same at every level that copies
+-- at all: a body copied into its caller is copied again with it, so twice
+-- the size is not twice the program -- at 32, Lingua did not finish and had
+-- 21 GB when it was stopped.
 def budget : Int = 16
 
 -- The most nodes a function that takes dictionaries may have and still be
--- kept for another unit to copy.
-def kept : Int = 600
+-- kept for another unit to copy: twice as many for a generous build, which
+-- is what its highest level is -- larger functions copied for the
+-- dictionaries and the representations they are called at.
+fun keptAt (generous : Bool) : Int = if generous then 1200 else 600
 
 -- How long a chain of copies -- a copy asking for a copy -- may get: only a
 -- function that calls itself at an ever larger type makes one that does not
@@ -216,8 +221,10 @@ fun leading (traits : HashMap String Bool) (params : [(Int, Type)]) (i : Int) : 
 
 -- The functions of `p` there may be a copy of, by binder: the small ones
 -- that reach themselves through none, and the ones that take dictionaries.
-fun candidates (p : CoreProgram) (traits : HashMap String Bool) (reps : Bool) : HashMap Int Body =
+fun candidates (p : CoreProgram) (traits : HashMap String Bool) (reps : Bool) (generous : Bool)
+    : HashMap Int Body =
   let a = coreArena p in
+  let kept = keptAt generous in
   let all =
     V.concatMap
       (\d ->
@@ -642,11 +649,12 @@ pass! {
 -- its own they may want a copy of, and -- as what it names of another unit
 -- is written -- each definition one of those mentions, its own included:
 -- its binder here, its symbol, and how it is written.
-@pub fun exports (p : CoreProgram) (traits : HashMap String Bool) (reps : Bool) : CoreProgram =
+@pub fun exports (p : CoreProgram) (traits : HashMap String Bool) (reps : Bool) (generous : Bool)
+    : CoreProgram =
   let a = coreArena p in
   let file = coreRoot p in
   let pkg = coreFilePackage a file in
-  let bodies = candidates p traits reps in
+  let bodies = candidates p traits reps generous in
   let own =
     V.foldl
       (\h d ->
@@ -770,6 +778,7 @@ fun imported
     (labels : [Entry [String]])
     (known : Bool)
     (inlines : Bool)
+    (generous : Bool)
     : CoreProgram =
   let a = coreArena p in
   let file = coreRoot p in
@@ -786,7 +795,10 @@ fun imported
   in
   let binders = V.foldl (\h kv -> H.insert (snd kv) (fst kv) h) H.empty (H.toVec symbols) in
   let bodies =
-    V.foldl (\h their -> imported binders traits their h) (candidates p traits inlines) theirs
+    V.foldl
+      (\h their -> imported binders traits their h)
+      (candidates p traits inlines generous)
+      theirs
   in runSt (\() ->
        let out = newCoreBuilder () in
        let sh =

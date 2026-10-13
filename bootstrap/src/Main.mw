@@ -55,11 +55,13 @@ use Std.Maybe as M
 use Std.Maybe.Maybe.*
 use Std.Collections.Vector as V
 use Std.Fs (Fs, readToString, writeString, createDirAll)
-use Std.Console (writeOutput)
+use Std.Console (writeOutput, writeError)
 use Std.Exn (catch)
 use Lingua.Query (QueryError)
 use Std.Process (exit, getEnv)
 use Std.Process as Proc
+use Std.Time (monotonic)
+use Std.Thread (parMap)
 use MeadowBoot.Macros as Mc
 use MeadowBoot.Macros (Wire)
 
@@ -521,6 +523,11 @@ fun cekCall (l : Loaded) (c : Call) (handed : String) =
 -- each answered (`Std.Macro.Serve.answeringAll`). MeadowBoot compiles it as
 -- it compiles any program, and the back end runs it: `meadow cut`, on Glade.
 
+-- When something of a round happened, for `MEADOWBOOT_TIMES`.
+fun stamp (what : String) =
+  if M.isSome (getEnv "MEADOWBOOT_TIMES") then writeError "${show (monotonic ())} expand ${what}\n"
+  else ()
+
 -- What names a macro among its unit's: its module and its name.
 fun served (module : [String]) (name : String) : String = "${S.join "." module}/${name}"
 
@@ -621,25 +628,30 @@ fun gladeRound
            calls
        in
        -- Each unit's calls in one run, and what each answered, by module and key.
+       -- Each unit on a thread of its own: its program is built, the first time, there.
        let ran =
-         V.concatMap
-           (\k ->
-             let dir = V.getOr "" dirs k in
-             let theirs =
-               V.filter (\x -> match x with | (_, _, (c : Call)) -> c.dir == dir) calls
-             in
-             let given = "${scratch}.${show wave}.${show k}.calls" in
-             let said = "${scratch}.${show wave}.${show k}.said" in
-             let failing =
-               \why ->
-                 V.map
-                   (\x ->
-                     match x with
-                     | (file, _, (c : Call)) -> (file, c.key, Err why))
-                   theirs
-             in match serverFor dir macros with
+         V.concat
+           (parMap
+              (\k ->
+                let dir = V.getOr "" dirs k in
+                let theirs =
+                  V.filter (\x -> match x with | (_, _, (c : Call)) -> c.dir == dir) calls
+                in
+                let given = "${scratch}.${show wave}.${show k}.calls" in
+                let said = "${scratch}.${show wave}.${show k}.said" in
+                let failing =
+                  \why ->
+                    V.map
+                      (\x ->
+                        match x with
+                        | (file, _, (c : Call)) -> (file, c.key, Err why))
+                      theirs
+                in
+                let m0 = stamp "wave ${show wave} ${dir} serving" in
+                match serverFor dir macros with
                 | Err why -> failing why
                 | Ok program ->
+                    let m1 = stamp "wave ${show wave} ${dir} served" in
                     let text =
                       S.join
                         ""
@@ -664,6 +676,7 @@ fun gladeRound
                      ] with
                      | Err why -> failing "the back end could not be run: ${why}"
                      | Ok (code, out, err) ->
+                         let m2 = stamp "wave ${show wave} ran ${show (V.len theirs)} calls" in
                          let answers =
                            Mc.readWires (M.unwrapOr "" (Res.toMaybe (readToString said)))
                          in if V.len answers != V.len theirs then
@@ -679,7 +692,7 @@ fun gladeRound
                                       (file, c.key, Err "it did not answer")
                                   | _ -> ("", "", Err ""))
                                 (V.range 0 (V.len theirs))))
-           (V.range 0 (V.len dirs))
+              (V.range 0 (V.len dirs)))
        in
        -- Each module's answers up to and with the first to define anything are
        -- what they are; the calls after it wait for the next wave.

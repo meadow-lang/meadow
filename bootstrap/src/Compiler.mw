@@ -16,6 +16,7 @@ use Lingua.Make (
 )
 use Std.Fs (Fs, readToString, writeString)
 use Std.Time (monotonic)
+use Std.Thread (parMap)
 use Std.Console (writeError)
 use Std.Process (getEnv)
 use MeadowBoot.Types.Type.*
@@ -171,6 +172,7 @@ database! {
              True
              False
              False
+             False
              (\x -> ()))
     -- The same with no entry: every definition of the unit, for whoever runs
     -- one of them -- a macro -- rather than the unit.
@@ -192,6 +194,7 @@ database! {
                 (modulesOf (queryFiles unit)))
              None
              True
+             False
              False
              False
              (\x -> ()))
@@ -304,6 +307,7 @@ fun checkedOf
     (entry : Maybe String)
     (keep : Bool)
     (inlines : Bool)
+    (generous : Bool)
     (naming : Bool)
     (mark : String -> () ! e)
     : ([Export], Bool, TypeEnv, Maybe (CoreProgram, Linked, Object), [String]) ! e =
@@ -423,6 +427,7 @@ fun checkedOf
                        labelled
                        (not keep)
                        inlines
+                       generous
                  in
                  let m4 = mark "optimised" in
                  let ownDatas =
@@ -469,7 +474,7 @@ fun checkedOf
                         -- most of what was written of it.
                         bodies =
                           if (keep and not inlines) or program then Inline.nothing ()
-                          else Inline.exports core traits inlines
+                          else Inline.exports core traits inlines generous
                       },
                       Seq.declarations
                         core
@@ -936,10 +941,12 @@ make! {
       opt : O0
         | O1
         | O2
-        | O3 = O1 "how hard to optimise: from O2 a small function is copied to where it is called"
+        | O3 =
+            O1
+              "how hard to optimise: O0 nothing; from O1 known dictionaries are read; from O2 a small function is copied to where it is called; O3 copies larger functions for the types they are called at"
       dictionaries : Bool =
         True
-          "copy a function for the dictionaries a call names, and read a known dictionary's method out of it"
+          "from O1, copy a function for the dictionaries a call names, and read a known dictionary's method out of it"
       kind : Debug | Release = Debug "what `@cfg(debug)` and `@cfg(release)` hold of"
       os : String = hostOs "the system `@cfg` answers for: windows, linux or macos"
       arch : String = hostArch "the processor `@cfg` answers for: x86_64 or aarch64"
@@ -1011,6 +1018,13 @@ fun pinnedOf (root : String) (dir : String) (manifest : String) (profile : Strin
 -- called: `meadow_rt`'s `OptLevel::inlines`, which is O2's, and here O3's
 -- too.
 fun inlining (o : UnitsOptions) : Bool = o.opt == UnitsOpt.O2 or o.opt == UnitsOpt.O3
+
+-- Whether a build at these options reads a known dictionary's method out of
+-- it and copies a function for the dictionaries a call names: from O1, where
+-- `dictionaries` has not turned it off. O0 is the program as it was written,
+-- every method asked of its dictionary as it runs -- what to set a level's
+-- answer against when one is doubted.
+fun resolving (o : UnitsOptions) : Bool = o.dictionaries and o.opt != UnitsOpt.O0
 
 -- Compile unit `u`: every file parsed and grouped by the unit's fixities, and
 -- its interface -- or what is wrong, drawn.
@@ -1151,8 +1165,9 @@ fun compiling (o : UnitsOptions) (u : Given Interface) =
                  (unitSources u))
               asts
               None
-              (not o.dictionaries)
+              (not (resolving o))
               (inlining o)
+              (o.opt == UnitsOpt.O3)
               (M.isSome (getEnv "MEADOWBOOT_NAMES"))
               mark with
             | _ if not (V.isEmpty misread and V.isEmpty unexpanded) ->
@@ -1282,6 +1297,11 @@ fun rounds
     (st : Rounds)
     (n : Int) =
   let dir = unitDir u in
+  let timed = M.isSome (getEnv "MEADOWBOOT_TIMES") in
+  let mark =
+    \what ->
+      if timed then writeError "${show (monotonic ())} ${dir} round ${show n} ${what}\n" else ()
+  in
   let cfg = cfgOf o in
   let deps = macroDeps u in
   let modules =
@@ -1314,9 +1334,12 @@ fun rounds
        let said = Path.join (unitOut u) "macros.answers" in
        let engine = if o.macros == UnitsMacros.Glade then "glade" else "cek" in
        let w = writeString (given, writeRound st.settled deps (V.map snd batches)) in
+       let m0 = mark "asked" in
        match Proc.run (Proc.currentExe ()) ["expand", engine, given, said] with
        | Err why -> { st | wrong = ["${dir}: its macros could not be run: ${why}\n"] }
        | Ok (code, _, err) ->
+           let m1 = (if timed then writeError err else ()) in
+           let m2 = mark "ran" in
            (match (code, readToString said) with
             | (0, Ok text) ->
                 let next =
@@ -1420,36 +1443,57 @@ fun rounds
                 in
                 let after = fst next in
                 let waiting = snd next in
+                let m3 = mark "answered" in
                 if not (V.isEmpty after.wrong) then after
                 else
                   -- Each file a call of was answered, lowered again with
                   -- every answer it has: what a macro wrote may call another.
+                  -- Each on a thread of its own, as they were lowered first, and
+                  -- handed its own file's text, tree and answers alone: a thread
+                  -- is given a copy of what it is given.
+                  let todo =
+                    V.concatMap
+                      (\x ->
+                        match x with
+                        | (f, _, _) ->
+                            (match (H.lookup f after.answers, H.lookup f grouping) with
+                             | (Just answered, Just (text, g)) ->
+                                 (if H.size answered
+                                    == H.size (M.unwrapOr H.empty (H.lookup f st.answers)) then []
+                                  else
+                                    [(
+                                      f,
+                                      text,
+                                      g,
+                                      M.unwrapOr
+                                        H.empty
+                                        (H.lookup "${pkg}/${relativeTo dir f}" expanded),
+                                      answered
+                                    )])
+                             | _ -> []))
+                      st.files
+                  in
+                  let again =
+                    H.fromVec
+                      (parMap
+                         (\job ->
+                           match job with
+                           | (f, text, g, recorded, answered) ->
+                               (match loweredWith cfg f pkg text g recorded fx answered with
+                                | (ast, more, _) -> (f, (ast, more))))
+                         todo)
+                  in
                   let files =
                     V.map
                       (\x ->
                         match x with
                         | (f, ast, asked) ->
-                            (match (H.lookup f after.answers, H.lookup f grouping) with
-                             | (Just answered, Just (text, g)) ->
-                                 (if H.size answered
-                                    == H.size (M.unwrapOr H.empty (H.lookup f st.answers)) then
-                                    (f, ast, asked)
-                                  else
-                                    match loweredWith
-                                      cfg
-                                      f
-                                      pkg
-                                      text
-                                      g
-                                      (M.unwrapOr
-                                         H.empty
-                                         (H.lookup "${pkg}/${relativeTo dir f}" expanded))
-                                      fx
-                                      answered with
-                                    | (again, more, _) -> (f, again, more))
-                             | _ -> (f, ast, asked)))
+                            (match H.lookup f again with
+                             | Just (redone, more) -> (f, redone, more)
+                             | None -> (f, ast, asked)))
                       st.files
                   in
+                  let m4 = mark "lowered again" in
                   let defined = V.len after.bindings != V.len st.bindings in
                   let answered =
                     V.any

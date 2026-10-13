@@ -25,6 +25,8 @@
 use MeadowBoot.Core
 use Std.Collections.Map as Map
 use Std.Collections.Map (Map)
+use Std.Collections.HashMap as H
+use Std.Collections.HashMap (HashMap)
 use Std.Collections.Vector as V
 use Std.Collections.List as L
 use Std.String as S
@@ -110,9 +112,14 @@ data Control = Eval ErasedTerm (Map (Ref Value)) | Ret Value
 
 -- What does not change as the machine runs: the program's tables, the
 -- definitions, each a cell, and each constructor's named fields.
+--
+-- The definitions are in a table by their hash and a scope is a tree by
+-- order: a program has thousands of definitions, numbered as they come, and
+-- a tree they are put in one after another is a list, searched to its end
+-- for every mention of one. A scope is the few names a function binds.
 @pub record Machine = {
   arena : ErasedArena,
-  root : Map (Ref Value),
+  root : HashMap Int (Ref Value),
   fields : [(String, [String])]
 }
 
@@ -129,8 +136,8 @@ data Control = Eval ErasedTerm (Map (Ref Value)) | Ret Value
   let file = erasedRoot p in
   let root =
     V.foldl
-      (\env d -> Map.insert (erasedDefId a d) (newRef (loaded a (erasedDefBody a d))) env)
-      Map.empty
+      (\env d -> H.insert (erasedDefId a d) (newRef (loaded a (erasedDefBody a d))) env)
+      H.empty
       (erasedFileDefs a file)
   in Machine {
        arena = a,
@@ -164,7 +171,7 @@ fun go (m : Machine) (c : Control) (k : List Frame) =
 fun lookup (m : Machine) (env : Map (Ref Value)) (v : Int) : Maybe (Ref Value) =
   match Map.lookup v env with
   | Just r -> Just r
-  | None -> Map.lookup v m.root
+  | None -> H.lookup v m.root
 
 fun define (env : Map (Ref Value)) (v : Int) (x : Value) = Map.insert v (newRef x) env
 
@@ -309,7 +316,7 @@ fun ret (m : Machine) (v : Value) (f : Frame) (k : List Frame) =
   | PerformWith e o -> perform m e o v k
   | Cache var ->
       let u =
-        (match Map.lookup var m.root with
+        (match H.lookup var m.root with
          | Just r -> setRef r v
          | None -> ())
       in go m (Ret v) k

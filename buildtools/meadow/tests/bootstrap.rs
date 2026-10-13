@@ -2607,6 +2607,73 @@ fn a_program_with_the_standard_library_lowered_by_meadowboot_answers_as_the_rust
     );
 }
 
+/// A program each level does something to that the level under it does not:
+/// an operator and `show` at a known type, a small function, and a function
+/// that takes a dictionary and is too large to be copied for it below O3 --
+/// its body is `show x` a hundred and sixty times over.
+fn with_levels() -> String {
+    format!(
+        "use Std.Collections.Vector as V\n\nfun double x = x * 2\n\nfun big x = {}\n\n\
+         def result = (V.map double [1, 2, 3], stringByteLength (big 7))\n",
+        vec!["show x"; 160].join(" ++ ")
+    )
+}
+
+/// What MeadowBoot's `cut` writes of [`with_levels`] at level `opt`.
+fn cut_at(opt: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("meadowboot-{opt}-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("src")).expect("a package directory");
+    std::fs::write(
+        dir.join("Meadow.toml"),
+        "[package]\nname = \"Levels\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("a manifest");
+    let main = dir.join("src").join("Main.mw");
+    std::fs::write(&main, with_levels()).expect("a source file");
+    let out = Command::new(meadowboot_exe())
+        .arg("cut")
+        .args(["--opt", opt])
+        .arg(&main)
+        .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+        .env_remove("MEADOWBOOT_EXPANSIONS")
+        .output()
+        .expect("MeadowBoot runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .split_once("\ncut 0\n")
+        .map(|(_, rest)| format!("cut 0\n{rest}"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no program at {opt}:\n{stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
+}
+
+/// Each level MeadowBoot optimises at is a level of its own: O0 leaves every
+/// method to be asked of its dictionary, O1 reads the known ones, O2 copies
+/// small functions to their calls, and O3 copies larger functions for the types
+/// they are called at. So each writes a
+/// program the level under it does not -- and all four answer the same.
+#[test]
+fn each_level_meadowboot_optimises_at_writes_its_own_program_and_the_same_answer() {
+    let levels = ["O0", "O1", "O2", "O3"];
+    let cuts: Vec<String> = levels.iter().map(|o| cut_at(o)).collect();
+    for (level, cut) in levels.iter().zip(&cuts) {
+        assert_eq!(axcut_answer(cut), "([2, 4, 6], 160)", "at {level}");
+    }
+    for pair in 0..levels.len() - 1 {
+        assert_ne!(
+            cuts[pair],
+            cuts[pair + 1],
+            "{} and {} write the same program",
+            levels[pair],
+            levels[pair + 1]
+        );
+    }
+}
+
 const WITH_CFG: &str = r#"@cfg(os = "linux")
 def system = "linux"
 

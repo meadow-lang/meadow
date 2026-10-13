@@ -63,6 +63,12 @@ beyond the last release is under _Unreleased_.
 - `meadow cut` on Glade compiles what runs often to machine code as it goes,
   as `meadow run` does, where it only interpreted; `--aot` compiles the
   whole program ahead of time into an executable.
+- `meadow cut FILE` on Glade keeps the program's bytecode image beside it,
+  under `target/cut`, named for the program's text and the `meadow` that
+  lowered it. A second run of the same text reads the image and lowers
+  nothing: a program a front end runs again and again -- the one that serves
+  a package's macros, once for every round of a build -- starts in a tenth
+  of the time.
 - A program of Cut may spawn threads: `prim threadSpawn(desc(rep), f; k)`
   says how what the thread answers is represented. And a top-level `val` is
   made the first time a thread reads it, not when the program starts, so a
@@ -129,6 +135,14 @@ St s }`), and `! Reading r` where a method's type says what it performs. A
 
 ### Fixed
 
+- A natively compiled program that makes `Ref`s by the million and no cycles
+  -- an interpreter, each of whose scopes shares cells with the one it was
+  made from -- no longer spends most of its time looking for cycles. The
+  collector waits for twice as many candidates each time a round of its runs
+  frees nothing, up to 262,144, and goes back to 1,024 when one does; most
+  candidates have died by then and are freed without a walk. One macro call
+  on MeadowBoot's CEK machine took 312 seconds, 72% of it in the collector,
+  and takes 54.
 - A natively compiled program lets go of what a finished thread answered,
   and of a `TVar`'s value, once nothing can reach them. Both were kept for
   the whole run -- "nothing says when the last handle is gone" -- and with
