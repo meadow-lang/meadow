@@ -2650,6 +2650,60 @@ fn a_function_generic_in_its_number_is_right_at_each_number_type_it_is_used_at()
     }
 }
 
+/// Definitions that are functions without being written with their
+/// parameters: another function by another name, one given some of its
+/// arguments, one that is such a definition in its turn -- and one whose
+/// argument is a call, which is run once where it stands and must stay so.
+const WITH_ARITIES: &str = r#"fun add3 x y z = x + y + z
+
+def plus = add3
+
+fun from1 x = add3 1 x
+
+def from12 = add3 1 2
+
+def again = from12
+
+fun next n = n + 1
+
+def held = add3 (next 1) 2
+
+def result = (plus 1 2 4, from1 3 5, again 9, (from1 2) 3, held 3)
+"#;
+
+/// A definition's arity is how many parameters the function it is takes, not
+/// how many it happens to be written with: from O1 one that is a function in
+/// sight given too few arguments, each a name or a literal, is written with
+/// the parameters it is missing, and a call that gives them all is then a
+/// direct one. O0 leaves a program as it was written. Every level answers
+/// the same.
+#[test]
+fn a_definition_that_is_a_function_has_the_parameters_the_function_takes() {
+    // Whether `symbol`'s definition of all its parameters is there, with `n`.
+    let entry = |cut: &str, n: usize| {
+        cut.lines().any(|line| {
+            line.starts_with("def meadow:Levels/d")
+                && line.matches("v19000000").count() == n
+                && line.contains("f (")
+        })
+    };
+    for opt in ["O0", "O1", "O2", "O3"] {
+        let cut = cut_of(&format!("arities-{opt}"), WITH_ARITIES, &["--opt", opt]);
+        assert_eq!(axcut_answer(&cut), "(7, 9, 12, 6, 7)", "at {opt}");
+        if opt == "O0" {
+            assert!(
+                !cut.contains("v19000000"),
+                "O0 gave a definition parameters"
+            );
+        }
+        if opt == "O1" {
+            // `plus` is given three, and `from1`, `from12` and `again` one.
+            assert!(entry(&cut, 3), "no definition was given three parameters");
+            assert!(entry(&cut, 1), "no definition was given one parameter");
+        }
+    }
+}
+
 /// A program each level does something to that the level under it does not:
 /// an operator and `show` at a known type, a small function, and a function
 /// that takes a dictionary and is too large to be copied for it below O3 --

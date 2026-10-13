@@ -46,6 +46,7 @@ use MeadowBoot.Seq as Seq
 use MeadowBoot.Lint (lint)
 use MeadowBoot.Dictionaries as Dictionaries
 use MeadowBoot.Inline as Inline
+use MeadowBoot.Eta as Eta
 use MeadowBoot.Dictionaries (emptySummary)
 use MeadowBoot.Types
 use MeadowBoot.Core (CoreProgram, joinedUnits)
@@ -432,12 +433,17 @@ fun checkedOf
                      linked
                  in
                  let ownNumbers = Inline.numbers written in
-                 let plain =
+                 let numbered =
                    Inline.numbered
                      written
                      (V.map (\(n : Numbers) -> (n.program, V.zip n.vars n.fracs)) theirNumbers)
                      done.numbers
                  in
+                 -- And a definition that is a function is written with all
+                 -- its parameters before anything asks how many it has
+                 -- (`Eta`): what is optimised, lowered and told the units
+                 -- that import this one is its arity as it is used.
+                 let plain = if keep and not inlines then numbered else Eta.expanded numbered in
                  let traits =
                    Inline.traitsOf
                      (V.append
@@ -686,11 +692,12 @@ fun wholeObject
     (entry : Int)
     (units : [(String, Interface, String)])
     : (Int, Object) =
-  let (plain, table) =
+  let (joined, table) =
     joinedUnits
       root.package
       (V.map (\u -> match u with | (_, (i : Interface), _) -> i.linked.whole) units)
   in
+  let plain = if not (resolving o or inlining o) then joined else Eta.expanded joined in
   let core =
     if not (resolving o or inlining o) then plain
     else
