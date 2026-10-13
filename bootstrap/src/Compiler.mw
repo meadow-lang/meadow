@@ -39,7 +39,9 @@ use MeadowBoot.Rules (Tok)
 use Std.Process as Proc
 use MeadowBoot.Ast (AstProgram)
 use MeadowBoot.Rename (mentionsOf, Binder)
-use MeadowBoot.Scopes (Source, Export, Renamed, DepExports, renameUnit, usesOf, macroFuns, saysVis)
+use MeadowBoot.Scopes (
+  Source, Export, Renamed, DepExports, renameUnit, usesOf, macroFuns, saysVis, builtinTyconNames
+)
 use MeadowBoot.Infer (inferUnit, Inferred)
 use MeadowBoot.Elab (unitCore, defSymbol, Linked, Numbers, DataSig, DefaultSig, Imported)
 use MeadowBoot.Seq as Seq
@@ -175,6 +177,7 @@ database! {
              False
              False
              False
+             False
              (\x -> ()))
     -- The same with no entry: every definition of the unit, for whoever runs
     -- one of them -- a macro -- rather than the unit.
@@ -196,6 +199,7 @@ database! {
                 (modulesOf (queryFiles unit)))
              None
              True
+             False
              False
              False
              False
@@ -313,6 +317,7 @@ fun checkedOf
     (generous : Bool)
     (wholly : Bool)
     (naming : Bool)
+    (checked : Bool)
     (mark : String -> () ! e)
     : ([Export], Bool, TypeEnv, Maybe (CoreProgram, Linked, Object), [String]) ! e =
   let m0 = mark "start" in
@@ -337,6 +342,46 @@ fun checkedOf
                     | Just (_, src) -> [(fileOf src, text)]
                     | None -> []))
              files)
+      in
+      -- What the unit names that nothing binds, each where it names it: the
+      -- renamer gives such a name a binder of its own, declared nowhere.
+      let undefined =
+        if not checked then []
+        else
+          V.concatMap
+            (\(b : Binder) ->
+              -- A value nothing binds has a binder of its own, declared
+              -- nowhere; a type or a constructor nothing declares is a use
+              -- of the one binder that stands for every such name.
+              (let what =
+                 if S.startsWith "?" b.site and b.name != "?" then Just "undefined variable: "
+                 else if S.isEmpty b.name and b.site == "-" and b.kind == "t" then
+                   Just "unknown type "
+                 else if S.isEmpty b.name and b.site == "-" and b.kind == "c" then
+                   Just "unknown constructor "
+                 else None
+               in match what with
+                  | None -> []
+                  | Just says ->
+                      V.concatMap
+                        (\used ->
+                          match used with
+                          | (file, start, stop) ->
+                              (let text = M.unwrapOr "" (H.lookup file texts) in
+                               let written =
+                                 if stop > stringByteLength text then ""
+                                 else stringSlice text start stop
+                               in
+                               -- The same binder is every type the language
+                               -- has without a declaration, `Int` or `()`:
+                               -- only a name that is none of those is unknown.
+                               if S.isEmpty b.name
+                                 and (not (named written) or V.elem written builtinTyconNames) then
+                                 []
+                               else
+                                 ["${file}:${placeIn text start}: ${says}${if S.isEmpty b.name then "`${written}`" else b.name}"]))
+                        b.uses))
+            r.binders
       in
       let pkg =
         M.unwrapOr
@@ -403,7 +448,7 @@ fun checkedOf
       -- better and written out: the two are most of what a unit is.
       let anyVis = r.anyVis in
       let types = done.types in
-      let problems = done.problems in
+      let problems = if checked then V.append undefined done.said else done.problems in
       let program = isProgram r.exports in
       (
         exports,
@@ -715,6 +760,24 @@ fun wholeObject
        M.unwrapOr entry (H.lookup (defSymbol root.package entry) table),
        Seq.declarations core [] [] (V.filter (\p -> p != "Std") root.linked.packages)
      )
+
+-- Whether `text` is one name of a type or a constructor: a capital, then
+-- letters and digits.
+fun named (text : String) : Bool =
+  let codes = V.map charCode (S.chars text) in
+  let capital = \c -> c >= 65 and c <= 90 in
+  let rest = \c -> capital c or (c >= 97 and c <= 122) or (c >= 48 and c <= 57) or c == 95 in
+  match V.get codes 0 with
+  | Just first -> capital first and V.all rest codes
+  | None -> False
+
+-- Where byte `offset` of `text` is, as a line and a column, each from one.
+fun placeIn (text : String) (offset : Int) : String =
+  if offset > stringByteLength text then "@${show offset}"
+  else
+    (let before = S.split "\n" (stringSlice text 0 offset) in
+     let line = V.getOr "" before (V.len before - 1) in
+     "${show (V.len before)}:${show (stringByteLength line + 1)}")
 
 -- The symbols reached from `todo`, through what each mentions.
 fun reach (mentions : HashMap String [String]) (todo : [String]) (seen : HashMap String Bool)
@@ -1055,6 +1118,9 @@ make! {
       whole : Bool =
         False
           "optimise the build's units as one program at the link, where each is otherwise optimised by itself"
+      checked : Bool =
+        True
+          "stop a build at whatever is wrong with a unit -- a name nothing binds, types that do not agree -- where it otherwise stops only at a `main` that is not one"
       entry : Maybe String =
         None
           "a value at the root the program answers, in place of `result` or of running `main`"
@@ -1271,6 +1337,7 @@ fun compiling (o : UnitsOptions) (u : Given Interface) =
               (o.opt == UnitsOpt.O3)
               o.whole
               (M.isSome (getEnv "MEADOWBOOT_NAMES"))
+              o.checked
               mark with
             | _ if not (V.isEmpty misread and V.isEmpty unexpanded) ->
                 Err (S.join "" (V.append misread unexpanded))

@@ -2399,10 +2399,14 @@ fun inferImpl
   -- a `Float`.
   numbers : [(Int, Bool)],
   -- What is wrong with the unit's `main`, if it has one: a unit is not
-  -- compiled with a `main` that is not `() -> () ! Eff`. Everything else
-  -- inference says is in the dumps; it still says of some of the standard
-  -- library what the Rust compiler does not, so it cannot stop a build yet.
-  problems : [String]
+  -- compiled with a `main` that is not `() -> () ! Eff`, whatever it is
+  -- built with.
+  problems : [String],
+  -- Everything inference says is wrong with the unit, those included: what
+  -- a build that is `checked` stops at, as every build is unless it is told
+  -- otherwise. It says nothing of the standard library, of MeadowBoot or of
+  -- what MeadowBoot is built on, as the Rust compiler says nothing of them.
+  said : [String]
 }
 
 -- Infer unit `r`, whose dependencies exported `deps` -- their values' schemes
@@ -2554,6 +2558,7 @@ fun inferImpl
         (H.values (stGetRef i.impls))
     in Inferred {
          problems = ofMain,
+         said = stGetRef i.errors,
          dumps,
          schemes = exported,
          types = ownTypes i,

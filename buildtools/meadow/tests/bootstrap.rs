@@ -3128,6 +3128,95 @@ fn a_cfg_that_could_never_hold_is_refused_by_meadowboot() {
     );
 }
 
+/// What MeadowBoot's `cut` says of the program `source`, on either stream:
+/// the package is made in a directory named for `name`.
+fn said_of(name: &str, source: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("meadowboot-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("src")).expect("a package directory");
+    std::fs::write(
+        dir.join("Meadow.toml"),
+        "[package]\nname = \"Wrong\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("a manifest");
+    let main = dir.join("src").join("Main.mw");
+    std::fs::write(&main, source).expect("a source file");
+    let out = Command::new(meadowboot_exe())
+        .arg("cut")
+        .arg(&main)
+        .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+        .env_remove("MEADOWBOOT_EXPANSIONS")
+        .output()
+        .expect("MeadowBoot runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// A program that is wrong is not compiled, and MeadowBoot says what is wrong
+/// with it: a name, a type or a constructor nothing declares, where it is
+/// written, and types that do not agree, as the Rust compiler words them. It
+/// wrote a program of every one of these before, which failed when it ran or
+/// answered regardless.
+#[test]
+fn a_program_that_is_wrong_is_refused_by_meadowboot_with_what_is_wrong() {
+    let wrong = [
+        (
+            "name",
+            "def result = nope 1\n",
+            "Main.mw:1:14: undefined variable: nope",
+        ),
+        (
+            "constructor",
+            "def result = Nope 1\n",
+            "Main.mw:1:14: unknown constructor `Nope`",
+        ),
+        (
+            "type",
+            "fun f (x : Nope) = x\n\ndef result = 1\n",
+            "Main.mw:1:12: unknown type `Nope`",
+        ),
+        (
+            "number",
+            "def result = 1 + \"a\"\n",
+            "type mismatch: `String` is not an integer type",
+        ),
+        (
+            "signature",
+            "fun f (x : Int) : String = x\n\ndef result = 1\n",
+            "type mismatch: `String` vs `Int`",
+        ),
+        (
+            "itself",
+            "fun f x = x x\n\ndef result = 1\n",
+            "infinite type: `a` occurs in `a`",
+        ),
+        (
+            "tuple",
+            "def result = match (1, 2) with | (a, b, c) -> a\n",
+            "type mismatch: `(a, b, c)` vs `(a, b)`",
+        ),
+    ];
+    for (name, source, why) in wrong {
+        let said = said_of(&format!("wrong-{name}"), source);
+        assert!(
+            said.contains(why) && said.contains("not compiled"),
+            "{name}: {said}"
+        );
+    }
+    // And one that is right is compiled: a built-in type is not an unknown one.
+    let right = said_of(
+        "wrong-none",
+        "fun f (x : Int) (s : String) (u : ()) : [Int] = [x]\n\ndef result = f 1 \"a\" ()\n",
+    );
+    assert!(
+        right.contains("\ncut 0\n") && !right.contains("not compiled"),
+        "{right}"
+    );
+}
+
 /// How many glade cases MeadowBoot has to lower to Cut so that the reference
 /// interpreter answers as the Rust compiler does. The rest wait on primitives
 /// the interpreter does not have -- the sized integers', the floats', `show`
