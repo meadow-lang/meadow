@@ -436,6 +436,77 @@ def t:Main/main (; k: ptr) =
         prim eq(r, 200002; μ̃ w: unit. <"wrong" | k>, μ̃ w: unit. <"200002" | k>))>))
 "#;
 
+/// The images kept of the programs of Cut in `dir`, by name.
+fn cut_images(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found: Vec<_> = std::fs::read_dir(dir.join("target").join("cut"))
+        .map(|d| d.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    found.retain(|p: &std::path::PathBuf| p.extension().is_some_and(|x| x == "image"));
+    found.sort();
+    found
+}
+
+/// A program of Cut that is run again -- the one a front end builds of a
+/// package's macros is run for every round of a build -- is not read and
+/// lowered again: its image is kept beside it, named for its text, and that
+/// is what runs. A program that changed has an image of its own, and one
+/// that cannot be read is made again.
+#[test]
+fn a_program_of_cut_run_again_runs_the_image_kept_of_it() {
+    let dir = scratch("cut-image");
+    let other = scratch("cut-image-other");
+    let said = "two hundred thousand and two";
+    std::fs::write(dir.join("count.cut"), CUT).unwrap();
+    std::fs::write(
+        other.join("count.cut"),
+        CUT.replace("\"200002\"", &format!("\"{said}\"")),
+    )
+    .unwrap();
+
+    let (ok, out, err) = meadow(&dir, &["cut", "count.cut"]);
+    assert!(ok, "{err}");
+    assert_eq!(out, "counting\n200002");
+    let kept = cut_images(&dir);
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    let (_, out, _) = meadow(&dir, &["cut", "count.cut"]);
+    assert_eq!(out, "counting\n200002");
+    assert_eq!(cut_images(&dir), kept, "the same text has the same image");
+
+    // It is the image that runs: with another program's in its place, the
+    // other program's answer is what comes back.
+    let (ok, out, err) = meadow(&other, &["cut", "count.cut"]);
+    assert!(ok, "{err}");
+    assert_eq!(out, format!("counting\n{said}"));
+    let theirs = cut_images(&other);
+    assert_eq!(theirs.len(), 1, "{theirs:?}");
+    assert_ne!(
+        theirs[0].file_name(),
+        kept[0].file_name(),
+        "named for its text"
+    );
+    std::fs::copy(&theirs[0], &kept[0]).unwrap();
+    let (_, out, _) = meadow(&dir, &["cut", "count.cut"]);
+    assert_eq!(out, format!("counting\n{said}"));
+
+    // One that does not read is made again, and the answer is the program's.
+    std::fs::write(&kept[0], b"not an image").unwrap();
+    let (ok, out, err) = meadow(&dir, &["cut", "count.cut"]);
+    assert!(ok, "{err}");
+    assert_eq!(out, "counting\n200002");
+
+    // A program that changed gets its own, and the one before it goes.
+    std::fs::write(
+        dir.join("count.cut"),
+        CUT.replace("\"200002\"", &format!("\"{said}\"")),
+    )
+    .unwrap();
+    let (_, out, _) = meadow(&dir, &["cut", "count.cut"]);
+    assert_eq!(out, format!("counting\n{said}"));
+    let now = cut_images(&dir);
+    assert_eq!(now.len(), 1, "{now:?}");
+    assert_ne!(now, kept);
+}
+
 #[test]
 fn a_program_of_cut_runs_on_glade_and_as_an_executable_of_silos() {
     let dir = scratch("cut");
