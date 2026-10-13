@@ -2619,20 +2619,24 @@ fn with_levels() -> String {
     )
 }
 
-/// What MeadowBoot's `cut` writes of [`with_levels`] at level `opt`.
-fn cut_at(opt: &str) -> String {
-    let dir = std::env::temp_dir().join(format!("meadowboot-{opt}-{}", std::process::id()));
+/// What MeadowBoot's `cut` writes of the program `source`, told `args`: the
+/// package is made in a directory named for `name`.
+fn cut_of(name: &str, source: &str, args: &[&str]) -> String {
+    let dir = std::env::temp_dir().join(format!("meadowboot-{name}-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("src")).expect("a package directory");
     std::fs::write(
         dir.join("Meadow.toml"),
-        "[package]\nname = \"Levels\"\nversion = \"0.1.0\"\n",
+        "[package]
+name = \"Levels\"
+version = \"0.1.0\"
+",
     )
     .expect("a manifest");
     let main = dir.join("src").join("Main.mw");
-    std::fs::write(&main, with_levels()).expect("a source file");
+    std::fs::write(&main, source).expect("a source file");
     let out = Command::new(meadowboot_exe())
         .arg("cut")
-        .args(["--opt", opt])
+        .args(args)
         .arg(&main)
         .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
         .env_remove("MEADOWBOOT_EXPANSIONS")
@@ -2641,14 +2645,57 @@ fn cut_at(opt: &str) -> String {
     let _ = std::fs::remove_dir_all(&dir);
     let stdout = String::from_utf8_lossy(&out.stdout);
     stdout
-        .split_once("\ncut 0\n")
-        .map(|(_, rest)| format!("cut 0\n{rest}"))
+        .split_once(
+            "
+cut 0
+",
+        )
+        .map(|(_, rest)| {
+            format!(
+                "cut 0
+{rest}"
+            )
+        })
         .unwrap_or_else(|| {
             panic!(
-                "no program at {opt}:\n{stdout}\n{}",
+                "no program of {name}:
+{stdout}
+{}",
                 String::from_utf8_lossy(&out.stderr)
             )
         })
+}
+
+/// What MeadowBoot's `cut` writes of [`with_levels`] at level `opt`.
+fn cut_at(opt: &str) -> String {
+    cut_of(opt, &with_levels(), &["--opt", opt])
+}
+
+/// A build told `whole` optimises its units as one program at the link, where
+/// each is otherwise optimised by itself: every unit is kept as it was
+/// written, the link joins them, and what is made better is the program. It
+/// answers as the program a unit at a time does, at the levels that do
+/// anything, with the standard library and without a call of it left out.
+#[test]
+fn a_program_optimised_as_one_answers_as_one_optimised_a_unit_at_a_time() {
+    for opt in ["O1", "O2", "O3"] {
+        let cut = cut_of(
+            &format!("whole-{opt}"),
+            WITH_STD,
+            &["--opt", opt, "--set", "whole=true"],
+        );
+        assert_eq!(
+            axcut_answer(&cut),
+            r#"([2, 4, 6], 6, Just(8), "ab", "12", [1; 2], Just(2), "x, y", "3 and True")"#,
+            "at {opt}"
+        );
+    }
+    let cut = cut_of(
+        "whole-levels",
+        &with_levels(),
+        &["--opt", "O2", "--set", "whole=true"],
+    );
+    assert_eq!(axcut_answer(&cut), "([2, 4, 6], 160)");
 }
 
 /// Each level MeadowBoot optimises at is a level of its own: O0 leaves every

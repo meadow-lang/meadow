@@ -866,7 +866,11 @@ def nowhere : Meta = spanMeta 0 0
   summary : Summary,
   -- The functions it keeps for a unit that imports it to copy to its calls
   -- (`Inline.exports`).
-  bodies : CoreProgram
+  bodies : CoreProgram,
+  -- All of it, as it was written and before anything was made of it, where
+  -- the build's units are to be optimised as one program
+  -- (`Core.joinedUnits`); nothing otherwise.
+  whole : CoreProgram
 }
 
 -- A declared type: its name in core, how many types it takes, and each

@@ -48,7 +48,7 @@ use MeadowBoot.Dictionaries as Dictionaries
 use MeadowBoot.Inline as Inline
 use MeadowBoot.Dictionaries (emptySummary)
 use MeadowBoot.Types
-use MeadowBoot.Core (CoreProgram)
+use MeadowBoot.Core (CoreProgram, joinedUnits)
 use MeadowBoot.Solve (TypeEnv, noTypes, Entry)
 use Std.Macro (Reflect)
 use Std.Json as J
@@ -173,6 +173,7 @@ database! {
              False
              False
              False
+             False
              (\x -> ()))
     -- The same with no entry: every definition of the unit, for whoever runs
     -- one of them -- a macro -- rather than the unit.
@@ -194,6 +195,7 @@ database! {
                 (modulesOf (queryFiles unit)))
              None
              True
+             False
              False
              False
              False
@@ -308,6 +310,7 @@ fun checkedOf
     (keep : Bool)
     (inlines : Bool)
     (generous : Bool)
+    (wholly : Bool)
     (naming : Bool)
     (mark : String -> () ! e)
     : ([Export], Bool, TypeEnv, Maybe (CoreProgram, Linked, Object), [String]) ! e =
@@ -474,7 +477,8 @@ fun checkedOf
                         -- most of what was written of it.
                         bodies =
                           if (keep and not inlines) or program then Inline.nothing ()
-                          else Inline.exports core traits inlines generous
+                          else Inline.exports core traits inlines generous,
+                        whole = if wholly then plain else Inline.nothing ()
                       },
                       Seq.declarations
                         core
@@ -506,7 +510,8 @@ fun emptyLinked () : Linked =
     aliases = [],
     arities = [],
     summary = emptySummary (),
-    bodies = Inline.nothing ()
+    bodies = Inline.nothing (),
+    whole = Inline.nothing ()
   }
 
 -- A unit's declarations of Cut, where its compiler writes them: its object.
@@ -538,15 +543,6 @@ fun linkProgram (o : UnitsOptions) (l : Linking Interface) : Result String () ! 
               (let sc =
                  M.unwrapOr (Scheme { quant = [], preds = [], ty = Error, lacks = [] }) e.scheme
                in
-               let (before, after) =
-                 Seq.around
-                   root.package
-                   e.binder
-                   sc.ty
-                   (V.len (V.filter (\k -> k == VarKind.Plain) sc.quant))
-                   (sigsOf root.linked.datas)
-                   (V.filter (\p -> p != "Std") root.linked.packages)
-               in
                -- A package reached by two names is one package: its object
                -- goes in once.
                let once =
@@ -559,20 +555,41 @@ fun linkProgram (o : UnitsOptions) (l : Linking Interface) : Result String () ! 
                    []
                    units
                in
+               -- Optimised as one program, the units are one object, and
+               -- the entry has the binder it was given there.
+               let whole = if o.whole then Just (wholeObject o root e.binder once) else None in
+               let entered = M.unwrapOr e.binder (M.map fst whole) in
+               let (before, after) =
+                 Seq.around
+                   root.package
+                   entered
+                   sc.ty
+                   (V.len (V.filter (\k -> k == VarKind.Plain) sc.quant))
+                   (sigsOf root.linked.datas)
+                   (V.filter (\p -> p != "Std") root.linked.packages)
+               in
                let objects =
-                 V.foldl
-                   (\acc u ->
-                     match (acc, u) with
-                     | (Err why, _) -> Err why
-                     | (Ok read, (_, (i : Interface), out)) ->
-                         (match (
-                            readToString (objectIn out i.package),
-                            readToString (indexIn out i.package)
-                          ) with
-                          | (Ok text, Ok index) -> Ok (V.pushBack read (text, indexed index))
-                          | _ -> Err "${i.package} wrote no object\n"))
-                   (Ok [])
-                   once
+                 if M.isSome whole then
+                   Ok
+                     (match whole with
+                      | Just (_, object) ->
+                          (match written object with
+                           | (text, index) -> [(text, indexed index)])
+                      | None -> [])
+                 else
+                   V.foldl
+                     (\acc u ->
+                       match (acc, u) with
+                       | (Err why, _) -> Err why
+                       | (Ok read, (_, (i : Interface), out)) ->
+                           (match (
+                              readToString (objectIn out i.package),
+                              readToString (indexIn out i.package)
+                            ) with
+                            | (Ok text, Ok index) -> Ok (V.pushBack read (text, indexed index))
+                            | _ -> Err "${i.package} wrote no object\n"))
+                     (Ok [])
+                     once
                in match objects with
                   | Err why -> Err why
                   | Ok read ->
@@ -591,7 +608,7 @@ fun linkProgram (o : UnitsOptions) (l : Linking Interface) : Result String () ! 
                            H.empty
                            read
                        in
-                       let kept = reach mentions [defSymbol root.package e.binder] H.empty in
+                       let kept = reach mentions [defSymbol root.package entered] H.empty in
                        let texts =
                          V.concatMap
                            (\o ->
@@ -619,6 +636,41 @@ fun linkProgram (o : UnitsOptions) (l : Linking Interface) : Result String () ! 
                           ) with
                           | Ok _ -> Ok ()
                           | Err why -> Err "the program could not be written: ${why}\n")))
+
+-- The build's units as one program of core -- each as it was written, kept
+-- in its interface -- made better as one and lowered: the one object the
+-- program is, and the binder `entry`, the root's, has in it. What a unit
+-- optimised by itself cannot do is then done: a function is copied to a
+-- call or for a dictionary wherever in the program it and the call are, and
+-- a copy several units would each have made is made once.
+fun wholeObject
+    (o : UnitsOptions)
+    (root : Interface)
+    (entry : Int)
+    (units : [(String, Interface, String)])
+    : (Int, Object) =
+  let (plain, table) =
+    joinedUnits
+      root.package
+      (V.map (\u -> match u with | (_, (i : Interface), _) -> i.linked.whole) units)
+  in
+  let core =
+    if not (resolving o or inlining o) then plain
+    else
+      Inline.program
+        plain
+        []
+        []
+        (V.map (\x -> Entry { key = fst x, value = snd x }) (Seq.aritiesOf plain))
+        (Inline.traitsOf (V.map fst (Seq.namedOf plain)))
+        []
+        (resolving o)
+        (inlining o)
+        (o.opt == UnitsOpt.O3)
+  in (
+       M.unwrapOr entry (H.lookup (defSymbol root.package entry) table),
+       Seq.declarations core [] [] (V.filter (\p -> p != "Std") root.linked.packages)
+     )
 
 -- The symbols reached from `todo`, through what each mentions.
 fun reach (mentions : HashMap String [String]) (todo : [String]) (seen : HashMap String Bool)
@@ -956,6 +1008,9 @@ make! {
       macros : Off
         | Cek
         | Glade = Off "what runs a procedural macro: nothing, the CEK machine, or Glade"
+      whole : Bool =
+        False
+          "optimise the build's units as one program at the link, where each is otherwise optimised by itself"
       entry : Maybe String =
         None
           "a value at the root the program answers, in place of `result` or of running `main`"
@@ -1165,9 +1220,12 @@ fun compiling (o : UnitsOptions) (u : Given Interface) =
                  (unitSources u))
               asts
               None
-              (not (resolving o))
-              (inlining o)
+              -- A unit of a build that is optimised as one program is
+              -- kept as it was written: the link makes the whole better.
+              (not (resolving o) or o.whole)
+              (inlining o and not o.whole)
               (o.opt == UnitsOpt.O3)
+              o.whole
               (M.isSome (getEnv "MEADOWBOOT_NAMES"))
               mark with
             | _ if not (V.isEmpty misread and V.isEmpty unexpanded) ->

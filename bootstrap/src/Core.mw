@@ -400,6 +400,156 @@ fun symbolOf (pkg : String) (id : Int) : String =
          newErasedFile out (spanMeta 0 0) (0 - 1) (V.concatMap fst made) (V.concatMap snd made)
        in (ErasedProgram (freezeErased out) root, table))
 
+-- What one unit of several is written with where they are made one program
+-- of core: the binder each definition of another unit it mentions has there,
+-- the binder each of its own names has been given so far, and the next to
+-- give -- upwards for a name, downwards for an `impl`'s dictionary, which is
+-- below every other.
+record Joining s = {
+  theirs : HashMap Int Int,
+  names : StRef s (HashMap Int Int),
+  next : StRef s Int,
+  below : StRef s Int
+}
+
+-- The binder `id` has in the program the units are made.
+fun joined (j : Joining s) (id : Int) =
+  match H.lookup id j.theirs with
+  | Just there -> there
+  | None ->
+      (let names = stGetRef j.names in
+       match H.lookup id names with
+       | Just n -> n
+       | None ->
+           if id < 0 then
+             (let n = stGetRef j.below - 1 in
+              let u = stSetRef j.below n in
+              let w = stSetRef j.names (H.insert id n names) in
+              n)
+           else
+             (let n = stGetRef j.next in
+              let u = stSetRef j.next (n + 1) in
+              let w = stSetRef j.names (H.insert id n names) in
+              n))
+
+-- A unit written again with every binder what `joined` makes it, and its
+-- types as they were: `relink`, for a program that is to be made better and
+-- lowered rather than run.
+pass! {
+  rejoin : Core -> Core with j from Def, Named, Data, Effect, Extern
+    | Def { id, body } -> Def { id = joined j id, body }
+    | Var { id, ty } -> Var { id = joined j id, ty }
+    | Lam { param, paramTy, body, ty } -> Lam { param = joined j param, paramTy, body, ty }
+    | Let { id, value, body, ty } -> Let { id = joined j id, value, body, ty }
+    | Bind { id, value } -> Bind { id = joined j id, value }
+    | Clause { eff, op, param, paramTy, resume, body } ->
+        Clause { eff, op, param = joined j param, paramTy, resume = joined j resume, body }
+    | Handle { body, clauses, retId, ret, ty } ->
+        Handle { body, clauses, retId = M.map (\x -> joined j x) retId, ret, ty }
+    | Join { id, params, rhs, body, ty } ->
+        Join { id = joined j id, params = V.map (\x -> joined j x) params, rhs, body, ty }
+    | Jump { id, args, ty } -> Jump { id = joined j id, args, ty }
+    | PVar { id, ty } -> PVar { id = joined j id, ty }
+    | PAs { id, pat, ty } -> PAs { id = joined j id, pat, ty }
+    | Extern { id, symbol, types, arity } -> Extern { id = joined j id, symbol, types, arity }
+}
+
+-- Several units as one program of core, package `pkg`'s: `linkedUnits` with
+-- the types kept, for a program that is optimised as one. Every binder is
+-- one no other unit has, numbered from nothing so that none is where a later
+-- pass makes its own; a mention of another unit's definition is that
+-- definition; and a type, a constructor's fields or an effect that several
+-- units declare is declared once. What no unit defines is still named by
+-- its symbol. With it, the binder each definition has, by the symbol it had.
+@pub fun joinedUnits (pkg : String) (units : [CoreProgram]) : (CoreProgram, HashMap String Int) =
+  let parts =
+    \u ->
+      (match V.get units u with
+       | Just (CoreProgram a file) -> Just (a, file)
+       | None -> None)
+  in runSt (\() ->
+       let out = newCoreBuilder () in
+       let next = stNewRef 0 in
+       let below = stNewRef 0 in
+       -- Every unit's definitions numbered first: one unit mentions another's.
+       let numbered =
+         V.map
+           (\u ->
+             let names = stNewRef H.empty in
+             let own = Joining { theirs = H.empty, names, next, below } in
+             (
+               names,
+               match parts u with
+               | Just (a, file) ->
+                   V.map
+                     (\d ->
+                       (
+                         symbolOf (coreFilePackage a file) (coreDefId a d),
+                         joined own (coreDefId a d)
+                       ))
+                     (coreFileDefs a file)
+               | None -> []
+             ))
+           (V.range 0 (V.len units))
+       in
+       let table = H.fromVec (V.concatMap snd numbered) in
+       let made =
+         V.map
+           (\u ->
+             match (parts u, V.get numbered u) with
+             | (Just (a, file), Just (names, _)) ->
+                 (let externs = coreFileExterns a file in
+                  let theirs =
+                    V.foldl
+                      (\h e ->
+                        match H.lookup (coreExternSymbol a e) table with
+                        | Just there -> H.insert (coreExternId a e) there h
+                        | None -> h)
+                      H.empty
+                      externs
+                  in
+                  let j = Joining { theirs, names, next, below } in
+                  (
+                    V.map (\d -> rejoinDef a out j d) (coreFileDefs a file),
+                    V.map (\n -> (coreNamedName a n, rejoinNamed a out j n)) (coreFileNamed a file),
+                    V.map (\d -> (coreDataName a d, rejoinData a out j d)) (coreFileDatas a file),
+                    V.map
+                      (\e -> (coreEffectName a e, rejoinEffect a out j e))
+                      (coreFileEffects a file),
+                    V.concatMap
+                      (\e ->
+                        if M.isSome (H.lookup (coreExternSymbol a e) table) then []
+                        else [rejoinExtern a out j e])
+                      externs
+                  ))
+             | _ -> ([], [], [], [], []))
+           (V.range 0 (V.len units))
+       in
+       let root =
+         newCoreFile
+           out
+           (spanMeta 0 0)
+           pkg
+           (0 - 1)
+           (V.concatMap (\m -> match m with | (defs, _, _, _, _) -> defs) made)
+           (once (V.concatMap (\m -> match m with | (_, named, _, _, _) -> named) made))
+           (once (V.concatMap (\m -> match m with | (_, _, datas, _, _) -> datas) made))
+           (once (V.concatMap (\m -> match m with | (_, _, _, effects, _) -> effects) made))
+           (V.concatMap (\m -> match m with | (_, _, _, _, externs) -> externs) made)
+       in (CoreProgram (freezeCore out) root, table))
+
+-- Each of `named` whose name none before it has.
+fun once (named : [(String, a)]) : [a] =
+  snd
+    (V.foldl
+       (\acc x ->
+         match acc with
+         | (seen, kept) ->
+             if M.isSome (H.lookup (fst x) seen) then acc
+             else (H.insert (fst x) True seen, V.pushBack kept (snd x)))
+       (H.empty, [])
+       named)
+
 -- Each numeral a number, each quoted string its text, each float's bits the
 -- float; everything else is as it was.
 pass! {
