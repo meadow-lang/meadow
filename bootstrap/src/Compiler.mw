@@ -1163,7 +1163,9 @@ make! {
       flags : [String] = [] "the flags `@cfg` holds of, each a name or `name=value`"
       macros : Off
         | Cek
-        | Glade = Off "what runs a procedural macro: nothing, the CEK machine, or Glade"
+        | Glade =
+            Glade
+              "what runs a procedural macro: nothing, the CEK machine, or Glade (the default: the program that serves a package's macros is built and run on it by `meadow cut`)"
       whole : Bool =
         False
           "optimise the build's units as one program at the link, where each is otherwise optimised by itself"
