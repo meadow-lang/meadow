@@ -66,8 +66,242 @@ use Std.Thread (parMap)
 use MeadowBoot.Macros as Mc
 use MeadowBoot.Macros (Wire)
 
+-- The command line is `meadow`'s, command for command and flag for flag
+-- (`buildtools/meadow/src/main.rs`): whoever runs one runs the other the
+-- same way, and `a_command_takes_what_meadow_s_takes` in
+-- `buildtools/meadow/tests/bootstrap.rs` holds the two together. What several
+-- commands take is declared once, so they cannot come to take it differently.
+-- After those are the commands only MeadowBoot has: each pass's output, for
+-- the tests that set it against the Rust compiler's.
 cli! {
-  pub Cli "meadowboot" "Meadow's compiler, written in Meadow"
+  pub
+    Cli
+    "meadowboot"
+    "Meadow's compiler, written in Meadow"
+    version
+    "0.3.0-dev"
+    default
+    repl
+    options
+    {
+      offline
+        : Flag
+          "Never fetch a dependency. What is already in the cache is used; anything else is an error saying what would have had to be fetched"
+      locked : Flag "Refuse anything that would change `Meadow.lock`"
+    }
+    options
+    Build
+    {
+      release : Flag "Build with the release profile: `-O2`, and `match` must be exhaustive"
+      debug : Flag "Build with the debug profile (the default)"
+      optLevel
+        : Option Int "Optimization level: 0, 1 or 2. Overrides the profile" short "O" value "LEVEL"
+      strict : Flag "Reject a non-exhaustive `match`, whatever the profile says"
+      lenient : Flag "Allow a non-exhaustive `match`, whatever the profile says"
+      runtime
+        : Option
+          ("glade" | "silo")
+          "The runtime system: `glade` (the default), bytecode and a garbage collector, or `silo`, compiled all the way down by LLVM and counting references"
+          value
+          "RUNTIME"
+      backend
+        : Option
+          ("vm" | "jit" | "aot")
+          "How Glade runs the program: the bytecode interpreter, the JIT, or machine code compiled ahead of time"
+          value
+          "BACKEND"
+      jit : Flag "`--backend jit`"
+      aot : Flag "`--backend aot`: Glade, compiled ahead of time into an executable" alias "native"
+      cfg
+        : Option
+          [String]
+          "Turn on a flag for `@cfg(…)` to test: `--cfg fast`, `--cfg feature=gpu`. Repeat it for more"
+          value
+          "FLAG"
+      noPrune
+        : Flag
+          "Compile every definition of the package and its dependencies, not only what `main` reaches"
+      target
+        : Option
+          String
+          "The architecture a native build compiles for: `aarch64` or `x86_64`"
+          value
+          "ARCH"
+      threads : Option Int "How many OS threads run the program's green threads" short "j" value "N"
+      nursery
+        : Option
+          String
+          "How large Glade's collector lets a thread's nursery grow: `8M`, `512K`, `1G`, or bytes"
+          value
+          "SIZE"
+      leaks : Flag "After running, report the blocks the program left behind"
+      features
+        : Option
+          String
+          "Features of the package to build with, by the names its `[features]` gives them: `--features gpu,simd`"
+          value
+          "FEATURES"
+      noDefaultFeatures : Flag "Build without the package's `default` features"
+      allFeatures : Flag "Build with every feature the package has"
+    }
+    options
+    Members
+    {
+      package
+        : Option
+          [String]
+          "In a workspace: the member to use, by name. Repeat it for more"
+          short
+          "p"
+          value
+          "NAME"
+      workspace : Flag "Every member of the workspace" alias "all"
+      exclude
+        : Option
+          [String]
+          "With `--workspace`: leave this member out. Repeat it for more"
+          value
+          "NAME"
+    }
+    | build
+      "Type-check and link a package, printing the annotated result"
+      {
+        path : Maybe String "Package directory (or a single `.mw` file), or a workspace"
+        types : Flag "Print the type of every top-level binding in your packages"
+        annotations : Flag "Also print every node's inferred type"
+        emit
+          : Option
+            [String]
+            "What to write, in place of what a build writes by default: `image`, `bytecode`, `asm`, `exe`, or `expanded`. Comma-separated, or repeated"
+            split
+            ","
+            value
+            "KIND"
+      }
+      with
+      Members,
+        Build
+    | run
+      "Build a package, then evaluate its `main` entry point"
+      {
+        path : Maybe String "Package directory (or a single `.mw` file), or a workspace"
+        args : [String] "Arguments for the program, after `--`: what `Process.argv` gives it"
+        types : Flag "Print the type of every top-level binding in your packages first"
+        package : Option String "In a workspace: the member to run" short "p" value "NAME"
+        cek : Flag "Evaluate with the CEK machine rather than the bytecode VM"
+        gcStats : Flag "After running, report what the garbage collector did (VM only)"
+        profileTo
+          : Option
+            String
+            "Sample where the program spends itself and write folded stacks to this file"
+            value
+            "FILE"
+        sampleEvery : Option Int "Block entries between samples, with `--profile-to`" value "N"
+        sampleHz : Option Int = 1000 "Samples a second, for the profile of time" value "HZ"
+        train
+          : Flag
+            "Run on the JIT and write what each call site was seen to enter, for an `aot` build to guard its calls on"
+        gc : Option ("generational" | "copying") "Which collector the VM uses" value "GC"
+      }
+      with
+      Build
+    | exec
+      "Run a bytecode image: what `meadow build` writes under `target/<profile>/bytecode/`, or what a compiler written in Meadow emits"
+      {
+        image : String "The image"
+        args : [String] "Arguments for the program, after `--`"
+        backend : Option String "How to run it: `vm` or `jit`" value "BACKEND"
+        optLevel : Option Int "How hard the JIT optimises: 0, 1 or 2" short "O" value "LEVEL"
+      }
+    | link "Compile a bytecode image to machine code and link it into an executable" {
+      image : String "The image"
+      output : Option String "Where to write the executable" short "o" value "FILE"
+      emit : Option [String] "What to write: `exe` or `asm`" split "," value "KIND"
+      optLevel : Option Int "Optimization level: 0, 1 or 2" short "O" value "LEVEL"
+      target : Option String "The architecture to compile for" value "ARCH"
+      threads : Option Int "How many OS threads run the program's green threads" short "j" value "N"
+      nursery : Option String "How large the collector lets a thread's nursery grow" value "SIZE"
+      leaks : Flag "After running, report the blocks the program left behind"
+      features : Option String "Features of the package to build with" value "FEATURES"
+      noDefaultFeatures : Flag "Build without the package's `default` features"
+      allFeatures : Flag "Build with every feature the package has"
+    }
+    | test
+      "Build a package and run its `@test` functions"
+      {
+        path : Maybe String "Package directory (or a single `.mw` file)"
+        filter : Maybe String "Only run tests whose name contains this"
+        exact : Flag "Only the test whose name is exactly FILTER"
+        std : Flag "Also run the standard library's own tests"
+        testThreads : Option Int "How many tests run at once" value "N"
+        noCapture : Flag "Write what tests print as they print it" alias "nocapture"
+        cek : Flag "Evaluate with the CEK machine rather than the bytecode VM"
+      }
+      with
+      Members,
+        Build
+    | dis
+      "Disassemble a package: the bytecode the VM would run"
+      {
+        path : Maybe String "Package directory (or a single `.mw` file), or a workspace"
+        asm : Flag "The machine code an `aot` build would link, as text"
+      }
+      with
+      Members,
+        Build
+    | lsp "Run the language server, speaking LSP over stdin and stdout" {
+      stdio : Flag "Ignored: clients pass this to select the stdio transport, the only one spoken"
+      clientProcessId
+        : Option Int "Ignored: the editor's process id" as "clientProcessId" value "PID"
+      fetch : Flag "Fetch what a package depends on when a file of it is opened, as a build would"
+    }
+    | dap "Run the debug adapter, speaking the Debug Adapter Protocol over stdin and stdout" {}
+    | fmt "Re-indent `.mw` sources in place" {
+      paths : [String] "Files or directories to format. Defaults to the current directory"
+      check : Flag "List the files that would change and exit 1, without writing"
+      stdout : Flag "Write the result to stdout instead of back to the file"
+      width : Option Int = 100 "How many characters a line may be" value "COLUMNS"
+    }
+    | init "Create a package: a `Meadow.toml` and a `src/Main.mw` that runs" {
+      path : Maybe String "Where to make it"
+      name : Option String "The package's name, where the directory's is not it" value "NAME"
+      workspace : Flag "A workspace, rather than a package"
+    }
+    | add "Add a dependency to a package's manifest" {
+      what : String "The dependency: a name, a path or a repository"
+      branch : Option String "The branch to follow" value "NAME"
+      tag : Option String "The tag to pin" value "NAME"
+      rev : Option String "The commit to pin" value "COMMIT"
+      rename : Option String "The name the package knows it by" value "NAME"
+      path : Option String "The package whose manifest to change" value "DIR"
+    }
+    | cut
+      "Run a program of Cut, the IR a front end hands the back end (`docs/CUT.md`): lowered to AxCut and run on Glade, or built for Silo and run as an executable"
+      {
+        file : String "The program, as the text `docs/CUT.md` describes"
+        args : [String] "What the program is given, after `--`: what its `argv` answers"
+        runtime : Option String =
+          "glade" "`glade`, on its bytecode, or `silo`, as native code" value "NAME"
+        aot : Flag "On Glade, compile the bytecode to machine code ahead of time and run that"
+        optLevel : Option Int =
+          2 "How hard an executable is optimised: 0, 1 or 2" short "O" value "LEVEL"
+        noRun : Flag "Build what would be run -- the bytecode image, or the executable -- and stop"
+      }
+    | clean
+      "Remove what a build wrote: the package's `target` directory, with the images, executables and incremental cache in it"
+      {
+        path : Maybe String "The package, or a workspace, whose `target` to remove"
+        profile : Option String "Only this profile's, rather than all of them" value "NAME"
+        dryRun : Flag "Say what would be removed without removing it"
+      }
+    | update
+      "Bring a package's dependencies forward to what their branches and tags now name, rewriting `Meadow.lock`"
+      {
+        names : [String] "The dependencies to bring forward: all of them, if none is named"
+        path : Option String "The package whose dependencies they are" value "DIR"
+        dryRun : Flag "Say what would change without changing it"
+      }
+    | repl "Read entries and evaluate them: what `meadowboot` alone does" {}
     | lex "Each file's tokens, one a line, and then what is wrong in them" {
       files : [String] "the files to read"
     }
@@ -98,20 +332,27 @@ cli! {
           : [String]
             "the files to read, each in a package; the standard library's sources are where `MEADOWBOOT_STD` says"
       }
-    | run
+    | cek
       "Compile each file's unit to core, run its `result` with the CEK machine, and say its value"
       { files : [String] "the files to read, each in a package" }
-    | cut
+    | lower
       "Compile each file's unit to Cut, and write the program that answers its `result` as text"
       {
-        files : [String] "the files to read, each in a package",
-        profile : Option String "the profile to build with: `debug`, or `release`",
-        opt : Option String "how hard to optimise, over the profile's: `O0` to `O3`",
-        set : Option String "options over the profile's, `name=value` with commas between",
+        files : [String] "the files to read, each in a package"
+        profile : Option String "the profile to build with: `debug`, or `release`"
+        opt : Option String "how hard to optimise, over the profile's: `O0` to `O3`"
+        set
+          : Option
+            [String]
+            "options over the profile's, `name=value`: with commas between, or repeated"
+            split
+            ","
         cfg
           : Option
-            String
-            "the flags `@cfg` holds of, each a name or `name=value`, with commas between"
+            [String]
+            "the flags `@cfg` holds of, each a name or `name=value`: with commas between, or repeated"
+            split
+            ","
       }
     | expand
       "Run a round of a unit's procedural macro calls, as a build asks it of another run of this program"
@@ -122,7 +363,7 @@ cli! {
       }
 }
 
-fun main () = catch failed (\() -> run (argsCli ()))
+fun main () = catch failed (\() -> match argsCli () with | (every, cli) -> run every cli)
 
 -- A query read before it was set, or one that needs itself: a mistake of the
 -- compiler's rather than of what it read. It is said, and the run fails.
@@ -132,19 +373,107 @@ fun failure (e : QueryError k) : String =
   match e with
   | QueryError.Unset _ -> "meadowboot: a query was read before it was set\n"
   | QueryError.Cycle ks -> "meadowboot: ${S.fromInt (V.len ks)} queries need each other\n"
+  | QueryError.Interrupted -> "meadowboot: it was told to stop\n"
 
-fun run (cli : Cli) =
+fun run (every : CliOptions) (cli : Cli) =
   match cli with
+  | Cli.Build r -> driven r.path r.build None
+  | Cli.Run r -> driven r.path r.build (Just r.args)
   | Cli.Lex r -> finish (V.foldl (\ok p -> lexFile p and ok) True r.files)
   | Cli.Eval r -> finish (V.foldl (\ok p -> evalFile p and ok) True r.files)
   | Cli.Parse r -> finish (V.foldl (\ok p -> parseFile p and ok) True r.files)
   | Cli.Fixity r -> finish (fixityFiles r.files)
   | Cli.Rename r -> finish (renameFiles r.files)
   | Cli.Infer r -> finish (inferFiles r.files)
-  | Cli.Run r -> finish (runFiles r.files)
-  | Cli.Cut r ->
-      finish (cutFiles (M.unwrapOr "debug" r.profile) (pairsOf r.opt r.set r.cfg) r.files)
+  | Cli.Cek r -> finish (runFiles r.files)
+  | Cli.Lower r ->
+      finish
+        (cutFiles
+           (M.unwrapOr "debug" r.profile)
+           (pairsOf
+              r.opt
+              (if V.isEmpty r.set then None else Just (S.join "," r.set))
+              (if V.isEmpty r.cfg then None else Just (S.join "," r.cfg)))
+           r.files)
   | Cli.Expand r -> finish (expandRound r.files)
+  -- What is not MeadowBoot's yet is `meadow`'s, asked the same way.
+  | _ -> handedOn ()
+
+-- The Rust compiler's `meadow`: where `MEADOW` says, or the one on the path.
+fun meadow () = M.unwrapOr "meadow" (getEnv "MEADOW")
+
+-- This command line as it was written, given to `meadow`, and its answer
+-- this program's: the tools MeadowBoot does not have yet, behind the command
+-- line it will have them at.
+fun handedOn () =
+  match Proc.runInherit (meadow ()) (Proc.argv ()) with
+  | Ok code -> exit code
+  | Err why -> (let u = writeError "meadowboot: `meadow` could not be run: ${why}\n" in exit 1)
+
+-- What `meadow` is told that MeadowBoot's build does not act on yet: said,
+-- so that nobody takes a flag for honoured because it was accepted.
+fun unheeded (b : CliBuild) : [String] =
+  V.concatMap (\x -> if fst x then [snd x] else []) [
+    (b.strict, "--strict"),
+    (b.lenient, "--lenient"),
+    (b.noPrune, "--no-prune"),
+    (M.isSome b.target, "--target"),
+    (M.isSome b.nursery, "--nursery"),
+    (b.leaks, "--leaks"),
+    (M.isSome b.features, "--features"),
+    (b.noDefaultFeatures, "--no-default-features"),
+    (b.allFeatures, "--all-features")
+  ]
+
+-- `build` and `run`: the package at `path` compiled to Cut by this compiler
+-- -- its macros run on Glade -- and that handed to the back end, `meadow
+-- cut`, to build, or to run with `args` where there are any to give.
+fun driven (path : Maybe String) (b : CliBuild) (args : Maybe [String]) =
+  let written = Proc.argv () in
+  -- After `--` everything is the program's: a path is only one written
+  -- before it.
+  let before = V.takeWhile (\a -> a != "--") written in
+  let given = M.andThen (\p -> if V.elem p before then Just p else None) path in
+  let theirs = V.drop written (V.len before + 1) in
+  let place = absolute (M.unwrapOr "." given) in
+  let root = if S.endsWith ".mw" place then packageOf place else Just place in
+  let said =
+    V.foldl (\u flag -> writeError "meadowboot: `${flag}` is not acted on yet\n") () (unheeded b)
+  in match root with
+     | None -> (let u = writeError "meadowboot: `${place}` is in no package\n" in exit 1)
+     | Just r ->
+         let profile = if b.release then "release" else "debug" in
+         let level = M.unwrapOr (if b.release then 2 else 1) b.optLevel in
+         let pairs =
+           V.concat [
+             [("opt", "O${show (if level > 2 then 2 else level)}"), ("macros", "Glade")],
+             (if V.isEmpty b.cfg then [] else [("flags", S.join "," b.cfg)]),
+             told ()
+           ]
+         in if not (buildUnits profile pairs r) then exit 1
+            else
+              (let program = Path.join (linkDirIn r profile) "program.cut" in
+               let ahead =
+                 b.aot
+                   or b.backend == Just "aot"
+                   or (b.release and not b.jit and M.isNone b.backend)
+               in
+               let threaded =
+                 match b.threads with
+                 | Just n -> Proc.setEnv ("MEADOW_THREADS", show n)
+                 | None -> ()
+               in
+               let back =
+                 V.concat [
+                   ["cut", program, "--runtime", M.unwrapOr "glade" b.runtime, "-O", show level],
+                   (if ahead and b.runtime != Just "silo" then ["--aot"] else []),
+                   (if M.isNone args then ["--no-run"] else V.pushFront theirs "--")
+                 ]
+               in match Proc.runInherit (meadow ()) back with
+                  | Ok code -> exit code
+                  | Err why ->
+                      (let u = writeError "meadowboot: the back end could not be run: ${why}\n" in
+                       exit 1))
 
 -- Each of `files`, its names resolved with every other of its unit's -- a
 -- package, built with the units it depends on first -- under a line naming

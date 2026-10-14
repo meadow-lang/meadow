@@ -86,9 +86,9 @@ fn meadowboot(args: &[String]) -> String {
     c.args(args);
     // Where the standard library's sources are, for the passes that build a
     // file's unit and the units it depends on.
-    // `run` and `cut` are of programs written with no library, as the glade
+    // `cek` and `lower` are of programs written with no library, as the glade
     // cases are.
-    if !matches!(args.first().map(String::as_str), Some("run" | "cut")) {
+    if !matches!(args.first().map(String::as_str), Some("cek" | "lower")) {
         c.env("MEADOWBOOT_STD", repo().join("lib").join("Std"));
     }
     // MeadowBoot runs the procedural macros itself, as a program it compiles
@@ -2418,7 +2418,7 @@ fn glade_cases_compiled_by_meadowboot_evaluate_as_the_rust_compiler_has_them() {
     let cases = run_cases(&dir);
     let wants: std::collections::HashMap<PathBuf, String> = cases.iter().cloned().collect();
     let files: Vec<PathBuf> = cases.iter().map(|(f, _)| f.clone()).collect();
-    let theirs = per_file("run", &files);
+    let theirs = per_file("cek", &files);
     let bad = differences(&theirs, |p| format!("{}\n", wants[p]));
     let _ = std::fs::remove_dir_all(&dir);
     let agreeing = files.len() - bad.len();
@@ -2533,7 +2533,7 @@ fn a_program_of_two_units_lowered_by_meadowboot_answers_as_the_rust_compiler_has
         "Main.mw",
         APP,
     );
-    let lowered = per_file("cut", &[main]);
+    let lowered = per_file("lower", &[main]);
     let text = &lowered[0].1;
     let want = "(6, 7, 1, 13, 41, 11, 8, 2)";
     let (interpreted, on_axcut) = (cut_answer(text), axcut_answer(text));
@@ -2582,7 +2582,7 @@ fn a_program_with_the_standard_library_lowered_by_meadowboot_answers_as_the_rust
     let main = dir.join("src").join("Main.mw");
     std::fs::write(&main, WITH_STD).expect("a source file");
     let out = Command::new(meadowboot_exe())
-        .arg("cut")
+        .arg("lower")
         .arg(&main)
         .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
         // With no macro expanded: what a macro of the library's writes is not
@@ -2716,7 +2716,7 @@ fn with_levels() -> String {
     )
 }
 
-/// What MeadowBoot's `cut` writes of the program `source`, told `args`: the
+/// What MeadowBoot's `lower` writes of the program `source`, told `args`: the
 /// package is made in a directory named for `name`.
 fn cut_of(name: &str, source: &str, args: &[&str]) -> String {
     let dir = std::env::temp_dir().join(format!("meadowboot-{name}-{}", std::process::id()));
@@ -2732,7 +2732,7 @@ version = \"0.1.0\"
     let main = dir.join("src").join("Main.mw");
     std::fs::write(&main, source).expect("a source file");
     let out = Command::new(meadowboot_exe())
-        .arg("cut")
+        .arg("lower")
         .args(args)
         .arg(&main)
         .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
@@ -2763,7 +2763,7 @@ cut 0
         })
 }
 
-/// What MeadowBoot's `cut` writes of [`with_levels`] at level `opt`.
+/// What MeadowBoot's `lower` writes of [`with_levels`] at level `opt`.
 fn cut_at(opt: &str) -> String {
     cut_of(opt, &with_levels(), &["--opt", opt])
 }
@@ -2870,7 +2870,7 @@ def shape = Shape { square = 2 }
 def result = (system, family, build, speed, level, debug shape)
 "#;
 
-/// What MeadowBoot's `cut` answers of [`WITH_CFG`], told `args`.
+/// What MeadowBoot's `lower` answers of [`WITH_CFG`], told `args`.
 fn cfg_answer(name: &str, args: &[&str]) -> String {
     let dir = std::env::temp_dir().join(format!("meadowboot-cfg-{name}-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("src")).expect("a package directory");
@@ -2882,7 +2882,7 @@ fn cfg_answer(name: &str, args: &[&str]) -> String {
     let main = dir.join("src").join("Main.mw");
     std::fs::write(&main, WITH_CFG).expect("a source file");
     let out = Command::new(meadowboot_exe())
-        .arg("cut")
+        .arg("lower")
         .args(args)
         .arg(&main)
         .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
@@ -3017,7 +3017,7 @@ fn macros_answer(engine: &str) -> String {
         std::fs::write(dir.join(pkg).join("src").join(file), text).expect("a source file");
     }
     let out = Command::new(meadowboot_exe())
-        .arg("cut")
+        .arg("lower")
         .arg("--set")
         .arg(format!("macros={engine}"))
         .arg(dir.join("App").join("src").join("Main.mw"))
@@ -3071,7 +3071,7 @@ fn the_built_in_macros_answer_in_meadowboot() {
     )
     .expect("a source file");
     let out = Command::new(meadowboot_exe())
-        .arg("cut")
+        .arg("lower")
         .arg(&main)
         .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
         .env_remove("MEADOWBOOT_EXPANSIONS")
@@ -3110,7 +3110,7 @@ fn a_cfg_that_could_never_hold_is_refused_by_meadowboot() {
     )
     .expect("a source file");
     let out = Command::new(meadowboot_exe())
-        .arg("cut")
+        .arg("lower")
         .arg(&main)
         .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
         .env_remove("MEADOWBOOT_EXPANSIONS")
@@ -3128,7 +3128,100 @@ fn a_cfg_that_could_never_hold_is_refused_by_meadowboot() {
     );
 }
 
-/// What MeadowBoot's `cut` says of the program `source`, on either stream:
+/// What a program prints when it is asked for help, on either stream.
+fn help_of(exe: &Path, args: &[&str]) -> String {
+    let out = Command::new(exe)
+        .args(args)
+        .output()
+        .expect("the program runs");
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// The flags a help text declares: each `--name`, and each `-x` beside one,
+/// where a line starts with it. A flag named in passing, in what another
+/// flag's help says, is not one.
+fn flags_in(help: &str) -> std::collections::BTreeSet<String> {
+    let mut flags = std::collections::BTreeSet::new();
+    for line in help.lines() {
+        let line = line.trim_start();
+        if !line.starts_with('-') {
+            continue;
+        }
+        for word in line.split([' ', ',']).take(3) {
+            let word = word.trim_end_matches(',');
+            let dashed = word.starts_with("--") && word.len() > 2;
+            let short = word.len() == 2 && word.starts_with('-') && word != "--";
+            if dashed || short {
+                flags.insert(word.to_string());
+            }
+        }
+        // `[alias: --all]`, `[aliases: --a, --b]`.
+        if let Some(at) = line.find("[alias") {
+            for word in line[at..].split([' ', ',', ']']) {
+                if word.starts_with("--") {
+                    flags.insert(word.to_string());
+                }
+            }
+        }
+    }
+    flags.remove("--help");
+    flags.remove("-h");
+    flags
+}
+
+/// MeadowBoot's command line is `meadow`'s: every command `meadow` has,
+/// MeadowBoot has, taking the same flags by the same names, letters and
+/// other names. Whoever runs one runs the other the same way, so nothing
+/// changes for them when a tool the Rust compiler is built on is one
+/// MeadowBoot is; and a flag added to one and not the other fails here.
+/// What MeadowBoot has besides -- each pass's output, for these tests, and
+/// `repl`, which `meadow` alone is -- is its own.
+#[test]
+fn a_command_takes_what_meadow_s_takes() {
+    let meadow_exe = meadow();
+    let boot = meadowboot_exe();
+    let top = help_of(&meadow_exe, &["--help"]);
+    let commands: Vec<String> = top
+        .lines()
+        .skip_while(|l| !l.starts_with("Commands:"))
+        .skip(1)
+        .take_while(|l| l.starts_with("  "))
+        .filter_map(|l| l.split_whitespace().next().map(str::to_string))
+        .filter(|c| c != "help")
+        .collect();
+    assert!(commands.len() >= 14, "{commands:?}");
+    assert_eq!(
+        flags_in(&top),
+        flags_in(&help_of(&boot, &["--help"])),
+        "what every command takes"
+    );
+    let mut wrong = Vec::new();
+    for command in &commands {
+        let theirs = flags_in(&help_of(&meadow_exe, &[command, "--help"]));
+        let ours = flags_in(&help_of(&boot, &[command, "--help"]));
+        if theirs != ours {
+            let missing: Vec<_> = theirs.difference(&ours).collect();
+            let extra: Vec<_> = ours.difference(&theirs).collect();
+            wrong.push(format!(
+                "`{command}`: MeadowBoot lacks {missing:?} and has {extra:?} besides"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    // And the version is said the same way.
+    let said = help_of(&boot, &["--version"]);
+    let theirs = help_of(&meadow_exe, &["--version"]);
+    assert_eq!(
+        said.trim().trim_start_matches("meadowboot"),
+        theirs.trim().trim_start_matches("meadow")
+    );
+}
+
+/// What MeadowBoot's `lower` says of the program `source`, on either stream:
 /// the package is made in a directory named for `name`.
 fn said_of(name: &str, source: &str) -> String {
     let dir = std::env::temp_dir().join(format!("meadowboot-{name}-{}", std::process::id()));
@@ -3141,7 +3234,7 @@ fn said_of(name: &str, source: &str) -> String {
     let main = dir.join("src").join("Main.mw");
     std::fs::write(&main, source).expect("a source file");
     let out = Command::new(meadowboot_exe())
-        .arg("cut")
+        .arg("lower")
         .arg(&main)
         .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
         .env_remove("MEADOWBOOT_EXPANSIONS")
@@ -3293,7 +3386,7 @@ fn glade_cases_lowered_to_cut_by_meadowboot_answer_as_the_rust_compiler_has_them
     let cases = run_cases(&dir);
     let wants: std::collections::HashMap<PathBuf, String> = cases.iter().cloned().collect();
     let files: Vec<PathBuf> = cases.iter().map(|(f, _)| f.clone()).collect();
-    let lowered = per_file("cut", &files);
+    let lowered = per_file("lower", &files);
     let answers: Vec<(PathBuf, String)> = lowered
         .iter()
         .map(|(p, text)| (p.clone(), format!("{}\n", cut_answer(text))))
