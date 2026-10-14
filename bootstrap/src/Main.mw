@@ -82,6 +82,7 @@ cli! {
     "0.3.0-dev"
     default
     repl
+    unnamed
     options
     {
       offline
@@ -185,7 +186,11 @@ cli! {
       "Build a package, then evaluate its `main` entry point"
       {
         path : Maybe String "Package directory (or a single `.mw` file), or a workspace"
-        args : [String] "Arguments for the program, after `--`: what `Process.argv` gives it"
+        args
+          : [String]
+            "Arguments for the program, after `--`: what `Process.argv` gives it"
+            after
+            "--"
         types : Flag "Print the type of every top-level binding in your packages first"
         package : Option String "In a workspace: the member to run" short "p" value "NAME"
         cek : Flag "Evaluate with the CEK machine rather than the bytecode VM"
@@ -209,7 +214,7 @@ cli! {
       "Run a bytecode image: what `meadow build` writes under `target/<profile>/bytecode/`, or what a compiler written in Meadow emits"
       {
         image : String "The image"
-        args : [String] "Arguments for the program, after `--`"
+        args : [String] "Arguments for the program, after `--`" after "--"
         backend : Option String "How to run it: `vm` or `jit`" value "BACKEND"
         optLevel : Option Int "How hard the JIT optimises: 0, 1 or 2" short "O" value "LEVEL"
       }
@@ -279,7 +284,7 @@ cli! {
       "Run a program of Cut, the IR a front end hands the back end (`docs/CUT.md`): lowered to AxCut and run on Glade, or built for Silo and run as an executable"
       {
         file : String "The program, as the text `docs/CUT.md` describes"
-        args : [String] "What the program is given, after `--`: what its `argv` answers"
+        args : [String] "What the program is given, after `--`: what its `argv` answers" after "--"
         runtime : Option String =
           "glade" "`glade`, on its bytecode, or `silo`, as native code" value "NAME"
         aot : Flag "On Glade, compile the bytecode to machine code ahead of time and run that"
@@ -301,7 +306,7 @@ cli! {
         path : Option String "The package whose dependencies they are" value "DIR"
         dryRun : Flag "Say what would change without changing it"
       }
-    | repl "Read entries and evaluate them: what `meadowboot` alone does" {}
+    | repl "Read entries and evaluate them" {}
     | lex "Each file's tokens, one a line, and then what is wrong in them" {
       files : [String] "the files to read"
     }
@@ -429,13 +434,8 @@ fun unheeded (b : CliBuild) : [String] =
 -- -- its macros run on Glade -- and that handed to the back end, `meadow
 -- cut`, to build, or to run with `args` where there are any to give.
 fun driven (path : Maybe String) (b : CliBuild) (args : Maybe [String]) =
-  let written = Proc.argv () in
-  -- After `--` everything is the program's: a path is only one written
-  -- before it.
-  let before = V.takeWhile (\a -> a != "--") written in
-  let given = M.andThen (\p -> if V.elem p before then Just p else None) path in
-  let theirs = V.drop written (V.len before + 1) in
-  let place = absolute (M.unwrapOr "." given) in
+  let theirs = M.unwrapOr [] args in
+  let place = absolute (M.unwrapOr "." path) in
   let root = if S.endsWith ".mw" place then packageOf place else Just place in
   let said =
     V.foldl (\u flag -> writeError "meadowboot: `${flag}` is not acted on yet\n") () (unheeded b)
