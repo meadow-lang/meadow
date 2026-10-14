@@ -142,9 +142,31 @@ mod sys {
     }
 
     pub fn open(path: &str) -> Result<i64, String> {
+        if path.is_empty() {
+            return own();
+        }
         let name = CString::new(path).map_err(|_| "a NUL in the library's name".to_string())?;
         // Safety: a C string, and flags `dlopen` documents.
         let handle = unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+        if handle.is_null() {
+            Err(last_error())
+        } else {
+            Ok(handle as i64)
+        }
+    }
+
+    /// The library this code is linked into -- a program's own executable,
+    /// or the library a plugin is -- found by an address in it.
+    fn own() -> Result<i64, String> {
+        let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+        // Safety: an address in this module, and room for the answer.
+        let found = unsafe { libc::dladdr(own as *const c_void, &mut info) };
+        if found == 0 || info.dli_fname.is_null() {
+            return Err("this library's own path could not be found".to_string());
+        }
+        // Safety: the path the loader keeps for the module, and the flags
+        // `dlopen` documents: the module is loaded already.
+        let handle = unsafe { libc::dlopen(info.dli_fname, libc::RTLD_NOW | libc::RTLD_LOCAL) };
         if handle.is_null() {
             Err(last_error())
         } else {
@@ -270,6 +292,7 @@ mod sys {
 
     unsafe extern "system" {
         fn LoadLibraryW(name: *const u16) -> *mut c_void;
+        fn GetModuleHandleExW(flags: u32, name: *const u16, module: *mut *mut c_void) -> i32;
         fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
         fn GetLastError() -> u32;
     }
@@ -285,6 +308,31 @@ mod sys {
     const WORDS: usize = 16;
 
     pub fn open(path: &str) -> Result<i64, String> {
+        if path.is_empty() {
+            // The module this code is linked into -- a program's own
+            // executable, or the library a plugin is -- by an address in it,
+            // and not counted as one more load of it.
+            const FROM_ADDRESS: u32 = 0x4;
+            const UNCHANGED_REFCOUNT: u32 = 0x2;
+            let mut module: *mut c_void = std::ptr::null_mut();
+            // Safety: an address in this module, and room for the answer.
+            let ok = unsafe {
+                GetModuleHandleExW(
+                    FROM_ADDRESS | UNCHANGED_REFCOUNT,
+                    open as *const () as *const u16,
+                    &mut module,
+                )
+            };
+            return if ok == 0 || module.is_null() {
+                // Safety: none needed.
+                Err(format!(
+                    "this library could not be found: Windows error {}",
+                    unsafe { GetLastError() }
+                ))
+            } else {
+                Ok(module as i64)
+            };
+        }
         let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
         // Safety: a NUL-terminated wide string.
         let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
@@ -508,7 +556,8 @@ mod sys {
 }
 
 /// Open the library at `path` -- or of that name, wherever the system's
-/// loader looks -- answering a handle to it, or why not.
+/// loader looks -- answering a handle to it, or why not. The empty path is
+/// the library this code is in: the program itself, or the plugin it is.
 pub fn open(path: &str) -> Result<i64, String> {
     sys::open(path)
 }

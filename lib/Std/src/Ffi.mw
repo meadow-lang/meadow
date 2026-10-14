@@ -97,6 +97,11 @@ use Std.Maybe.Maybe.*
   | Ok at -> Ok (Library at)
   | Err why -> Err why
 
+-- The library this program is: its own executable, or the library a plugin
+-- is -- where the functions it exports to C are found, to hand C their
+-- addresses.
+@pub fun own () : Result String Library ! { Process | e } = open ""
+
 -- The function `name` in `library`.
 @pub fun function (library : Library) (name : String) : Result String Function ! { Process | e } =
   match library with
