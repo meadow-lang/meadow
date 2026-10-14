@@ -3267,6 +3267,94 @@ fn a_package_s_tests_are_run_by_meadowboot_as_meadow_test_runs_them() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A function written `@export` is one C can call: a package of them is
+/// built by MeadowBoot as a library -- native, through Silo -- and each is a
+/// C function of the C types its Meadow types are. What calls them here is a
+/// Meadow program through `Std.Ffi`, as a C host would: an `int32_t`, a
+/// `double`, a `float` and two `int64_t`s go in, under the function's own
+/// name or the one `@export(name)` gives it, and the answers come back.
+#[test]
+fn a_function_meadowboot_exports_is_called_from_c() {
+    let root = std::env::temp_dir().join(format!("meadowboot-exports-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let lib = root.join("Lib");
+    std::fs::create_dir_all(lib.join("src")).expect("a package directory");
+    std::fs::write(
+        lib.join("Meadow.toml"),
+        "[package]\nname = \"Lib\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("a manifest");
+    std::fs::write(
+        lib.join("src").join("Main.mw"),
+        "@export\nfun twice (x : Int32) : Int32 = x * 2\n\n\
+         @export(lib_half)\nfun half (x : Float) : Float = x *. 0.5\n\n\
+         @export\nfun same32 (x : Float32) : Float32 = x\n\n\
+         @export\nfun add (a : Int) (b : Int) : Int = a + b\n",
+    )
+    .expect("the library's source");
+    let built = Command::new(meadowboot_exe())
+        .arg("build")
+        .arg(&lib)
+        .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+        .env("MEADOW", meadow())
+        .env_remove("MEADOWBOOT_EXPANSIONS")
+        .output()
+        .expect("MeadowBoot runs");
+    let name = if cfg!(windows) {
+        "program.dll"
+    } else if cfg!(target_os = "macos") {
+        "libprogram.dylib"
+    } else {
+        "libprogram.so"
+    };
+    let library = lib
+        .join("target/debug/link/target/release/native/silo")
+        .join(name);
+    assert!(
+        library.exists(),
+        "no library at {}:\n{}{}",
+        library.display(),
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let host = root.join("Host");
+    std::fs::create_dir_all(host.join("src")).expect("a package directory");
+    std::fs::write(
+        host.join("Meadow.toml"),
+        "[package]\nname = \"Host\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("a manifest");
+    std::fs::write(
+        host.join("src").join("Main.mw"),
+        format!(
+            "@!feature(ffi)\n\nuse Std.Ffi as Ffi\nuse Std.Ffi (Arg)\nuse Std.Result as R\n\n\
+             fun call name args = match Ffi.open {path:?} with\n  \
+             | Err why -> Err why\n  \
+             | Ok l -> (match Ffi.function l name with | Err why -> Err why | Ok f -> Ok f)\n\n\
+             fun main () =\n  let shown = (\n    \
+             R.andThen (\\f -> Ffi.callInt f [Arg.Int 21]) (call \"twice\" []),\n    \
+             R.andThen (\\f -> Ffi.callFloat f [Arg.Float 3.0]) (call \"lib_half\" []),\n    \
+             R.andThen (\\f -> Ffi.callFloat32 f [Arg.Float32 0.25]) (call \"same32\" []),\n    \
+             R.andThen (\\f -> Ffi.callInt f [Arg.Int 40, Arg.Int 2]) (call \"add\" [])\n  )\n  \
+             in println \"${{shown:?}}\"\n",
+            path = library.to_string_lossy().replace('\\', "/")
+        ),
+    )
+    .expect("the host's source");
+    let out = Command::new(meadow())
+        .args(["run", "--offline"])
+        .arg(&host)
+        .output()
+        .expect("meadow runs");
+    let said = String::from_utf8_lossy(&out.stdout);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        said.contains("(Ok(42), Ok(1.5), Ok(0.25), Ok(42))"),
+        "{said}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// What a program prints when it is asked for help, on either stream.
 fn help_of(exe: &Path, args: &[&str]) -> String {
     let out = Command::new(exe)

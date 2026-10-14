@@ -37,14 +37,17 @@ use Std.Result as Res
 use MeadowBoot.Rules as Ru
 use MeadowBoot.Rules (Tok)
 use Std.Process as Proc
-use MeadowBoot.Ast (AstProgram)
+use MeadowBoot.Ast (
+  AstProgram, AstAttr, AstDecl, AstDeclKind, AstBindKind, kindAstDecl, kindAstBind, astDeclBindBind,
+  astBindFunName, astAttrName, astAttrArgs, astNameText
+)
 use MeadowBoot.Rename (mentionsOf, Binder)
 use MeadowBoot.Scopes (
   Source, Export, Renamed, DepExports, renameUnit, usesOf, macroFuns, saysVis, moduleFile,
-  builtinTyconNames
+  builtinTyconNames, declsOf
 )
 use MeadowBoot.Infer (inferUnit, Inferred)
-use MeadowBoot.Elab (unitCore, defSymbol, Linked, Numbers, DataSig, DefaultSig, Imported)
+use MeadowBoot.Elab (unitCore, defSymbol, Linked, Numbers, DataSig, DefaultSig, Imported, CExport)
 use MeadowBoot.Seq as Seq
 use MeadowBoot.Lint (lint)
 use MeadowBoot.Dictionaries as Dictionaries
@@ -500,6 +503,30 @@ fun checkedOf
         if checked then V.concat [undefined, placedSaid, unmatched] else done.problems
       in
       let program = isProgram r.exports in
+      -- What C may call: each function an `@export` is written on, with the
+      -- name C calls it by -- its own, or the one the attribute says -- and
+      -- what it answers, which has to be something C can take.
+      let cExported =
+        V.concatMap
+          (\s ->
+            match s with
+            | (_, (src : Source)) ->
+                V.concatMap
+                  (\x ->
+                    match x with
+                    | (attrs, d) -> exportOf src attrs d r.exports done.schemes)
+                  (declsOf src))
+          sources
+      in
+      let refused =
+        V.concatMap
+          (\(c : CExport) ->
+            if V.elem c.result passable then []
+            else
+              ["`@export` of `${c.name}`: what it answers is not something C can take, a number or `()`"])
+          cExported
+      in
+      let problems = V.append problems refused in
       (
         exports,
         anyVis,
@@ -615,7 +642,8 @@ fun checkedOf
                                  fracs = V.map snd done.numbers
                                })
                           else theirNumbers,
-                        whole = if wholly then plain else Inline.nothing ()
+                        whole = if wholly then plain else Inline.nothing (),
+                        cExports = cExported
                       },
                       Seq.declarations
                         core
@@ -649,7 +677,8 @@ fun emptyLinked () : Linked =
     summary = emptySummary (),
     bodies = Inline.nothing (),
     numbers = [],
-    whole = Inline.nothing ()
+    whole = Inline.nothing (),
+    cExports = []
   }
 
 -- A unit's declarations of Cut, where its compiler writes them: its object.
@@ -676,104 +705,139 @@ fun linkProgram (o : UnitsOptions) (l : Linking Interface) : Result String () ! 
            | (Just n, None) -> Err "${root.package} has no value `${n}` at its root to enter at\n"
            | (None, None) -> Ok (named "main")) with
           | Err why -> Err why
-          | Ok None -> Ok ()
+          -- A library has no entry, and the first of what it exports
+          -- stands for one: nothing calls it.
+          | Ok None ->
+              (match V.get root.linked.cExports 0 with
+               | None -> Ok ()
+               | Just (c : CExport) -> linkAt o l units root c.binder (Con "Unit" []) 0)
           | Ok (Just (e : Export)) ->
               (let sc =
                  M.unwrapOr (Scheme { quant = [], preds = [], ty = Error, lacks = [] }) e.scheme
-               in
-               -- A package reached by two names is one package: its object
-               -- goes in once.
-               let once =
-                 V.foldl
-                   (\acc u ->
-                     match u with
-                     | (_, (i : Interface), _) ->
-                         if V.any (\x -> packageOfUnit x == i.package) acc then acc
-                         else V.pushBack acc u)
-                   []
-                   units
-               in
-               -- Optimised as one program, the units are one object, and
-               -- the entry has the binder it was given there.
-               let whole = if o.whole then Just (wholeObject o root e.binder once) else None in
-               let entered = M.unwrapOr e.binder (M.map fst whole) in
-               let (before, after) =
-                 Seq.around
-                   root.package
-                   entered
-                   sc.ty
-                   (V.len (V.filter (\k -> k == VarKind.Plain) sc.quant))
-                   (sigsOf root.linked.datas)
-                   (V.filter (\p -> p != "Std") root.linked.packages)
-               in
-               let objects =
-                 if M.isSome whole then
-                   Ok
-                     (match whole with
-                      | Just (_, object) ->
-                          (match written object with
-                           | (text, index) -> [(text, indexed index)])
-                      | None -> [])
-                 else
-                   V.foldl
-                     (\acc u ->
-                       match (acc, u) with
-                       | (Err why, _) -> Err why
-                       | (Ok read, (_, (i : Interface), out)) ->
-                           (match (
-                              readToString (objectIn out i.package),
-                              readToString (indexIn out i.package)
-                            ) with
-                            | (Ok text, Ok index) -> Ok (V.pushBack read (text, indexed index))
-                            | _ -> Err "${i.package} wrote no object\n"))
-                     (Ok [])
-                     once
-               in match objects with
-                  | Err why -> Err why
-                  | Ok read ->
-                      -- Only what the entry reaches is part of the program
-                      -- (`meadow_core::prune`): every definition it mentions,
-                      -- and those they do.
-                      (let mentions =
-                         V.foldl
-                           (\h o ->
-                             V.foldl
-                               (\g x ->
-                                 match x with
-                                 | (symbol, _, _, refs) -> H.insert symbol refs g)
-                               h
-                               (snd o))
-                           H.empty
-                           read
-                       in
-                       let kept = reach mentions [defSymbol root.package entered] H.empty in
-                       let texts =
-                         V.concatMap
-                           (\o ->
-                             match o with
-                             | (text, parts) ->
-                                 -- Taken apart once, at the line between
-                                 -- its parts: what is always there, then
-                                 -- each definition's, as the index has them.
-                                 (let pieces = S.split parted text in
-                                  V.pushFront
-                                    (V.concatMap
-                                       (\k ->
-                                         match V.get parts k with
-                                         | Just (symbol, _, _, _) ->
-                                             if M.isSome (H.lookup symbol kept) then
-                                               [V.getOr "" pieces (k + 1)]
-                                             else []
-                                         | None -> [])
-                                       (V.range 0 (V.len parts)))
-                                    (V.getOr "" pieces 0)))
-                           read
-                       in match writeString (
-                            Path.join (linkOut l) "program.cut",
-                            concatStrings (V.toArray (V.concat [[before], texts, [after]]))
-                          ) with
-                          | Ok _ -> Ok ()
-                          | Err why -> Err "the program could not be written: ${why}\n")))
+               in linkAt
+                    o
+                    l
+                    units
+                    root
+                    e.binder
+                    sc.ty
+                    (V.len (V.filter (\k -> k == VarKind.Plain) sc.quant))))
+
+-- The program the units link to, entered at `binder` of type `ty`, generic
+-- in `types` types; and what C may call of it, where it exports anything.
+fun linkAt
+    (o : UnitsOptions)
+    (l : Linking Interface)
+    (units : [(String, Interface, String)])
+    (root : Interface)
+    (binder : Int)
+    (ty : Type)
+    (types : Int)
+    : Result String () ! { Fs | e } =
+  -- A package reached by two names is one package: its object
+  -- goes in once.
+  let once =
+    V.foldl
+      (\acc u ->
+        match u with
+        | (_, (i : Interface), _) ->
+            if V.any (\x -> packageOfUnit x == i.package) acc then acc else V.pushBack acc u)
+      []
+      units
+  in
+  -- Optimised as one program, the units are one object, and
+  -- the entry has the binder it was given there.
+  -- A library is not made one program yet: its exports name the
+  -- binders the units gave them.
+  let whole =
+    if o.whole and V.isEmpty root.linked.cExports then Just (wholeObject o root binder once)
+    else None
+  in
+  let entered = M.unwrapOr binder (M.map fst whole) in
+  let (before, after) =
+    Seq.around
+      root.package
+      entered
+      ty
+      types
+      (sigsOf root.linked.datas)
+      (V.filter (\p -> p != "Std") root.linked.packages)
+  in
+  let objects =
+    if M.isSome whole then
+      Ok
+        (match whole with
+         | Just (_, object) ->
+             (match written object with
+              | (text, index) -> [(text, indexed index)])
+         | None -> [])
+    else
+      V.foldl
+        (\acc u ->
+          match (acc, u) with
+          | (Err why, _) -> Err why
+          | (Ok read, (_, (i : Interface), out)) ->
+              (match (
+                 readToString (objectIn out i.package),
+                 readToString (indexIn out i.package)
+               ) with
+               | (Ok text, Ok index) -> Ok (V.pushBack read (text, indexed index))
+               | _ -> Err "${i.package} wrote no object\n"))
+        (Ok [])
+        once
+  in match objects with
+     | Err why -> Err why
+     | Ok read ->
+         -- Only what the entry reaches is part of the program
+         -- (`meadow_core::prune`): every definition it mentions,
+         -- and those they do.
+         (let mentions =
+            V.foldl
+              (\h o ->
+                V.foldl
+                  (\g x ->
+                    match x with
+                    | (symbol, _, _, refs) -> H.insert symbol refs g)
+                  h
+                  (snd o))
+              H.empty
+              read
+          in
+          let exported =
+            V.concatMap
+              (\(c : CExport) ->
+                [defSymbol root.package c.binder, "${defSymbol root.package c.binder}f"])
+              root.linked.cExports
+          in
+          let kept =
+            reach mentions (V.pushFront exported (defSymbol root.package entered)) H.empty
+          in
+          let texts =
+            V.concatMap
+              (\o ->
+                match o with
+                | (text, parts) ->
+                    -- Taken apart once, at the line between
+                    -- its parts: what is always there, then
+                    -- each definition's, as the index has them.
+                    (let pieces = S.split parted text in
+                     V.pushFront
+                       (V.concatMap
+                          (\k ->
+                            match V.get parts k with
+                            | Just (symbol, _, _, _) ->
+                                if M.isSome (H.lookup symbol kept) then [V.getOr "" pieces (k + 1)]
+                                else []
+                            | None -> [])
+                          (V.range 0 (V.len parts)))
+                       (V.getOr "" pieces 0)))
+              read
+          in match writeString (
+               Path.join (linkOut l) "program.cut",
+               concatStrings (V.toArray (V.concat [[withExports before root], texts, [after]]))
+             ) with
+             | Ok _ -> Ok ()
+             | Err why -> Err "the program could not be written: ${why}\n")
 
 -- The build's units as one program of core -- each as it was written, kept
 -- in its interface -- made better as one and lowered: the one object the
@@ -828,6 +892,67 @@ fun placeIn (text : String) (offset : Int) : String =
     (let before = S.split "\n" (stringSlice text 0 offset) in
      let line = V.getOr "" before (V.len before - 1) in
      "${show (V.len before)}:${show (stringByteLength line + 1)}")
+
+-- The representations a value crosses into C as: numbers of each width,
+-- and `()` for `void`.
+def passable : [String] =
+  ["i64", "f64", "f32", "i8", "i16", "i32", "u8", "u16", "u32", "u64", "bool", "char", "unit"]
+
+-- The function declaration `d` of `src` exports to C, if its attributes say
+-- so: `@export` under its own name, `@export(cName)` under another.
+fun exportOf
+    (src : Source)
+    (attrs : [AstAttr])
+    (d : AstDecl)
+    (exports : [Export])
+    (schemes : HashMap Int Scheme)
+    : [CExport] =
+  match src.ast with
+  | AstProgram a _ ->
+      (match V.find (\at -> astNameText a (astAttrName a at) == "export") attrs with
+       | None -> []
+       | Just at ->
+           if kindAstDecl a d != AstDeclKind.Bind then []
+           else
+             (let b = astDeclBindBind a d in
+              if kindAstBind a b != AstBindKind.Fun then []
+              else
+                (let own = astNameText a (astBindFunName a b) in
+                 let called =
+                   M.unwrapOr own (M.map (\n -> astNameText a n) (V.get (astAttrArgs a at) 0))
+                 in match V.find
+                      (\(e : Export) -> e.name == own and e.kind == "v" and e.module == src.path)
+                      exports with
+                    | None -> []
+                    | Just (e : Export) ->
+                        (let ty =
+                           M.unwrapOr
+                             Error
+                             (M.map (\(sc : Scheme) -> sc.ty) (H.lookup e.binder schemes))
+                         in [CExport {
+                               name = called,
+                               binder = e.binder,
+                               result = Seq.repOf (answered ty)
+                             }]))))
+
+-- What a function of type `t` answers, all its parameters given.
+fun answered (t : Type) : Type =
+  match t with
+  | Fun _ result _ -> answered result
+  | other -> other
+
+-- A program's opening with a line for each function C may call of it: each
+-- names the function's definition of all its parameters (`Seq.directly`).
+fun withExports (opening : String) (root : Interface) : String =
+  let lines =
+    S.join
+      ""
+      (V.map
+         (\(c : CExport) ->
+           "export " ++ show c.name ++ " = ${defSymbol root.package c.binder}f -> ${c.result}\n")
+         root.linked.cExports)
+  in if S.startsWith "cut 0\n" opening then "cut 0\n" ++ lines ++ S.drop opening 6
+     else lines ++ opening
 
 -- The symbols reached from `todo`, through what each mentions.
 fun reach (mentions : HashMap String [String]) (todo : [String]) (seen : HashMap String Bool)

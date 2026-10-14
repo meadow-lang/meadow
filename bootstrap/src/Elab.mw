@@ -931,7 +931,18 @@ def nowhere : Meta = spanMeta 0 0
   -- All of it, as it was written and before anything was made of it, where
   -- the build's units are to be optimised as one program
   -- (`Core.joinedUnits`); nothing otherwise.
-  whole : CoreProgram
+  whole : CoreProgram,
+  -- Its functions C may call (`@export`): a program of them is a library.
+  cExports : [CExport]
+}
+
+-- A function C may call: the name C calls it by, its binder, and the
+-- representation of what it answers, as Cut writes one.
+@derive(Reflect, Debug, PartialEq)
+@pub record CExport = {
+  name : String,
+  binder : Int,
+  result : String
 }
 
 -- A unit's definitions that are generic in a number's type, as they were

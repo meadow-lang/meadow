@@ -492,12 +492,21 @@ fun driven (path : Maybe String) (b : CliBuild) (args : Maybe [String]) =
                  | Just n -> Proc.setEnv ("MEADOW_THREADS", show n)
                  | None -> ()
                in
+               -- A program that exports functions to C is a library of them,
+               -- built native, and not run.
+               let library =
+                 match readToString program with
+                 | Ok text -> S.contains "\nexport " text
+                 | Err _ -> False
+               in
                let back =
-                 V.concat [
-                   ["cut", program, "--runtime", M.unwrapOr "glade" b.runtime, "-O", show level],
-                   (if ahead and b.runtime != Just "silo" then ["--aot"] else []),
-                   (if M.isNone args then ["--no-run"] else V.pushFront theirs "--")
-                 ]
+                 if library then ["cut", program, "--runtime", "silo", "-O", show level, "--no-run"]
+                 else
+                   V.concat [
+                     ["cut", program, "--runtime", M.unwrapOr "glade" b.runtime, "-O", show level],
+                     (if ahead and b.runtime != Just "silo" then ["--aot"] else []),
+                     (if M.isNone args then ["--no-run"] else V.pushFront theirs "--")
+                   ]
                in match Proc.runInherit (meadow ()) back with
                   | Ok code -> exit code
                   | Err why ->

@@ -49,6 +49,17 @@ beyond the last release is under _Unreleased_.
   one), reads and writes one value of a C type where it is (`readInt`,
   `writeFloat`, `readPtr`, …), and lends text to C as a pointer and a length
   (`withText`).
+- `Std.Ffi.own ()` opens the module the calling code is in -- the program
+  itself, or the library a plugin is -- so a function of it can be called by
+  address, as `open ""` does.
+- C calls Meadow: MeadowBoot builds a package whose functions say `@export`
+  -- or `@export(cName)`, under another name -- as a C library (`.dll`,
+  `lib….so`, `lib….dylib`), each such function a C function of its numbers
+  (`int64_t`, `double`, `float`, the sized integers, `bool`) answering one
+  of them or `void`. Cut writes them as `export "name" = SYMBOL -> rep`, and
+  the Silo back end gives each a C entry that starts the runtime the first
+  time it is called on a thread. A function whose answer is not a number or
+  `()` is refused, saying so.
 - `meadow cut --no-run` builds what would be run -- the bytecode image, or the
   executable with `--aot` or `--runtime silo` -- and stops: what a front end's
   `build` asks the back end for.
