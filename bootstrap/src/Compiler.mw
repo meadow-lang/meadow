@@ -355,10 +355,12 @@ fun checkedOf
               -- of the one binder that stands for every such name.
               (let what =
                  if S.startsWith "?" b.site and b.name != "?" then Just "undefined variable: "
-                 else if S.isEmpty b.name and b.site == "-" and b.kind == "t" then
+                 else if S.isEmpty b.name and b.site == "-" and b.kind == "t" and b.until < 0 then
                    Just "unknown type "
                  else if S.isEmpty b.name and b.site == "-" and b.kind == "c" then
                    Just "unknown constructor "
+                 -- And a `use` of a module there is not is a use of another.
+                 else if S.isEmpty b.name and b.site == "-" and b.kind == "m" then Just "no module "
                  else None
                in match what with
                   | None -> []
@@ -376,6 +378,7 @@ fun checkedOf
                                -- has without a declaration, `Int` or `()`:
                                -- only a name that is none of those is unknown.
                                if S.isEmpty b.name
+                                 and b.kind != "m"
                                  and (not (named written) or V.elem written builtinTyconNames) then
                                  []
                                else

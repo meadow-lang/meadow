@@ -1514,6 +1514,29 @@ fun patRecordParts (cx : Cx s) (src : HirArena) out (fields : [HirPatField]) (op
       backwards
   in (V.reverse backwards, Record row)
 
+-- A top-level `def` has to be pure to evaluate (`check_pure_def`): its
+-- right-hand side is evaluated once and the value kept, which is the same
+-- program as evaluating it at every use only when evaluating it does nothing
+-- a program can see. A `def` may be a function that prints, not a value
+-- whose making prints. `main` is the exception: running it once is running
+-- the program.
+fun pureDef (i : Inf s) (bound : [Int]) (eff : Type) : () ! { St s | e } =
+  if V.any (\v -> V.elem v i.entries) bound then ()
+  else
+    (let labels = performed (zonk i.ar eff) [] in
+     if V.isEmpty labels then ()
+     else
+       (let list = S.join ", " (V.map (\l -> "`${spelling l}`") labels) in
+        report
+          i
+          "a top-level `def` cannot perform effects, and this one performs ${list}; perform them inside a function instead -- `fun name () = ...` -- or in `main`"))
+
+-- The effects a row names, each once, after `seen`.
+fun performed (row : Type) (seen : [String]) : [String] =
+  match row with
+  | RowExtend l _ rest -> performed rest (if V.elem l seen then seen else V.pushBack seen l)
+  | _ -> seen
+
 -- A function binding, as `cx.mode` says: alone -- in an expression, or at the
 -- top of a module and generalized when it is done -- or as one of a group.
 fun funBindParts (cx : Cx s) (src : HirArena) out (vid : Int) params (ret : Maybe HirType) body =
@@ -1616,6 +1639,7 @@ fun alonePat (cx : Cx s) out (toplevel : Bool) pat value =
   let u5 = stSetRef i.curEffect saved in
   let u6 = solveOverloads i toplevel in
   let u7 = solveSubsumptions i mark in
+  let pured = if toplevel then pureDef i (V.map fst bound) rhsEff else () in
   let u8 = solveWanted i in
   let u9 = exitLevel i.ar in
   let u10 = holdBackWanted i in
@@ -2307,6 +2331,20 @@ fun inferImpl
                  | None -> ())
                ()
                methods
+           in
+           -- Every method the trait does not do itself is the `impl`'s to do.
+           let written = V.map (\b -> V.getOr "" i.names (V.getOr 0 (boundBy a b) 0)) methods in
+           let lacking =
+             V.filter
+               (\m -> not (V.elem m shape.defaulted) and not (V.elem m written))
+               shape.methods
+           in
+           let said =
+             if V.isEmpty lacking then ()
+             else
+               report
+                 i
+                 "this `impl ${spelling tr}` is missing ${S.join ", " (V.map (\m -> "`${m}`") lacking)}"
            in if V.isEmpty shape.supers then ()
               else
                 let started = beginBinding i in

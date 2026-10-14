@@ -3198,6 +3198,21 @@ fn a_program_that_is_wrong_is_refused_by_meadowboot_with_what_is_wrong() {
             "def result = match (1, 2) with | (a, b, c) -> a\n",
             "type mismatch: `(a, b, c)` vs `(a, b)`",
         ),
+        (
+            "module",
+            "use Std.Nope as N\n\ndef result = 1\n",
+            "Main.mw:1:5: no module `Std.Nope`",
+        ),
+        (
+            "method",
+            "trait Named a { fun name : a -> String }\n\nimpl Named Int {}\n\ndef result = name 1\n",
+            "this `impl Named` is missing `name`",
+        ),
+        (
+            "effect",
+            "fun f x = let u = print \"a\" in x\n\ndef result = f 1\n",
+            "a top-level `def` cannot perform effects, and this one performs `Console`",
+        ),
     ];
     for (name, source, why) in wrong {
         let said = said_of(&format!("wrong-{name}"), source);

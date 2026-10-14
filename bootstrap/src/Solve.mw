@@ -81,6 +81,9 @@ use Std.Macro (Reflect)
   assocParams : [[Int]],
   ownAssocs : Int,
   methods : [String],
+  -- Those of its methods it says how to do itself: an `impl` may leave
+  -- them out.
+  defaulted : [String],
   dict : String,
   labels : [String]
 }

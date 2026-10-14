@@ -581,6 +581,10 @@ fun namedRefs (items : [Item]) (names : [(String, Meta)]) : [(Meta, Int)] =
              | None -> (if isCapital (fst n) then [(snd n, 0 - 1)] else [])))
     names
 
+-- What a `use` of a module there is not refers to, among a module's
+-- references: no binder's number.
+def noModule : Int = 0 - 2
+
 -- One `use` of module `m`, on top of what the ones before it brought.
 fun applyUse (cx : UnitCx) (m : ModFrame) (acc : Layers) (one : (AstDecl, Vis)) : Layers =
   match m.src.ast with
@@ -617,6 +621,18 @@ fun applyUse (cx : UnitCx) (m : ModFrame) (acc : Layers) (one : (AstDecl, Vis)) 
                if V.isEmpty names then bring acc vis (bareUse items root)
                else withRefs (bring acc vis (namedIn items names)) (namedRefs items written))
       in
+      -- A path that names no module: a use of what stands for one
+      -- (`noModule`), spanning the path, for whoever says so.
+      let missing =
+        withRefs
+          acc
+          [(
+            spanMeta
+              (metaStart (M.unwrapOr lastAt (M.map (metaAstName a) (V.get (astDeclUsePath a u) 0))))
+              (metaEnd lastAt),
+            noModule
+          )]
+      in
       -- `use Ty ...` for a type this very module declares.
       match (if V.len segs == 1 then typeIn m.items else None) with
       | Just t -> useType acc vis m.items t lastAt written glob False
@@ -629,7 +645,10 @@ fun applyUse (cx : UnitCx) (m : ModFrame) (acc : Layers) (one : (AstDecl, Vis)) 
                  useType acc vis (siblingItems cx localOwner here) t lastAt written glob cx.isStd
              | None ->
                  (match V.find (\(d : Dep) -> d.name == V.getOr "" segs 0) cx.deps with
-                  | None -> acc
+                  -- One name with something asked of it may be a type in
+                  -- sight already; anything else names no module.
+                  | None ->
+                      if V.len segs == 1 and (glob or not (V.isEmpty names)) then acc else missing
                   | Just d ->
                       let path = V.drop segs 1 in
                       if depHas d path then moduleUse (depItems d path)
@@ -637,7 +656,7 @@ fun applyUse (cx : UnitCx) (m : ModFrame) (acc : Layers) (one : (AstDecl, Vis)) 
                         (let items = depItems d (V.drop owner 1) in
                          match typeIn items with
                          | Just t -> useType acc vis items t lastAt written glob True
-                         | None -> acc)))
+                         | None -> missing)))
 
 -- The base every module of the unit shares: the primitives, then the
 -- prelude. For a module of the standard library, the modules before it whose
@@ -963,6 +982,12 @@ fun renaming (pkg : String) (isStd : Bool) (sources : [Source]) (deps : [DepExpo
       ctorFields
     }
   in
+  -- What a `use` of a module there is not is a use of.
+  let missingModule = declareBinder "" "m" "-" in
+  -- And what a capital a `use` names that no type is: an effect, which is
+  -- not an unknown type, so not a use of what stands for those. It is told
+  -- from that by where its name ends, which that has none of.
+  let namedEffect = declareBinderTo "" "t" "-" 0 in
   let done =
     V.map
       (\(f : ModFrame) ->
@@ -970,7 +995,13 @@ fun renaming (pkg : String) (isStd : Bool) (sources : [Source]) (deps : [DepExpo
          | (sc, re, refs) ->
              (let u =
                 V.foldl
-                  (\z r -> useOf f.src.file (if snd r < 0 then builtinType else snd r) (fst r))
+                  (\z r ->
+                    useOf
+                      f.src.file
+                      (if snd r == noModule then missingModule
+                       else if snd r < 0 then namedEffect
+                       else snd r)
+                      (fst r))
                   ()
                   refs
               in (f, sc, re))))

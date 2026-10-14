@@ -873,6 +873,12 @@ fun impliedPreds (i : Inf s) (preds : [Pred]) (st : AssocVars) (k : Int)
       assocParams,
       ownAssocs = V.len assocs,
       methods = V.map (\m -> match m with | (mn, _, _, _) -> mn) methods,
+      defaulted =
+        V.concatMap
+          (\m ->
+            match m with
+            | (mn, _, _, default) -> if M.isSome default then [mn] else [])
+          methods,
       dict,
       labels =
         V.append
