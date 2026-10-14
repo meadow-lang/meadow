@@ -66,6 +66,11 @@ beyond the last release is under _Unreleased_.
   each runs on a stack of its own, let go of when it fails. The message is on
   stderr, and `Std.Ffi.failure ()` answers it once, so a plugin that calls
   its own function through C, by address, can tell its host what went wrong.
+- `Std.Num.Float`: `sqrt`, `sin`, `cos`, `tan`, `atan`, `atan2`, `hypot`,
+  `ceil` and `round` (to an `Int`, as the built-in `floor` is), `abs`,
+  `isNaN`, `isFinite`, `pi` and `tau`, written in Meadow so every runtime
+  answers alike: good to a unit or two in the last place for arguments of
+  moderate size.
 - `meadow cut --no-run` builds what would be run -- the bytecode image, or the
   executable with `--aot` or `--runtime silo` -- and stops: what a front end's
   `build` asks the back end for.

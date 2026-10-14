@@ -377,8 +377,8 @@ def primNames : [String] =
 def stdOrder : [String] =
   [
     "Lib", "Ops", "Display", "Debug", "Test", "Bool", "Ref", "Ordering", "Function", "Tuple", "Num",
-    "Num.Int", "Maybe", "Cmp", "Char", "Result", "Num.Bits", "Bytes", "Yield", "Collections",
-    "Collections.Vector", "Collections.List", "Collections.Tree", "Collections.Set",
+    "Num.Int", "Maybe", "Cmp", "Char", "Result", "Num.Bits", "Num.Float", "Bytes", "Yield",
+    "Collections", "Collections.Vector", "Collections.List", "Collections.Tree", "Collections.Set",
     "Collections.Map", "Either", "St", "Sort", "Collections.HashMap", "Collections.HashTable",
     "Compact", "Thread", "Stm", "State", "Exn", "Stream", "Random", "Fs", "Process", "String",
     "String.Parse", "String.Parse.Char", "String.Parse.Lexer", "Path", "Json", "Macro",

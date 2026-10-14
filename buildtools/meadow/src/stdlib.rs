@@ -58,6 +58,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("Char", include_str!("../../../lib/Std/src/Char.mw")),
     ("Result", include_str!("../../../lib/Std/src/Result.mw")),
     ("Num.Bits", include_str!("../../../lib/Std/src/Num/Bits.mw")),
+    ("Num.Float", include_str!("../../../lib/Std/src/Num/Float.mw")),
     ("Bytes", include_str!("../../../lib/Std/src/Bytes.mw")),
     ("Yield", include_str!("../../../lib/Std/src/Yield.mw")),
     (
