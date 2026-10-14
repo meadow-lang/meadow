@@ -638,7 +638,7 @@ pub fn run_tests_native(
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let modules = crate::aot::write_units(&dir, "tests", &units)?;
     let exe = dir.join(format!("tests{}", std::env::consts::EXE_SUFFIX));
-    crate::aot::clang_link(&modules, &[], &runtime, &exe, opt, target)?;
+    crate::aot::clang_link(&modules, &[], &runtime, &exe, opt, target, false)?;
 
     let threads = threads.clamp(1, tests.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);

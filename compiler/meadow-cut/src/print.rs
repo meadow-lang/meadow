@@ -452,6 +452,9 @@ pub fn listing(p: &Program) -> Listing {
         };
         let _ = writeln!(out, "answer {answer}");
     }
+    for e in &p.exports {
+        let _ = writeln!(out, "export {:?} = {} -> {}", e.name, e.symbol, e.result);
+    }
     for d in &p.datas {
         let vars = if d.rep_vars.is_empty() {
             String::new()

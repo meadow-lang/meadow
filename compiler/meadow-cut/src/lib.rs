@@ -313,6 +313,18 @@ pub struct Val {
     pub body: Statement,
 }
 
+/// `export "c_name" = S -> rep`: definition `S` is a function C can call,
+/// as `c_name`: its parameters are the C arguments, each as its
+/// representation says -- `i32` an `int32_t`, `f32` a `float`, `i64` an
+/// integer or a pointer -- and what it answers is `result`, `unit` for
+/// `void`. A program of exports is built as a library, not an executable.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Export {
+    pub name: String,
+    pub symbol: Symbol,
+    pub result: Rep,
+}
+
 /// A whole program, as one text.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Program {
@@ -320,6 +332,8 @@ pub struct Program {
     pub version: u32,
     pub entry: Option<Symbol>,
     pub answer: Answer,
+    /// What C may call, by the names it calls them.
+    pub exports: Vec<Export>,
     pub datas: Vec<DataDecl>,
     /// Each role a runtime knows (`meadow_rt::roles`), by its name, and the
     /// constructor that plays it.

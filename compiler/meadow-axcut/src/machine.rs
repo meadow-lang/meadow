@@ -1762,6 +1762,7 @@ mod tests {
 
     fn program(body: Statement) -> Program {
         Program {
+            exports: Default::default(),
             returns: Default::default(),
             frames: Default::default(),
             continuations: Default::default(),

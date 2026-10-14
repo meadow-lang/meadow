@@ -1046,6 +1046,14 @@ fn command() {
                 }
                 Some(aot::Runtime::Silo) => {
                     meadow::cut::build_for_silo(&file, opt).and_then(|exe| {
+                        // A library is built, and there is nothing to run.
+                        if matches!(
+                            exe.extension().and_then(|e| e.to_str()),
+                            Some("dll" | "so" | "dylib")
+                        ) {
+                            meadow::status::status("Built", exe.display().to_string());
+                            return Ok(0);
+                        }
                         std::process::Command::new(&exe)
                             .args(&args)
                             .status()

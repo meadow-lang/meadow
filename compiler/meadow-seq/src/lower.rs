@@ -547,6 +547,7 @@ pub fn lower_program(program: &core::Program, opt: OptLevel) -> Lowered {
     timing.since("lower", lowering);
     Lowered {
         program: Program {
+            exports: Vec::new(),
             defs,
             entry,
             tags: lower.tags,

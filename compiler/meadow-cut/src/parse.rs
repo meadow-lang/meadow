@@ -451,6 +451,7 @@ impl Parser {
             version,
             entry: None,
             answer: Answer::None,
+            exports: Vec::new(),
             datas: Vec::new(),
             roles: Vec::new(),
             natives: Vec::new(),
@@ -474,6 +475,7 @@ impl Parser {
                             _ => return self.fail("`none` or `str`"),
                         };
                     }
+                    "export" => p.exports.push(self.export()?),
                     "data" => p.datas.push(self.data()?),
                     "roles" => self.roles(&mut p.roles)?,
                     "native" => self.natives(&mut p.natives)?,
@@ -486,6 +488,24 @@ impl Parser {
             }
         }
         Ok(p)
+    }
+
+    /// `export "c_name" = S -> rep`.
+    fn export(&mut self) -> R<Export> {
+        self.word("export")?;
+        let name = match self.next() {
+            Tok::Str(s) => s,
+            _ => return self.fail("the name C calls it by, in quotes"),
+        };
+        self.punct("=")?;
+        let symbol = self.symbol()?;
+        self.punct("->")?;
+        let result = self.rep()?;
+        Ok(Export {
+            name,
+            symbol,
+            result,
+        })
     }
 
     fn data(&mut self) -> R<DataDecl> {

@@ -292,6 +292,7 @@ fn lowered(p: &Program, prints: bool) -> R<Lowered> {
     l.current = None;
     l.rep_vars.clear();
     l.start(p)?;
+    l.exports(p)?;
     if l.handles {
         l.search_block();
     }
@@ -549,6 +550,80 @@ impl Lower {
     /// The block a program starts at: each top-level value computed, in the
     /// order written, and kept; then the entry, answering the continuation
     /// the block was given.
+    /// A block for each export, which C enters as a program's entry is
+    /// entered: its arguments and the continuation it answers through. It
+    /// starts with no handlers, as the program does, and is the exported
+    /// definition from there.
+    fn exports(&mut self, p: &Program) -> R<()> {
+        for e in &p.exports {
+            let Some(&(label, _)) = self.defs.get(&e.symbol) else {
+                return Err(format!(
+                    "`{}` exports `{}`, which is not a definition",
+                    e.name, e.symbol
+                ));
+            };
+            let Some(d) = p.defs.iter().find(|d| d.symbol == e.symbol) else {
+                return Err(format!(
+                    "`{}` exports `{}`, which is not here",
+                    e.name, e.symbol
+                ));
+            };
+            if !d.rep_vars.is_empty() || d.conts.len() != 1 {
+                return Err(format!(
+                    "`{}` exports `{}`, which is generic or takes other than one continuation",
+                    e.name, e.symbol
+                ));
+            }
+            let mut params = Vec::new();
+            let mut args = Vec::new();
+            for b in &d.params {
+                let rep = self.rep(&b.rep)?;
+                params.push(rep);
+                args.push(self.fresh(rep));
+            }
+            let result = self.rep(&e.result)?;
+            let k = self.fresh(ax::Rep::Ref);
+            self.out.returns.insert(k);
+            let ev = self.fresh(ax::Rep::Ref);
+            let mut given = args.clone();
+            given.push(k);
+            let mut passed = given.clone();
+            passed.push(ev);
+            let none = meadow_rt::roles::evidence::NONE;
+            let body = S::Let {
+                name: ev,
+                tag: self.tag_of(none),
+                ctor: InternedString::from(none),
+                fields: Vec::new(),
+                rest: Box::new(S::Substitute(
+                    passed.clone(),
+                    Box::new(Block {
+                        params: passed,
+                        body: S::Jump(label),
+                    }),
+                )),
+            };
+            let entry = Label(self.out.defs.len() as u32);
+            self.out.defs.push(ax::Def {
+                label: entry,
+                name: InternedString::from(format!("#export {}", e.name).as_str()),
+                module: InternedString::from(""),
+                block: Block {
+                    params: given,
+                    body,
+                },
+            });
+            self.out.results.insert(entry, result);
+            self.out.exports.push(ax::Export {
+                name: e.name.clone(),
+                label: entry,
+                params,
+                result,
+            });
+        }
+        Ok(())
+    }
+
     fn start(&mut self, p: &Program) -> R<()> {
         let Some(entry) = &p.entry else {
             return Ok(());

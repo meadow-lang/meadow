@@ -2376,6 +2376,22 @@ impl<'p> Module<'p> {
         self.units(Entries::Main(entry), result, fingerprint, unit)
     }
 
+    /// [`Module::text_split`], for a library: a C function for each of
+    /// `exports`, and no `main`.
+    pub fn text_library(
+        self,
+        exports: &[meadow_axcut::Export],
+        fingerprint: &str,
+        unit: usize,
+    ) -> Vec<(String, String)> {
+        self.units(
+            Entries::Library(exports.to_vec()),
+            meadow_rt::desc::ANY,
+            fingerprint,
+            unit,
+        )
+    }
+
     /// [`Module::text_split`], for a test executable: a table of `entries`,
     /// and a `main` that runs the one its first argument numbers.
     pub fn text_tests(
@@ -2740,6 +2756,24 @@ impl<'p> Module<'p> {
                     labels.len()
                 );
             }
+            Entries::Library(exports) => {
+                let (get, arg) = self.entry_ctx();
+                for e in &exports {
+                    let callee = self.label_fn(e.label);
+                    let cc = self.cc.to_string();
+                    if let Err(why) = export_fn(
+                        &mut out,
+                        &e.name,
+                        &callee,
+                        &cc,
+                        (&get, &arg),
+                        &e.params,
+                        e.result,
+                    ) {
+                        let _ = writeln!(out, "; {why}");
+                    }
+                }
+            }
         }
         out
     }
@@ -2801,6 +2835,7 @@ fn declarations(body: &str, arity: &HashMap<&str, usize>, cc: &str) -> String {
 /// What the emitted code calls in the runtime, `silo/src/lib.rs`.
 const RUNTIME: &str = "\
 declare i64 @meadow_acquire(i64, i64)
+declare void @meadow_export_enter()
 declare void @meadow_free(i64, i64)
 declare void @meadow_clean(i64, i64)
 declare void @meadow_fail(ptr, i64) noreturn
@@ -3171,6 +3206,114 @@ impl Fun {
 enum Entries {
     Main(meadow_axcut::Label),
     Tests(Vec<meadow_axcut::Label>),
+    /// A library's: a C function for each export, and no `main`.
+    Library(Vec<meadow_axcut::Export>),
+}
+
+/// The C type a word of representation `rep` crosses the boundary as, and
+/// how it becomes the word: `None` for one that cannot cross, a reference.
+///
+/// | rep | C | to the word |
+/// |---|---|---|
+/// | `Int` | `int64_t` (or a pointer) | itself |
+/// | `Float` | `double` | its bits |
+/// | `Float32` | `float` | its bits, in the low half |
+/// | a sized integer | its own | sign- or zero-extended |
+/// | `Bool` | `uint8_t` | zero-extended |
+/// | `Char` | `uint32_t` | zero-extended |
+/// | `()` | `void` | `0` |
+fn c_type(rep: meadow_axcut::Rep) -> Option<(&'static str, &'static str)> {
+    use meadow_axcut::Rep;
+    use meadow_rt::num::Width;
+    Some(match rep {
+        Rep::Int => ("i64", "same"),
+        Rep::Float => ("double", "double"),
+        Rep::Bits(d) if d == desc::FLOAT32 => ("float", "float"),
+        Rep::Bits(d) if d == desc::BOOL => ("i8", "zext"),
+        Rep::Bits(d) if d == desc::CHAR => ("i32", "zext"),
+        Rep::Bits(d) if d == desc::UNIT => ("void", "void"),
+        Rep::Bits(d) if d == desc::word(Width::I8) => ("i8", "sext"),
+        Rep::Bits(d) if d == desc::word(Width::I16) => ("i16", "sext"),
+        Rep::Bits(d) if d == desc::word(Width::I32) => ("i32", "sext"),
+        Rep::Bits(d) if d == desc::word(Width::U8) => ("i8", "zext"),
+        Rep::Bits(d) if d == desc::word(Width::U16) => ("i16", "zext"),
+        Rep::Bits(d) if d == desc::word(Width::U32) => ("i32", "zext"),
+        Rep::Bits(d) if d == desc::word(Width::U64) => ("i64", "same"),
+        _ => return None,
+    })
+}
+
+/// A C function `name` that runs export block `label` of `params`
+/// answering `result`: the runtime made ready for this thread, each argument
+/// made the word it is, the block entered as a program's entry is -- its
+/// continuation the native return -- and the word made what C is answered.
+fn export_fn(
+    out: &mut String,
+    name: &str,
+    callee: &str,
+    cc: &str,
+    ctx: (&str, &str),
+    params: &[meadow_axcut::Rep],
+    result: meadow_axcut::Rep,
+) -> Result<(), String> {
+    let mut sig = Vec::new();
+    let mut body = String::new();
+    let mut words = Vec::new();
+    for (i, p) in params.iter().enumerate() {
+        let Some((ty, how)) = c_type(*p) else {
+            return Err(format!(
+                "`{name}`'s argument {i} is not of a type C can pass"
+            ));
+        };
+        let a = format!("%c{i}");
+        let w = format!("%w{i}");
+        match how {
+            "void" => {
+                let _ = writeln!(body, "  {w} = add i64 0, 0");
+            }
+            "same" => {
+                sig.push(format!("i64 {a}"));
+                let _ = writeln!(body, "  {w} = add i64 {a}, 0");
+            }
+            "double" => {
+                sig.push(format!("double {a}"));
+                let _ = writeln!(body, "  {w} = bitcast double {a} to i64");
+            }
+            "float" => {
+                sig.push(format!("float {a}"));
+                let _ = writeln!(body, "  {w}b = bitcast float {a} to i32");
+                let _ = writeln!(body, "  {w} = zext i32 {w}b to i64");
+            }
+            ext => {
+                sig.push(format!("{ty} {a}"));
+                let _ = writeln!(body, "  {w} = {ext} {ty} {a} to i64");
+            }
+        }
+        words.push(format!("i64 {w}"));
+    }
+    let Some((rty, rhow)) = c_type(result) else {
+        return Err(format!("what `{name}` answers is not of a type C can take"));
+    };
+    let (get, arg) = ctx;
+    let _ = writeln!(
+        out,
+        "define dllexport {rty} @\"{name}\"({}) {{\n  call void @meadow_export_enter()\n{get}{body}  %r = call {cc} i64 {callee}({arg}{}i64 0)",
+        sig.join(", "),
+        words.iter().map(|w| format!("{w}, ")).collect::<String>()
+    );
+    match rhow {
+        "void" => out.push_str("  ret void\n"),
+        "same" => out.push_str("  ret i64 %r\n"),
+        "double" => out.push_str("  %d = bitcast i64 %r to double\n  ret double %d\n"),
+        "float" => out.push_str(
+            "  %t = trunc i64 %r to i32\n  %f = bitcast i32 %t to float\n  ret float %f\n",
+        ),
+        _ => {
+            let _ = write!(out, "  %t = trunc i64 %r to {rty}\n  ret {rty} %t\n");
+        }
+    }
+    out.push_str("}\n\n");
+    Ok(())
 }
 
 /// Sharing and erasing, the paper's `share` and `erase`, as the module's own

@@ -169,6 +169,37 @@ fn run_main(entry: extern "C" fn() -> Word) -> (Box<Ctx>, Word) {
     (c, v)
 }
 
+/// Make the runtime ready for a call from C into a library of Meadow's: what
+/// every exported function does first (`meadow_llvm::emit`'s `export_fn`).
+/// The first call sets the runtime up, as a program's start does, and the
+/// first from each OS thread gives that thread a context of its own, which
+/// stays for its later calls: a host calls a plugin's systems from one
+/// thread, again and again, and what the library keeps between calls lives
+/// in that context's heap.
+///
+/// A library whose code spawns threads is not ready this way yet: its
+/// scheduler is not started.
+#[unsafe(no_mangle)]
+pub extern "C" fn meadow_export_enter() {
+    static READY: std::sync::Once = std::sync::Once::new();
+    READY.call_once(|| {
+        allocator();
+        memory::start();
+    });
+    thread_local! {
+        static HAS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    HAS.with(|has| {
+        if !has.get() {
+            // Kept for the life of the thread: the library's values live in
+            // its heap from one call to the next.
+            let c: &'static mut Ctx = Box::leak(Ctx::new(0));
+            ctx::set(c);
+            has.set(true);
+        }
+    });
+}
+
 /// Run one test of a test executable: the entry of `tests` numbered by the
 /// first argument. A test passes by returning -- status 0 -- and fails by
 /// failing, with its message on stderr, as `Test.fail` makes it.

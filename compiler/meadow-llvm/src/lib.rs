@@ -85,6 +85,9 @@ impl Unit {
 /// `emit::Module::units`. Their functions are in `conv`, which is the
 /// target's: see [`CallConv`].
 pub fn compile_split(program: &Program, unit: usize, conv: CallConv) -> Result<Vec<Unit>, Error> {
+    if !program.exports.is_empty() {
+        return compile_library(program, unit, conv);
+    }
     let entry = program.entry.ok_or_else(|| Error {
         msg: "the program has no entry point".into(),
     })?;
@@ -143,6 +146,34 @@ fn report_sizes(module: &emit::Module) {
     for (m, d, bytes, funs) in sizes.iter().take(n) {
         eprintln!("{:>10.1} {funs:>8}  {m}.{d}", *bytes as f64 / 1024.0);
     }
+}
+
+/// `program` as an LLVM module for a library: a C function for each of its
+/// exports, which is all of it that is kept, and no `main`. In modules of
+/// about `unit` bytes, as [`compile_split`] makes them.
+pub fn compile_library(program: &Program, unit: usize, conv: CallConv) -> Result<Vec<Unit>, Error> {
+    let roots: Vec<meadow_axcut::Label> = program.exports.iter().map(|e| e.label).collect();
+    let mut module = emit::Module::new(program, conv);
+    let blocks = linear::program(program, &roots)?;
+    module.name_labels(blocks.iter().map(|(i, label, _)| {
+        let d = &program.defs[*i];
+        (*label, d.module.to_string(), d.name.to_string())
+    }));
+    for (i, label, lb) in &blocks {
+        module.in_module(
+            &program.defs[*i].module.to_string(),
+            &program.defs[*i].name.to_string(),
+        );
+        module.def(*label, lb).map_err(|e| Error {
+            msg: format!("in {}: {}", program.defs[*i].name, e.msg),
+        })?;
+    }
+    report_sizes(&module);
+    Ok(Unit::all(module.text_library(
+        &program.exports,
+        fingerprint(),
+        unit,
+    )))
 }
 
 /// `program` as an LLVM module for a test executable: `tests` are the labels

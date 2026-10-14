@@ -163,6 +163,7 @@ pub fn to_cut_in(program: &core::Program, outside: &HashMap<Var, Outside>) -> Lo
             version: meadow_cut::VERSION,
             entry: None,
             answer: meadow_cut::Answer::None,
+            exports: Vec::new(),
             datas,
             roles: Vec::new(),
             natives: Vec::new(),
