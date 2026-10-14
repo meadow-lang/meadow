@@ -537,6 +537,7 @@ impl Vm<'_> {
                                 0 => ffi::Arg::Int(int(self, a[1])?),
                                 1 => ffi::Arg::Float(float(self, a[2])?),
                                 2 => ffi::Arg::Str(self.str_arg(&what, a[3])?.to_string()),
+                                3 => ffi::Arg::Float32(float(self, a[2])?),
                                 _ => return err(format!("{what}: no such kind of argument")),
                             });
                         }

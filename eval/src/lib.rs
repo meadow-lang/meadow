@@ -2312,6 +2312,7 @@ fn native_process(op: &str, arg: Value) -> Result<Value, RuntimeError> {
                     0 => ffi::Arg::Int(as_int(&a[1])?),
                     1 => ffi::Arg::Float(as_float(&a[2])?),
                     2 => ffi::Arg::Str(as_str(&a[3])?.to_string()),
+                    3 => ffi::Arg::Float32(as_float(&a[2])?),
                     _ => return err("Process.ffiCall: no such kind of argument".to_string()),
                 });
             }

@@ -39,6 +39,16 @@ beyond the last release is under _Unreleased_.
 
 ### Added
 
+- `Std.Ffi` calls C on Windows (x86-64), where before it was Unix only: a
+  library is opened with `LoadLibrary`, and a call is made in one of sixteen
+  shapes, by which of its first four arguments are floats.
+- `Std.Ffi` passes and answers a C `float` (`Arg.Float32`, `callFloat32`),
+  calls a function whose address is in memory (`functionAt`, as a C library
+  hands its plugins a table of what they may call), lays out C structs
+  (`CType`, `sizeOf`, `alignOf`, `offsetOf`, `Aligned` for an over-aligned
+  one), reads and writes one value of a C type where it is (`readInt`,
+  `writeFloat`, `readPtr`, …), and lends text to C as a pointer and a length
+  (`withText`).
 - `meadow cut --no-run` builds what would be run -- the bytecode image, or the
   executable with `--aot` or `--runtime silo` -- and stops: what a front end's
   `build` asks the back end for.

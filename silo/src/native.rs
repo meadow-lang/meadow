@@ -510,6 +510,7 @@ fn process(op: &str, arg: Val) -> Option<Build> {
                                 0 => ffi::Arg::Int(int(a[1])),
                                 1 => ffi::Arg::Float(float(a[2])),
                                 2 => ffi::Arg::Str(text(a[3], &what)),
+                                3 => ffi::Arg::Float32(float(a[2])),
                                 _ => fail(format!("{what}: no such kind of argument")),
                             }
                         })
