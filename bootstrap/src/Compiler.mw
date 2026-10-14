@@ -1331,13 +1331,13 @@ make! {
 -- what it builds for unless told another: whoever compiled it decided these
 -- `@cfg`s.
 @cfg(os = "linux")
-def hostOs : String = "linux"
+@pub def hostOs : String = "linux"
 
 @cfg(os = "macos")
-def hostOs : String = "macos"
+@pub def hostOs : String = "macos"
 
 @cfg(os = "windows")
-def hostOs : String = "windows"
+@pub def hostOs : String = "windows"
 
 @cfg(arch = "x86_64")
 def hostArch : String = "x86_64"

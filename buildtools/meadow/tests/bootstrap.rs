@@ -3300,16 +3300,15 @@ fn a_function_meadowboot_exports_is_called_from_c() {
         .env_remove("MEADOWBOOT_EXPANSIONS")
         .output()
         .expect("MeadowBoot runs");
+    // Named for its package, and where `meadow build` puts a native program.
     let name = if cfg!(windows) {
-        "program.dll"
+        "Lib.dll"
     } else if cfg!(target_os = "macos") {
-        "libprogram.dylib"
+        "libLib.dylib"
     } else {
-        "libprogram.so"
+        "libLib.so"
     };
-    let library = lib
-        .join("target/debug/link/target/release/native/silo")
-        .join(name);
+    let library = lib.join("target/debug/native/silo").join(name);
     assert!(
         library.exists(),
         "no library at {}:\n{}{}",

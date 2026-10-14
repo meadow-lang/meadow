@@ -53,8 +53,9 @@ beyond the last release is under _Unreleased_.
   itself, or the library a plugin is -- so a function of it can be called by
   address, as `open ""` does.
 - C calls Meadow: MeadowBoot builds a package whose functions say `@export`
-  -- or `@export(cName)`, under another name -- as a C library (`.dll`,
-  `lib….so`, `lib….dylib`), each such function a C function of its numbers
+  -- or `@export(cName)`, under another name -- as a C library named for the
+  package (`Name.dll`, `libName.so`, `libName.dylib`), in
+  `target/<profile>/native/silo` as a native program is, each such function a C function of its numbers
   (`int64_t`, `double`, `float`, the sized integers, `bool`) answering one
   of them or `void`. Cut writes them as `export "name" = SYMBOL -> rep`, and
   the Silo back end gives each a C entry that starts the runtime the first

@@ -41,11 +41,11 @@ use MeadowBoot.Seq as Seq
 use MeadowBoot.Tests as Tests
 use MeadowBoot.Parse (parsed, checked)
 use MeadowBoot.Fixity (chainsOf)
-use MeadowBoot.Unit (packageOf, absolute)
+use MeadowBoot.Unit (packageOf, absolute, packageName)
 use Std.Result as Res
 use MeadowBoot.Compiler (
   unitDatabase, buildUnits, givenUnits, setCompilerSource, compilerGrouped, compilerRenamed,
-  compilerInferred, compilerCore, compilerWhole, Interface
+  compilerInferred, compilerCore, compilerWhole, Interface, hostOs
 )
 use Lingua.Make (linkDirIn)
 use Std.Path as Path
@@ -58,7 +58,7 @@ use Std.String as S
 use Std.Maybe as M
 use Std.Maybe.Maybe.*
 use Std.Collections.Vector as V
-use Std.Fs (Fs, readToString, writeString, createDirAll)
+use Std.Fs (Fs, readToString, writeString, createDirAll, copy)
 use Std.Console (writeOutput, writeError)
 use Std.Exn (catch)
 use Lingua.Query (QueryError)
@@ -508,10 +508,51 @@ fun driven (path : Maybe String) (b : CliBuild) (args : Maybe [String]) =
                      (if M.isNone args then ["--no-run"] else V.pushFront theirs "--")
                    ]
                in match Proc.runInherit (meadow ()) back with
+                  | Ok 0 ->
+                      if not library then exit 0
+                      else
+                        (match placed r profile library with
+                         | Ok at -> (let u = writeError "      Copied ${at}\n" in exit 0)
+                         | Err why ->
+                             (let u =
+                                writeError
+                                  "meadowboot: what was built could not be put in place: ${why}\n"
+                              in exit 1))
                   | Ok code -> exit code
                   | Err why ->
                       (let u = writeError "meadowboot: the back end could not be run: ${why}\n" in
                        exit 1))
+
+-- What the back end built natively for the package at `r` -- a library of
+-- what it exports, or a program -- named for the package and put where `meadow
+-- build` puts a native program, `target/<profile>/native/silo`, so that two
+-- packages' do not share a name. A library is put there; a program is not yet.
+fun placed (r : String) (profile : String) (library : Bool) : Result String String ! { Fs | e } =
+  let name =
+    match readToString (Path.join r "Meadow.toml") with
+    | Ok text -> packageName text
+    | Err _ -> "program"
+  in
+  let fileOf =
+    \n ->
+      if library then
+        (if hostOs == "windows" then "${n}.dll"
+         else if hostOs == "macos" then "lib${n}.dylib"
+         else "lib${n}.so")
+      else if hostOs == "windows" then "${n}.exe"
+      else n
+  in
+  let built =
+    Path.join (Path.join (linkDirIn r profile) "target/release/native/silo") (fileOf "program")
+  in
+  let dir = Path.join r "target/${profile}/native/silo" in
+  let dest = Path.join dir (fileOf name) in
+  match createDirAll dir with
+  | Err why -> Err why
+  | Ok _ ->
+      (match copy (built, dest) with
+       | Ok _ -> Ok dest
+       | Err why -> Err why)
 
 -- Each of `files`, its names resolved with every other of its unit's -- a
 -- package, built with the units it depends on first -- under a line naming
