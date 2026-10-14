@@ -40,7 +40,8 @@ use Std.Process as Proc
 use MeadowBoot.Ast (AstProgram)
 use MeadowBoot.Rename (mentionsOf, Binder)
 use MeadowBoot.Scopes (
-  Source, Export, Renamed, DepExports, renameUnit, usesOf, macroFuns, saysVis, builtinTyconNames
+  Source, Export, Renamed, DepExports, renameUnit, usesOf, macroFuns, saysVis, moduleFile,
+  builtinTyconNames
 )
 use MeadowBoot.Infer (inferUnit, Inferred)
 use MeadowBoot.Elab (unitCore, defSymbol, Linked, Numbers, DataSig, DefaultSig, Imported)
@@ -451,7 +452,20 @@ fun checkedOf
       -- better and written out: the two are most of what a unit is.
       let anyVis = r.anyVis in
       let types = done.types in
-      let problems = if checked then V.append undefined done.said else done.problems in
+      -- What inference says, each where it is about: the file of the module
+      -- it was in, and the line and column.
+      let placedSaid =
+        V.map
+          (\x ->
+            match x with
+            | ((m, at), why) ->
+                (match (if m < 0 or at < 0 then None else moduleFile r m) with
+                 | Just file ->
+                     "${file}:${placeIn (M.unwrapOr "" (H.lookup file texts)) at}: ${why}"
+                 | None -> why))
+          (V.zip done.saidAt done.said)
+      in
+      let problems = if checked then V.append undefined placedSaid else done.problems in
       let program = isProgram r.exports in
       (
         exports,

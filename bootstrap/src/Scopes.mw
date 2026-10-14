@@ -810,6 +810,10 @@ fun scopeOf (cx : UnitCx) (sh : Shared) (m : ModFrame) : (Scope, [Item], [(Meta,
   items : [Item]
 }
 
+-- The file module `m` of a renamed unit is, as a dump names it.
+@pub fun moduleFile (r : Renamed) (m : Int) : Maybe String =
+  M.map (\(d : Declared) -> d.file) (V.get r.modules m)
+
 -- Rename unit `pkg` -- the standard library when `isStd` -- its modules
 -- `sources`, against what its dependencies export.
 @pub fun renameUnit (pkg : String) (isStd : Bool) (sources : [Source]) (deps : [DepExports])

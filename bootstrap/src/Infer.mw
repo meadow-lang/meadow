@@ -26,6 +26,7 @@ use MeadowBoot.Traits
 use MeadowBoot.Rename
 use MeadowBoot.Rename (Hir!)
 use Lingua (lang!, pass!)
+use Lingua.Lang (Meta, metaStart)
 use MeadowBoot.Groups (Binding, Group, bindingsOf, boundBy, groupModule, moduleOrder, unitGroups)
 use MeadowBoot.Prims (primScheme)
 use MeadowBoot.Scopes (Renamed, Declared, Item, DepExports, Export)
@@ -704,178 +705,216 @@ fun binding (cx : Cx s) : Cx s ! { St s | e } = { (plain cx) | bound = stNewRef 
 -- can say how, `raw`, translated when the case is ready. The order children
 -- are inferred in is `meadow_infer`'s, since what unification knows when a
 -- field is selected or a name chosen depends on it.
+-- What a node of the walk does, with inference marked as at the node while
+-- it does it, and where it was before once it is done: what an error found
+-- on the way is said to be about.
+fun placed (cx : Cx s) (m : Meta) (f : () -> a ! { St s | e }) : a ! { St s | e } =
+  let before = stGetRef cx.i.at in
+  let u = stSetRef cx.i.at (cx.here.m, metaStart m) in
+  let x = f () in
+  let v = stSetRef cx.i.at before in
+  x
+
 pass! {
   pub infer : Hir -> Inferring with cx
-    | Expr.Lit { lit } -> Expr.Lit { lit, typ = litTypeIn cx.i out lit }
-    | Expr.Unit {} -> Expr.Unit { typ = unitT () }
-    | Expr.Hole {} -> Expr.Hole { typ = Error }
-    | Expr.MacCall { call } -> Expr.MacCall { call, typ = Error }
-    | Expr.Var { ref } -> Expr.Var { ref, typ = varType cx out ref }
+    | Expr.Lit { lit } -> placed cx here (\() -> Expr.Lit { lit, typ = litTypeIn cx.i out lit })
+    | Expr.Unit {} -> placed cx here (\() -> Expr.Unit { typ = unitT () })
+    | Expr.Hole {} -> placed cx here (\() -> Expr.Hole { typ = Error })
+    | Expr.MacCall { call } -> placed cx here (\() -> Expr.MacCall { call, typ = Error })
+    | Expr.Var { ref } -> placed cx here (\() -> Expr.Var { ref, typ = varType cx out ref })
     | Lam { later params, later body } ->
-        (match lamParts cx out params body with
-         | (ps, b, t) -> Lam { params = ps, body = b, typ = t })
+        placed cx here (\() ->
+          (match lamParts cx out params body with
+           | (ps, b, t) -> Lam { params = ps, body = b, typ = t }))
     | App { raw func, raw args } ->
-        (match appParts cx src out func args with
-         | (f, xs, t) -> App { func = f, args = xs, typ = t })
+        placed cx here (\() ->
+          (match appParts cx src out func args with
+           | (f, xs, t) -> App { func = f, args = xs, typ = t }))
     | Let { later binds, later body } ->
-        (let bs = V.map (\b -> b (plain cx)) binds in
-         let b = body (plain cx) in
-         Let { binds = bs, body = b, typ = typInferringExpr b })
+        placed cx here (\() ->
+          (let bs = V.map (\b -> b (plain cx)) binds in
+           let b = body (plain cx) in
+           Let { binds = bs, body = b, typ = typInferringExpr b }))
     | If { later cond, later yes, later no } ->
-        (let c = cond (plain cx) in
-         let u = unifyAt cx.i (typInferringExpr c) (boolT ()) in
-         let y = yes (plain cx) in
-         let n = no (plain cx) in
-         let v = unifyAt cx.i (typInferringExpr y) (typInferringExpr n) in
-         If { cond = c, yes = y, no = n, typ = typInferringExpr y })
+        placed cx here (\() ->
+          (let c = cond (plain cx) in
+           let u = unifyAt cx.i (typInferringExpr c) (boolT ()) in
+           let y = yes (plain cx) in
+           let n = no (plain cx) in
+           let v = unifyAt cx.i (typInferringExpr y) (typInferringExpr n) in
+           If { cond = c, yes = y, no = n, typ = typInferringExpr y }))
     | Match { later scrutinee, later arms } ->
-        (let s = scrutinee (plain cx) in
-         let result = fresh cx.i.ar in
-         let pl = plain cx in
-         let ars = V.map (\arm -> arm { pl | arm = Just (typInferringExpr s, result) }) arms in
-         Match { scrutinee = s, arms = ars, typ = result })
+        placed cx here (\() ->
+          (let s = scrutinee (plain cx) in
+           let result = fresh cx.i.ar in
+           let pl = plain cx in
+           let ars = V.map (\arm -> arm { pl | arm = Just (typInferringExpr s, result) }) arms in
+           Match { scrutinee = s, arms = ars, typ = result }))
     | Arm { later pat, later guard, later body } ->
-        (let p = pat (binding cx) in
-         let u =
-           (match cx.arm with
-            | Just (st, _) -> unifyAt cx.i (typInferringPat p) st
-            | None -> ())
-         in
-         let g =
-           M.map
-             (\gt ->
-               (let gx = gt (plain cx) in
-                let v = unifyAt cx.i (typInferringExpr gx) (boolT ()) in
-                gx))
-             guard
-         in
-         let b = body (plain cx) in
-         let w =
-           (match cx.arm with
-            | Just (_, result) -> unifyAt cx.i (typInferringExpr b) result
-            | None -> ())
-         in Arm { pat = p, guard = g, body = b })
-    | Expr.Tuple { items } -> Tuple { items, typ = Tuple (V.map (\x -> typInferringExpr x) items) }
+        placed cx here (\() ->
+          (let p = pat (binding cx) in
+           let u =
+             (match cx.arm with
+              | Just (st, _) -> unifyAt cx.i (typInferringPat p) st
+              | None -> ())
+           in
+           let g =
+             M.map
+               (\gt ->
+                 (let gx = gt (plain cx) in
+                  let v = unifyAt cx.i (typInferringExpr gx) (boolT ()) in
+                  gx))
+               guard
+           in
+           let b = body (plain cx) in
+           let w =
+             (match cx.arm with
+              | Just (_, result) -> unifyAt cx.i (typInferringExpr b) result
+              | None -> ())
+           in Arm { pat = p, guard = g, body = b }))
+    | Expr.Tuple { items } ->
+        placed cx here (\() ->
+          Tuple { items, typ = Tuple (V.map (\x -> typInferringExpr x) items) })
     | Expr.Array { later items } ->
-        (let elem = fresh cx.i.ar in
-         let xs =
-           V.map
-             (\it ->
-               (let x = it (plain cx) in
-                let u = unifyAt cx.i (typInferringExpr x) elem in
-                x))
-             items
-         in Expr.Array { items = xs, typ = arrayT elem })
+        placed cx here (\() ->
+          (let elem = fresh cx.i.ar in
+           let xs =
+             V.map
+               (\it ->
+                 (let x = it (plain cx) in
+                  let u = unifyAt cx.i (typInferringExpr x) elem in
+                  x))
+               items
+           in Expr.Array { items = xs, typ = arrayT elem }))
     | Expr.List { later items } ->
-        (let elem = fresh cx.i.ar in
-         let xs =
-           V.map
-             (\it ->
-               (let x = it (plain cx) in
-                let u = unifyAt cx.i (typInferringExpr x) elem in
-                x))
-             items
-         in Expr.List { items = xs, typ = listT elem })
+        placed cx here (\() ->
+          (let elem = fresh cx.i.ar in
+           let xs =
+             V.map
+               (\it ->
+                 (let x = it (plain cx) in
+                  let u = unifyAt cx.i (typInferringExpr x) elem in
+                  x))
+               items
+           in Expr.List { items = xs, typ = listT elem }))
     | Expr.Cons { ref, raw args } ->
-        (match consParts cx src out ref args with
-         | (xs, t) -> Expr.Cons { ref, args = xs, typ = t })
+        placed cx here (\() ->
+          (match consParts cx src out ref args with
+           | (xs, t) -> Expr.Cons { ref, args = xs, typ = t }))
     | Expr.Record { raw fields, later base } ->
-        (match recordParts cx src out fields base with
-         | (fs, b, t) -> Expr.Record { fields = fs, base = b, typ = t })
+        placed cx here (\() ->
+          (match recordParts cx src out fields base with
+           | (fs, b, t) -> Expr.Record { fields = fs, base = b, typ = t }))
     | Update { later base, raw fields } ->
-        (match updateParts cx src out base fields with
-         | (b, fs, t) -> Update { base = b, fields = fs, typ = t })
-    | Proj { target, label } -> Proj { target, label, typ = projType cx out target label }
+        placed cx here (\() ->
+          (match updateParts cx src out base fields with
+           | (b, fs, t) -> Update { base = b, fields = fs, typ = t }))
+    | Proj { target, label } ->
+        placed cx here (\() -> Proj { target, label, typ = projType cx out target label })
     | Handle { later body, raw arms, raw ret } ->
-        (match handleParts cx src out body arms ret with
-         | (b, hs, r, t) -> Handle { body = b, arms = hs, ret = r, typ = t })
+        placed cx here (\() ->
+          (match handleParts cx src out body arms ret with
+           | (b, hs, r, t) -> Handle { body = b, arms = hs, ret = r, typ = t }))
     | HArm { op, opRef, later param, resume, later body } ->
-        (let tys =
-           M.unwrapOr
-             (ClauseTys {
-                arg = fresh cx.i.ar,
-                ret = fresh cx.i.ar,
-                result = fresh cx.i.ar,
-                outside = freshEffect cx.i.ar
-              })
-             cx.clause
-         in
-         let p = param (binding cx) in
-         let u = unifyAt cx.i (typInferringPat p) tys.arg in
-         let v = setScheme cx.i resume (mono (Fun [tys.ret] tys.result tys.outside)) in
-         let b = body (plain cx) in
-         let w = unifyAt cx.i (typInferringExpr b) tys.result in
-         HArm { op, opRef, param = p, resume, body = b })
+        placed cx here (\() ->
+          (let tys =
+             M.unwrapOr
+               (ClauseTys {
+                  arg = fresh cx.i.ar,
+                  ret = fresh cx.i.ar,
+                  result = fresh cx.i.ar,
+                  outside = freshEffect cx.i.ar
+                })
+               cx.clause
+           in
+           let p = param (binding cx) in
+           let u = unifyAt cx.i (typInferringPat p) tys.arg in
+           let v = setScheme cx.i resume (mono (Fun [tys.ret] tys.result tys.outside)) in
+           let b = body (plain cx) in
+           let w = unifyAt cx.i (typInferringExpr b) tys.result in
+           HArm { op, opRef, param = p, resume, body = b }))
     | Ret { later pat, later body } ->
-        (let p = pat (binding cx) in
-         let u =
-           (match cx.back with
-            | Just (bodyTy, _) -> unifyAt cx.i (typInferringPat p) bodyTy
-            | None -> ())
-         in
-         let b = body (plain cx) in
-         let v =
-           (match cx.back with
-            | Just (_, result) -> unifyAt cx.i (typInferringExpr b) result
-            | None -> ())
-         in Ret { pat = p, body = b })
-    | Pat.Wild {} -> Pat.Wild { typ = fresh cx.i.ar }
-    | Pat.Unit {} -> Pat.Unit { typ = unitT () }
-    | Pat.MacCall { call } -> Pat.MacCall { call, typ = Error }
-    | Pat.Lit { lit } -> Pat.Lit { lit, typ = litTypeIn cx.i out lit }
-    | Pat.Var { id } -> Pat.Var { id, typ = bindPatVar cx id (fresh cx.i.ar) }
-    | Pat.As { id, pat } -> Pat.As { id, pat, typ = bindPatVar cx id (typInferringPat pat) }
+        placed cx here (\() ->
+          (let p = pat (binding cx) in
+           let u =
+             (match cx.back with
+              | Just (bodyTy, _) -> unifyAt cx.i (typInferringPat p) bodyTy
+              | None -> ())
+           in
+           let b = body (plain cx) in
+           let v =
+             (match cx.back with
+              | Just (_, result) -> unifyAt cx.i (typInferringExpr b) result
+              | None -> ())
+           in Ret { pat = p, body = b }))
+    | Pat.Wild {} -> placed cx here (\() -> Pat.Wild { typ = fresh cx.i.ar })
+    | Pat.Unit {} -> placed cx here (\() -> Pat.Unit { typ = unitT () })
+    | Pat.MacCall { call } -> placed cx here (\() -> Pat.MacCall { call, typ = Error })
+    | Pat.Lit { lit } -> placed cx here (\() -> Pat.Lit { lit, typ = litTypeIn cx.i out lit })
+    | Pat.Var { id } ->
+        placed cx here (\() -> Pat.Var { id, typ = bindPatVar cx id (fresh cx.i.ar) })
+    | Pat.As { id, pat } ->
+        placed cx here (\() -> Pat.As { id, pat, typ = bindPatVar cx id (typInferringPat pat) })
     | Pat.Ann { pat, raw ty } ->
-        (let declared = annotation cx.i cx.here ty in
-         let u = unifyAt cx.i (typInferringPat pat) declared in
-         Pat.Ann { pat, ty = inferType src out cx ty, typ = typInferringPat pat })
+        placed cx here (\() ->
+          (let declared = annotation cx.i cx.here ty in
+           let u = unifyAt cx.i (typInferringPat pat) declared in
+           Pat.Ann { pat, ty = inferType src out cx ty, typ = typInferringPat pat }))
     | Pat.Cons { ref, raw args } ->
-        (match patConsParts cx src out ref args with
-         | (ps, t) -> Pat.Cons { ref, args = ps, typ = t })
+        placed cx here (\() ->
+          (match patConsParts cx src out ref args with
+           | (ps, t) -> Pat.Cons { ref, args = ps, typ = t }))
     | Pat.Tuple { items } ->
-        Pat.Tuple { items, typ = Tuple (V.map (\p -> typInferringPat p) items) }
+        placed cx here (\() ->
+          Pat.Tuple { items, typ = Tuple (V.map (\p -> typInferringPat p) items) })
     | Pat.Array { later items } ->
-        (let elem = fresh cx.i.ar in
-         let ps =
-           V.map
-             (\it ->
-               (let p = it cx in
-                let u = unifyAt cx.i (typInferringPat p) elem in
-                p))
-             items
-         in Pat.Array { items = ps, typ = arrayT elem })
+        placed cx here (\() ->
+          (let elem = fresh cx.i.ar in
+           let ps =
+             V.map
+               (\it ->
+                 (let p = it cx in
+                  let u = unifyAt cx.i (typInferringPat p) elem in
+                  p))
+               items
+           in Pat.Array { items = ps, typ = arrayT elem }))
     | Pat.List { later items } ->
-        (let elem = fresh cx.i.ar in
-         let ps =
-           V.map
-             (\it ->
-               (let p = it cx in
-                let u = unifyAt cx.i (typInferringPat p) elem in
-                p))
-             items
-         in Pat.List { items = ps, typ = listT elem })
-    | Pat.Vector { items } -> Pat.Vector { items, typ = Error }
+        placed cx here (\() ->
+          (let elem = fresh cx.i.ar in
+           let ps =
+             V.map
+               (\it ->
+                 (let p = it cx in
+                  let u = unifyAt cx.i (typInferringPat p) elem in
+                  p))
+               items
+           in Pat.List { items = ps, typ = listT elem }))
+    | Pat.Vector { items } -> placed cx here (\() -> Pat.Vector { items, typ = Error })
     | Pat.Record { raw fields, open } ->
-        (match patRecordParts cx src out fields open with
-         | (fs, t) -> Pat.Record { fields = fs, open, typ = t })
+        placed cx here (\() ->
+          (match patRecordParts cx src out fields open with
+           | (fs, t) -> Pat.Record { fields = fs, open, typ = t }))
     | Pat.View { fn, pat } ->
-        (let arg = fresh cx.i.ar in
-         let phi = freshEffect cx.i.ar in
-         let u = unifyAt cx.i (typInferringExpr fn) (Fun [arg] (typInferringPat pat) phi) in
-         let v = joinEffect cx.i phi in
-         Pat.View { fn, pat, typ = arg })
+        placed cx here (\() ->
+          (let arg = fresh cx.i.ar in
+           let phi = freshEffect cx.i.ar in
+           let u = unifyAt cx.i (typInferringExpr fn) (Fun [arg] (typInferringPat pat) phi) in
+           let v = joinEffect cx.i phi in
+           Pat.View { fn, pat, typ = arg }))
     | Bind.Fun { id, later params, raw ret, later body } ->
-        (match funBindParts cx src out id params ret body with
-         | (ps, b) ->
-             Bind.Fun {
-               id,
-               params = ps,
-               ret = M.map (\t -> inferType src out (plain cx) t) ret,
-               body = b
-             })
+        placed cx here (\() ->
+          (match funBindParts cx src out id params ret body with
+           | (ps, b) ->
+               Bind.Fun {
+                 id,
+                 params = ps,
+                 ret = M.map (\t -> inferType src out (plain cx) t) ret,
+                 body = b
+               }))
     | Bind.Pat { later pat, later value } ->
-        (match patBindParts cx out pat value with
-         | (p, v) -> Bind.Pat { pat = p, value = v })
+        placed cx here (\() ->
+          (match patBindParts cx out pat value with
+           | (p, v) -> Bind.Pat { pat = p, value = v }))
 }
 
 -- `id`, a pattern's name, bound to `t` and collected as the pattern's.
@@ -2444,7 +2483,10 @@ fun inferImpl
   -- a build that is `checked` stops at, as every build is unless it is told
   -- otherwise. It says nothing of the standard library, of MeadowBoot or of
   -- what MeadowBoot is built on, as the Rust compiler says nothing of them.
-  said : [String]
+  said : [String],
+  -- Where each of those is: the module, and the byte it starts at (-1 for
+  -- what is of no one place).
+  saidAt : [(Int, Int)]
 }
 
 -- Infer unit `r`, whose dependencies exported `deps` -- their values' schemes
@@ -2597,6 +2639,7 @@ fun inferImpl
     in Inferred {
          problems = ofMain,
          said = stGetRef i.errors,
+         saidAt = stGetRef i.errorsAt,
          dumps,
          schemes = exported,
          types = ownTypes i,
@@ -2887,6 +2930,8 @@ fun newInf (r : Renamed) : Inf s ! { St s | e } =
     assocEffectVars = stNewRef [],
     settlingJoins = stNewRef False,
     errors = stNewRef [],
+    at = stNewRef (0 - 1, 0 - 1),
+    errorsAt = stNewRef [],
     runSt = M.unwrapOr (0 - 1) (M.map snd (V.find (\p -> fst p == "runSt") r.prims)),
     stLevels = stNewRef [],
     entries = entriesOf r,

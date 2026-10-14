@@ -274,6 +274,10 @@ use Sol.*
   -- variable now is tied to its region after all.
   settlingJoins : StRef s Bool,
   errors : StRef s [String],
+  -- Where inference is: the module, and the byte its node starts at (-1
+  -- for none), as `Infer.placed` marks it; and where each of `errors` was.
+  at : StRef s (Int, Int),
+  errorsAt : StRef s [(Int, Int)],
   runSt : Int,
   stLevels : StRef s [Int],
   entries : [Int],
@@ -300,6 +304,7 @@ use Sol.*
 }
 
 @pub fun report (i : Inf s) (msg : String) : () ! { St s | e } =
+  let u = stSetRef i.errorsAt (V.pushBack (stGetRef i.errorsAt) (stGetRef i.at)) in
   stSetRef i.errors (V.pushBack (stGetRef i.errors) msg)
 
 @pub fun schemeOf (i : Inf s) (v : Int) : Maybe Scheme ! { St s | e } = H.lookup v (stGetRef i.env)
