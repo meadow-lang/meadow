@@ -572,13 +572,13 @@ fun namedRefs (items : [Item]) (names : [(String, Meta)]) : [(Meta, Int)] =
       | Just i -> [(snd n, i.id)]
       | None ->
           -- A pattern synonym is its matcher and builder, and is itself a use
-          -- of neither.
-          if V.any (\(i : Item) -> i.kind == "v" and partOfSynonym i.name (fst n)) items then []
-          else
-            (match V.find (\(i : Item) -> i.name == fst n and i.kind == "t") items with
-             | Just t -> [(snd n, t.id)]
-             -- A capital nothing declares: an effect the language has, named.
-             | None -> (if isCapital (fst n) then [(snd n, 0 - 1)] else [])))
+          -- of neither; a type of its name is still the type.
+          (let synonym =
+             V.any (\(i : Item) -> i.kind == "v" and partOfSynonym i.name (fst n)) items
+           in match V.find (\(i : Item) -> i.name == fst n and i.kind == "t") items with
+              | Just t -> [(snd n, t.id)]
+              -- A capital nothing declares: an effect the language has, named.
+              | None -> (if not synonym and isCapital (fst n) then [(snd n, 0 - 1)] else [])))
     names
 
 -- What a `use` of a module there is not refers to, among a module's
