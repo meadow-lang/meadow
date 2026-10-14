@@ -3286,10 +3286,21 @@ fn a_function_meadowboot_exports_is_called_from_c() {
     .expect("a manifest");
     std::fs::write(
         lib.join("src").join("Main.mw"),
-        "@export\nfun twice (x : Int32) : Int32 = x * 2\n\n\
+        "use Std.Ffi as Ffi\nuse Std.Ffi (Arg)\n\n\
+         @export\nfun twice (x : Int32) : Int32 = x * 2\n\n\
          @export(lib_half)\nfun half (x : Float) : Float = x *. 0.5\n\n\
          @export\nfun same32 (x : Float32) : Float32 = x\n\n\
-         @export\nfun add (a : Int) (b : Int) : Int = a + b\n",
+         @export\nfun add (a : Int) (b : Int) : Int = a + b\n\n\
+         @export\nfun broken (x : Int) : Int = x / (x - x)\n\n\
+         @export\nfun guarded (x : Int) : Int ! Process =\n  \
+         match Ffi.own () with\n  \
+         | Err _ -> 0\n  \
+         | Ok l ->\n      \
+         (match Ffi.function l \"broken\" with\n       \
+         | Err _ -> 0\n       \
+         | Ok f ->\n           \
+         (let r = Ffi.callInt f [Arg.Int x] in\n            \
+         match Ffi.failure () with | Just _ -> 1 | None -> 2))\n",
     )
     .expect("the library's source");
     let built = Command::new(meadowboot_exe())
@@ -3335,7 +3346,14 @@ fn a_function_meadowboot_exports_is_called_from_c() {
              R.andThen (\\f -> Ffi.callFloat f [Arg.Float 3.0]) (call \"lib_half\" []),\n    \
              R.andThen (\\f -> Ffi.callFloat32 f [Arg.Float32 0.25]) (call \"same32\" []),\n    \
              R.andThen (\\f -> Ffi.callInt f [Arg.Int 40, Arg.Int 2]) (call \"add\" [])\n  )\n  \
-             in println \"${{shown:?}}\"\n",
+             in\n  \
+             let failing = (\n    \
+             R.andThen (\\f -> Ffi.callInt f [Arg.Int 7]) (call \"broken\" []),\n    \
+             R.andThen (\\f -> Ffi.callInt f [Arg.Int 21]) (call \"twice\" []),\n    \
+             R.andThen (\\f -> Ffi.callInt f [Arg.Int 7]) (call \"guarded\" [])\n  )\n  \
+             in\n  \
+             let u = println \"${{shown:?}}\" in\n  \
+             println \"${{failing:?}}\"\n",
             path = library.to_string_lossy().replace('\\', "/")
         ),
     )
@@ -3349,6 +3367,14 @@ fn a_function_meadowboot_exports_is_called_from_c() {
     let _ = std::fs::remove_dir_all(&root);
     assert!(
         said.contains("(Ok(42), Ok(1.5), Ok(0.25), Ok(42))"),
+        "{said}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // A call that fails answers zero, and C goes on: the library's next call
+    // is answered, and one of its functions calling another through C gets
+    // control back and is told why that one failed.
+    assert!(
+        said.contains("(Ok(0), Ok(42), Ok(1))"),
         "{said}{}",
         String::from_utf8_lossy(&out.stderr)
     );

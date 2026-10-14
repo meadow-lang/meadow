@@ -54,7 +54,7 @@
 
 use Std.Process (
   Process, ffiOpen, ffiSymbol, ffiCall, ffiAlloc, ffiFree, ffiWriteInts, ffiReadInts,
-  ffiWriteFloats, ffiReadFloats, ffiReadText
+  ffiWriteFloats, ffiReadFloats, ffiReadText, ffiFailure
 )
 use Std.Collections.Vector as V
 use Std.Collections.Vector (vecFromArray)
@@ -101,6 +101,16 @@ use Std.Maybe.Maybe.*
 -- is -- where the functions it exports to C are found, to hand C their
 -- addresses.
 @pub fun own () : Result String Library ! { Process | e } = open ""
+
+-- What the last call C made into this library failed with -- an `error`, a
+-- division by zero -- if one has since this was last asked. A failure in a
+-- function the library exports ends that call, which answers C zero, and not
+-- the program C is. A function that calls another of the library's through
+-- C, by its address, gets control back when that one fails, and asks this
+-- why: what a plugin does to report a failure to its host.
+@pub fun failure () : Maybe String ! { Process | e } =
+  let why = ffiFailure () in
+  if why == "" then None else Just why
 
 -- The function `name` in `library`.
 @pub fun function (library : Library) (name : String) : Result String Function ! { Process | e } =

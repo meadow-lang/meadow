@@ -200,6 +200,18 @@ pub extern "C" fn meadow_export_enter() {
     });
 }
 
+/// Run `body` of `env`, a call C made into the library, so that a failure in
+/// it ends the call and not the process: 0 when it returned, 1 when it
+/// failed. The emitted C entry of each export calls it: see
+/// `meadow_llvm::emit`'s `export_fn` and [`sched::export_run`].
+#[unsafe(no_mangle)]
+pub extern "C" fn meadow_export_run(
+    body: extern "C" fn(*mut std::ffi::c_void),
+    env: *mut std::ffi::c_void,
+) -> i32 {
+    sched::export_run(body, env)
+}
+
 /// Run one test of a test executable: the entry of `tests` numbered by the
 /// first argument. A test passes by returning -- status 0 -- and fails by
 /// failing, with its message on stderr, as `Test.fail` makes it.

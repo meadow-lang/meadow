@@ -2369,6 +2369,8 @@ fn native_process(op: &str, arg: Value) -> Result<Value, RuntimeError> {
             // Safety: as above.
             sv(unsafe { ffi::read_text(as_int(&t[0])?, as_int(&t[1])?) })
         }
+        // Only a library Silo builds is called by C.
+        "ffiFailure" => sv(String::new()),
         other => return err(format!("unhandled effect Process.{other}")),
     })
 }

@@ -562,6 +562,9 @@ fn process(op: &str, arg: Val) -> Option<Build> {
                     // Safety: as above.
                     Build::Str(unsafe { ffi::read_text(int(t[0]), int(t[1])) })
                 }
+                // What the last call C made into this library failed with,
+                // once; nothing when none did.
+                "ffiFailure" => Build::Str(crate::sched::take_failure().unwrap_or_default()),
                 _ => return None,
             }
         }

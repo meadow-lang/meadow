@@ -2836,6 +2836,7 @@ fn declarations(body: &str, arity: &HashMap<&str, usize>, cc: &str) -> String {
 const RUNTIME: &str = "\
 declare i64 @meadow_acquire(i64, i64)
 declare void @meadow_export_enter()
+declare i32 @meadow_export_run(ptr, ptr)
 declare void @meadow_free(i64, i64)
 declare void @meadow_clean(i64, i64)
 declare void @meadow_fail(ptr, i64) noreturn
@@ -3289,17 +3290,48 @@ fn export_fn(
                 let _ = writeln!(body, "  {w} = {ext} {ty} {a} to i64");
             }
         }
-        words.push(format!("i64 {w}"));
+        words.push(w);
     }
     let Some((rty, rhow)) = c_type(result) else {
         return Err(format!("what `{name}` answers is not of a type C can take"));
     };
     let (get, arg) = ctx;
-    let _ = writeln!(
+    let n = words.len();
+    // The call itself, of its arguments as words in `env`, its answer put
+    // after them: what the runtime runs on a segment of its own, so that a
+    // failure in it ends the call and not the program C is.
+    let _ = write!(
         out,
-        "define dllexport {rty} @\"{name}\"({}) {{\n  call void @meadow_export_enter()\n{get}{body}  %r = call {cc} i64 {callee}({arg}{}i64 0)",
+        "define internal void @\"{name}$run\"(ptr %env) {{\n{get}"
+    );
+    for i in 0..n {
+        let _ = write!(
+            out,
+            "  %p{i} = getelementptr i64, ptr %env, i64 {i}\n  %v{i} = load i64, ptr %p{i}\n"
+        );
+    }
+    let _ = write!(
+        out,
+        "  %r = call {cc} i64 {callee}({arg}{}i64 0)\n  %rp = getelementptr i64, ptr %env, i64 {n}\n  store i64 %r, ptr %rp\n  ret void\n}}\n\n",
+        (0..n).map(|i| format!("i64 %v{i}, ")).collect::<String>()
+    );
+    // The C function: its arguments as words, the call run, and the answer
+    // -- zero where the call failed -- as C's type.
+    let _ = write!(
+        out,
+        "define dllexport {rty} @\"{name}\"({}) {{\n  call void @meadow_export_enter()\n  %env = alloca [{} x i64]\n{body}",
         sig.join(", "),
-        words.iter().map(|w| format!("{w}, ")).collect::<String>()
+        n + 1
+    );
+    for (i, w) in words.iter().enumerate() {
+        let _ = write!(
+            out,
+            "  %s{i} = getelementptr i64, ptr %env, i64 {i}\n  store i64 {w}, ptr %s{i}\n"
+        );
+    }
+    let _ = write!(
+        out,
+        "  %rp = getelementptr i64, ptr %env, i64 {n}\n  store i64 0, ptr %rp\n  %failed = call i32 @meadow_export_run(ptr @\"{name}$run\", ptr %env)\n  %r = load i64, ptr %rp\n"
     );
     match rhow {
         "void" => out.push_str("  ret void\n"),

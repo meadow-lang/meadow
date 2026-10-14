@@ -761,10 +761,11 @@ fn park(request: Request) -> Wake {
 }
 
 /// A failure in a thread other than `main` fails that thread: `await` fails
-/// with the same message, and nothing else is affected. Answers whether it
-/// was one; for `main`, or outside every thread, the program stops.
+/// with the same message, and nothing else is affected; so does one in a call
+/// C made into a library, which ends that call ([`export_run`]). Answers
+/// whether it was one; for `main`, or outside every thread, the program stops.
 pub fn fail_thread(msg: &str) -> bool {
-    if !ctx::present() || cx().tid == 0 || segments::innermost().is_none() {
+    if !ctx::present() || (cx().tid == 0 && !cx().guarded) || segments::innermost().is_none() {
         return false;
     }
     loop {
@@ -1099,4 +1100,92 @@ fn drop_writes(levels: Vec<Vec<(usize, Word, i64)>>) {
     for (_, x, d) in levels.into_iter().flatten() {
         heap::erase(x, d);
     }
+}
+
+// --- calls C makes into a library ------------------------------------------
+
+thread_local! {
+    /// Stacks of calls into the library that have finished, to run the next
+    /// on.
+    static EXPORT_STACKS: std::cell::RefCell<Vec<DefaultStack>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// What the last call into the library that failed on this OS thread
+    /// failed with, until `Std.Ffi.failure` asks.
+    static FAILURE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `body` of `env` -- a call C made into a library, its arguments in
+/// `env` -- on a segment of its own, so that a failure in it ends the call
+/// rather than the process: as a thread's does, it parks the segment, which
+/// is let go without unwinding. Answers 0 when it returned, and 1 when it
+/// failed, its message said on stderr and kept for [`take_failure`]. What the
+/// call's frames held is given up; the context is as it was before the call.
+pub fn export_run(body: extern "C" fn(*mut std::ffi::c_void), env: *mut std::ffi::c_void) -> i32 {
+    let c = cx();
+    let depth = c.running.len();
+    let shadow = crate::shadow::head();
+    let in_txn = c.txn.is_some();
+    let guarded = std::mem::replace(&mut c.guarded, true);
+    let stack = EXPORT_STACKS
+        .with(|s| s.borrow_mut().pop())
+        .unwrap_or_else(|| {
+            DefaultStack::new(THREAD).unwrap_or_else(|e| {
+                crate::fail(&format!(
+                    "could not make a stack for a call into the library: {e}"
+                ))
+            })
+        });
+    let env = env as usize;
+    let mut co: segments::Segment =
+        Coroutine::with_stack(stack, move |y: &Yielder<Down, Up>, _: Down| {
+            segments::enter_thread(y);
+            body(env as *mut std::ffi::c_void);
+            segments::leave_thread();
+            0
+        });
+    let failed = match co.resume(Down::Start) {
+        CoroutineResult::Return(_) => None,
+        CoroutineResult::Yield(up) => {
+            let why = match (up, cx().request.take()) {
+                (Up::Park, Some(Request::Failed(m))) => m,
+                (Up::Park, _) => "a thread waited in a call C made into a library, where there                                   is no scheduler to run another"
+                    .to_string(),
+                (Up::Detach { .. }, _) => "an effect was performed after its handler had                                            finished, in a call C made into a library"
+                    .to_string(),
+            };
+            // Never resumed, and not unwound.
+            // Safety: nothing will resume it.
+            unsafe { co.force_reset() };
+            Some(why)
+        }
+    };
+    EXPORT_STACKS.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.len() < 2 {
+            s.push(co.into_stack());
+        }
+    });
+    let c = cx();
+    c.running.truncate(depth);
+    c.guarded = guarded;
+    if !in_txn {
+        c.txn = None;
+    }
+    crate::shadow::set(shadow);
+    match failed {
+        None => 0,
+        Some(why) => {
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            eprintln!("{why}");
+            FAILURE.with(|f| *f.borrow_mut() = Some(why));
+            1
+        }
+    }
+}
+
+/// What the last call into the library that failed on this OS thread failed
+/// with, once: see [`export_run`].
+pub fn take_failure() -> Option<String> {
+    FAILURE.with(|f| f.borrow_mut().take())
 }

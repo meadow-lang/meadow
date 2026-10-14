@@ -114,6 +114,9 @@ pub struct Ctx {
     pub spill: Vec<Word>,
     /// The thread's number: 0 is `main`.
     pub tid: usize,
+    /// Inside a call C made into a library, on a segment of its own: a
+    /// failure ends the call, not the process. See `crate::sched::export_run`.
+    pub guarded: bool,
 }
 
 // Safety: a context is used by one OS thread at a time -- the one running its
@@ -141,6 +144,7 @@ impl Ctx {
             // Safety: a constant the emitted module defines.
             spill: vec![0; unsafe { meadow_spill_words }.max(0) as usize],
             tid,
+            guarded: false,
         });
         c.spill_at = c.spill.as_mut_ptr();
         c

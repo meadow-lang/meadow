@@ -61,6 +61,11 @@ beyond the last release is under _Unreleased_.
   the Silo back end gives each a C entry that starts the runtime the first
   time it is called on a thread. A function whose answer is not a number or
   `()` is refused, saying so.
+- A call C makes into a Meadow library that fails -- an `error`, a division
+  by zero -- ends that call, which answers zero, and not the program C is:
+  each runs on a stack of its own, let go of when it fails. The message is on
+  stderr, and `Std.Ffi.failure ()` answers it once, so a plugin that calls
+  its own function through C, by address, can tell its host what went wrong.
 - `meadow cut --no-run` builds what would be run -- the bytecode image, or the
   executable with `--aot` or `--runtime silo` -- and stops: what a front end's
   `build` asks the back end for.
