@@ -50,6 +50,7 @@ use MeadowBoot.Lint (lint)
 use MeadowBoot.Dictionaries as Dictionaries
 use MeadowBoot.Inline as Inline
 use MeadowBoot.Eta as Eta
+use MeadowBoot.Exhaust as Exhaust
 use MeadowBoot.Dictionaries (emptySummary)
 use MeadowBoot.Types
 use MeadowBoot.Core (CoreProgram, joinedUnits)
@@ -179,6 +180,7 @@ database! {
              False
              False
              False
+             False
              (\x -> ()))
     -- The same with no entry: every definition of the unit, for whoever runs
     -- one of them -- a macro -- rather than the unit.
@@ -200,6 +202,7 @@ database! {
                 (modulesOf (queryFiles unit)))
              None
              True
+             False
              False
              False
              False
@@ -319,6 +322,7 @@ fun checkedOf
     (wholly : Bool)
     (naming : Bool)
     (checked : Bool)
+    (strict : Bool)
     (mark : String -> () ! e)
     : ([Export], Bool, TypeEnv, Maybe (CoreProgram, Linked, Object), [String]) ! e =
   let m0 = mark "start" in
@@ -465,7 +469,35 @@ fun checkedOf
                  | None -> why))
           (V.zip done.saidAt done.said)
       in
-      let problems = if checked then V.append undefined placedSaid else done.problems in
+      -- And, where the build is strict, each `match` that misses a value,
+      -- where it is: the file of the definition it is in, as its binder was
+      -- declared there.
+      let unmatched =
+        if not strict then []
+        else
+          (match cored with
+           | Just (written, _, _, _) ->
+               V.map
+                 (\x ->
+                   match x with
+                   | (owner, at, why) ->
+                       (let file =
+                          M.andThen
+                            (\(b : Binder) ->
+                              match S.indexOf "@" b.site with
+                              | Just k -> Just (S.take b.site k)
+                              | None -> None)
+                            (if owner >= 0 then V.get r.binders owner else None)
+                        in match file with
+                           | Just f ->
+                               "${f}:${placeIn (M.unwrapOr "" (H.lookup f texts)) at}: ${why}"
+                           | None -> why))
+                 (Exhaust.check written (V.append (sigsOf known) (Seq.datasOf written)))
+           | None -> [])
+      in
+      let problems =
+        if checked then V.concat [undefined, placedSaid, unmatched] else done.problems
+      in
       let program = isProgram r.exports in
       (
         exports,
@@ -1135,6 +1167,9 @@ make! {
       whole : Bool =
         False
           "optimise the build's units as one program at the link, where each is otherwise optimised by itself"
+      strict : Bool =
+        False
+          "stop a build at a `match` that misses a value, as the release profile does: what `--strict` and `--lenient` say"
       checked : Bool =
         True
           "stop a build at whatever is wrong with a unit -- a name nothing binds, types that do not agree -- where it otherwise stops only at a `main` that is not one"
@@ -1145,7 +1180,7 @@ make! {
           link
     }
     | profile debug {}
-    | profile release { opt = O2, kind = Release }
+    | profile release { opt = O2, kind = Release, strict = True }
     | pinned = pinnedOf
 }
 
@@ -1355,6 +1390,7 @@ fun compiling (o : UnitsOptions) (u : Given Interface) =
               o.whole
               (M.isSome (getEnv "MEADOWBOOT_NAMES"))
               o.checked
+              (o.checked and o.strict)
               mark with
             | _ if not (V.isEmpty misread and V.isEmpty unexpanded) ->
                 Err (S.join "" (V.append misread unexpanded))

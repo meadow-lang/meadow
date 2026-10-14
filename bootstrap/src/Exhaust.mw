@@ -1,0 +1,373 @@
+-- Whether a `match` matches every value: `meadow_exhaust`'s check, over core.
+--
+-- The engine is Maranget's usefulness ("Warnings for pattern matching", JFP
+-- 2007) in the form that hands back a value: given a `match`'s patterns, a
+-- row each, it proves every value is matched or answers one no row matches,
+-- which is what the diagnostic says. It goes by types: each pattern in core
+-- carries its type, so what a column's values can be is known -- a type's
+-- constructors are its declaration's, a tuple or a record has one, and a
+-- number, a text or a character has more than any `match` lists.
+--
+-- A row with a guard covers nothing: the guard may fail. A `case` core has
+-- that no `match` was written for -- a `let` taken apart, a view -- has one
+-- arm that matches everything, or a last arm that does, so it is never
+-- said to be wrong unless it is.
+--
+-- What the build is told is each `match` that is not, by the definition it
+-- is in and the byte it starts at: the build knows which file a definition
+-- is in. The check is the build's `strict`, as `--strict` and the release
+-- profile ask for (`meadow_compiler::Options::check_exhaustive`).
+
+use MeadowBoot.Core
+use MeadowBoot.Types
+use MeadowBoot.Types.Type.*
+use Lingua.Lang (metaStart)
+use Std.Collections.Vector as V
+use Std.Collections.HashMap as H
+use Std.Collections.HashMap (HashMap)
+use Std.String as S
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+
+-- What a pattern's head is: a constructor of a declared type, by its name
+-- without its qualifiers; a tuple of so many; a record of these labels; an
+-- array of so many; or a literal, as it is written.
+@derive(PartialEq, Debug)
+data Head
+  = HCtor String
+  | HTuple Int
+  | HRecord [String]
+  | HArray Int
+  | HLit String
+
+use Head.*
+
+-- A pattern as the check sees it: anything, or a head and what is under it;
+-- each with the type of the values it matches, which core says of every
+-- pattern, so that what a column below a head can hold is always known.
+@derive(PartialEq, Debug)
+data P = Any Type | Headed Head [P] Type
+
+use P.*
+
+fun typeOfP (p : P) : Type = match p with | Any t -> t | Headed _ _ t -> t
+
+-- The constructors of each declared type, by its name: each one's name
+-- without its qualifiers, and how many fields it has.
+type Table = HashMap String [(String, Int)]
+
+-- `name` without its qualifiers: `Std.Maybe.Maybe.Just` is `Just`.
+fun bare (name : String) : String =
+  match V.get (S.split "." name) (V.len (S.split "." name) - 1) with
+  | Just last -> last
+  | None -> name
+
+-- --- patterns ------------------------------------------------------------------
+
+-- A pattern of core as the check sees it.
+fun patOf (a : CoreArena) (p : CorePat) : P =
+  let t = tyCorePat a p in
+  match viewCorePat a p with
+  | CorePatView.PWild _ -> Any t
+  | CorePatView.PVar _ -> Any t
+  | CorePatView.PAs r -> patOf a r.pat
+  | CorePatView.PLit r -> Headed (litHead a r.lit) [] t
+  | CorePatView.PTuple r -> Headed (HTuple (V.len r.items)) (V.map (\x -> patOf a x) r.items) t
+  | CorePatView.PArray r -> Headed (HArray (V.len r.items)) (V.map (\x -> patOf a x) r.items) t
+  | CorePatView.PCtor r -> Headed (HCtor (bare r.name)) (V.map (\x -> patOf a x) r.args) t
+  | CorePatView.PRecord r ->
+      -- A record is matched by the labels its type has, in its row's order;
+      -- a label the pattern leaves out is anything.
+      (let labels = labelsOf t in
+       let given = V.map (\f -> (corePFieldLabel a f, corePFieldPat a f)) r.fields in
+       Headed
+         (HRecord labels)
+         (V.map
+            (\l ->
+              match V.find (\g -> fst g == l) given with
+              | Just g -> patOf a (snd g)
+              | None -> Any (M.unwrapOr Error (fieldTypeOf t l)))
+            labels)
+         t)
+
+fun litHead (a : CoreArena) lit : Head =
+  match viewCoreLit a lit with
+  | CoreLitView.LBool r -> HCtor (if r.value then "True" else "False")
+  | CoreLitView.LUnit _ -> HTuple 0
+  | CoreLitView.LInt r -> HLit (show r.value)
+  | CoreLitView.LBig r -> HLit (show r.value)
+  | CoreLitView.LWord r -> HLit (show r.bits)
+  | CoreLitView.LF64 r -> HLit (show r.value)
+  | CoreLitView.LF32 r -> HLit (show r.value)
+  | CoreLitView.LStr r -> HLit (show r.text)
+  | CoreLitView.LChar r -> HLit "'${show r.code}'"
+
+-- A record type's labels, as its row has them, and the type of one.
+fun labelsOf (t : Type) : [String] = V.map fst (rowFields (recordRow t))
+
+fun fieldTypeOf (t : Type) (l : String) : Maybe Type =
+  M.map snd (V.find (\f -> fst f == l) (rowFields (recordRow t)))
+
+fun recordRow (t : Type) : Type = match t with | Record row -> row | _ -> RowEmpty
+
+fun rowFields (row : Type) : [(String, Type)] =
+  match row with
+  | RowExtend l f rest -> V.pushFront (rowFields rest) (l, f)
+  | _ -> []
+
+-- --- usefulness ------------------------------------------------------------------
+
+-- Every head a value of type `t` can have, each with how many fields, if
+-- there are few enough to list: a declared type's constructors, the one of
+-- a tuple or a record, `True` and `False`.
+fun complete (table : Table) (t : Type) : Maybe [(Head, Int)] =
+  match t with
+  | Tuple items -> Just [(HTuple (V.len items), V.len items)]
+  | Record _ -> (let ls = labelsOf t in Just [(HRecord ls, V.len ls)])
+  | Con "Unit" [] -> Just [(HTuple 0, 0)]
+  | Con "Bool" [] -> Just [(HCtor "False", 0), (HCtor "True", 0)]
+  | Con name _ -> M.map (\cs -> V.map (\c -> (HCtor (fst c), snd c)) cs) (H.lookup name table)
+  | _ -> None
+
+-- The same where the type is not known but the rows name constructors: the
+-- one declared type that has every constructor they name.
+fun completeFor (table : Table) (t : Type) (heads : [Head]) : Maybe [(Head, Int)] =
+  match complete table t with
+  | Just all -> Just all
+  | None ->
+      (let named = V.concatMap (\h -> match h with | HCtor c -> [c] | _ -> []) heads in
+       if V.isEmpty named or V.len named != V.len heads then None
+       else
+         (let fits =
+            V.filter (\cs -> V.all (\c -> V.any (\x -> fst x == c) cs) named) (H.values table)
+          in if V.len fits == 1 then
+               M.map (\cs -> V.map (\c -> (HCtor (fst c), snd c)) cs) (V.get fits 0)
+             else None))
+
+-- The type of column 0's values: the column's, or where that is not known,
+-- what a row's pattern there says.
+fun columnType (rows : [[P]]) (t : Type) : Type =
+  match t with
+  | Error ->
+      (match V.find (\row -> M.isSome (V.get row 0)) rows with
+       | Just row -> M.unwrapOr Error (M.map typeOfP (V.get row 0))
+       | None -> Error)
+  | _ -> t
+
+-- The patterns under head `h` in the first row that has it in column 0.
+fun headFields (rows : [[P]]) (h : Head) : [P] =
+  V.foldl
+    (\found row ->
+      match found with
+      | Just ps -> Just ps
+      | None ->
+          (match V.get row 0 with
+           | Just (Headed g ps _) -> if g == h then Just ps else None
+           | _ -> None))
+    None
+    rows
+    |> M.unwrapOr []
+
+-- The rows of `rows` that `h` gets past, each with `h`'s fields in place of
+-- its first pattern: a row of anything there has anything in each, of the
+-- types `ts`.
+fun specialized (rows : [[P]]) (h : Head) (ts : [Type]) : [[P]] =
+  V.concatMap
+    (\row ->
+      match V.get row 0 with
+      | Just (Any _) -> [V.append (V.map (\t -> Any t) ts) (V.drop row 1)]
+      | Just (Headed g ps _) -> if g == h then [V.append ps (V.drop row 1)] else []
+      | None -> [])
+    rows
+
+-- The rows whose first pattern is anything, without it.
+fun defaulted (rows : [[P]]) : [[P]] =
+  V.concatMap
+    (\row ->
+      match V.get row 0 with
+      | Just (Any _) -> [V.drop row 1]
+      | _ -> [])
+    rows
+
+-- The heads the rows' first patterns have, each once.
+fun headsOf (rows : [[P]]) : [Head] =
+  V.foldl
+    (\acc row ->
+      match V.get row 0 with
+      | Just (Headed h _ _) -> if V.elem h acc then acc else V.pushBack acc h
+      | _ -> acc)
+    []
+    rows
+
+-- The types of what is under head `h` with `n` fields: what a row with it
+-- says, or nothing known where no row has it.
+fun fieldTypes (rows : [[P]]) (h : Head) (n : Int) : [Type] =
+  let ps = headFields rows h in
+  if V.len ps == n then V.map typeOfP ps else V.replicate n Error
+
+-- A row of values no row of `rows` matches, if there is one, its columns of
+-- types `tys`.
+fun missing (table : Table) (rows : [[P]]) (tys : [Type]) (deep : Int) : Maybe [P] =
+  if V.isEmpty tys then (if V.isEmpty rows then Just [] else None)
+  else if deep > 64 then None
+  else
+    (let t = columnType rows (V.getOr Error tys 0) in
+     let rest = V.drop tys 1 in
+     let heads = headsOf rows in
+     -- A value missed under head `h`, of `n` fields: one the rows that get
+     -- past it miss, with `h` put back around its first `n`.
+     let under =
+       \h n ->
+         (let ts = fieldTypes rows h n in
+          M.map
+            (\w -> V.pushFront (V.drop w n) (Headed h (V.take w n) t))
+            (missing table (specialized rows h ts) (V.append ts rest) (deep + 1)))
+     in
+     let firstOf =
+       \hns ->
+         V.foldl
+           (\found hn ->
+             match found with
+             | Just w -> Just w
+             | None -> under (fst hn) (snd hn))
+           None
+           hns
+     in match completeFor table t heads with
+        | Just all ->
+            if not (V.isEmpty all) and V.all (\hn -> V.elem (fst hn) heads) all then
+              -- Every head is written: a value is missed if it is missed under
+              -- one of them.
+              firstOf all
+            else
+              M.map
+                (\w ->
+                  -- A head none of the rows writes, if the type has one to name;
+                  -- otherwise anything.
+                  match V.find (\hn -> not (V.elem (fst hn) heads)) all with
+                  | Just (h, n) ->
+                      V.pushFront w (Headed h (V.map (\x -> Any Error) (V.range 0 n)) t)
+                  | None -> V.pushFront w (Any t))
+                (missing table (defaulted rows) rest (deep + 1))
+        | None ->
+            -- More values than any `match` lists -- numbers, texts, arrays of
+            -- any length -- so one with none of the rows' heads is missed where
+            -- the rows that match anything here miss one.
+            M.map (\w -> V.pushFront w (Any t)) (missing table (defaulted rows) rest (deep + 1)))
+
+-- --- what is said ----------------------------------------------------------------
+
+-- A value, as the diagnostic writes it.
+fun render (p : P) (nested : Bool) : String =
+  match p with
+  | Any _ -> "_"
+  | Headed (HTuple 0) _ _ -> "()"
+  | Headed (HTuple _) ps _ -> "(${S.join ", " (V.map (\x -> render x False) ps)})"
+  | Headed (HArray _) ps _ -> "#[${S.join ", " (V.map (\x -> render x False) ps)}]"
+  | Headed (HRecord ls) ps _ ->
+      "{ ${S.join ", " (V.map (\lp -> "${fst lp} = ${render (snd lp) False}") (V.zip ls ps))} }"
+  | Headed (HLit text) _ _ -> text
+  | Headed (HCtor name) [] _ -> name
+  | Headed (HCtor name) ps _ ->
+      (let s = "${name} ${S.join " " (V.map (\x -> render x True) ps)}" in
+       if nested then "(${s})" else s)
+
+-- --- the walk --------------------------------------------------------------------
+
+-- The terms directly under `t`.
+fun kids (a : CoreArena) (t : CoreTerm) : [CoreTerm] =
+  match viewCoreTerm a t with
+  | CoreTermView.Lam r -> [r.body]
+  | CoreTermView.TyLam r -> [r.body]
+  | CoreTermView.TyApp r -> [r.func]
+  | CoreTermView.App r -> [r.func, r.arg]
+  | CoreTermView.Let r -> [r.value, r.body]
+  | CoreTermView.LetRec r -> V.pushBack (V.map (\b -> coreBindValue a b) r.binds) r.body
+  | CoreTermView.If r -> [r.cond, r.yes, r.no]
+  | CoreTermView.Tuple r -> r.items
+  | CoreTermView.Array r -> r.items
+  | CoreTermView.Proj r -> [r.tuple]
+  | CoreTermView.Record r -> V.map (\f -> coreFieldValue a f) r.fields
+  | CoreTermView.Sel r -> [r.target]
+  | CoreTermView.Extend r -> [r.target, r.value]
+  | CoreTermView.Ctor r -> r.args
+  | CoreTermView.Prim r -> r.args
+  | CoreTermView.Perform r -> [r.arg]
+  | CoreTermView.Case r ->
+      V.pushFront
+        (V.concatMap
+           (\arm ->
+             match coreArmGuard a arm with
+             | Just g -> [g, coreArmBody a arm]
+             | None -> [coreArmBody a arm])
+           r.arms)
+        r.scrutinee
+  | CoreTermView.Handle r ->
+      V.concat [
+        [r.body],
+        V.map (\c -> coreClauseBody a c) r.clauses,
+        (match r.ret with | Just x -> [x] | None -> [])
+      ]
+  | CoreTermView.Join r -> [r.rhs, r.body]
+  | CoreTermView.Jump r -> r.args
+  | _ -> []
+
+-- Whether an arm is one with a view in its pattern, as `Elab.arm` writes
+-- one: its guard asks whether what the view answers matches, by a `case` of
+-- that pattern and of anything, which answers `False`.
+fun viewed (a : CoreArena) arm : Bool =
+  match coreArmGuard a arm with
+  | Just g ->
+      (match viewCoreTerm a g with
+       | CoreTermView.Case r ->
+           (match V.get r.arms (V.len r.arms - 1) with
+            | Just last ->
+                (match (viewCorePat a (coreArmPat a last), viewCoreTerm a (coreArmBody a last)) with
+                 | (CorePatView.PWild _, CoreTermView.Const c) ->
+                     (match viewCoreLit a c.lit with
+                      | CoreLitView.LBool b -> not b.value
+                      | _ -> False)
+                 | _ -> False)
+            | None -> False)
+       | _ -> False)
+  | None -> False
+
+-- What is said of `case` term `t`, if it misses a value: where it starts,
+-- and what.
+fun checked (table : Table) (a : CoreArena) (t : CoreTerm) : [(Int, String)] =
+  match viewCoreTerm a t with
+  -- A `match` an arm of which is a view is not said to be wrong: a set of
+  -- pattern synonyms may cover its type together (`pattern A | B`), which
+  -- the Rust compiler's check knows and core no longer says.
+  | CoreTermView.Case r if V.any (\arm -> viewed a arm) r.arms -> []
+  | CoreTermView.Case r ->
+      (let arms = V.filter (\arm -> M.isNone (coreArmGuard a arm)) r.arms in
+       let rows = V.map (\arm -> [patOf a (coreArmPat a arm)]) arms in
+       match missing table rows [tyCoreTerm a r.scrutinee] 0 with
+       | Just w ->
+           [(
+             metaStart (metaCoreTerm a t),
+             "non-exhaustive patterns: `${render (V.getOr (Any Error) w 0) False}` is not matched"
+           )]
+       | None -> [])
+  | _ -> []
+
+-- Every `case` under `t` that misses a value.
+fun within (table : Table) (a : CoreArena) (t : CoreTerm) : [(Int, String)] =
+  V.append (checked table a t) (V.concatMap (\k -> within table a k) (kids a t))
+
+-- What is wrong with the `match`es of `p`, each by the definition it is in,
+-- the byte it starts at and what is missed; `datas` are the types in sight,
+-- each with its constructors and their fields.
+@pub fun check (p : CoreProgram) (datas : [(String, Int, [(String, [Type])])])
+    : [(Int, Int, String)] =
+  let a = coreArena p in
+  let table =
+    V.foldl
+      (\h d ->
+        match d with
+        | (name, _, ctors) -> H.insert name (V.map (\c -> (bare (fst c), V.len (snd c))) ctors) h)
+      H.empty
+      datas
+  in V.concatMap
+       (\d -> V.map (\x -> (coreDefId a d, fst x, snd x)) (within table a (coreDefBody a d)))
+       (coreFileDefs a (coreRoot p))

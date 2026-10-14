@@ -229,12 +229,28 @@ fun arm src out (cx : Low s) (m : Meta) pat guard body =
          (M.unwrapOr (truth True) g)
          views
      in
+     -- What the guard found to match is taken apart again for what it binds.
+     -- It matches, so the arm after it is never taken: it is there so that
+     -- the `case` matches every value as a `match` must (`Exhaust`).
      let under =
        V.foldr
          (\view rest ->
            match view with
            | (_, _, _, q) ->
-               newCoreTermCase out m (seen view) [newCoreArm out m q None rest] (tyCoreTerm out b))
+               newCoreTermCase
+                 out
+                 m
+                 (seen view)
+                 [
+                   newCoreArm out m q None rest,
+                   newCoreArm
+                     out
+                     m
+                     (newCorePatPWild out m (tyCorePat out q))
+                     None
+                     (newCoreTermIll out m (tyCoreTerm out b))
+                 ]
+                 (tyCoreTerm out b))
          b
          views
      in newCoreArm out m p (Just holds) under)

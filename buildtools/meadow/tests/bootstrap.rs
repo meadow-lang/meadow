@@ -3128,6 +3128,83 @@ fn a_cfg_that_could_never_hold_is_refused_by_meadowboot() {
     );
 }
 
+/// A `match` that misses a value is refused where the build is strict -- the
+/// release profile, or `--strict` -- saying a value it misses, as the Rust
+/// compiler says it; a build that is not strict compiles it. A guard covers
+/// nothing, since it may fail, and a `match` that covers everything is not
+/// refused, however its patterns are nested.
+#[test]
+fn a_match_that_misses_a_value_is_refused_where_the_build_is_strict() {
+    let strict = ["--set", "strict=true"];
+    let missed = [
+        (
+            "ctor",
+            "data T = A | B | C
+
+use T.*
+
+fun f t = match t with | A -> 1 | B -> 2
+
+def result = f C
+",
+            "Main.mw:5:11: non-exhaustive patterns: `C` is not matched",
+        ),
+        (
+            "nested",
+            "fun f m = match m with | Just (Just x) -> x | None -> 0
+
+def result = f None
+",
+            "non-exhaustive patterns: `Just None` is not matched",
+        ),
+        (
+            "tuple",
+            "fun f p = match p with | (True, _) -> 1 | (_, False) -> 2
+
+def result = f (True, True)
+",
+            "non-exhaustive patterns: `(False, True)` is not matched",
+        ),
+        (
+            "number",
+            "fun f n = match n with | 0 -> 1
+
+def result = f 0
+",
+            "non-exhaustive patterns: `_` is not matched",
+        ),
+        (
+            "guard",
+            "fun f m = match m with | Just x if x > 0 -> x | None -> 0
+
+def result = f None
+",
+            "non-exhaustive patterns: `Just _` is not matched",
+        ),
+    ];
+    for (name, source, why) in missed {
+        let said = said_of_with(&format!("strict-{name}"), source, &strict);
+        assert!(
+            said.contains(why) && said.contains("not compiled"),
+            "{name}: {said}"
+        );
+        let lenient = said_of(&format!("lenient-{name}"), source);
+        assert!(
+            !lenient.contains("not compiled"),
+            "{name}, not strict: {lenient}"
+        );
+    }
+    let covered = said_of_with(
+        "strict-covered",
+        "fun f m = match m with | Just (Just x) -> x | Just None -> 1 | None -> 0
+
+def result = f None
+",
+        &strict,
+    );
+    assert!(!covered.contains("not compiled"), "{covered}");
+}
+
 /// What a program prints when it is asked for help, on either stream.
 fn help_of(exe: &Path, args: &[&str]) -> String {
     let out = Command::new(exe)
@@ -3224,6 +3301,11 @@ fn a_command_takes_what_meadow_s_takes() {
 /// What MeadowBoot's `lower` says of the program `source`, on either stream:
 /// the package is made in a directory named for `name`.
 fn said_of(name: &str, source: &str) -> String {
+    said_of_with(name, source, &[])
+}
+
+/// The same, MeadowBoot told `args` besides.
+fn said_of_with(name: &str, source: &str, args: &[&str]) -> String {
     let dir = std::env::temp_dir().join(format!("meadowboot-{name}-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("src")).expect("a package directory");
     std::fs::write(
@@ -3235,6 +3317,7 @@ fn said_of(name: &str, source: &str) -> String {
     std::fs::write(&main, source).expect("a source file");
     let out = Command::new(meadowboot_exe())
         .arg("lower")
+        .args(args)
         .arg(&main)
         .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
         .env_remove("MEADOWBOOT_EXPANSIONS")

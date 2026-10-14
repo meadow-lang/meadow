@@ -419,8 +419,6 @@ fun handedOn () =
 -- so that nobody takes a flag for honoured because it was accepted.
 fun unheeded (b : CliBuild) : [String] =
   V.concatMap (\x -> if fst x then [snd x] else []) [
-    (b.strict, "--strict"),
-    (b.lenient, "--lenient"),
     (b.noPrune, "--no-prune"),
     (M.isSome b.target, "--target"),
     (M.isSome b.nursery, "--nursery"),
@@ -448,6 +446,9 @@ fun driven (path : Maybe String) (b : CliBuild) (args : Maybe [String]) =
            V.concat [
              [("opt", "O${show (if level > 2 then 2 else level)}"), ("macros", "Glade")],
              (if V.isEmpty b.cfg then [] else [("flags", S.join "," b.cfg)]),
+             (if b.strict then [("strict", "true")]
+              else if b.lenient then [("strict", "false")]
+              else []),
              told ()
            ]
          in if not (buildUnits profile pairs r) then exit 1
