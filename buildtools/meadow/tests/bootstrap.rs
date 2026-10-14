@@ -3205,6 +3205,68 @@ def result = f None
     assert!(!covered.contains("not compiled"), "{covered}");
 }
 
+/// `meadowboot test` runs a package's `@test` functions -- the root module's
+/// and another's, private ones too -- compiled by MeadowBoot, and says each
+/// and what failed as `meadow test` says them; it fails when a test does, and
+/// a filter after the package runs only the tests whose names have it.
+#[test]
+fn a_package_s_tests_are_run_by_meadowboot_as_meadow_test_runs_them() {
+    let dir = std::env::temp_dir().join(format!("meadowboot-tests-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).expect("a package directory");
+    std::fs::write(
+        dir.join("Meadow.toml"),
+        "[package]\nname = \"Tp\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("a manifest");
+    std::fs::write(
+        dir.join("src").join("Main.mw"),
+        "mod Sums\n\nuse Std.Test (assert)\n\n@test fun addsUp () = assert (1 + 1 == 2) \"sums\"\n\n\
+         @test fun isWrong () = assert (1 > 2) \"one is not more than two\"\n\n\
+         fun main () = println \"hi\"\n",
+    )
+    .expect("the root module");
+    std::fs::write(
+        dir.join("src").join("Sums.mw"),
+        "use Std.Test (assert)\n\nfun double x = x * 2\n\n@test fun doubles () = assert (double 4 == 8) \"doubles\"\n",
+    )
+    .expect("a module");
+    let run = |more: &[&str]| {
+        let out = Command::new(meadowboot_exe())
+            .arg("test")
+            .arg(&dir)
+            .args(more)
+            .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+            .env("MEADOW", meadow())
+            .env_remove("MEADOWBOOT_EXPANSIONS")
+            .output()
+            .expect("MeadowBoot runs");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+    let (code, said) = run(&[]);
+    for line in [
+        "running 3 tests",
+        "test addsUp ... ok",
+        "test isWrong ... FAILED",
+        "test Sums.doubles ... ok",
+        "---- isWrong ----\n\"one is not more than two\"",
+        "test result: FAILED. 2 passed; 1 failed",
+    ] {
+        assert!(said.contains(line), "no `{line}` in:\n{said}");
+    }
+    assert_eq!(code, Some(1), "{said}");
+    let (code, said) = run(&["Sums"]);
+    assert!(
+        said.contains("running 1 test\n") && said.contains("test result: ok. 1 passed; 0 failed"),
+        "{said}"
+    );
+    assert_eq!(code, Some(0), "{said}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// What a program prints when it is asked for help, on either stream.
 fn help_of(exe: &Path, args: &[&str]) -> String {
     let out = Command::new(exe)

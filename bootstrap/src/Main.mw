@@ -15,6 +15,8 @@ mod Lint
 mod Dictionaries
 mod Inline
 mod Eta
+mod Exhaust
+mod Tests
 mod Cek
 mod Syntax
 mod Parse
@@ -36,6 +38,7 @@ use Std.Result.Result.*
 use MeadowBoot.Cek as Cek
 use MeadowBoot.Cek (Machine)
 use MeadowBoot.Seq as Seq
+use MeadowBoot.Tests as Tests
 use MeadowBoot.Parse (parsed, checked)
 use MeadowBoot.Fixity (chainsOf)
 use MeadowBoot.Unit (packageOf, absolute)
@@ -384,6 +387,27 @@ fun run (every : CliOptions) (cli : Cli) =
   match cli with
   | Cli.Build r -> driven r.path r.build None
   | Cli.Run r -> driven r.path r.build (Just r.args)
+  -- The standard library's own tests are `meadow`'s to run, for now.
+  | Cli.Test r if r.std -> handedOn ()
+  | Cli.Test r ->
+      let said =
+        V.foldl
+          (\u flag -> writeError "meadowboot: `${flag}` is not acted on yet\n")
+          ()
+          (V.concat [
+             if M.isSome r.testThreads then ["--test-threads"] else [],
+             if r.noCapture then ["--no-capture"] else [],
+             if r.cek then ["--cek"] else []
+           ])
+      in driven
+           r.path
+           r.build
+           (Just
+              (V.concat [
+                 ["--test"],
+                 M.unwrapOr [] (M.map (\f -> [f]) r.filter),
+                 if r.exact then ["--exact"] else []
+               ]))
   | Cli.Lex r -> finish (V.foldl (\ok p -> lexFile p and ok) True r.files)
   | Cli.Eval r -> finish (V.foldl (\ok p -> evalFile p and ok) True r.files)
   | Cli.Parse r -> finish (V.foldl (\ok p -> parseFile p and ok) True r.files)
@@ -432,7 +456,10 @@ fun unheeded (b : CliBuild) : [String] =
 -- -- its macros run on Glade -- and that handed to the back end, `meadow
 -- cut`, to build, or to run with `args` where there are any to give.
 fun driven (path : Maybe String) (b : CliBuild) (args : Maybe [String]) =
-  let theirs = M.unwrapOr [] args in
+  -- `test` is a build with `@cfg(test)` holding, entered at what runs the
+  -- tests (`Tests`), and what follows `--test` is that program's.
+  let testing = M.unwrapOr False (M.map (\xs -> V.getOr "" xs 0 == "--test") args) in
+  let theirs = if testing then V.drop (M.unwrapOr [] args) 1 else M.unwrapOr [] args in
   let place = absolute (M.unwrapOr "." path) in
   let root = if S.endsWith ".mw" place then packageOf place else Just place in
   let said =
@@ -449,6 +476,7 @@ fun driven (path : Maybe String) (b : CliBuild) (args : Maybe [String]) =
              (if b.strict then [("strict", "true")]
               else if b.lenient then [("strict", "false")]
               else []),
+             (if testing then [("test", "true"), ("entry", Tests.runner)] else []),
              told ()
            ]
          in if not (buildUnits profile pairs r) then exit 1

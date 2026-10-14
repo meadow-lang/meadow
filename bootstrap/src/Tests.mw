@@ -1,0 +1,162 @@
+-- `test`: a package's `@test` functions, run by a program of the package's
+-- own, which is what `meadow test` runs (`buildtools/meadow/src/test.rs`).
+--
+-- A build with `test` set -- which only the package being tested is, never
+-- what it depends on -- reads each of its modules with a little more at the
+-- end than the file says: the module's tests, by name, in a list another
+-- module may ask for, and in the root module a function that runs every
+-- one. Nothing is written to disk, and nothing a test is or names changes:
+-- a test may be private to its module, since the list is the module's own;
+-- and it is compiled as everything else is, by this compiler.
+--
+-- A test is `@test fun name () = …`, run with `()`. It fails by performing
+-- `Std.Test.fail` -- which `assert` and `assertEq` do -- and the run goes
+-- on to the next. Each is said as it finishes, `test Module.name ... ok`,
+-- and at the end what failed and why, then `test result: ok. 3 passed; 0
+-- failed`, as `meadow test` says it. What a test is given after `--` is a
+-- filter of names, `--exact` for a whole name.
+--
+-- Not yet as `meadow test` has it: tests are run one at a time, what they
+-- print is not kept to be shown beside a failure, and a test that stops the
+-- program -- a runtime error -- stops the run.
+
+use Std.Collections.Vector as V
+use Std.String as S
+use Std.Path as Path
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+
+-- What the root module is entered at in a build that tests.
+@pub def runner : String = "meadowTestsMainQ"
+
+-- The names of the functions `text` says are tests: each `fun` an `@test` is
+-- written on, on its line or the one before.
+@pub fun testsIn (text : String) : [String] =
+  let lines = S.lines text in
+  V.concatMap
+    (\i ->
+      (let line = S.trimStart (V.getOr "" lines i) in
+       if not (S.startsWith "@test" line) then []
+       else
+         (let here = funAfter line in
+          match here with
+          | Just name -> [name]
+          | None ->
+              M.unwrapOr
+                []
+                (M.map (\n -> [n]) (funAfter (S.trimStart (V.getOr "" lines (i + 1))))))))
+    (V.range 0 (V.len lines))
+
+-- The name a `fun` on `line` defines, if one is there after its attributes.
+fun funAfter (line : String) : Maybe String =
+  let words = V.filter (\w -> not (S.isEmpty w)) (S.split " " line) in
+  let at =
+    V.foldl
+      (\found i ->
+        if M.isSome found then found else if V.getOr "" words i == "fun" then Just i else None)
+      None
+      (V.range 0 (V.len words))
+  in match at with
+     | Just i -> (let name = V.getOr "" words (i + 1) in if S.isEmpty name then None else Just name)
+     | None -> None
+
+-- The module a file under `src` of the package at `dir` is: its path, `[]`
+-- for the root.
+fun moduleOf (dir : String) (file : String) : Maybe [String] =
+  let src = Path.normalize (Path.join dir "src") in
+  let f = Path.normalize file in
+  if not (S.startsWith src f) or not (S.endsWith ".mw" f) then None
+  else
+    (let rel = S.drop f (stringByteLength src + 1) in
+     let bare = S.take rel (stringByteLength rel - 3) in
+     let path = V.filter (\p -> not (S.isEmpty p)) (S.split "/" (S.join "/" (S.split "\\" bare))) in
+     if path == ["Main"] or path == ["Lib"] then Just [] else Just path)
+
+-- The list of a module's tests, as it is written at its end.
+fun listed (path : [String]) (names : [String]) : String =
+  let qualified = \n -> if V.isEmpty path then n else "${S.join "." path}.${n}" in
+  -- Each is run for what it does, not what it answers: a test that answers
+  -- something is a test all the same, and a list holds one type.
+  let entry = \n -> "(\"${qualified n}\", \\() -> (let r = ${n} () in ()))" in
+  "\n\n@pub def meadowTestsHereQ = [${S.join ", " (V.map entry names)}]\n"
+
+-- The package's sources, `pkg`'s at `dir`, each module with its tests listed
+-- at its end and the root with what runs them.
+@pub fun withTests (pkg : String) (dir : String) (sources : [(String, String)])
+    : [(String, String)] =
+  let modules =
+    V.concatMap
+      (\s ->
+        match moduleOf dir (fst s) with
+        | Just path -> [(fst s, path, testsIn (snd s))]
+        | None -> [])
+      sources
+  in
+  let others =
+    V.concatMap
+      (\m ->
+        match m with
+        | (_, path, names) -> if V.isEmpty path or V.isEmpty names then [] else [path])
+      modules
+  in V.map
+       (\s ->
+         match V.find (\m -> match m with | (f, _, _) -> f == fst s) modules with
+         | Just (_, path, names) ->
+             (let mine = if V.isEmpty names then "" else listed path names in
+              if V.isEmpty path then (fst s, snd s ++ listed [] names ++ runs pkg others)
+              else (fst s, snd s ++ mine))
+         | None -> s)
+       sources
+
+-- What the root module runs its tests and the other modules' with.
+fun runs (pkg : String) (others : [[String]]) : String =
+  let uses =
+    V.map
+      (\i -> "use ${pkg}.${S.join "." (V.getOr [] others i)} as MeadowTests${show i}Q\n")
+      (V.range 0 (V.len others))
+  in
+  let lists =
+    V.append
+      ["meadowTestsHereQ"]
+      (V.map (\i -> "MeadowTests${show i}Q.meadowTestsHereQ") (V.range 0 (V.len others)))
+  in S.join "" [
+       "\nuse Std.Test as MeadowTestsTQ\n",
+       "use Std.Collections.Vector as MeadowTestsVQ\n",
+       "use Std.String as MeadowTestsSQ\n",
+       "use Std.Process as MeadowTestsPQ\n",
+       S.join "" uses,
+       "\n@pub fun meadowTestsMainQ () : () ! Eff =\n",
+       "  let asked = MeadowTestsPQ.argv () in\n",
+       "  let exact = MeadowTestsVQ.elem \"--exact\" asked in\n",
+       "  let filter = MeadowTestsVQ.get (MeadowTestsVQ.filter (\\a -> a != \"--exact\") asked) 0 in\n",
+       "  let cases = MeadowTestsVQ.filter (\\c -> meadowTestsWantedQ exact filter (fst c)) (MeadowTestsVQ.concat [",
+       S.join ", " lists,
+       "]) in\n",
+       "  let n = MeadowTestsVQ.len cases in\n",
+       "  let u = println \"running \${show n} test\${if n == 1 then \"\" else \"s\"}\" in\n",
+       "  let failed =\n",
+       "    MeadowTestsVQ.concatMap\n",
+       "      (\\c ->\n",
+       "        match c with\n",
+       "        | (name, t) ->\n",
+       "            (match MeadowTestsTQ.failure t with\n",
+       "             | (True, why) -> (let w = println \"test \${name} ... FAILED\" in [(name, why)])\n",
+       "             | (False, _) -> (let w = println \"test \${name} ... ok\" in [])))\n",
+       "      cases\n",
+       "  in\n",
+       "  let v =\n",
+       "    if MeadowTestsVQ.isEmpty failed then ()\n",
+       "    else\n",
+       "      (let a = println \"\" in\n",
+       "       let b = println \"failures:\" in\n",
+       "       let c = println \"\" in\n",
+       "       MeadowTestsVQ.foldl (\\z f -> (let x = println \"---- \${fst f} ----\" in let y = println (show (snd f)) in println \"\")) () failed)\n",
+       "  in\n",
+       "  let w = println \"\" in\n",
+       "  let x = println \"test result: \${if MeadowTestsVQ.isEmpty failed then \"ok\" else \"FAILED\"}. \${show (n - MeadowTestsVQ.len failed)} passed; \${show (MeadowTestsVQ.len failed)} failed\" in\n",
+       "  if MeadowTestsVQ.isEmpty failed then () else MeadowTestsPQ.exit 1\n",
+       "\nfun meadowTestsWantedQ exact filter name =\n",
+       "  match filter with\n",
+       "  | None -> True\n",
+       "  | Just f -> if exact then name == f else MeadowTestsSQ.contains f name\n"
+     ]

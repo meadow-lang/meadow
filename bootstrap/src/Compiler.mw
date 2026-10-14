@@ -51,6 +51,7 @@ use MeadowBoot.Dictionaries as Dictionaries
 use MeadowBoot.Inline as Inline
 use MeadowBoot.Eta as Eta
 use MeadowBoot.Exhaust as Exhaust
+use MeadowBoot.Tests as Tests
 use MeadowBoot.Dictionaries (emptySummary)
 use MeadowBoot.Types
 use MeadowBoot.Core (CoreProgram, joinedUnits)
@@ -1082,7 +1083,7 @@ fun unitDatabaseWith
     (cfg : Cfg)
     (kept : [(String, String, Int, Int, String)]) =
   let db = newCompiler () in
-  let sources = unitSources u in
+  let sources = testedSources cfg.test u in
   let a = setCompilerFiles db 0 (V.map fst sources) in
   let b = setCompilerImported db 0 (V.map snd (unitImports u)) in
   let h = setCompilerHome db 0 (unitDir u) in
@@ -1090,6 +1091,21 @@ fun unitDatabaseWith
   let g = setCompilerCfg db 0 cfg in
   let c = V.foldl (\acc s -> setCompilerSource db (fst s) (snd s)) () sources in
   db
+
+-- A unit's sources, and where it is being tested -- only the package asked
+-- for ever is -- each module with its tests listed at its end and the root
+-- with what runs them (`Tests`).
+fun testedSources (test : Bool) (u : Given Interface) : [(String, String)] =
+  let sources = unitSources u in
+  if not test then sources
+  else
+    (let pkg =
+       M.unwrapOr
+         ""
+         (M.map
+            (\s -> packageName (snd s))
+            (V.find (\s -> S.endsWith "Meadow.toml" (fst s)) sources))
+     in Tests.withTests pkg (unitDir u) sources)
 
 -- What a unit's macros answered, as it is kept: each call's file, key and
 -- place, and its answer as its macro wrote it, one `Wire` after another.
@@ -1261,7 +1277,7 @@ fun compiling (o : UnitsOptions) (u : Given Interface) =
   -- A unit's files are parsed, and their operators grouped, each on a thread
   -- of its own: neither needs what another file's comes to.
   let db = parallelCompiler (unitDatabaseWith u (cfgOf o) []) in
-  let sources = V.filter (\s -> S.endsWith ".mw" (fst s)) (unitSources u) in
+  let sources = V.filter (\s -> S.endsWith ".mw" (fst s)) (testedSources o.test u) in
   let files = V.map fst sources in
   let parsed = compilerParsedEach db files in
   let m1 = mark "parsed" in
@@ -1381,7 +1397,7 @@ fun compiling (o : UnitsOptions) (u : Given Interface) =
                        M.unwrapOr None (V.get groups (indexOf files (fst s)))
                      else None
                    ))
-                 (unitSources u))
+                 (testedSources o.test u))
               asts
               None
               -- A unit of a build that is optimised as one program is
