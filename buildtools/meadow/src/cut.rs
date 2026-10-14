@@ -95,6 +95,12 @@ fn image_key(path: &Path) -> Option<(PathBuf, String, u64)> {
     Some((root.join("target").join("cut"), stem, h.finish()))
 }
 
+/// Lower it for Glade and keep the image, running nothing: what a later
+/// run of the same program reads rather than lowering it again.
+pub fn kept_for_glade(path: &Path) -> Result<(), String> {
+    image(path).map(|_| ())
+}
+
 /// Run it on Glade: compiled to bytecode, which is interpreted, and what
 /// runs often compiled to machine code as it goes -- as `meadow run` does.
 /// Where there is no JIT for the machine, it is interpreted throughout.

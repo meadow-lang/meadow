@@ -302,6 +302,10 @@ enum Cmd {
             value_name = "LEVEL"
         )]
         opt: u8,
+        /// Build what would be run -- the bytecode image, or the executable
+        /// -- and stop: what a front end's `build` asks for.
+        #[arg(long)]
+        no_run: bool,
         /// What the program is given, after `--`: what its `argv` answers.
         #[arg(last = true, value_name = "ARGS")]
         args: Vec<String>,
@@ -1008,6 +1012,7 @@ fn command() {
             runtime,
             aot: ahead,
             opt,
+            no_run,
             args,
         }) => {
             let opt = match opt {
@@ -1016,6 +1021,15 @@ fn command() {
                 _ => meadow_compiler::OptLevel::O2,
             };
             let ran = match aot::Runtime::named(&runtime) {
+                Some(aot::Runtime::Glade) if no_run && ahead => {
+                    meadow::cut::build_for_glade(&file, opt).map(|_| 0)
+                }
+                Some(aot::Runtime::Glade) if no_run => {
+                    meadow::cut::kept_for_glade(&file).map(|()| 0)
+                }
+                Some(aot::Runtime::Silo) if no_run => {
+                    meadow::cut::build_for_silo(&file, opt).map(|_| 0)
+                }
                 Some(aot::Runtime::Glade) if ahead => meadow::cut::build_for_glade(&file, opt)
                     .and_then(|exe| {
                         std::process::Command::new(&exe)

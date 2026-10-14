@@ -39,6 +39,9 @@ beyond the last release is under _Unreleased_.
 
 ### Added
 
+- `meadow cut --no-run` builds what would be run -- the bytecode image, or the
+  executable with `--aot` or `--runtime silo` -- and stops: what a front end's
+  `build` asks the back end for.
 - Property tests and fuzzing in the standard library. `Std.Test.Property`
   checks a property on a hundred values a generator makes -- `forAll gen
   prop`, or `check` where the property draws for itself -- and fails with the
