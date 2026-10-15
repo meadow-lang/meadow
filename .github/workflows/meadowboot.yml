@@ -1,0 +1,169 @@
+# Build MeadowBoot -- the Meadow compiler written in Meadow -- for every
+# platform it runs on, and attach an archive of it to the release of the tag
+# pushed. Each archive holds MeadowBoot, the `meadow` it hands the back end to
+# (built from the same commit), and the standard library's sources, which it
+# compiles: MeadowBoot finds the other two beside itself.
+#
+# Cut one by pushing a tag, which is pushed once and does not move:
+#
+#     git tag meadowboot-v0.1.0-pre.3 && git push origin meadowboot-v0.1.0-pre.3
+#
+# A tag with no release yet is given one, as a prerelease that is not the
+# latest: `meadow`'s own releases are `release.yml`'s. Each target is built on
+# a runner of its own system and processor, since `meadow` compiles MeadowBoot
+# natively for the machine it is on. A manual run builds everything and keeps
+# the archives as artifacts without publishing.
+
+name: meadowboot
+
+on:
+  push:
+    tags: ["meadowboot-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    # A target marked experimental that fails does not hold up the others:
+    # `publish` needs this job, and one red leg would otherwise skip it.
+    continue-on-error: ${{ matrix.experimental == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          # Built natively on the platforms' own runners, and experimental
+          # until each has been seen to work: Silo on ARM has been run under
+          # emulation only, and the Intel macOS runner is the last of its kind.
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            experimental: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            experimental: true
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+            experimental: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # As in `release.yml`: the macos-26 image's Command Line Tools link
+      # against an SDK they cannot read, and Xcode's, named three ways, is one
+      # they can. A native build links with clang, so MeadowBoot's does too.
+      - name: Use Xcode's SDK
+        if: runner.os == 'macOS'
+        run: |
+          xcode=$(ls -d /Applications/Xcode_*.app | sort -V | tail -n 1)
+          sdk="$xcode/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+          echo "DEVELOPER_DIR=$xcode/Contents/Developer" >> "$GITHUB_ENV"
+          echo "SDKROOT=$sdk" >> "$GITHUB_ENV"
+          sudo ln -sfn "$sdk" /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
+
+      - name: Install Rust
+        run: rustup update stable
+
+      # Silo links with clang: the Windows images carry LLVM but leave it off
+      # the path.
+      - name: Put LLVM on the path
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH"
+
+      - name: Which clang
+        shell: bash
+        run: clang --version
+
+      - name: Build meadow
+        working-directory: buildtools
+        run: cargo build --release -p meadow
+
+      # MeadowBoot's dependencies (Lingua, Scythe) are fetched by git.
+      - name: Build MeadowBoot
+        shell: bash
+        run: |
+          meadow=buildtools/target/release/meadow
+          [ -f "$meadow.exe" ] && meadow="$meadow.exe"
+          "$meadow" build --release bootstrap
+
+      - name: Bundle
+        shell: bash
+        run: |
+          exe=""
+          [ "$RUNNER_OS" = "Windows" ] && exe=".exe"
+          dir="meadowboot-${{ matrix.target }}"
+          mkdir -p "$dir/lib/Std"
+          cp "bootstrap/target/release/native/silo/MeadowBoot$exe" "buildtools/target/release/meadow$exe" "$dir/"
+          cp lib/Std/Meadow.toml "$dir/lib/Std/"
+          cp -r lib/Std/src "$dir/lib/Std/"
+          if [ "$RUNNER_OS" != "Windows" ]; then strip "$dir/MeadowBoot" "$dir/meadow"; fi
+          echo "BUNDLE=$dir" >> "$GITHUB_ENV"
+
+      # The bundle on its own, told nothing: a program runs, and a package
+      # that exports to C builds to a library named for it.
+      - name: Smoke test
+        shell: bash
+        run: |
+          exe=""
+          [ "$RUNNER_OS" = "Windows" ] && exe=".exe"
+          mb="$PWD/$BUNDLE/MeadowBoot$exe"
+          work="$RUNNER_TEMP/smoke"
+          mkdir -p "$work/Hello/src" "$work/Lib/src"
+          printf '[package]\nname = "Hello"\nversion = "0.1.0"\n' > "$work/Hello/Meadow.toml"
+          printf 'use Std.Num.Float as F\n\nfun main () = println (show (F.round (F.sqrt 2.0 *. 100.0)))\n' > "$work/Hello/src/Main.mw"
+          printf '[package]\nname = "Lib"\nversion = "0.1.0"\n' > "$work/Lib/Meadow.toml"
+          printf '@export\nfun twice (x : Int) : Int = x * 2\n' > "$work/Lib/src/Main.mw"
+          cd "$work"
+          env -u MEADOW -u MEADOWBOOT_STD "$mb" run Hello | tail -1 | grep -qx '141'
+          env -u MEADOW -u MEADOWBOOT_STD "$mb" build Lib
+          ls Lib/target/debug/native/silo/ | grep -E '^(Lib\.dll|libLib\.so|libLib\.dylib)$'
+
+      # A zip whose paths use forward slashes, which every unzip reads:
+      # 7-Zip's.
+      - name: Archive
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a -tzip "$BUNDLE.zip" "$BUNDLE" > /dev/null
+            echo "ARCHIVE=$BUNDLE.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "$BUNDLE.tar.gz" "$BUNDLE"
+            echo "ARCHIVE=$BUNDLE.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUNDLE }}
+          path: ${{ env.ARCHIVE }}
+
+  publish:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          if ! gh release view "$TAG" -R "$REPO" > /dev/null 2>&1; then
+            gh release create "$TAG" -R "$REPO" --verify-tag --prerelease --latest=false \
+              --title "MeadowBoot ${TAG#meadowboot-v}" \
+              --notes "MeadowBoot built from ${GITHUB_SHA::7}: each archive holds MeadowBoot, a \`meadow\` from the same commit, and \`lib/Std\`. Native builds need \`clang\` on \`PATH\`."
+          fi
+          gh release upload "$TAG" -R "$REPO" dist/* --clobber
