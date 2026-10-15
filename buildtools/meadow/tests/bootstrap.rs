@@ -3277,11 +3277,24 @@ fn a_package_s_tests_are_run_by_meadowboot_as_meadow_test_runs_them() {
 fn a_function_meadowboot_exports_is_called_from_c() {
     let root = std::env::temp_dir().join(format!("meadowboot-exports-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
+    // A dependency's exports are the library's too.
+    let dep = root.join("Dep");
+    std::fs::create_dir_all(dep.join("src")).expect("a package directory");
+    std::fs::write(
+        dep.join("Meadow.toml"),
+        "[package]\nname = \"Dep\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("a manifest");
+    std::fs::write(
+        dep.join("src").join("Lib.mw"),
+        "@export\nfun dep_three () : Int = 3\n",
+    )
+    .expect("the dependency's source");
     let lib = root.join("Lib");
     std::fs::create_dir_all(lib.join("src")).expect("a package directory");
     std::fs::write(
         lib.join("Meadow.toml"),
-        "[package]\nname = \"Lib\"\nversion = \"0.1.0\"\n",
+        "[package]\nname = \"Lib\"\nversion = \"0.1.0\"\n\n[dependencies]\nDep = { path = \"../Dep\" }\n",
     )
     .expect("a manifest");
     std::fs::write(
@@ -3350,7 +3363,8 @@ fn a_function_meadowboot_exports_is_called_from_c() {
              let failing = (\n    \
              R.andThen (\\f -> Ffi.callInt f [Arg.Int 7]) (call \"broken\" []),\n    \
              R.andThen (\\f -> Ffi.callInt f [Arg.Int 21]) (call \"twice\" []),\n    \
-             R.andThen (\\f -> Ffi.callInt f [Arg.Int 7]) (call \"guarded\" [])\n  )\n  \
+             R.andThen (\\f -> Ffi.callInt f [Arg.Int 7]) (call \"guarded\" []),\n    \
+             R.andThen (\\f -> Ffi.callInt f []) (call \"dep_three\" [])\n  )\n  \
              in\n  \
              let u = println \"${{shown:?}}\" in\n  \
              println \"${{failing:?}}\"\n",
@@ -3372,9 +3386,10 @@ fn a_function_meadowboot_exports_is_called_from_c() {
     );
     // A call that fails answers zero, and C goes on: the library's next call
     // is answered, and one of its functions calling another through C gets
-    // control back and is told why that one failed.
+    // control back and is told why that one failed. And the dependency's
+    // function is called as the library's own are.
     assert!(
-        said.contains("(Ok(0), Ok(42), Ok(1))"),
+        said.contains("(Ok(0), Ok(42), Ok(1), Ok(3))"),
         "{said}{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -3631,11 +3646,18 @@ fn axcut_answer(text: &str) -> String {
         Ok(l) => l,
         Err(e) => return format!("not lowered: {e}"),
     };
-    match Machine::run(&lowered, 500_000_000) {
-        Ok(Value::Str(s)) => s.to_string(),
-        Ok(v) => format!("answered {v}, not a string"),
-        Err(e) => format!("fails: {e:?}"),
-    }
+    // On a thread of its own, with room: the machine recurses as deep as
+    // the program does, past what a test's thread is given.
+    std::thread::Builder::new()
+        .stack_size(256 << 20)
+        .spawn(move || match Machine::run(&lowered, 500_000_000) {
+            Ok(Value::Str(s)) => s.to_string(),
+            Ok(v) => format!("answered {v}, not a string"),
+            Err(e) => format!("fails: {e:?}"),
+        })
+        .expect("a thread")
+        .join()
+        .unwrap_or_else(|_| "the machine panicked".to_string())
 }
 
 #[test]
