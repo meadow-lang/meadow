@@ -58,7 +58,7 @@ use Std.String as S
 use Std.Maybe as M
 use Std.Maybe.Maybe.*
 use Std.Collections.Vector as V
-use Std.Fs (Fs, readToString, writeString, createDirAll, copy)
+use Std.Fs (Fs, readToString, writeString, createDirAll, copy, exists)
 use Std.Console (writeOutput, writeError)
 use Std.Exn (catch)
 use Lingua.Query (QueryError)
@@ -428,8 +428,17 @@ fun run (every : CliOptions) (cli : Cli) =
   -- What is not MeadowBoot's yet is `meadow`'s, asked the same way.
   | _ -> handedOn ()
 
--- The Rust compiler's `meadow`: where `MEADOW` says, or the one on the path.
-fun meadow () = M.unwrapOr "meadow" (getEnv "MEADOW")
+-- The Rust compiler's `meadow`: where `MEADOW` says, the one beside this
+-- program -- as a release of it has them -- or the one on the path.
+fun meadow () =
+  match getEnv "MEADOW" with
+  | Just m -> m
+  | None ->
+      (let named = if hostOs == "windows" then "meadow.exe" else "meadow" in
+       match Path.parent (Proc.currentExe ()) with
+       | Just dir ->
+           (let beside = Path.join dir named in if exists beside then beside else "meadow")
+       | None -> "meadow")
 
 -- This command line as it was written, given to `meadow`, and its answer
 -- this program's: the tools MeadowBoot does not have yet, behind the command
@@ -1076,13 +1085,7 @@ fun gladeRound
                     in
                     let w = writeString (given, text) in
                     let x = writeString (said, "") in
-                    (match Proc.run (M.unwrapOr "meadow" (getEnv "MEADOW")) [
-                       "cut",
-                       program,
-                       "--",
-                       given,
-                       said
-                     ] with
+                    (match Proc.run (meadow ()) ["cut", program, "--", given, said] with
                      | Err why -> failing "the back end could not be run: ${why}"
                      | Ok (code, out, err) ->
                          let m2 = stamp "wave ${show wave} ran ${show (V.len theirs)} calls" in

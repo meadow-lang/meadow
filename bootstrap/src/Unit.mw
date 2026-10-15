@@ -12,7 +12,7 @@
 -- "text"`, and inline tables of those, `Name = { path = "../x" }`.
 
 use Std.Fs (Fs, readToString, readDir, isDir, exists)
-use Std.Process (Process, getEnv)
+use Std.Process (Process, getEnv, currentExe)
 use Std.Path as Path
 use Std.Collections.Vector as V
 use Std.String as S
@@ -109,7 +109,7 @@ fun under (dir : String) : [String] ! { Fs | e } =
 @pub fun dependenciesOf (root : String) (dir : String) (text : String)
     : Result String [String] ! { Fs, Process | e } =
   let manifest = readToml text in
-  let std = M.map absolute (getEnv "MEADOWBOOT_STD") in
+  let std = stdDir () in
   let named = V.filter (\(e : Entry) -> e.section == "dependencies") manifest in
   let found =
     V.foldl
@@ -126,6 +126,18 @@ fun under (dir : String) : [String] ! { Fs | e } =
      | (Err why, _) -> Err why
      | (Ok ds, Just s) -> Ok (if absolute dir == s then ds else V.pushBack ds s)
      | (Ok ds, None) -> Ok ds
+
+-- Where the standard library's sources are: where `MEADOWBOOT_STD` says, or
+-- `lib/Std` beside this program, as a release of it lays them out.
+@pub fun stdDir () : Maybe String ! { Fs, Process | e } =
+  match getEnv "MEADOWBOOT_STD" with
+  | Just s -> Just (absolute s)
+  | None ->
+      (match Path.parent (currentExe ()) with
+       | Just dir ->
+           (let beside = Path.join dir "lib/Std" in
+            if isDir beside then Just (absolute beside) else None)
+       | None -> None)
 
 -- Where dependency `e` of the unit at `dir` is.
 fun locate (root : String) (dir : String) (e : Entry) : Result String String ! { Fs, Process | f } =
