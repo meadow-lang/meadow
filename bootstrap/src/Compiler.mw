@@ -499,8 +499,38 @@ fun checkedOf
                  (Exhaust.check written (V.append (sigsOf known) (Seq.datasOf written)))
            | None -> [])
       in
+      -- A value a module defines twice, at the second: where the Rust
+      -- renamer refuses it, which would otherwise be taken for an overload
+      -- of the first and fail as one.
+      let twice =
+        if not checked then []
+        else
+          V.concatMap
+            (\(e : Export) ->
+              if e.kind != "v" or not (S.isEmpty e.owner) or S.startsWith "$" e.name then []
+              else if V.any
+                (\(x : Export) ->
+                  x.kind == "v"
+                    and S.isEmpty x.owner
+                    and x.name == e.name
+                    and x.module == e.module
+                    and x.binder < e.binder)
+                r.exports then
+                (match M.andThen
+                   (\(b : Binder) ->
+                     match S.indexOf "@" b.site with
+                     | Just k ->
+                         Just (S.take b.site k, M.unwrapOr 0 (S.toInt (S.drop b.site (k + 1))))
+                     | None -> None)
+                   (V.get r.binders e.binder) with
+                 | Just (file, at) ->
+                     ["${file}:${placeIn (M.unwrapOr "" (H.lookup file texts)) at}: `${e.name}` is already defined in this module"]
+                 | None -> ["`${e.name}` is already defined in this module"])
+              else [])
+            r.exports
+      in
       let problems =
-        if checked then V.concat [undefined, placedSaid, unmatched] else done.problems
+        if checked then V.concat [undefined, twice, placedSaid, unmatched] else done.problems
       in
       let program = isProgram r.exports in
       -- What C may call: each function an `@export` is written on, with the

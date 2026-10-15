@@ -3565,6 +3565,11 @@ fn a_program_that_is_wrong_is_refused_by_meadowboot_with_what_is_wrong() {
             "type mismatch: `(a, b, c)` vs `(a, b)`",
         ),
         (
+            "twice",
+            "fun f (x : Int) : Int = x\n\ndef f = 3\n\ndef result = 1\n",
+            "Main.mw:3:5: `f` is already defined in this module",
+        ),
+        (
             "module",
             "use Std.Nope as N\n\ndef result = 1\n",
             "Main.mw:1:5: no module `Std.Nope`",
