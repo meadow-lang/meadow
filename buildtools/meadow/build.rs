@@ -239,11 +239,19 @@ fn build(out: &Path, name: &str) -> Result<Vec<u8>, String> {
     ] {
         cmd.env_remove(var);
     }
-    let status = cmd
-        .status()
+    let built = cmd
+        .output()
         .map_err(|e| format!("could not run cargo: {e}"))?;
-    if !status.success() {
-        return Err(format!("`cargo build` in {name} failed ({status})"));
+    if !built.status.success() {
+        // What it said is in this script's output, which cargo keeps to
+        // itself: the end of it goes in the warning, where it is seen.
+        let said = String::from_utf8_lossy(&built.stderr);
+        let lines: Vec<&str> = said.lines().collect();
+        let tail = lines[lines.len().saturating_sub(15)..].join("\ncargo:warning=  ");
+        return Err(format!(
+            "`cargo build` in {name} failed ({}):\ncargo:warning=  {tail}",
+            built.status
+        ));
     }
     let lib = if target.contains("windows-msvc") {
         format!("meadow_{name}.lib")
