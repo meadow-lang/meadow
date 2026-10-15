@@ -138,6 +138,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The macos-26 image's Command Line Tools link against an SDK they
+      # cannot read ("unknown architecture arm64e.x1-macos"). Xcode's own SDK,
+      # named three ways -- the developer directory, `SDKROOT`, and the path
+      # the Command Line Tools look at -- is one they can. Harmless on the
+      # image before it, which needs none of this; a run lands on either
+      # while the image rolls out, and says which under "Set up job".
+      - name: Use Xcode's SDK
+        if: runner.os == 'macOS'
+        run: |
+          xcode=$(ls -d /Applications/Xcode_*.app | sort -V | tail -n 1)
+          sdk="$xcode/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+          echo "DEVELOPER_DIR=$xcode/Contents/Developer" >> "$GITHUB_ENV"
+          echo "SDKROOT=$sdk" >> "$GITHUB_ENV"
+          sudo ln -sfn "$sdk" /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
+
       - name: Install Rust
         run: rustup update stable && rustup target add ${{ matrix.target }}
 
