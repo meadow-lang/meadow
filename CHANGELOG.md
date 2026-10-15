@@ -68,7 +68,8 @@ beyond the last release is under _Unreleased_.
   each runs on a stack of its own, let go of when it fails. The message is on
   stderr, and `Std.Ffi.failure ()` answers it once, so a plugin that calls
   its own function through C, by address, can tell its host what went wrong.
-- `Std.Num.Float`: `sqrt`, `sin`, `cos`, `tan`, `atan`, `atan2`, `hypot`,
+- `Std.Num.Float`: `sqrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`,
+  `exp`, `ln`, `pow`, `hypot`,
   `ceil` and `round` (to an `Int`, as the built-in `floor` is), `abs`,
   `isNaN`, `isFinite`, `pi` and `tau`, written in Meadow so every runtime
   answers alike: good to a unit or two in the last place for arguments of
