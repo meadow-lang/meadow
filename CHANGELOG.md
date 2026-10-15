@@ -60,7 +60,9 @@ beyond the last release is under _Unreleased_.
   of them or `void`. Cut writes them as `export "name" = SYMBOL -> rep`, and
   the Silo back end gives each a C entry that starts the runtime the first
   time it is called on a thread. A function whose answer is not a number or
-  `()` is refused, saying so.
+  `()` is refused, saying so. A library exports its dependencies' `@export`
+  functions too, as a Rust `cdylib` does every crate's `#[no_mangle]` ones,
+  and two of one name are an error; a program exports only its own.
 - A call C makes into a Meadow library that fails -- an `error`, a division
   by zero -- ends that call, which answers zero, and not the program C is:
   each runs on a stack of its own, let go of when it fails. The message is on

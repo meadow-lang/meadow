@@ -700,36 +700,92 @@ fun linkProgram (o : UnitsOptions) (l : Linking Interface) : Result String () ! 
             (\(e : Export) ->
               e.kind == "v" and e.name == n and S.isEmpty e.owner and V.isEmpty e.module)
             root.exports
-      in (match (match (o.entry, named (M.unwrapOr "result" o.entry)) with
-           | (_, Just e) -> Ok (Just e)
-           | (Just n, None) -> Err "${root.package} has no value `${n}` at its root to enter at\n"
-           | (None, None) -> Ok (named "main")) with
-          | Err why -> Err why
-          -- A library has no entry, and the first of what it exports
-          -- stands for one: nothing calls it.
-          | Ok None ->
-              (match V.get root.linked.cExports 0 with
-               | None -> Ok ()
-               | Just (c : CExport) -> linkAt o l units root c.binder (Con "Unit" []) 0)
-          | Ok (Just (e : Export)) ->
-              (let sc =
-                 M.unwrapOr (Scheme { quant = [], preds = [], ty = Error, lacks = [] }) e.scheme
-               in linkAt
-                    o
-                    l
-                    units
-                    root
-                    e.binder
-                    sc.ty
-                    (V.len (V.filter (\k -> k == VarKind.Plain) sc.quant))))
+      in
+      let entry =
+        match (o.entry, named (M.unwrapOr "result" o.entry)) with
+        | (_, Just e) -> Ok (Just e)
+        | (Just n, None) -> Err "${root.package} has no value `${n}` at its root to enter at\n"
+        | (None, None) -> Ok (named "main")
+      in
+      -- What C may call: a library's, and its dependencies' too, as a
+      -- Rust `cdylib` exports every crate's `#[no_mangle]` functions; a
+      -- program's own only.
+      let library =
+        match entry with
+        | Ok None -> True
+        | _ -> not (V.isEmpty root.linked.cExports)
+      in
+      let exports =
+        if library then cExportsOf units else V.map (\c -> (root.package, c)) root.linked.cExports
+      in match (entry, clashOf exports) with
+         | (Err why, _) -> Err why
+         | (_, Just why) -> Err why
+         -- A library has no entry, and the first of what it exports
+         -- stands for one: nothing calls it.
+         | (Ok None, None) ->
+             (match V.get exports 0 with
+              | None -> Ok ()
+              | Just (pkg, (c : CExport)) ->
+                  linkAt o l units root exports pkg c.binder (Con "Unit" []) 0)
+         | (Ok (Just (e : Export)), None) ->
+             (let sc =
+                M.unwrapOr (Scheme { quant = [], preds = [], ty = Error, lacks = [] }) e.scheme
+              in linkAt
+                   o
+                   l
+                   units
+                   root
+                   exports
+                   root.package
+                   e.binder
+                   sc.ty
+                   (V.len (V.filter (\k -> k == VarKind.Plain) sc.quant)))
 
--- The program the units link to, entered at `binder` of type `ty`, generic
--- in `types` types; and what C may call of it, where it exports anything.
+-- Each unit's functions C may call, with its package: each package once,
+-- however many names it was reached by.
+fun cExportsOf (units : [(String, Interface, String)]) : [(String, CExport)] =
+  snd
+    (V.foldl
+       (\acc u ->
+         match (acc, u) with
+         | ((seen, out), (_, (i : Interface), _)) ->
+             if V.elem i.package seen then acc
+             else
+               (
+                 V.pushBack seen i.package,
+                 V.append out (V.map (\c -> (i.package, c)) i.linked.cExports)
+               ))
+       ([], [])
+       units)
+
+-- Why `exports` cannot all be C's: two of them under one name.
+fun clashOf (exports : [(String, CExport)]) : Maybe String =
+  V.foldl
+    (\found x ->
+      match (found, x) with
+      | (Just why, _) -> Just why
+      | (None, (pkg, (c : CExport))) ->
+          (match V.find
+             (\y ->
+               match y with
+               | (other, (d : CExport)) ->
+                   d.name == c.name and (other != pkg or d.binder != c.binder))
+             exports with
+           | Just (other, _) -> Just "`${c.name}` is exported to C by both ${pkg} and ${other}\n"
+           | None -> None))
+    None
+    exports
+
+-- The program the units link to, entered at `binder` of package `pkg`, of
+-- type `ty`, generic in `types` types; and `exports`, what C may call of it,
+-- each with its package.
 fun linkAt
     (o : UnitsOptions)
     (l : Linking Interface)
     (units : [(String, Interface, String)])
     (root : Interface)
+    (exports : [(String, CExport)])
+    (pkg : String)
     (binder : Int)
     (ty : Type)
     (types : Int)
@@ -750,13 +806,12 @@ fun linkAt
   -- A library is not made one program yet: its exports name the
   -- binders the units gave them.
   let whole =
-    if o.whole and V.isEmpty root.linked.cExports then Just (wholeObject o root binder once)
-    else None
+    if o.whole and V.isEmpty exports then Just (wholeObject o root binder once) else None
   in
   let entered = M.unwrapOr binder (M.map fst whole) in
   let (before, after) =
     Seq.around
-      root.package
+      pkg
       entered
       ty
       types
@@ -805,13 +860,12 @@ fun linkAt
           in
           let exported =
             V.concatMap
-              (\(c : CExport) ->
-                [defSymbol root.package c.binder, "${defSymbol root.package c.binder}f"])
-              root.linked.cExports
+              (\x ->
+                match x with
+                | (p, (c : CExport)) -> [defSymbol p c.binder, "${defSymbol p c.binder}f"])
+              exports
           in
-          let kept =
-            reach mentions (V.pushFront exported (defSymbol root.package entered)) H.empty
-          in
+          let kept = reach mentions (V.pushFront exported (defSymbol pkg entered)) H.empty in
           let texts =
             V.concatMap
               (\o ->
@@ -834,7 +888,7 @@ fun linkAt
               read
           in match writeString (
                Path.join (linkOut l) "program.cut",
-               concatStrings (V.toArray (V.concat [[withExports before root], texts, [after]]))
+               concatStrings (V.toArray (V.concat [[withExports before exports], texts, [after]]))
              ) with
              | Ok _ -> Ok ()
              | Err why -> Err "the program could not be written: ${why}\n")
@@ -941,16 +995,18 @@ fun answered (t : Type) : Type =
   | Fun _ result _ -> answered result
   | other -> other
 
--- A program's opening with a line for each function C may call of it: each
+-- A program's opening with a line for each of `exports`, a function C may call: each
 -- names the function's definition of all its parameters (`Seq.directly`).
-fun withExports (opening : String) (root : Interface) : String =
+fun withExports (opening : String) (exports : [(String, CExport)]) : String =
   let lines =
     S.join
       ""
       (V.map
-         (\(c : CExport) ->
-           "export " ++ show c.name ++ " = ${defSymbol root.package c.binder}f -> ${c.result}\n")
-         root.linked.cExports)
+         (\x ->
+           match x with
+           | (pkg, (c : CExport)) ->
+               "export " ++ show c.name ++ " = ${defSymbol pkg c.binder}f -> ${c.result}\n")
+         exports)
   in if S.startsWith "cut 0\n" opening then "cut 0\n" ++ lines ++ S.drop opening 6
      else lines ++ opening
 
