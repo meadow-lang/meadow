@@ -77,6 +77,9 @@ beyond the last release is under _Unreleased_.
 - A type is written through the module a `use … as` names, as its functions
   are: `use Mira as M` and then `(s : M.System)`, without importing the type
   by name. A type the module lacks is an unknown type, `M.Nope`.
+- A git dependency may be a directory of its repository rather than all of
+  it: `{ git = "…", rev = "…", subdir = "lib/Cut" }`. Its directory is part of
+  its source in `Meadow.lock`, so two packages of one repository are two.
 - `meadow cut --no-run` builds what would be run -- the bytecode image, or the
   executable with `--aot` or `--runtime silo` -- and stops: what a front end's
   `build` asks the back end for.

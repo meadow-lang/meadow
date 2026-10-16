@@ -145,7 +145,15 @@ fun locate (root : String) (dir : String) (e : Entry) : Result String String ! {
   | (Just p, _) -> Ok (Path.normalize (Path.join dir p))
   | (_, Just url) ->
       (match pinned root dir e.key with
-       | Just rev -> checkout url rev
+       | Just rev ->
+           (match checkout url rev with
+            -- The package is the directory `subdir` names, where one is named.
+            | Ok d ->
+                Ok
+                  (M.unwrapOr
+                     d
+                     (M.map (\s -> Path.normalize (Path.join d s)) (field "subdir" e.value)))
+            | Err why -> Err why)
        | None -> Err "`${e.key}` is not in `Meadow.lock`: run `meadow build` once to fetch it")
   | _ -> Err "`${e.key}` is neither a `path` nor a `git` dependency"
 

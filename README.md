@@ -178,6 +178,13 @@ util = { path = "../util" }
 you, and finds the package's name by reading its own manifest rather than
 guessing it from the URL.
 
+A package that is one directory of a repository, rather than all of it, is
+named by `subdir`:
+
+```toml
+Cut = { git = "https://github.com/someone/monorepo", rev = "…", subdir = "lib/Cut" }
+```
+
 What was actually used goes in **`Meadow.lock`** — the commit, and a hash of its
 source tree. Commit that file: it is what makes a build on another machine the
 build you tested. A branch moves, and a tag _can_ be moved, so a build follows

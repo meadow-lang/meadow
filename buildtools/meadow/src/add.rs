@@ -47,7 +47,7 @@ pub fn run(opts: &Options) -> Result<(), String> {
                 .ok_or_else(|| format!("{} has no Meadow.toml", crate::workspace::shown(&at)))?;
             (m.name, m.version, None)
         }
-        DepSource::Git { url, reference } => {
+        DepSource::Git { url, reference, .. } => {
             let cache = git::default_cache()?;
             let got = git::ensure(&cache, url, reference, None, crate::package::policy().net)?;
             let m = Manifest::load(&got.path)
@@ -113,7 +113,7 @@ pub fn run(opts: &Options) -> Result<(), String> {
 
     // As cargo says it: what went into the manifest, then what was pinned.
     status::status("Adding", format!("{name} v{version} to dependencies"));
-    if let (Some(got), DepSource::Git { url, reference }) = (&pinned, &source) {
+    if let (Some(got), DepSource::Git { url, reference, .. }) = (&pinned, &source) {
         status::status("Locking", "1 package");
         status::status(
             "Adding",
@@ -164,7 +164,11 @@ fn source_of(what: &str, reference: &GitRef, from: &Path) -> Result<DepSource, S
         },
         chosen => chosen.clone(),
     };
-    Ok(DepSource::Git { url, reference })
+    Ok(DepSource::Git {
+        url,
+        reference,
+        subdir: None,
+    })
 }
 
 /// The newest release the repository has tagged, as a requirement to write
@@ -222,7 +226,7 @@ fn url_of(what: &str) -> Result<String, String> {
 fn describe(source: &DepSource) -> String {
     match source {
         DepSource::Path(p) => format!("the directory {}", p.display()),
-        DepSource::Git { url, reference } => match reference.written() {
+        DepSource::Git { url, reference, .. } => match reference.written() {
             Some(r) => format!("{url} ({r})"),
             None => url.clone(),
         },
@@ -233,7 +237,7 @@ fn describe(source: &DepSource) -> String {
 fn written(source: &DepSource) -> String {
     match source {
         DepSource::Path(p) => format!("{{ path = \"{}\" }}", p.display()),
-        DepSource::Git { url, reference } => match reference {
+        DepSource::Git { url, reference, .. } => match reference {
             GitRef::Default => format!("{{ git = \"{url}\" }}"),
             GitRef::Branch(b) => format!("{{ git = \"{url}\", branch = \"{b}\" }}"),
             GitRef::Tag(t) => format!("{{ git = \"{url}\", tag = \"{t}\" }}"),
@@ -299,6 +303,7 @@ mod tests {
         DepSource::Git {
             url: url.to_string(),
             reference: r,
+            subdir: None,
         }
     }
 

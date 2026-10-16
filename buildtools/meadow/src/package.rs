@@ -132,8 +132,14 @@ pub enum DepSource {
     /// `util = { path = "../util" }` -- a directory, relative to the manifest,
     /// or absolute for one inherited from a workspace.
     Path(PathBuf),
-    /// `json = { git = "https://github.com/…", tag = "v1.2.0" }`
-    Git { url: String, reference: GitRef },
+    /// `json = { git = "https://github.com/…", tag = "v1.2.0" }`, and
+    /// `subdir = "lib/json"` where the package is a directory of the
+    /// repository rather than all of it.
+    Git {
+        url: String,
+        reference: GitRef,
+        subdir: Option<String>,
+    },
 }
 
 /// One entry of `[dependencies]`.
@@ -666,7 +672,12 @@ impl Resolver {
     }
 
     fn resolve(&mut self, dep: &Dependency, from: &Path) -> Result<PathBuf, String> {
-        let DepSource::Git { url, reference } = &dep.source else {
+        let DepSource::Git {
+            url,
+            reference,
+            subdir,
+        } = &dep.source
+        else {
             let DepSource::Path(rel) = &dep.source else {
                 unreachable!("a dependency is a path or a git repository")
             };
@@ -728,8 +739,24 @@ impl Resolver {
             )));
         }
         let got = crate::git::ensure(&self.cache, url, reference, pinned.as_deref(), self.net)?;
+        // The package is the directory `subdir` says, where it says one.
+        let at = match subdir {
+            Some(d) => got.path.join(d),
+            None => got.path.clone(),
+        };
+        if !at.join("Meadow.toml").is_file() {
+            return Err(format!(
+                "`{}` from {} has no `Meadow.toml`{}",
+                dep.name,
+                url,
+                match subdir {
+                    Some(d) => format!(" in `{d}`"),
+                    None => " at its root: name the directory it is in with `subdir`".to_string(),
+                }
+            ));
+        }
         self.origins.insert(
-            canonical(&got.path),
+            canonical(&at),
             format!("{url}#{}", &got.rev[..8.min(got.rev.len())]),
         );
         self.seen.push((dep.name.clone(), source.clone()));
@@ -740,7 +767,7 @@ impl Resolver {
             tree: got.tree,
             version: resolved_version,
         });
-        Ok(got.path)
+        Ok(at)
     }
 }
 
@@ -1489,7 +1516,27 @@ fn dep_source(value: &str, key: &str, warn: &mut impl FnMut(String)) -> Option<D
                 return None;
             }
         };
-        return Some(DepSource::Git { url, reference });
+        // A directory of the repository, under it: never out of it.
+        let subdir = match field("subdir") {
+            Some(d)
+                if Path::new(&d).is_absolute()
+                    || Path::new(&d)
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir)) =>
+            {
+                warn(format!(
+                    "dependency `{key}` has `subdir = \"{d}\"`, which is not a directory \
+                     inside the repository, so it was ignored"
+                ));
+                return None;
+            }
+            other => other,
+        };
+        return Some(DepSource::Git {
+            url,
+            reference,
+            subdir,
+        });
     }
     field("path").map(|p| DepSource::Path(PathBuf::from(p)))
 }
