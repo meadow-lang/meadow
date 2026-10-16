@@ -74,6 +74,10 @@ beyond the last release is under _Unreleased_.
   `isNaN`, `isFinite`, `pi` and `tau`, written in Meadow so every runtime
   answers alike: good to a unit or two in the last place for arguments of
   moderate size.
+- `intercalate` in the prelude joins strings with one between each two:
+  `intercalate ", " names` (`Std.String.join` by the name a list's has).
+  `Std.Collections.Vector` has `intersperse` and `intercalate` too, for any
+  vector: `V.intersperse 0 [1, 2]` is `[1, 0, 2]`.
 - A type is written through the module a `use … as` names, as its functions
   are: `use Mira as M` and then `(s : M.System)`, without importing the type
   by name. A type the module lacks is an unknown type, `M.Nope`.

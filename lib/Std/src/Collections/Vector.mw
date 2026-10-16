@@ -591,6 +591,15 @@ fun vaIndex (keep : a -> Bool ! e) (xs : #[a]) (i : Int) (n : Int) : Int ! e =
 
 @pub fun concatMap (f : a -> [b] ! e) (v : [a]) : [b] ! e = v |> map f |> concat
 
+-- `sep` between each two of `v`: `intersperse 0 [1, 2, 3]` is
+-- `[1, 0, 2, 0, 3]`.
+@pub fun intersperse (sep : a) (v : [a]) : [a] =
+  foldl (\acc x -> if isEmpty acc then pushBack acc x else pushBack (pushBack acc sep) x) empty v
+
+-- `sep` between each two of `vs`, and all of it one vector:
+-- `intercalate [0] [[1, 2], [3]]` is `[1, 2, 0, 3]`.
+@pub fun intercalate (sep : [a]) (vs : [[a]]) : [a] = concat (intersperse sep vs)
+
 @pub fun replicate (n : n) (x : a) : [a] =
   let rec go k acc = if k <= 0 then acc else go (k - 1) (pushBack acc x) in
   go n empty
@@ -823,3 +832,11 @@ use Std.Yield (Yield)
   let b = assertEq (toList (dropWhile (\n -> n < 3) [1, 2, 3, 1])) [3; 1] "dropWhile" in
   let c = assertEq (toList (concat [[1, 2], [3]])) [1; 2; 3] "concat" in
   assertEq (toList (concatMap (\n -> [n, n]) [1, 2])) [1; 1; 2; 2] "concatMap"
+
+@test fun intersperseAndIntercalate () =
+  let a = assertEq (toList (intersperse 0 [1, 2, 3])) [1; 0; 2; 0; 3] "between each two" in
+  let b = assertEq (toList (intersperse 0 [7])) [7;] "one has nothing between" in
+  let c = assertTrue (isEmpty (intersperse 0 empty)) "none is none" in
+  let d =
+    assertEq (toList (intercalate [0, 0] [[1, 2], [3], [4]])) [1; 2; 0; 0; 3; 0; 0; 4] "joined"
+  in assertTrue (isEmpty (intercalate [0] empty)) "nothing to join"
