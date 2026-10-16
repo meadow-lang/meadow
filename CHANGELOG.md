@@ -13,6 +13,15 @@ beyond the last release is under _Unreleased_.
 
 ## Unreleased
 
+## 0.3.0 - 2026-10-16
+
+The release of MeadowBoot, the Meadow compiler written in Meadow with the
+Lingua toolkit: it compiles itself, agrees with the Rust compiler pass by
+pass, and is published beside `meadow` as an archive for each platform, with
+the `meadow` it hands the back end to and the standard library's sources.
+Meadow libraries can now be called from C, which is how mira runs Meadow
+scripts.
+
 ### Breaking
 
 - The lockfile is `Meadow.lock`, spelt as `Meadow.toml` is. One named
