@@ -366,6 +366,21 @@ fun cFunction (name : String) =
   | Err why -> Err why
   | Ok l -> function l name
 
+-- Where C's maths functions are: the C library on macOS and Windows, but a
+-- library of their own on Linux, `floorf` among them.
+fun libm () =
+  match open "libSystem.dylib" with
+  | Ok l -> Ok l
+  | Err _ ->
+      (match open "libm.so.6" with
+       | Ok l -> Ok l
+       | Err _ -> open "ucrtbase.dll")
+
+fun mathFunction (name : String) =
+  match libm () with
+  | Err why -> Err why
+  | Ok l -> function l name
+
 @test fun aStringGoesInAndAnIntegerComesBack () =
   match cFunction "strlen" with
   | Err why -> noC why "the C library has strlen"
@@ -445,8 +460,8 @@ fun cFunction (name : String) =
   assertEq (readText nowhere 8) "" "and no text is there"
 
 @test fun aFloatGoesInAndComesBackAsAFloat () =
-  match cFunction "floorf" with
-  | Err why -> noC why "the C library has floorf"
+  match mathFunction "floorf" with
+  | Err why -> noC why "the C maths library has floorf"
   | Ok floorf -> assertEq (callFloat32 floorf [Arg.Float32 2.75]) (Ok 2.0) "a C float, both ways"
 
 @test fun floatsAndIntegersMixedGoWhereTheyShould () =
