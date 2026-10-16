@@ -9,7 +9,9 @@
 #     git tag meadowboot-v0.1.0-pre.3 && git push origin meadowboot-v0.1.0-pre.3
 #
 # A tag with no release yet is given one, as a prerelease that is not the
-# latest: `meadow`'s own releases are `release.yml`'s. Each target is built on
+# latest: `meadow`'s own releases are `release.yml`'s. A version's tag,
+# `v0.3.0`, builds MeadowBoot too, and its archives go on the release
+# `release.yml` makes for it, once that exists. Each target is built on
 # a runner of its own system and processor, since `meadow` compiles MeadowBoot
 # natively for the machine it is on. A manual run builds everything and keeps
 # the archives as artifacts without publishing.
@@ -18,7 +20,7 @@ name: meadowboot
 
 on:
   push:
-    tags: ["meadowboot-v*"]
+    tags: ["meadowboot-v*", "v*"]
   workflow_dispatch:
 
 permissions:
@@ -149,6 +151,7 @@ jobs:
     needs: build
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
+    timeout-minutes: 150
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -161,6 +164,15 @@ jobs:
           TAG: ${{ github.ref_name }}
           REPO: ${{ github.repository }}
         run: |
+          # A version's release is `release.yml`'s to make: wait for it, for
+          # as long as that workflow takes, rather than make one of its name.
+          if [[ "$TAG" == v* ]]; then
+            for i in $(seq 1 120); do
+              gh release view "$TAG" -R "$REPO" > /dev/null 2>&1 && break
+              sleep 60
+            done
+            gh release view "$TAG" -R "$REPO" > /dev/null
+          fi
           if ! gh release view "$TAG" -R "$REPO" > /dev/null 2>&1; then
             gh release create "$TAG" -R "$REPO" --verify-tag --prerelease --latest=false \
               --title "MeadowBoot ${TAG#meadowboot-v}" \
