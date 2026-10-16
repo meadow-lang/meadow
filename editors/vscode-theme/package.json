@@ -1,0 +1,37 @@
+{
+	"name": "meadow-theme",
+	"displayName": "Meadow Theme",
+	"description": "The Meadow colour scheme, dark and light: a colour for each kind of name, after the Meadow REPL.",
+	"version": "0.3.0",
+	"publisher": "ChrisMcDearman",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/meadow-lang/meadow"
+	},
+	"categories": [
+		"Themes"
+	],
+	"keywords": [
+		"theme",
+		"dark",
+		"light",
+		"meadow"
+	],
+	"engines": {
+		"vscode": "^1.75.0"
+	},
+	"contributes": {
+		"themes": [
+			{
+				"label": "Meadow Dark",
+				"uiTheme": "vs-dark",
+				"path": "./themes/meadow-dark-color-theme.json"
+			},
+			{
+				"label": "Meadow Light",
+				"uiTheme": "vs",
+				"path": "./themes/meadow-light-color-theme.json"
+			}
+		]
+	}
+}

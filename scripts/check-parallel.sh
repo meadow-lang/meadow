@@ -104,7 +104,7 @@ job smoke bash -c '
 ' smoke "$WORK" "$HOST"
 
 if command -v npm >/dev/null 2>&1; then
-  job vscode bash -c 'cd editors/vscode && npm install --silent && npm test --silent >/dev/null && bash build.sh >/dev/null && ls -1 *.vsix'
+  job vscode bash -c 'cd editors/vscode && npm install --silent && npm test --silent >/dev/null && bash build.sh >/dev/null && ls -1 *.vsix && bash ../vscode-theme/build.sh >/dev/null && ls -1 ../vscode-theme/*.vsix'
 fi
 
 # --- then: the language's own checks, which need a `meadow` -------------------

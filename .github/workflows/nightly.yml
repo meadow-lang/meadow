@@ -87,7 +87,7 @@ jobs:
           git tag -f nightly
           git push -f origin nightly
           gh release delete nightly --repo "${{ github.repository }}" --yes || true
-          gh release create nightly artifacts/* \
+          gh release create nightly $(find artifacts -type f) \
             --repo "${{ github.repository }}" \
             --prerelease \
             --title "$NAME" \

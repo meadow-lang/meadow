@@ -138,6 +138,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The macos-26 image's Command Line Tools link against an SDK they
+      # cannot read ("unknown architecture arm64e.x1-macos"). Xcode's own SDK,
+      # named three ways -- the developer directory, `SDKROOT`, and the path
+      # the Command Line Tools look at -- is one they can. Harmless on the
+      # image before it, which needs none of this; a run lands on either
+      # while the image rolls out, and says which under "Set up job".
+      - name: Use Xcode's SDK
+        if: runner.os == 'macOS'
+        run: |
+          xcode=$(ls -d /Applications/Xcode_*.app | sort -V | tail -n 1)
+          sdk="$xcode/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+          echo "DEVELOPER_DIR=$xcode/Contents/Developer" >> "$GITHUB_ENV"
+          echo "SDKROOT=$sdk" >> "$GITHUB_ENV"
+          sudo ln -sfn "$sdk" /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
+
       - name: Install Rust
         run: rustup update stable && rustup target add ${{ matrix.target }}
 
@@ -256,8 +271,8 @@ jobs:
             meadowup-*.exe
           if-no-files-found: error
 
-  # The VS Code extension. Platform-independent, so it is built once rather than
-  # per target, and attached alongside the binaries.
+  # The VS Code extension and the colour theme. Platform-independent, so they
+  # are built once rather than per target, and attached alongside the binaries.
   extension:
     name: vsix
     needs: checks
@@ -267,12 +282,20 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+      # Both extensions in one directory: an artifact of files from two keeps
+      # the directories they came from, and a release takes files, not a
+      # directory -- the nightly of 2026-10-11 failed on `artifacts/vscode`
+      # after the release before it was deleted, and none was published again.
       - name: Build
-        run: editors/vscode/build.sh
+        run: |
+          editors/vscode/build.sh
+          editors/vscode-theme/build.sh
+          mkdir -p vsix
+          cp editors/vscode/*.vsix editors/vscode-theme/*.vsix vsix/
       - uses: actions/upload-artifact@v4
         with:
           name: vsix
-          path: editors/vscode/*.vsix
+          path: vsix/*.vsix
           if-no-files-found: error
 
   release:
@@ -325,13 +348,14 @@ jobs:
             a package, while `meadowup update` brings the toolchain forward --
             the two split the way `cargo` and `rustup` do.
 
-            **VS Code** — download **`meadow-*.vsix`** below and install it with
-            *Extensions: Install from VSIX…*, or:
+            **VS Code** — download **`meadow-<version>.vsix`** below and install it
+            with *Extensions: Install from VSIX…*, or:
 
             ```sh
-            code --install-extension meadow-*.vsix
+            code --install-extension meadow-[0-9]*.vsix
             ```
 
             It gives you syntax highlighting on its own, and diagnostics, hover,
             go-to-definition and inlay hints once `meadow` is on your `PATH` —
-            the extension runs `meadow lsp`.
+            the extension runs `meadow lsp`. **`meadow-theme-<version>.vsix`** is
+            the Meadow colour theme, dark and light, installed the same way.

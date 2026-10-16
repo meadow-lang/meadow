@@ -12,6 +12,7 @@ target/
 # each release by `release.yml`. A checked-in binary would only go stale.
 editors/vscode/node_modules/
 editors/vscode/*.vsix
+editors/vscode-theme/*.vsix
 .metals
 work/
 .koka/

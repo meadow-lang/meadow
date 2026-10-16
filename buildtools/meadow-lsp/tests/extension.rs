@@ -55,6 +55,58 @@ fn the_manifest_is_valid_and_points_at_files_that_exist() {
     }
 }
 
+/// The theme is a second extension, in `editors/vscode-theme`, and as much
+/// unvalidated JSON as the first: a theme whose file fails to parse is listed
+/// in the picker and colours nothing.
+#[test]
+fn the_theme_manifest_points_at_themes_that_are_valid() {
+    let pkg = editor_file("../vscode-theme/package.json");
+    assert_eq!(
+        pkg["version"],
+        editor_file("package.json")["version"],
+        "the theme is released with the language extension, at its version"
+    );
+    let themes = pkg["contributes"]["themes"].as_array().unwrap();
+    assert_eq!(themes.len(), 2, "a dark theme and a light one");
+    for entry in themes {
+        let path = entry["path"].as_str().unwrap().trim_start_matches("./");
+        let theme = editor_file(&format!("../vscode-theme/{path}"));
+        // The picker shows the manifest's label; the file's own name is what
+        // a `[Meadow Dark]` block in someone's settings is matched against.
+        assert_eq!(theme["name"], entry["label"], "{path}");
+        let kind = match entry["uiTheme"].as_str().unwrap() {
+            "vs-dark" => "dark",
+            "vs" => "light",
+            other => panic!("{path}: unexpected uiTheme {other}"),
+        };
+        assert_eq!(theme["type"], kind, "{path}");
+        // Without this the server's tokens are ignored, and a constructor is
+        // coloured as the type the grammar guessed it to be.
+        assert_eq!(theme["semanticHighlighting"], true, "{path}");
+
+        let colours = theme["colors"]
+            .as_object()
+            .unwrap()
+            .values()
+            .chain(theme["semanticTokenColors"].as_object().unwrap().values())
+            .chain(
+                theme["tokenColors"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|rule| &rule["settings"]["foreground"]),
+            );
+        for colour in colours {
+            let hex = colour.as_str().unwrap();
+            let digits = hex.strip_prefix('#').unwrap_or("");
+            assert!(
+                matches!(digits.len(), 6 | 8) && digits.chars().all(|c| c.is_ascii_hexdigit()),
+                "{path}: {hex} is not a colour"
+            );
+        }
+    }
+}
+
 #[test]
 fn the_grammar_is_valid_and_matches_the_declared_scope() {
     let grammar = editor_file("syntaxes/meadow.tmLanguage.json");

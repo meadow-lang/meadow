@@ -100,7 +100,7 @@ Builds the Meadow toolchain from source and installs it.
 
     --version <TAG>    fetch and build that tag, rather than this checkout
     --local <PATH>     build the checkout at PATH, rather than this one
-    --with-extension   also build and install the VS Code extension
+    --with-extension   also build and install the VS Code extension and theme
     --no-modify-path   do not touch your shell profiles
     --uninstall        remove Meadow and undo the PATH entry
 
@@ -169,31 +169,39 @@ build_everything() {
     return 0
 }
 
-# Build the VS Code extension from `$1` and install it, for someone working on
-# Meadow who wants the editor to follow what they just built.
+# Build the VS Code extensions from `$1` and install them, for someone working
+# on Meadow who wants the editor to follow what they just built: the language
+# extension, and the colour theme beside it.
 install_extension() {
     src="$1"
-    [ -x "$src/editors/vscode/build.sh" ] \
-        || err "$src has no editors/vscode/build.sh"
-    say "building the VS Code extension"
-    (cd "$src" && ./editors/vscode/build.sh) || err "could not build the extension"
+    installed=0
+    for dir in editors/vscode editors/vscode-theme; do
+        [ -x "$src/$dir/build.sh" ] || err "$src has no $dir/build.sh"
+        say "building $dir"
+        (cd "$src" && "./$dir/build.sh") || err "could not build $dir"
 
-    vsix="$(ls -1 "$src"/editors/vscode/*.vsix 2>/dev/null | head -1)"
-    [ -n "$vsix" ] || err "the extension built but produced no .vsix"
+        vsix="$(ls -1 "$src/$dir"/*.vsix 2>/dev/null | head -1)"
+        [ -n "$vsix" ] || err "$dir built but produced no .vsix"
 
-    if command -v code >/dev/null 2>&1; then
-        say "installing $(basename "$vsix")"
-        # `--force` because the version usually has not changed between two
-        # local builds, and without it VS Code declines to reinstall it.
-        code --install-extension "$vsix" --force >/dev/null \
-            || err "could not install the extension"
+        if command -v code >/dev/null 2>&1; then
+            say "installing $(basename "$vsix")"
+            # `--force` because the version usually has not changed between
+            # two local builds, and without it VS Code declines to reinstall it.
+            code --install-extension "$vsix" --force >/dev/null \
+                || err "could not install $(basename "$vsix")"
+            installed=1
+        else
+            say ""
+            say "\`code\` is not on PATH, so it was built but not installed:"
+            say "  code --install-extension $vsix --force"
+        fi
+    done
+
+    if [ "$installed" -eq 1 ]; then
         say ""
         say "Reload the editor window (Developer: Reload Window) so the language"
-        say "server restarts on the binary just built."
-    else
-        say ""
-        say "\`code\` is not on PATH, so the extension was built but not installed:"
-        say "  code --install-extension $vsix --force"
+        say "server restarts on the binary just built. The theme is chosen with"
+        say "Preferences: Color Theme (Meadow Dark, Meadow Light)."
     fi
 }
 

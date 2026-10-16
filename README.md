@@ -14,6 +14,14 @@ fun classify n =
 fun main () = println (classify 42)
 ```
 
+## AI disclosure
+
+Meadow is written with AI coding agents: Anthropic's Claude, through Claude
+Code. Most of the code, the tests, the documentation and the commit messages in
+this repository were written by an agent, under the direction of the project's
+author, who decides the design and what goes in. Read it, and rely on it, with
+that in mind.
+
 ## Install
 
 **Windows** — download `meadowup-x86_64.exe` from the
@@ -84,7 +92,7 @@ takes a few minutes.
 ```sh
 git clone https://github.com/meadow-lang/meadow && cd meadow
 scripts/install.sh                     # build and install this checkout
-scripts/install.sh --with-extension    # ...and the VS Code extension
+scripts/install.sh --with-extension    # ...and the VS Code extension and theme
 scripts/install.sh --version <tag>     # fetch that tag into ~/.meadow/src and build it
 scripts/install.sh --local <path>      # build the checkout at <path> instead
 scripts/install.sh --no-modify-path    # leave shell profiles alone
@@ -499,7 +507,17 @@ editors/vscode/build.sh
 code --install-extension editors/vscode/meadow-*.vsix
 ```
 
-Each release also attaches a built `.vsix`.
+The Meadow colour theme is a second extension, in `editors/vscode-theme`, so
+that either can be used without the other. It has a colour for each kind of
+name the server tells apart, in a dark and a light variant:
+
+```sh
+editors/vscode-theme/build.sh
+code --install-extension editors/vscode-theme/meadow-theme-*.vsix
+```
+
+Each release also attaches both `.vsix` files, and
+`scripts/install.sh --with-extension` builds and installs the two together.
 
 The extension runs `meadow lsp`, and finds it on your `PATH`, then in
 `$MEADOW_HOME/bin`, `~/.cargo/bin` and `~/.meadow/bin` — the last three because
@@ -638,7 +656,7 @@ scripts/check.sh --strict                # ...plus rustfmt and clippy
 scripts/bench.sh                         # the benchmarks, on both runtimes
 scripts/bench-compact.sh                 # what compacting a large live value saves the collector
 scripts/install.sh                       # install this checkout the way a release installs
-scripts/install.sh --with-extension      # ...and the VS Code extension with it
+scripts/install.sh --with-extension      # ...and the VS Code extension and theme with it
 cargo install --path buildtools/meadow   # install the CLI
 ```
 
@@ -701,7 +719,8 @@ To cut a release:
 1. Move what is under _Unreleased_ in `CHANGELOG.md` into a section for the
    version, and set that version in every manifest: the six `Cargo.toml`s
    (`compiler`, `eval`, `glade`, `silo`, `buildtools`, `installer`),
-   `lib/Std/Meadow.toml` and `editors/vscode/package.json`.
+   `lib/Std/Meadow.toml`, `editors/vscode/package.json` and
+   `editors/vscode-theme/package.json`.
 2. Run `scripts/check.sh --version v0.2.0`, which fails if any of them, or the
    changelog, disagrees with the tag.
 3. Tag that commit and push the tag:

@@ -28,12 +28,14 @@ for manifest in compiler/Cargo.toml eval/Cargo.toml glade/Cargo.toml \
   fi
   echo "  $manifest $got"
 done
-got=$(grep -m1 '"version"' editors/vscode/package.json | sed 's/.*: *"\(.*\)".*/\1/')
-if [ "$got" != "$want" ]; then
-  echo "  editors/vscode/package.json says $got, tag says $want" >&2
-  exit 1
-fi
-echo "  editors/vscode/package.json $got"
+for manifest in editors/vscode/package.json editors/vscode-theme/package.json; do
+  got=$(grep -m1 '"version"' "$manifest" | sed 's/.*: *"\(.*\)".*/\1/')
+  if [ "$got" != "$want" ]; then
+    echo "  $manifest says $got, tag says $want" >&2
+    exit 1
+  fi
+  echo "  $manifest $got"
+done
 if ! grep -q "^## $want " CHANGELOG.md; then
   echo "  CHANGELOG.md has no section for $want" >&2
   exit 1

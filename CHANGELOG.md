@@ -130,6 +130,11 @@ beyond the last release is under _Unreleased_.
   of `foldl`, `find`, `any`, `elem` and their kin copied it whole first.
 - `Std.Json` writes a value in time and room in its size, escapes control
   characters as `\u00XX`, and reads `\uXXXX` back.
+- The Meadow colour theme for VS Code, **Meadow Dark** and **Meadow Light**, is
+  an extension of its own in `editors/vscode-theme`: a colour for each kind of
+  name the language server tells apart. Each release attaches it as
+  `meadow-theme-<version>.vsix`, and `scripts/install.sh --with-extension`
+  installs it beside the language extension.
 - `meadow cut FILE -- ARGS` gives the program what follows `--` as its
   arguments.
 - `meadow cut` on Glade compiles what runs often to machine code as it goes,

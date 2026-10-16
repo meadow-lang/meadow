@@ -108,6 +108,8 @@ step "vscode extension"
 if command -v npm >/dev/null 2>&1; then
   (cd editors/vscode && npm install --silent && npm test --silent >/dev/null && bash build.sh >/dev/null)
   echo "  packaged $(ls -1 editors/vscode/*.vsix | head -1)"
+  bash editors/vscode-theme/build.sh >/dev/null
+  echo "  packaged $(ls -1 editors/vscode-theme/*.vsix | head -1)"
 else
   echo "  skipped: npm not found"
 fi

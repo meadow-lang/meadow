@@ -4281,6 +4281,8 @@ spelled the same, and it refuses a name whose definition is outside the package
 The VS Code extension lives in `editors/vscode`; `editors/vscode/build.sh`
 produces a `.vsix`, and every release attaches one. It runs `meadow lsp`, and
 falls back to plain syntax highlighting if the executable is not on your `PATH`.
+The Meadow colour theme, dark and light, is a second extension beside it in
+`editors/vscode-theme`, built and attached the same way.
 
 ### The formatter
 
