@@ -113,6 +113,7 @@ use Std.Sort (sortOn)
   values : HashMap String [Int],
   base : HashMap String Int,
   quals : HashMap String (HashMap String Int),
+  qualTypes : HashMap String (HashMap String Int),
   types : HashMap String Int,
   ctors : HashMap String [Int],
   ctorFields : HashMap Int [String],
@@ -223,8 +224,17 @@ fun baseValue (env : Env) (name : String) : Int =
   M.unwrapOr env.scope.unknown (H.lookup name env.scope.base)
 
 -- A type no module declares is one of the language's own: `Int`, `Array`.
+-- `M.Ty` is the type `Ty` of the module `M` qualifies.
 fun typeOf (env : Env) (name : String) : Int =
-  M.unwrapOr env.scope.builtinType (H.lookup (unmarked name) env.scope.types)
+  let n = unmarked name in
+  let parts = S.split "." n in
+  if V.len parts > 1 then
+    M.unwrapOr
+      env.scope.builtinType
+      (M.andThen
+         (H.lookup (V.getOr "" parts (V.len parts - 1)))
+         (H.lookup (S.join "." (V.take parts (V.len parts - 1))) env.scope.qualTypes))
+  else M.unwrapOr env.scope.builtinType (H.lookup n env.scope.types)
 
 fun ctorOf (env : Env) (name : String) : Int =
   M.unwrapOr

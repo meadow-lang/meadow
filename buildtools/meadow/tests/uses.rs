@@ -154,3 +154,37 @@ fn distinct_modules_keep_distinct_aliases() {
         "(2, [1; 2])"
     );
 }
+
+// --- qualified types -----------------------------------------------------------
+
+#[test]
+fn a_type_is_written_through_the_module_that_qualifies_it() {
+    // `M.Ty` in a type, as `M.f` in an expression: the module's type, which
+    // `use M as Q` puts in scope no other way.
+    assert_eq!(
+        eval_main_std(
+            "use Std.Collections.List as L\n\
+             use Std.Maybe as Mb\n\
+             fun size (xs : L.List Int) : Int = L.length xs\n\
+             fun pick (m : Mb.Maybe Int) : Int = match m with | Just n -> n | None -> 0\n\
+             def result = size [1; 2; 3] + pick (Just 4)\n"
+        ),
+        "7"
+    );
+}
+
+#[test]
+fn a_qualified_type_the_module_lacks_or_a_qualifier_nothing_names_is_said() {
+    assert_eq!(
+        errors(
+            "use Std.Collections.List as L\n\
+             fun f (x : L.Nope) : Int = 1\n\
+             def result = 1\n"
+        ),
+        "unknown type `L.Nope`"
+    );
+    assert_eq!(
+        errors("fun f (x : W.List Int) : Int = 1\ndef result = 1\n"),
+        "module `W` is not in scope here (add `use <path> as W`)"
+    );
+}

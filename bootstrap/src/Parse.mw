@@ -151,6 +151,19 @@ fun nameOf (t : Syn) : Name = Name { text = R.text t, at = spanOf t }
 
 fun named (text : String) (at : Meta) : Name = Name { text, at }
 
+-- A type's name under `s`: its first token, and each `.Name` after it --
+-- `M.Ty` -- as one name, dots and all, as `meadow-parser` keeps one.
+fun typeName (s : Syn) : Name =
+  let first = firstName s in
+  let quals = childrenOf NodeTQual s in
+  if V.isEmpty quals then first
+  else
+    (let names = V.map (\q -> lastName q) quals in
+     let last = V.getOr first names (V.len names - 1) in
+     named
+       (V.foldl (\acc (n : Name) -> "${acc}.${n.text}") first.text names)
+       (spanMeta (metaStart first.at) (metaEnd last.at)))
+
 -- The first token under `s`, however deep, as a name.
 fun firstName (s : Syn) : Name =
   match s with
@@ -761,7 +774,7 @@ fun sigDecl (c : Cx) (s : Syn) (isFun : Bool) (n : Name) (annot : Syn) (clauses 
 fun boundsOf (t : Syn) : [(Name, [Syn])] =
   match (childOf NodeArrow t, firstNode (must NodeTHead t)) with
   | (None, Just h) ->
-      if R.kindOf h == NodeTCon then [(firstName h, childrenOf NodeTAtom h)]
+      if R.kindOf h == NodeTCon then [(typeName h, childrenOf NodeTAtom h)]
       else if R.kindOf h == NodeTParen then V.concatMap boundsOf (childrenOf NodeType h)
       else []
   | _ -> []
@@ -1043,7 +1056,7 @@ fun thead (c : Cx) (d : Int) (s : Syn) : [String] =
         "TCon"
         (spanOf con)
         (V.append
-           (ident (d + 1) (firstName con))
+           (ident (d + 1) (typeName con))
            (many (d + 1) "args" (each (tatom c) (childrenOf NodeTAtom con))))
   | None -> tatom c d s
 
@@ -1054,7 +1067,10 @@ fun tatom (c : Cx) (d : Int) (s : Syn) : [String] =
   match firstNode s with
   | Just n ->
       let k = R.kindOf n in
-      if k == NodeTParen then tparen c d n
+      -- A qualified name: its first token, then its `.Name`s.
+      if k == NodeTQual then
+        node d "TCon" m (V.append (ident (d + 1) (typeName s)) (many (d + 1) "args" []))
+      else if k == NodeTParen then tparen c d n
       else if k == NodeTArray then
         node
           d

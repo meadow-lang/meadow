@@ -412,12 +412,22 @@ record Layers = {
   types : [(String, Int)],
   ctors : [(String, Int)],
   quals : [(String, HashMap String Int)],
+  -- And the types each qualifies, which `M.Ty` in a type reaches.
+  qualTypes : [(String, HashMap String Int)],
   reexports : [Item],
   refs : [(Meta, Int)]
 }
 
 def noLayers : Layers =
-  Layers { values = [], types = [], ctors = [], quals = [], reexports = [], refs = [] }
+  Layers {
+    values = [],
+    types = [],
+    ctors = [],
+    quals = [],
+    qualTypes = [],
+    reexports = [],
+    refs = []
+  }
 
 fun withRefs (acc : Layers) (refs : [(Meta, Int)]) : Layers =
   { acc | refs = V.append acc.refs refs }
@@ -535,6 +545,15 @@ fun indexIn (x : String) (xs : [String]) : Int =
 
 fun depHas (d : Dep) (path : [String]) : Bool = V.any (\x -> fst x == path) d.items
 
+-- The types of `items` a qualifier reaches: what they declare, not a
+-- trait's associated types.
+fun typesMap (items : [Item]) : HashMap String Int =
+  V.foldl
+    (\m (i : Item) ->
+      if i.kind == "t" and not (S.startsWith "assoc" i.owner) then H.insert i.name i.id m else m)
+    H.empty
+    items
+
 fun valuesMap (items : [Item]) : HashMap String Int =
   V.foldl (\m (i : Item) -> if i.kind == "v" then H.insert i.name i.id m else m) H.empty items
 
@@ -614,9 +633,14 @@ fun applyUse (cx : UnitCx) (m : ModFrame) (acc : Layers) (one : (AstDecl, Vis)) 
           let root = V.len segs == 1 and V.getOr "" segs 0 != cx.pkg in
           (match alias with
            | Just q ->
-               (let qualified = { acc | quals = V.pushBack acc.quals (q, valuesMap items) } in
-                if V.isEmpty names then qualified
-                else withRefs (bring qualified vis (namedIn items names)) (namedRefs items written))
+               (let qualified =
+                  {
+                    acc | quals = V.pushBack acc.quals (q, valuesMap items),
+                    qualTypes = V.pushBack acc.qualTypes (q, typesMap items)
+                  }
+                in if V.isEmpty names then qualified
+                   else
+                     withRefs (bring qualified vis (namedIn items names)) (namedRefs items written))
            | None ->
                if V.isEmpty names then bring acc vis (bareUse items root)
                else withRefs (bring acc vis (namedIn items names)) (namedRefs items written))
@@ -759,6 +783,7 @@ fun scopeOf (cx : UnitCx) (sh : Shared) (m : ModFrame) : (Scope, [Item], [(Meta,
       values = firstFirst,
       base = lastWins base.values,
       quals = lastWins used.quals,
+      qualTypes = lastWins used.qualTypes,
       types = lastWins (V.concat [sh.builtinTypes, base.types, used.types]),
       -- A constructor written bare is every one of its name the module's
       -- own declarations and its `use`s bring, in order -- several are an

@@ -74,6 +74,9 @@ beyond the last release is under _Unreleased_.
   `isNaN`, `isFinite`, `pi` and `tau`, written in Meadow so every runtime
   answers alike: good to a unit or two in the last place for arguments of
   moderate size.
+- A type is written through the module a `use … as` names, as its functions
+  are: `use Mira as M` and then `(s : M.System)`, without importing the type
+  by name. A type the module lacks is an unknown type, `M.Nope`.
 - `meadow cut --no-run` builds what would be run -- the bytecode image, or the
   executable with `--aot` or `--runtime silo` -- and stops: what a front end's
   `build` asks the back end for.

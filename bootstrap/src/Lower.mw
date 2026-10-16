@@ -279,6 +279,19 @@ fun nameOf (t : GTree) : Nm = Nm { text = R.text t, at = spanOf t }
 
 fun named (text : String) (at : Meta) : Nm = Nm { text, at }
 
+-- A type's name under `s`: its first token, and each `.Name` after it --
+-- `M.Ty` -- as one name, dots and all, as `meadow-parser` keeps one.
+fun typeName (s : GTree) : Nm =
+  let first = firstName s in
+  let quals = childrenOf NodeTQual s in
+  if V.isEmpty quals then first
+  else
+    (let names = V.map (\q -> lastName q) quals in
+     let last = V.getOr first names (V.len names - 1) in
+     named
+       (V.foldl (\acc (n : Nm) -> "${acc}.${n.text}") first.text names)
+       (spanMeta (metaStart first.at) (metaEnd last.at)))
+
 fun firstName (s : GTree) : Nm =
   match s with
   | Syntax g i ->
@@ -391,7 +404,14 @@ pass! {
          let name = nm out (nameOf (must TokenUpperIdent node)) in
          match fieldList with
          | Just r ->
-             newAstVariant out (spanOf node) attrs name True [] (V.map (field c out) (fieldsThere c r))
+             newAstVariant
+               out
+               (spanOf node)
+               attrs
+               name
+               True
+               []
+               (V.map (field c out) (fieldsThere c r))
          | None -> newAstVariant out (spanOf node) attrs name False (V.map (tatom c out) args) [])
     | Attr {} -> attr c out node
     | RecordDecl { raw fields } ->
@@ -963,7 +983,7 @@ pass! {
         (match V.get (V.concatMap asList [con, paren, array, brack, recTy]) 0 with
          | Just t -> t
          | _ -> newAstTypeVar out (spanOf node) (nm out (firstName node)))
-    | TCon { args } -> newAstTypeCon out (spanOf node) (nm out (firstName node)) args
+    | TCon { args } -> newAstTypeCon out (spanOf node) (nm out (typeName node)) args
     | TAtom { paren, array, brack, recTy } ->
         (match V.get (V.concatMap asList [paren, array, brack, recTy]) 0 with
          | Just t -> t
@@ -1014,7 +1034,10 @@ fun asList (x : Maybe a) : [a] = match x with | Just v -> [v] | None -> []
 fun named_ out (s : GTree) =
   match V.get (tokenKids s) 0 with
   | Just t ->
-      if R.kindOf t == TokenUpperIdent or R.kindOf t == TokenMacUpper then
+      -- `M.Ty`: a constructor, qualified.
+      if not (V.isEmpty (childrenOf NodeTQual s)) then
+        newAstTypeCon out (spanOf s) (nm out (typeName s)) []
+      else if R.kindOf t == TokenUpperIdent or R.kindOf t == TokenMacUpper then
         newAstTypeCon out (spanOf s) (nm out (nameOf t)) []
       else newAstTypeVar out (spanOf s) (nm out (nameOf t))
   | None -> newAstTypeTuple out (spanOf s) []

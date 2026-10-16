@@ -1311,7 +1311,7 @@ fn ty<'a, I: ValueInput<'a, Token = Token, Span = Span>>()
             });
 
         let tvar = lower_ident().map_with(|n, e| Located::new(TypeExpr::Var(n), e.span()));
-        let tcon0 = upper_ident().map_with(|n, e| Located::new(TypeExpr::Con(n, vec![]), e.span()));
+        let tcon0 = type_name().map_with(|n, e| Located::new(TypeExpr::Con(n, vec![]), e.span()));
         let record = record_ty(ty.clone());
 
         // A macro call written at the start of a line begins a declaration
@@ -1332,7 +1332,7 @@ fn ty<'a, I: ValueInput<'a, Token = Token, Span = Span>>()
             tcon0,
         )));
 
-        let app = upper_ident()
+        let app = type_name()
             .then(atom.clone().repeated().at_least(1).collect::<Vec<_>>())
             .map_with(|(n, args), e| Located::new(TypeExpr::Con(n, args), e.span()));
 
@@ -1422,7 +1422,7 @@ fn ty_atom<'a, I: ValueInput<'a, Token = Token, Span = Span>>()
             )
         });
     let tvar = lower_ident().map_with(|n, e| Located::new(TypeExpr::Var(n), e.span()));
-    let tcon0 = upper_ident().map_with(|n, e| Located::new(TypeExpr::Con(n, vec![]), e.span()));
+    let tcon0 = type_name().map_with(|n, e| Located::new(TypeExpr::Con(n, vec![]), e.span()));
     // A variant's own `{ ... }` is its named fields, and `variant` tries that
     // first; a positional field of record type is written in parentheses.
     let record = record_ty(inner.clone());
@@ -1464,6 +1464,31 @@ where
         .then(just(Token::Bar).ignore_then(lower_ident()).or_not())
         .delimited_by(just(Token::LBrace), just(Token::RBrace))
         .map_with(|(fields, tail), e| Located::new(TypeExpr::Record(fields, tail), e.span()))
+}
+
+/// A type's name: `Ty`, or `M.Ty` -- the type `Ty` of the module `M`
+/// qualifies, as `M.f` is its function `f`. A path is kept as one name, dots
+/// and all, as [`qualifier`] keeps one.
+fn type_name<'a, I: ValueInput<'a, Token = Token, Span = Span>>()
+-> impl Parser<'a, I, Ident, extra::Err<Rich<'a, Token, Span>>> + Clone {
+    upper_ident()
+        .separated_by(just(Token::Period))
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .map(|segs: Vec<Ident>| {
+            if let [only] = &segs[..] {
+                return only.clone();
+            }
+            let text = segs
+                .iter()
+                .map(|s| s.value().to_string())
+                .collect::<Vec<_>>()
+                .join(".");
+            let span = segs[1..]
+                .iter()
+                .fold(segs[0].span, |acc, s| acc.extend(s.span));
+            Ident::new(InternedString::from(text), span)
+        })
 }
 
 /// A qualifier: `Mod`, or a path of them, `Core.Expr`, each followed by its
