@@ -29,8 +29,8 @@ use Lingua (pass!)
 use Lingua.Lang (Meta)
 use MeadowBoot.Core
 use MeadowBoot.Core (Core!)
-use MeadowBoot.Cut as C
-use MeadowBoot.Cut (Cut!, CutProgram, CutBuilder)
+use Cut as C
+use Cut (Cut!, CutProgram, CutBuilder)
 use MeadowBoot.Types
 use MeadowBoot.Types.Type.*
 use Std.Collections.Vector as V
