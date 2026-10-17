@@ -220,8 +220,12 @@ fn the_axcut_machine_agrees_too() {
                     checked += 1
                 }
                 // Nor does it reach outside itself: `Std.Ffi`'s tests call C,
-                // and are checked between the CEK and the VM above.
-                (Ok(_), Err(e)) if e.msg.starts_with("unhandled effect Process.ffi") => {
+                // and `Std.Net`'s open sockets, and are checked between the
+                // CEK and the VM above.
+                (Ok(_), Err(e))
+                    if e.msg.starts_with("unhandled effect Process.ffi")
+                        || e.msg.starts_with("unhandled effect Net.") =>
+                {
                     checked += 1
                 }
                 (Err(_), Err(_)) => checked += 1,
