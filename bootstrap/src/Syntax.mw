@@ -349,10 +349,10 @@ use Std.Result.Result.*
     ConsTail = "::" atom:PAtom
     AsTail = "as" name:Vid
     PAtom = con:ConPat | arg:Arg
-    ConPat = name:"upper" qual:QualTail? args:Parg*
+    ConPat = name:"upper" qual:QualTail* args:Parg*
     QualTail = "." name:"upper"
     Parg = con:NullCon | arg:Arg
-    NullCon = name:"upper" qual:QualTail?
+    NullCon = name:"upper" qual:QualTail*
     Arg = paren:PatParen
       | recPat:RecPat
       | var:Vid
@@ -414,7 +414,7 @@ use Std.Result.Result.*
     -- parser tries them -- told apart here by their first two tokens.
     Base = head:Head args:Atom*
     Head = mac:MacCall | qual:QualHead | con:"upper" | low:LowAtom
-    QualHead = qual:"upper" "." name:("lower" | "upper")
+    QualHead = qual:"upper" "." name:("lower" | "upper") more:QualTail*
 
     -- An argument. A bare constructor takes no fields: `A.x` is a qualified
     -- name, never `A`'s field `x`.
@@ -425,7 +425,7 @@ use Std.Result.Result.*
     MacAtom = path:ArgPath "!" arg:Group fields:FieldTail*
     ArgPath = segs:(ArgSeg ("." ArgSeg)*)
     ArgSeg = "mac_lower" | "mac_upper"
-    QualAtom = qual:"upper" "." name:("lower" | "upper") fields:FieldTail*
+    QualAtom = qual:"upper" "." name:("lower" | "upper") more:QualTail* fields:FieldTail*
     -- A form that ends in an expression -- `let`, `if`, a lambda, `match`,
     -- `handle` -- takes no fields: that expression takes them first.
     LowAtom = closed:ClosedAtom | open:OpenPrim
