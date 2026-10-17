@@ -43,6 +43,7 @@
 @pub mod Log
 @pub mod Net
 @pub mod Tls
+@pub mod Http
 @pub mod Eff
 @pub mod Bench
 @pub mod Prelude

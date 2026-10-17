@@ -155,6 +155,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("Net", include_str!("../../../lib/Std/src/Net.mw")),
     ("Tls", include_str!("../../../lib/Std/src/Tls.mw")),
     ("Eff", include_str!("../../../lib/Std/src/Eff.mw")),
+    ("Http", include_str!("../../../lib/Std/src/Http.mw")),
     ("Bench", include_str!("../../../lib/Std/src/Bench.mw")),
     ("Prelude", include_str!("../../../lib/Std/src/Prelude.mw")),
 ];

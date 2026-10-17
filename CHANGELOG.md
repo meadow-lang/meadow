@@ -34,6 +34,20 @@ beyond the last release is under _Unreleased_.
   key in PEM files. What it answers is a `Stream` like any other. The
   runtime's TLS is rustls, so nothing has to be installed where a program
   runs.
+- `Std.Http`, HTTP/1.1 in the standard library. A server: `serve host port
+  handler`, a `handler : Request -> Response ! Eff` answering each request on
+  a thread of the connection's own, with keep-alive, chunked bodies and
+  `serveTls` for HTTPS; `serveOn` and `serveOne` for a listener of the
+  program's own. A client: `get`, `post` and `request`, over `http://` or
+  `https://`. `text`, `html`, `json` and `withHeader` build a response;
+  `header` reads one in any case, and `bodyText` and `requestText` read a
+  body.
+- A thread waiting on a socket holds up only itself. Glade and Silo make a
+  call that may wait on an I/O thread while the worker runs the program's
+  other threads, and the CEK machine makes it on an OS thread of its own, so
+  a server's thousand reading connections need no more workers than cores. A
+  program ends when `main` does even with a thread still accepting, and
+  closing a socket wakes a call another thread waits in on it.
 
 ## 0.3.0 - 2026-10-16
 
