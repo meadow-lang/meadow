@@ -13,6 +13,7 @@
 --
 -- `Console`, `Fs`, `Process`, `Random` and `Time` are the outside world;
 -- `Log` is what a program says it is doing, written to standard error;
+-- `Net` is its sockets, plain and TLS;
 -- `Test` is a failed assertion; `Mut` is a `Ref`'s, and `Thread` a green
 -- thread's.
 
@@ -23,6 +24,7 @@ use Std.Random (Random)
 use Std.Time (Time)
 use Std.Test (Test)
 use Std.Log (Log)
+use Std.Net (Net)
 
 @pub effect Eff = {
   Console,
@@ -32,6 +34,7 @@ use Std.Log (Log)
   Time,
   Test,
   Log,
+  Net,
   Mut,
   Thread
 }

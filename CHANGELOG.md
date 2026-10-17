@@ -23,6 +23,17 @@ beyond the last release is under _Unreleased_.
   block's lines, `silenced` drops them, and `atLeast` keeps those at a level
   or above. `main` and a spawned thread may perform it, as `Eff` now says; a
   program's own effect called `Log` is still its own.
+- `Std.Net`, TCP sockets: `listen`, `accept`, `connect`, `read`, `write` and
+  their text forms, `close`, `setTimeout`, `port` and `lookup`, on a
+  `Listener` and a `Stream`. Every operation answers `Err` with what went
+  wrong rather than stopping the program. `Net` is in `Eff`, so `main` and a
+  spawned thread may use it.
+- `Std.Tls` makes a `Std.Net` stream a TLS session: `connect` as a client,
+  checked against Mozilla's roots (and one more authority with
+  `connectTrusting`), or `accept` as a server, from a certificate chain and
+  key in PEM files. What it answers is a `Stream` like any other. The
+  runtime's TLS is rustls, so nothing has to be installed where a program
+  runs.
 
 ## 0.3.0 - 2026-10-16
 

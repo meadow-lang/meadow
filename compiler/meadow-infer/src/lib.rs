@@ -4403,6 +4403,7 @@ pub const THREAD_EFFECTS: &[&str] = &[
     // A Std effect the runtime answers but whose name the language does not
     // reserve, so a program's own `Log` is its own: by its canonical name.
     "Std.Log.Log",
+    "Std.Net.Net",
 ];
 
 /// The row `{ Stm | Bound(tail) }` -- what a transaction operation costs.

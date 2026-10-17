@@ -150,6 +150,70 @@ fn vector(items: Vec<Val>) -> Word {
     }
 }
 
+/// `Std.Net`'s sockets and `Std.Tls`'s sessions: see `meadow_rt::net`.
+fn net(op: &str, arg: Val) -> Option<Build> {
+    use meadow_rt::net;
+    let what = format!("Net.{op}");
+    let int = |v: Val| match v {
+        Val::Int(n) => n,
+        other => fail(format!("{what}: expected an Int, got {}", shown(other))),
+    };
+    let answered = |r: Result<Build, String>| match r {
+        Ok(b) => Build::ok(b),
+        Err(e) => Build::error(e),
+    };
+    Some(match op {
+        "tcpListen" | "tcpConnect" => {
+            let t = tuple(arg, 2, &what);
+            let (host, port) = (text(t[0], &what), int(t[1]));
+            let made = if op == "tcpListen" {
+                net::listen(&host, port)
+            } else {
+                net::connect(&host, port)
+            };
+            answered(made.map(Build::int))
+        }
+        "tcpAccept" => answered(
+            net::accept(int(arg))
+                .map(|(s, peer)| Build::Tuple(vec![Build::int(s), Build::Str(peer)])),
+        ),
+        "tcpRead" => {
+            let t = tuple(arg, 2, &what);
+            answered(net::read(int(t[0]), int(t[1])).map(Build::Bytes))
+        }
+        "tcpWrite" => {
+            let t = tuple(arg, 2, &what);
+            let id = int(t[0]);
+            let bytes = crate::prims::byte_array(t[1], &what);
+            answered(net::write(id, &bytes).map(Build::int))
+        }
+        "tcpClose" => {
+            net::close(int(arg));
+            Build::unit()
+        }
+        "tcpTimeout" => {
+            let t = tuple(arg, 2, &what);
+            answered(net::set_timeout(int(t[0]), int(t[1])).map(|()| Build::unit()))
+        }
+        "tcpLocalPort" => answered(net::local_port(int(arg)).map(Build::int)),
+        "resolve" => answered(
+            net::resolve(&text(arg, &what))
+                .map(|ips| Build::Vector(ips.into_iter().map(Build::Str).collect())),
+        ),
+        "tlsConnect" | "tlsAccept" => {
+            let t = tuple(arg, 3, &what);
+            let (id, a, b) = (int(t[0]), text(t[1], &what), text(t[2], &what));
+            let made = if op == "tlsConnect" {
+                net::tls_connect(id, &a, &b)
+            } else {
+                net::tls_accept(id, &a, &b)
+            };
+            answered(made.map(Build::int))
+        }
+        _ => return None,
+    })
+}
+
 /// `Std.Log`'s line, where no handler took it: see `meadow_rt::log`.
 fn log(op: &str, arg: Val) -> Option<Build> {
     match op {
@@ -253,6 +317,7 @@ pub unsafe extern "C" fn meadow_native(
         "Random" => random(&op, arg),
         "Time" => time(&op, arg),
         "Log" => log(&op, arg),
+        "Net" => net(&op, arg),
         _ => None,
     };
     match built {

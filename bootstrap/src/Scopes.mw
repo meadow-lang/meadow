@@ -382,7 +382,7 @@ def stdOrder : [String] =
     "Collections.Map", "Either", "St", "Sort", "Collections.HashMap", "Collections.HashTable",
     "Compact", "Thread", "Stm", "State", "Exn", "Stream", "Random", "Fs", "Process", "String",
     "String.Parse", "String.Parse.Char", "String.Parse.Lexer", "Path", "Json", "Macro",
-    "Macro.Parse", "Console", "Macro.Serve", "Time", "Log", "Bench", "Prelude"
+    "Macro.Parse", "Console", "Macro.Serve", "Time", "Log", "Net", "Tls", "Bench", "Prelude"
   ]
 
 -- The modules every later one of the standard library has unqualified, and so

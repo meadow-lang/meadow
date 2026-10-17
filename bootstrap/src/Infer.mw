@@ -2744,7 +2744,10 @@ fun writtenBind (cx : Cx s) (src : HirArena) out (done : HashMap String Int) (b 
 -- The effects the runtime answers itself: `Std.Eff`, `meadow_infer`'s
 -- `THREAD_EFFECTS`.
 def runtimeEffects : [String] =
-  ["Thread", "Console", "Fs", "Process", "Random", "Time", "Test", "Mut", "Std.Log.Log"]
+  [
+    "Thread", "Console", "Fs", "Process", "Random", "Time", "Test", "Mut", "Std.Log.Log",
+    "Std.Net.Net"
+  ]
 
 -- The root module's `main` is `() -> () ! Eff`: given nothing, giving nothing
 -- back, and performing at most what the runtime answers -- as

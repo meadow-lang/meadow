@@ -41,6 +41,8 @@
 @pub mod Ffi
 @pub mod Time
 @pub mod Log
+@pub mod Net
+@pub mod Tls
 @pub mod Eff
 @pub mod Bench
 @pub mod Prelude

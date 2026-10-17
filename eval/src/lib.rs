@@ -1377,6 +1377,11 @@ impl<'a> Machine<'a> {
                 self.ctrl = Control::Ret(result);
                 return Ok(());
             }
+            if &*effect == "Net" || &*effect == "Std.Net.Net" {
+                let result = native_net(&op, arg)?;
+                self.ctrl = Control::Ret(result);
+                return Ok(());
+            }
             if &*effect == "Log" || &*effect == "Std.Log.Log" {
                 let result = native_log(&op, arg)?;
                 self.ctrl = Control::Ret(result);
@@ -2998,6 +3003,112 @@ pub fn read_exact_bounded<R: std::io::Read>(
 }
 
 /// The runtime's default handler for the `Std.Time` effect: the real clock.
+/// `Std.Net`'s sockets and `Std.Tls`'s sessions: see `meadow_rt::net`.
+fn native_net(op: &str, arg: Value) -> Result<Value, RuntimeError> {
+    use meadow_core::net;
+    let sv = |s: String| Value::Str(InternedString::from(s));
+    let ok = |v: Value| Value::ctor(InternedString::from("Result.Ok"), vec![v]);
+    let errv = |m: String| Value::ctor(InternedString::from("Result.Err"), vec![sv(m)]);
+    let answered = |r: Result<Value, String>| match r {
+        Ok(v) => ok(v),
+        Err(e) => errv(e),
+    };
+    let wrong = |arg: &Value| err(format!("Net.{op}: unexpected argument {arg}"));
+    let int = |v: &Value| match v {
+        Value::Int(n) => Some(*n),
+        _ => None,
+    };
+    let text = |v: &Value| match v {
+        Value::Str(s) => Some(s.to_string()),
+        _ => None,
+    };
+    let parts = |v: &Value| match v {
+        Value::Tuple(t) => t.to_vec(),
+        _ => Vec::new(),
+    };
+    let t = parts(&arg);
+    Ok(match op {
+        "tcpListen" | "tcpConnect" => match (t.first().and_then(text), t.get(1).and_then(int)) {
+            (Some(host), Some(port)) => answered(
+                if op == "tcpListen" {
+                    net::listen(&host, port)
+                } else {
+                    net::connect(&host, port)
+                }
+                .map(Value::Int),
+            ),
+            _ => return wrong(&arg),
+        },
+        "tcpAccept" => match int(&arg) {
+            Some(id) => answered(
+                net::accept(id).map(|(s, peer)| Value::Tuple(vec![Value::Int(s), sv(peer)])),
+            ),
+            None => return wrong(&arg),
+        },
+        "tcpRead" => match (t.first().and_then(int), t.get(1).and_then(int)) {
+            (Some(id), Some(max)) => answered(net::read(id, max).map(|b| {
+                Value::Array(Rc::new(
+                    b.into_iter()
+                        .map(|x| Value::Word(num::Width::U8, u64::from(x)))
+                        .collect(),
+                ))
+            })),
+            _ => return wrong(&arg),
+        },
+        "tcpWrite" => match (t.first().and_then(int), t.get(1)) {
+            (Some(id), Some(Value::Array(xs))) => {
+                let bytes: Vec<u8> = xs
+                    .iter()
+                    .map(|x| match x {
+                        Value::Word(_, w) => *w as u8,
+                        Value::Int(n) => *n as u8,
+                        _ => 0,
+                    })
+                    .collect();
+                answered(net::write(id, &bytes).map(Value::Int))
+            }
+            _ => return wrong(&arg),
+        },
+        "tcpClose" => match int(&arg) {
+            Some(id) => {
+                net::close(id);
+                Value::Unit
+            }
+            None => return wrong(&arg),
+        },
+        "tcpTimeout" => match (t.first().and_then(int), t.get(1).and_then(int)) {
+            (Some(id), Some(ms)) => answered(net::set_timeout(id, ms).map(|()| Value::Unit)),
+            _ => return wrong(&arg),
+        },
+        "tcpLocalPort" => match int(&arg) {
+            Some(id) => answered(net::local_port(id).map(Value::Int)),
+            None => return wrong(&arg),
+        },
+        "resolve" => match text(&arg) {
+            Some(host) => answered(
+                net::resolve(&host).map(|ips| vector_value(ips.into_iter().map(sv).collect())),
+            ),
+            None => return wrong(&arg),
+        },
+        "tlsConnect" | "tlsAccept" => match (
+            t.first().and_then(int),
+            t.get(1).and_then(text),
+            t.get(2).and_then(text),
+        ) {
+            (Some(id), Some(a), Some(b)) => answered(
+                if op == "tlsConnect" {
+                    net::tls_connect(id, &a, &b)
+                } else {
+                    net::tls_accept(id, &a, &b)
+                }
+                .map(Value::Int),
+            ),
+            _ => return wrong(&arg),
+        },
+        _ => return err(format!("unhandled effect Net.{op}")),
+    })
+}
+
 /// `Std.Log`'s line, where no handler took it: see `meadow_rt::log`.
 fn native_log(op: &str, arg: Value) -> Result<Value, RuntimeError> {
     match (op, &arg) {

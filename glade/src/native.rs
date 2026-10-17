@@ -295,6 +295,79 @@ impl Vm<'_> {
     // --- the natives ------------------------------------------------------
 
     /// Discharge `effect.op` against the real world, or say it cannot.
+    /// `Std.Net`'s sockets and `Std.Tls`'s sessions: see `meadow_rt::net`.
+    fn native_net(&mut self, op: &str, arg: Value) -> Result<Option<Build>, Error> {
+        use meadow_rt::net;
+        let what = format!("Net.{op}");
+        let int = |vm: &Vm, v: Value| -> Result<i64, Error> {
+            match v {
+                Value::Int(n) => Ok(n),
+                other => err(format!("{what}: expected an Int, got {}", vm.show(other))),
+            }
+        };
+        let answered = |r: Result<Build, String>| match r {
+            Ok(b) => Build::ok(b),
+            Err(e) => Build::error(e),
+        };
+        Ok(Some(match op {
+            "tcpListen" | "tcpConnect" => {
+                let t = self.tuple_arg(&what, arg, 2)?;
+                let host = self.str_arg(&what, t[0])?;
+                let port = int(self, t[1])?;
+                let made = if op == "tcpListen" {
+                    net::listen(&host, port)
+                } else {
+                    net::connect(&host, port)
+                };
+                answered(made.map(Build::int))
+            }
+            "tcpAccept" => answered(
+                net::accept(int(self, arg)?)
+                    .map(|(s, peer)| Build::Tuple(vec![Build::int(s), Build::Str(peer)])),
+            ),
+            "tcpRead" => {
+                let t = self.tuple_arg(&what, arg, 2)?;
+                answered(net::read(int(self, t[0])?, int(self, t[1])?).map(Build::Bytes))
+            }
+            "tcpWrite" => {
+                let t = self.tuple_arg(&what, arg, 2)?;
+                let id = int(self, t[0])?;
+                let bytes = self.bytes(t[1], &what)?;
+                answered(net::write(id, &bytes).map(Build::int))
+            }
+            "tcpClose" => {
+                net::close(int(self, arg)?);
+                Build::unit()
+            }
+            "tcpTimeout" => {
+                let t = self.tuple_arg(&what, arg, 2)?;
+                answered(
+                    net::set_timeout(int(self, t[0])?, int(self, t[1])?).map(|()| Build::unit()),
+                )
+            }
+            "tcpLocalPort" => answered(net::local_port(int(self, arg)?).map(Build::int)),
+            "resolve" => {
+                let host = self.str_arg(&what, arg)?;
+                answered(
+                    net::resolve(&host)
+                        .map(|ips| Build::Vector(ips.into_iter().map(Build::Str).collect())),
+                )
+            }
+            "tlsConnect" | "tlsAccept" => {
+                let t = self.tuple_arg(&what, arg, 3)?;
+                let id = int(self, t[0])?;
+                let (a, b) = (self.str_arg(&what, t[1])?, self.str_arg(&what, t[2])?);
+                let made = if op == "tlsConnect" {
+                    net::tls_connect(id, &a, &b)
+                } else {
+                    net::tls_accept(id, &a, &b)
+                };
+                answered(made.map(Build::int))
+            }
+            _ => return Ok(None),
+        }))
+    }
+
     /// `Std.Log`'s line, where no handler took it: see `meadow_rt::log`.
     fn native_log(&mut self, op: &str, arg: Value) -> Result<Option<Build>, Error> {
         match op {
@@ -330,6 +403,7 @@ impl Vm<'_> {
             // A Std effect not among the language's names comes here by its
             // canonical one, and through Cut by its bare one.
             "Log" | "Std.Log.Log" => self.native_log(op, arg)?,
+            "Net" | "Std.Net.Net" => self.native_net(op, arg)?,
             // Not the runtime's own: the host's, if this machine has one.
             _ => return self.ask_host(effect, op, arg),
         };
