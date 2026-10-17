@@ -17,6 +17,7 @@ pub mod console;
 pub mod desc;
 pub mod ffi;
 pub mod hash;
+pub mod log;
 pub mod num;
 pub mod roles;
 pub mod stm;

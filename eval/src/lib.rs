@@ -1377,6 +1377,11 @@ impl<'a> Machine<'a> {
                 self.ctrl = Control::Ret(result);
                 return Ok(());
             }
+            if &*effect == "Log" || &*effect == "Std.Log.Log" {
+                let result = native_log(&op, arg)?;
+                self.ctrl = Control::Ret(result);
+                return Ok(());
+            }
             let effect = meadow_core::spelling(&effect);
             return err(format!("unhandled effect {effect}.{op}"));
         };
@@ -2993,6 +2998,21 @@ pub fn read_exact_bounded<R: std::io::Read>(
 }
 
 /// The runtime's default handler for the `Std.Time` effect: the real clock.
+/// `Std.Log`'s line, where no handler took it: see `meadow_rt::log`.
+fn native_log(op: &str, arg: Value) -> Result<Value, RuntimeError> {
+    match (op, &arg) {
+        ("logAt", Value::Tuple(t)) if t.len() == 2 => match (&t[0], &t[1]) {
+            (Value::Int(n), Value::Str(s)) => {
+                meadow_core::log::line(*n, s);
+                Ok(Value::Unit)
+            }
+            _ => err(format!("Log.logAt: expected (Int, String), got {arg}")),
+        },
+        ("logAt", other) => err(format!("Log.logAt: expected (Int, String), got {other}")),
+        _ => err(format!("unhandled effect Log.{op}")),
+    }
+}
+
 fn native_time(op: &str, arg: Value) -> Result<Value, RuntimeError> {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     // A process-wide origin, so `monotonic` is a small number that fits an `Int`

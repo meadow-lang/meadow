@@ -327,6 +327,7 @@ a `str` error.
 | `Time.monotonic`                                   | `unit`                       | `i64`, nanoseconds                                          |
 | `Time.sleep`                                       | `i64`, milliseconds          | `unit`                                                      |
 | `Test.fail`                                        | `str`                        | does not return: stops with the message, status 1           |
+| `Log.logAt`                                        | `(i64, str)`, a level's rank | `unit`: a line to standard error, by `MEADOW_LOG`'s level   |
 
 A sequence a runtime makes -- `Process.argv`'s, and any other an operation
 answers as a sequence -- is a vector if the program declares the vector roles,

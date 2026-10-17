@@ -2557,7 +2557,7 @@ fun roles (datas : [(String, Int, [(String, [Type])])]) : String =
 -- does (`meadow_rt`'s native operations): each operation is the runtime's
 -- of the same effect and name.
 def answered : [String] =
-  ["Std/Console", "Std/Fs", "Std/Process", "Std/Random", "Std/Time", "Std/Test"]
+  ["Std/Console", "Std/Fs", "Std/Process", "Std/Random", "Std/Time", "Std/Test", "Std/Log"]
 
 -- `native { ... }` for those of them a unit declares: every operation bound
 -- to the runtime's.

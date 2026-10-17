@@ -150,6 +150,23 @@ fn vector(items: Vec<Val>) -> Word {
     }
 }
 
+/// `Std.Log`'s line, where no handler took it: see `meadow_rt::log`.
+fn log(op: &str, arg: Val) -> Option<Build> {
+    match op {
+        "logAt" => {
+            let what = "Log.logAt";
+            let t = tuple(arg, 2, what);
+            let level = match t[0] {
+                Val::Int(n) => n,
+                other => fail(format!("{what}: expected an Int, got {}", shown(other))),
+            };
+            meadow_rt::log::line(level, &text(t[1], what));
+            Some(Build::unit())
+        }
+        _ => None,
+    }
+}
+
 fn text(v: Val, what: &str) -> String {
     match value::text(v) {
         Some(b) => String::from_utf8_lossy(&b).into_owned(),
@@ -235,6 +252,7 @@ pub unsafe extern "C" fn meadow_native(
         "Process" => process(&op, arg),
         "Random" => random(&op, arg),
         "Time" => time(&op, arg),
+        "Log" => log(&op, arg),
         _ => None,
     };
     match built {

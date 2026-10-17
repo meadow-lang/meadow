@@ -13,6 +13,17 @@ beyond the last release is under _Unreleased_.
 
 ## Unreleased
 
+### Added
+
+- `Std.Log`, what a program says it is doing, as an effect: `Log.info`,
+  `Log.warn`, `Log.error`, `Log.debug`, or `log level message`. Where nothing
+  handles it the runtime writes each line to standard error with its time and
+  level, if the level is at or above the one `MEADOW_LOG` names (`debug`,
+  `info`, `warn`, `error` or `off`; `info` by default). `captured` collects a
+  block's lines, `silenced` drops them, and `atLeast` keeps those at a level
+  or above. `main` and a spawned thread may perform it, as `Eff` now says; a
+  program's own effect called `Log` is still its own.
+
 ## 0.3.0 - 2026-10-16
 
 The release of MeadowBoot, the Meadow compiler written in Meadow with the

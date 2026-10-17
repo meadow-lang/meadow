@@ -295,6 +295,26 @@ impl Vm<'_> {
     // --- the natives ------------------------------------------------------
 
     /// Discharge `effect.op` against the real world, or say it cannot.
+    /// `Std.Log`'s line, where no handler took it: see `meadow_rt::log`.
+    fn native_log(&mut self, op: &str, arg: Value) -> Result<Option<Build>, Error> {
+        match op {
+            "logAt" => {
+                let what = "Log.logAt";
+                let t = self.tuple_arg(what, arg, 2)?;
+                let level = match t[0] {
+                    Value::Int(n) => n,
+                    other => {
+                        return err(format!("{what}: expected an Int, got {}", self.show(other)));
+                    }
+                };
+                let message = self.str_arg(what, t[1])?;
+                meadow_rt::log::line(level, &message);
+                Ok(Some(Build::unit()))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub(crate) fn native(
         &mut self,
         effect: &str,
@@ -307,6 +327,9 @@ impl Vm<'_> {
             "Random" => self.native_random(op, arg)?,
             "Time" => self.native_time(op, arg)?,
             "Console" => self.native_console(op, arg)?,
+            // A Std effect not among the language's names comes here by its
+            // canonical one, and through Cut by its bare one.
+            "Log" | "Std.Log.Log" => self.native_log(op, arg)?,
             // Not the runtime's own: the host's, if this machine has one.
             _ => return self.ask_host(effect, op, arg),
         };

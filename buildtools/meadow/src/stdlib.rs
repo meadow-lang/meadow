@@ -151,6 +151,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("Ffi", include_str!("../../../lib/Std/src/Ffi.mw")),
     // After `Console`, so `time` can print what it measured.
     ("Time", include_str!("../../../lib/Std/src/Time.mw")),
+    ("Log", include_str!("../../../lib/Std/src/Log.mw")),
     ("Eff", include_str!("../../../lib/Std/src/Eff.mw")),
     ("Bench", include_str!("../../../lib/Std/src/Bench.mw")),
     ("Prelude", include_str!("../../../lib/Std/src/Prelude.mw")),

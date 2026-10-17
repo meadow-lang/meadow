@@ -4392,7 +4392,17 @@ fn thread_row(tail: u32) -> Type {
 /// spawned it is on another heap, and may not even be running. An effect the
 /// function handles itself does not appear in its type, so it is allowed.
 pub const THREAD_EFFECTS: &[&str] = &[
-    "Thread", "Console", "Fs", "Process", "Random", "Time", "Test", "Mut",
+    "Thread",
+    "Console",
+    "Fs",
+    "Process",
+    "Random",
+    "Time",
+    "Test",
+    "Mut",
+    // A Std effect the runtime answers but whose name the language does not
+    // reserve, so a program's own `Log` is its own: by its canonical name.
+    "Std.Log.Log",
 ];
 
 /// The row `{ Stm | Bound(tail) }` -- what a transaction operation costs.
