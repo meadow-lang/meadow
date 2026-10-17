@@ -2,7 +2,7 @@
 //! that names no module.
 
 mod common;
-use common::{errors_std_with, eval_main_std};
+use common::{errors_std_with, eval_main_std, eval_unit, unit_errors};
 use meadow::Options;
 
 fn errors(src: &str) -> String {
@@ -186,5 +186,66 @@ fn a_qualified_type_the_module_lacks_or_a_qualifier_nothing_names_is_said() {
     assert_eq!(
         errors("fun f (x : W.List Int) : Int = 1\ndef result = 1\n"),
         "module `W` is not in scope here (add `use <path> as W`)"
+    );
+}
+
+// --- qualified constructors ----------------------------------------------------
+
+#[test]
+fn a_constructor_is_written_through_the_module_that_qualifies_it() {
+    // `M.Ctor` in an expression and a pattern, as `M.f` and `M.Ty` are: the
+    // module's constructor, which `use M as Q` puts in scope no other way.
+    assert_eq!(
+        eval_main_std(
+            "use Std.Maybe as Mb
+             fun pick (m : Mb.Maybe Int) : Int = match m with | Mb.Just n -> n | Mb.None -> 0
+             def result = pick (Mb.Just 4) + pick Mb.None
+"
+        ),
+        "4"
+    );
+    // And through its type, `M.Ty.Ctor`.
+    assert_eq!(
+        eval_main_std(
+            "use Std.Maybe as Mb
+             def result = match Mb.Maybe.Just 2 with | Mb.Maybe.Just n -> n | Mb.Maybe.None -> 0
+"
+        ),
+        "2"
+    );
+}
+
+#[test]
+fn a_module_constructor_two_of_its_types_have_is_written_through_its_type() {
+    let ast = "@pub mod Ast {
+  @pub data Term = Var Int | App Term Term
+  @pub data Ty = Var Int
+}
+";
+    // Through the type, it is the one meant.
+    assert_eq!(
+        eval_unit(&[(
+            "",
+            &format!(
+                "{ast}fun size (t : Ast.Term) : Int = match t with | Ast.Term.Var _ -> 1 | Ast.App f x -> size f + size x
+                 def result = size (Ast.App (Ast.Term.Var 1) (Ast.Term.Var 2))
+"
+            )
+        )]),
+        "2"
+    );
+    // Without it, the module cannot say which.
+    let said = unit_errors(&[(
+        "",
+        &format!(
+            "{ast}def result = Ast.Var 1
+"
+        ),
+    )]);
+    assert!(
+        said.contains(
+            "`Ast.Var` could be the constructor of any of `Term`, `Ty`: write `Ast.<Type>.Var`"
+        ),
+        "{said}"
     );
 }

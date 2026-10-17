@@ -3469,13 +3469,60 @@ impl Resolver {
                 self.ambiguous_type(*q.value(), &cs, q.span);
             }
         }
-        let canonical = self
+        let canonical = match self
             .resolve_qualified_ctor(*q.value(), name)
-            .or_else(|| self.module_type_ctor(*q.value(), name))?;
+            .or_else(|| self.module_type_ctor(*q.value(), name))
+        {
+            Some(c) => c,
+            None => {
+                let found = self.alias_ctors(*q.value(), name);
+                if found.len() > 1 {
+                    let mut owners: Vec<String> = found
+                        .iter()
+                        .map(|c| format!("`{}`", hir::spelling(&owner_of(*c))))
+                        .collect();
+                    owners.sort();
+                    self.error(
+                        format!(
+                            "`{}.{name}` could be the constructor of any of {}: write `{}.<Type>.{name}`",
+                            q.value(),
+                            owners.join(", "),
+                            q.value()
+                        ),
+                        "ambiguous constructor".to_string(),
+                        q.span,
+                    );
+                }
+                *found.first()?
+            }
+        };
         // The qualifier *is* the type, written out — so it is a reference to
         // it, and a rename of the type has to rewrite it.
         self.note_ref(q.span, NameRef::Type(owner_of(canonical)));
         Some(canonical)
+    }
+
+    /// `A.Var` and `A.Term.Var`, through a `use … as A`: the constructors
+    /// `name` of the types that alias reaches -- of the type named, where one
+    /// is, or else of each that has one. More than one is for the caller to
+    /// say is ambiguous.
+    fn alias_ctors(&self, q: InternedString, name: InternedString) -> Vec<InternedString> {
+        let (alias, ty) = match q.rsplit_once('.') {
+            Some((a, t)) => (a, Some(t)),
+            None => (&*q, None),
+        };
+        let Some(types) = self.qualifier_types.get(&InternedString::from(alias)) else {
+            return Vec::new();
+        };
+        let mut found: Vec<InternedString> = types
+            .iter()
+            .filter(|(bare, _)| ty.is_none_or(|t| &***bare == t))
+            .map(|(_, (c, _))| canonical_ctor(*c, name))
+            .filter(|c| self.ctors.contains_key(c))
+            .collect();
+        found.sort();
+        found.dedup();
+        found
     }
 
     /// What [`Resolver::qualified_type_ctor`] would answer, without saying
@@ -3487,6 +3534,7 @@ impl Resolver {
     ) -> Option<InternedString> {
         self.resolve_qualified_ctor(*q.value(), name)
             .or_else(|| self.module_type_ctor(*q.value(), name))
+            .or_else(|| self.alias_ctors(*q.value(), name).first().copied())
     }
 
     fn check_qualifier(&mut self, q: &ast::Ident) {

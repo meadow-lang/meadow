@@ -164,6 +164,22 @@ fun typeName (s : Syn) : Name =
        (V.foldl (\acc (n : Name) -> "${acc}.${n.text}") first.text names)
        (spanMeta (metaStart first.at) (metaEnd last.at)))
 
+-- A qualified name's parts, as `meadow-parser`'s `qualifier` takes them
+-- apart: what qualifies it -- `A`, or `A.Term` -- and its last part, the name.
+fun qualParts (s : Syn) : (Name, Name) =
+  let words = \x -> V.filter (\t -> R.kindOf t != TokenPeriod) (tokenKids x) in
+  let ns = V.map nameOf (V.append (words s) (V.concatMap words (childrenOf NodeQualTail s))) in
+  let last = V.getOr (named "" (spanOf s)) ns (V.len ns - 1) in
+  let quals = V.take ns (V.len ns - 1) in
+  let first = V.getOr last quals 0 in
+  let stop = V.getOr last quals (V.len quals - 1) in
+  (
+    named
+      (S.join "." (V.map (\(n : Name) -> n.text) quals))
+      (spanMeta (metaStart first.at) (metaEnd stop.at)),
+    last
+  )
+
 -- The first token under `s`, however deep, as a name.
 fun firstName (s : Syn) : Name =
   match s with
@@ -1248,18 +1264,10 @@ fun patom (c : Cx) (d : Int) (s : Syn) (over : Maybe Meta) : [String] =
 fun conPat (c : Cx) (d : Int) (s : Syn) (args : [Syn]) (over : Maybe Meta) : [String] =
   let m = M.unwrapOr (spanOf s) over in
   let argsOut = many (d + 1) "args" (each (\k a -> parg c k a) args) in
-  match childOf NodeQualTail s with
-  | Just q ->
-      node
-        d
-        "PQualCons"
-        m
-        (V.concat [
-           ident (d + 1) (nameOf (must TokenUpperIdent s)),
-           ident (d + 1) (nameOf (must TokenUpperIdent q)),
-           argsOut
-         ])
-  | None -> node d "PCons" m (V.append (ident (d + 1) (nameOf (must TokenUpperIdent s))) argsOut)
+  if has NodeQualTail s then
+    (match qualParts s with
+     | (q, x) -> node d "PQualCons" m (V.concat [ident (d + 1) q, ident (d + 1) x, argsOut]))
+  else node d "PCons" m (V.append (ident (d + 1) (nameOf (must TokenUpperIdent s))) argsOut)
 
 fun parg (c : Cx) (d : Int) (s : Syn) : [String] =
   match childOf NodeNullCon s with
@@ -2190,11 +2198,8 @@ fun baseE (c : Cx) (hs : [Int]) (d : Int) (s : Syn) (over : Maybe Meta) : [Strin
          else if k == NodeQualHead then
            applied
              (\j o ->
-               node
-                 j
-                 "Qual"
-                 (spanOf s)
-                 (V.append (ident (j + 1) (firstName h)) (ident (j + 1) (lastName h))))
+               match qualParts h with
+               | (q, x) -> node j "Qual" (spanOf s) (V.append (ident (j + 1) q) (ident (j + 1) x)))
              (spanOf s)
          else if V.isEmpty args then lowAtom c hs d h over
          else node d "App" m (V.append (lowAtom c hs (d + 1) h None) (argsOut (d + 1)))
@@ -2208,18 +2213,10 @@ fun atomE (c : Cx) (hs : [Int]) (d : Int) (s : Syn) : [String] =
       if k == NodeMacAtom then
         fields d n (\j -> node j "MacCallE" (macSpan n) (macCall c (j + 1) n))
       else if k == NodeQualAtom then
-        let toks = V.filter (\t -> R.kindOf t != TokenPeriod) (tokenKids n) in
-        let q =
-          (match V.get toks 0 with
-           | Just t -> nameOf t
-           | None -> named "" m)
-        in
-        let nm =
-          (match V.get toks 1 with
-           | Just t -> nameOf t
-           | None -> named "" m)
-        in fields d n (\j ->
-             node j "Qual" (from q.at nm.at) (V.append (ident (j + 1) q) (ident (j + 1) nm)))
+        match qualParts n with
+        | (q, nm) ->
+            fields d n (\j ->
+              node j "Qual" (from q.at nm.at) (V.append (ident (j + 1) q) (ident (j + 1) nm)))
       else lowAtom c hs d n None
   | None -> node d "Cons" m (V.append (ident (d + 1) (firstName s)) (many (d + 1) "args" []))
 

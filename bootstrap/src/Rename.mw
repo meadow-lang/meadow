@@ -26,7 +26,7 @@ use Std.Collections.HashMap (HashMap)
 use Std.String as S
 use Std.Maybe as M
 use Std.Maybe.Maybe.*
-use Std.Sort (sortOn)
+use Std.Sort (sortOn, sort)
 
 @pub(pkg) lang! {
   pub Hir extends Ast
@@ -607,10 +607,38 @@ fun qualified out (env : Env) (m : Meta) (qual : HirName) (name : HirName) (args
     if V.isEmpty args then v else newHirExprApp out m v args
 
 fun qualifiedCtor out (env : Env) (qual : HirName) (name : HirName) =
-  match typeCtor env (textOf out qual) (textOf out name) with
+  match (match typeCtor env (textOf out qual) (textOf out name) with
+   | Just found -> Just found
+   | None -> aliasCtor env (textOf out qual) (textOf out name)) with
   | Just (t, c) ->
       (let u = mention env t (nameMeta out qual) in refTo out env c (nameMeta out name))
   | None -> refTo out env (ctorOf env (textOf out name)) (nameMeta out name)
+
+-- `A.C` and `A.T.C` through a `use … as A`: the constructor `C` of the type
+-- `T` that alias reaches, or of the one type it reaches with a constructor of
+-- that name -- the first by name where several have one, which `meadow-rename`
+-- says is ambiguous (`alias_ctors`).
+fun aliasCtor (env : Env) (qual : String) (name : String) : Maybe (Int, Int) =
+  let parts = S.split "." qual in
+  match H.lookup (V.getOr "" parts 0) env.scope.qualTypes with
+  | None -> None
+  | Just types ->
+      (let wanted = if V.len parts > 1 then Just (V.getOr "" parts 1) else None in
+       let found =
+         V.concatMap
+           (\ty ->
+             if M.unwrapOr True (M.map (\w -> w == ty) wanted) then
+               (match H.lookup ty types with
+                | Just t ->
+                    (match M.andThen
+                       (H.lookup (unmarked name))
+                       (H.lookup t env.scope.typeCtors) with
+                     | Just c -> [(t, c)]
+                     | None -> [])
+                | None -> [])
+             else [])
+           (sort (H.keys types))
+       in V.get found 0)
 
 -- Each of a pattern's parts renamed in turn, one after what those to its
 -- left bind.
