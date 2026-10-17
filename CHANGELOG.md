@@ -13,6 +13,14 @@ beyond the last release is under _Unreleased_.
 
 ## Unreleased
 
+### Added
+
+- A constructor is written through the module a `use … as` names, as its
+  functions and types are: `use Mira as M` and then `M.VoxelHit b f d k`, in
+  a pattern or an expression, of the package's own modules and a
+  dependency's alike. Where two of the module's types have a constructor of
+  that name, `M.Type.Ctor` says which, and `M.Ctor` is an error saying so.
+
 ## 0.3.0 - 2026-10-16
 
 The release of MeadowBoot, the Meadow compiler written in Meadow with the
