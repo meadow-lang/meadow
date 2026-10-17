@@ -186,6 +186,13 @@ util = { path = "../util" }
 you, and finds the package's name by reading its own manifest rather than
 guessing it from the URL.
 
+A package that is one directory of a repository, rather than all of it, is
+named by `subdir`:
+
+```toml
+Cut = { git = "https://github.com/someone/monorepo", rev = "…", subdir = "lib/Cut" }
+```
+
 What was actually used goes in **`Meadow.lock`** — the commit, and a hash of its
 source tree. Commit that file: it is what makes a build on another machine the
 build you tested. A branch moves, and a tag _can_ be moved, so a build follows
@@ -388,6 +395,29 @@ in the package's root module — because two modules may each declare a test of
 the same name. `meadow test <path> <filter>` runs the tests whose name contains
 `<filter>`; add `--exact` to run only the one whose name _is_ it, which is what
 the editor's **▶ Test** link above each `@test` does.
+
+A property says what holds of every value, and `Std.Test.Property` looks for
+one it does not hold of:
+
+```
+use Std.Test.Property (forAll, vector, between)
+
+@test fun reversingTwiceIsTheSame () =
+  forAll
+    (\() -> vector 20 (\() -> between 0 100))
+    (\xs -> assertEq (V.reverse (V.reverse xs)) xs "reversed twice")
+```
+
+A generator is a function that draws numbers, so one of your own is any
+function that calls the ones there. A case that fails is made smaller before
+the test fails with it, by running it again on fewer and smaller draws, and
+the same cases are checked every run. `Std.Test.Fuzz` is the same thing for
+text: `fuzz examples words prop` runs `prop` on a thousand texts made by
+changing the examples -- pieces taken out, doubled, moved, words dropped in.
+`fuzzGuided` is `fuzz` steered by coverage: an input that reaches somewhere in
+the program no input before it did is kept as an example to make more from,
+so it gets through a check one change at a time. Either sees a failure only
+as a test does: a program that stops the process is not caught.
 
 ### Effects
 

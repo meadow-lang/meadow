@@ -1301,7 +1301,8 @@ fn mark_tests(a: &mut Analysis, pkg: &CompiledPackage) {
 /// type, which is all a definition that is not exported has, still carries it.
 fn without_lone_effect(t: &str) -> String {
     if let Some((body, var)) = t.rsplit_once(" ! ") {
-        let lone = !var.is_empty()
+        // A variable is written small; `Eff` is an effect's name.
+        let lone = var.chars().next().is_some_and(|c| c.is_ascii_lowercase())
             && var.chars().all(|c| c.is_ascii_alphanumeric() || c == '\'')
             && !body
                 .split(|c: char| !(c.is_ascii_alphanumeric() || c == '\''))

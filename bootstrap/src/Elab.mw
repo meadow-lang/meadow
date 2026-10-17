@@ -28,6 +28,7 @@ use MeadowBoot.Solve (
 use MeadowBoot.Traits (methodKey)
 use MeadowBoot.Core
 use MeadowBoot.Core (Core!)
+use MeadowBoot.Dictionaries (Summary)
 use MeadowBoot.Types
 use MeadowBoot.Types.Type.*
 use MeadowBoot.Scopes (Renamed, Item, Declared, Export)
@@ -85,6 +86,8 @@ record Low s = {
   impls : HashMap Int ImplDef,
   generics : HashMap Int Generalized,
   extTypes : HashMap Int Int,
+  -- How many number types a definition of another unit is generic in.
+  extNums : HashMap Int Int,
   shapes : HashMap String TraitShape,
   methods : HashMap String Scheme,
   defaults : HashMap String Int,
@@ -226,12 +229,28 @@ fun arm src out (cx : Low s) (m : Meta) pat guard body =
          (M.unwrapOr (truth True) g)
          views
      in
+     -- What the guard found to match is taken apart again for what it binds.
+     -- It matches, so the arm after it is never taken: it is there so that
+     -- the `case` matches every value as a `match` must (`Exhaust`).
      let under =
        V.foldr
          (\view rest ->
            match view with
            | (_, _, _, q) ->
-               newCoreTermCase out m (seen view) [newCoreArm out m q None rest] (tyCoreTerm out b))
+               newCoreTermCase
+                 out
+                 m
+                 (seen view)
+                 [
+                   newCoreArm out m q None rest,
+                   newCoreArm
+                     out
+                     m
+                     (newCorePatPWild out m (tyCorePat out q))
+                     None
+                     (newCoreTermIll out m (tyCoreTerm out b))
+                 ]
+                 (tyCoreTerm out b))
          b
          views
      in newCoreArm out m p (Just holds) under)
@@ -397,20 +416,50 @@ fun typesOf (cx : Low s) (id : Int) : Int =
 -- How many of a scheme's quantifiers are variables over types.
 fun plains (sc : Scheme) : Int = V.len (plainOf sc sc.quant VarKind.Plain)
 
+-- Those of `xs`, one for each of `sc`'s quantifiers, that are for variables
+-- over number types.
+fun numberOf (sc : Scheme) (xs : [a]) (other : a) : [a] =
+  V.concatMap
+    (\k ->
+      (let kind = V.getOr VarKind.Plain sc.quant k in
+       if kind == VarKind.Num or kind == VarKind.Frac then [V.getOr other xs k] else []))
+    (V.range 0 (V.len sc.quant))
+
+-- The variables over number types binder `id` is generic in.
+fun numvarsOf (cx : Low s) (id : Int) : [Int] =
+  match H.lookup id cx.generics with
+  | Just (g : Generalized) -> numberOf g.scheme g.vars 0
+  | None -> []
+
+-- How many number types binder `id` is generic in.
+fun numbersOf (cx : Low s) (id : Int) : Int =
+  match H.lookup id cx.extNums with
+  | Just n -> n
+  | None -> V.len (numvarsOf cx id)
+
 -- A mention of binder `id`, of type `t`, at types `tys`. One of a binding
 -- from inside it is at the binding's own variables, which nothing wrote.
+-- `tys` are the types and then, where inference said, the number types:
+-- a mention it did not say them of is at no number type that is known.
 fun instance out (cx : Low s) (m : Meta) (id : Int) (t : Type) (tys : [Type]) =
   let n = typesOf cx id in
+  let k = numbersOf cx id in
   let head = newCoreTermVar out m id t in
-  if n == 0 then head
-  else if V.len tys == n then newCoreTermTyApp out m head tys t
+  if n == 0 and k == 0 then head
+  else if V.len tys == n + k then newCoreTermTyApp out m head (V.take tys n) (V.drop tys n) t
   else
+    -- Inference said nothing of the number types: a mention from inside the
+    -- binding, which is at the binding's own, so that a copy of it for a
+    -- number type calls that copy and not the binding as it was written.
     (let own = V.map (\v -> Var v) (tyvarsOf cx id) in
-     newCoreTermTyApp out m head (V.map (\k -> V.getOr Error own k) (V.range 0 n)) t)
+     let nums = V.map (\v -> Var v) (numvarsOf cx id) in
+     let plain = if V.len tys == n then tys else V.map (\i -> V.getOr Error own i) (V.range 0 n) in
+     newCoreTermTyApp out m head plain nums t)
 
--- `value`, generic in `vars`.
-fun typeAbs out (vars : [Int]) value =
-  if V.isEmpty vars then value else newCoreTermTyLam out nowhere vars value (tyCoreTerm out value)
+-- `value`, generic in `vars`, and in `nums` over number types.
+fun typeAbs out (vars : [Int]) (nums : [Int]) value =
+  if V.isEmpty vars and V.isEmpty nums then value
+  else newCoreTermTyLam out nowhere vars nums value (tyCoreTerm out value)
 
 -- What each of `pattern`'s quantifiers is where it is `actual`, after `h`.
 fun matchTy (pattern : Type) (actual : Type) (h : HashMap Int Type) : HashMap Int Type =
@@ -474,7 +523,8 @@ fun topBind (a : BareArena) out (cx : Low s) b =
   | (pat, value, isFun) ->
       (let v = stSetRef cx.dicts [] in
        let vars = M.unwrapOr [] (M.map (\id -> tyvarsOf cx id) (boundId a b)) in
-       (pat, typeAbs out vars (abstracted out ds value), isFun))
+       let nums = M.unwrapOr [] (M.map (\id -> numvarsOf cx id) (boundId a b)) in
+       (pat, typeAbs out vars nums (abstracted out ds value), isFun))
 
 -- A method's type, over its trait's parameters.
 fun methodType (cx : Low s) (tr : String) (name : String) : Type =
@@ -674,6 +724,7 @@ fun implDefs out (cx : Low s) (a : BareArena) d (dict : Int) =
            (typeAbs
               out
               typed
+              []
               (abstracted
                  out
                  ds
@@ -760,10 +811,15 @@ fun bound out (cx : Low s) (m : Meta) b body =
   | (p, value, isFun) ->
       if isFun then
         (let id = corePatPVarId out p in
-         newCoreTermLetRec out m [newCoreBind out m id (typeAbs out (tyvarsOf cx id) value)] body t)
+         newCoreTermLetRec
+           out
+           m
+           [newCoreBind out m id (typeAbs out (tyvarsOf cx id) [] value)]
+           body
+           t)
       else if kindCorePat out p == CorePatKind.PVar then
         (let id = corePatPVarId out p in
-         newCoreTermLet out m id (typeAbs out (tyvarsOf cx id) value) body t)
+         newCoreTermLet out m id (typeAbs out (tyvarsOf cx id) [] value) body t)
       else if kindCorePat out p == CorePatKind.PWild then
         newCoreTermLet out m (fresh cx) value body t
       else newCoreTermCase out m value [newCoreArm out m p None body] t
@@ -860,7 +916,43 @@ def nowhere : Meta = spanMeta 0 0
   aliases : [Entry String],
   -- Each function it writes with its parameters, and each it exports of
   -- another unit's: its symbol, and how many they are.
-  arities : [Entry Int]
+  arities : [Entry Int],
+  -- What `Dictionaries` needs to know of its definitions.
+  summary : Summary,
+  -- The functions it keeps for a unit that imports it to copy to its calls
+  -- (`Inline.exports`).
+  bodies : CoreProgram,
+  -- Its definitions that are generic in a number's type, as they were
+  -- written, and those of the units it imports, a program a package: what a
+  -- unit that uses one at a number type makes its copy of
+  -- (`Inline.numbered`). A unit hands on what it was handed, since a
+  -- definition it keeps may mention one of theirs.
+  numbers : [Numbers],
+  -- All of it, as it was written and before anything was made of it, where
+  -- the build's units are to be optimised as one program
+  -- (`Core.joinedUnits`); nothing otherwise.
+  whole : CoreProgram,
+  -- Its functions C may call (`@export`): a program of them is a library.
+  cExports : [CExport]
+}
+
+-- A function C may call: the name C calls it by, its binder, and the
+-- representation of what it answers, as Cut writes one.
+@derive(Reflect, Debug, PartialEq)
+@pub record CExport = {
+  name : String,
+  binder : Int,
+  result : String
+}
+
+-- A unit's definitions that are generic in a number's type, as they were
+-- written, with each variable over number types they are written with and
+-- whether it is over fractions.
+@derive(Reflect, Debug, PartialEq)
+@pub record Numbers = {
+  program : CoreProgram,
+  vars : [Int],
+  fracs : [Bool]
 }
 
 -- A declared type: its name in core, how many types it takes, and each
@@ -1127,6 +1219,23 @@ def nowhere : Meta = spanMeta 0 0
                    theirDefaults,
                extTypes =
                  V.foldl (\h x -> match x with | (id, _, n) -> H.insert id n h) H.empty externs,
+               extNums =
+                 V.foldl
+                   (\h x ->
+                     match x with
+                     | ((it : Item), (ex : Export), _) ->
+                         if it.kind != "v" or not (S.isEmpty it.owner) then h
+                         else
+                           H.insert
+                             it.id
+                             (M.unwrapOr
+                                0
+                                (M.map
+                                   (\(sc : Scheme) -> V.len (numberOf sc sc.quant VarKind.Plain))
+                                   ex.scheme))
+                             h)
+                   H.empty
+                   theirs,
                shapes = traitShapes,
                methods =
                  V.foldl
@@ -1387,76 +1496,79 @@ fun declShapes (a : BareArena) (d : BareDecl) : [(String, String, Int, Maybe [St
 fun moduleDatas out (items : [Item]) (variants : [VariantSig]) (p : BareProgram) =
   match p with
   | BareProgram a root ->
+      -- Each constructor's and each type's name in core, by what the module
+      -- calls it -- the first so called -- and each constructor's fields as
+      -- inference has them.
+      let ctorCanons =
+        V.foldr
+          (\(i : Item) h -> if i.kind == "c" then H.insert "${i.owner}.${i.name}" i.canon h else h)
+          H.empty
+          items
+      in
+      let typeCanons =
+        V.foldr
+          (\(i : Item) h -> if i.kind == "t" then H.insert i.name i.canon h else h)
+          H.empty
+          items
+      in
+      let fields = V.foldr (\(v : VariantSig) h -> H.insert v.name v h) H.empty variants in
       V.concatMap
         (\d0 ->
           (let d = peeled a d0 in
            let canon =
-             \owner name ->
-               M.unwrapOr
-                 "${owner}.${name}"
-                 (M.map
-                    (\(i : Item) -> i.canon)
-                    (V.find
-                       (\(i : Item) -> i.kind == "c" and i.owner == owner and i.name == name)
-                       items))
+             \owner name -> M.unwrapOr "${owner}.${name}" (H.lookup "${owner}.${name}" ctorCanons)
            in
-           let typeCanon =
-             \owner ->
-               M.unwrapOr
-                 owner
-                 (M.map
-                    (\(i : Item) -> i.canon)
-                    (V.find (\(i : Item) -> i.kind == "t" and i.name == owner) items))
-           in if kindBareDecl a d == BareDeclKind.Data then
-                (let owner = bareNameText a (bareDeclDataName a d) in
-                 let params = V.map (\n -> bareNameText a n) (bareDeclDataParams a d) in
-                 [newCoreData
-                    out
-                    nowhere
-                    (typeCanon owner)
-                    (V.len params)
-                    (V.map
-                       (\v ->
-                         newCoreDataCtor
-                           out
-                           nowhere
+           let typeCanon = \owner -> M.unwrapOr owner (H.lookup owner typeCanons) in
+           if kindBareDecl a d == BareDeclKind.Data then
+             (let owner = bareNameText a (bareDeclDataName a d) in
+              let params = V.map (\n -> bareNameText a n) (bareDeclDataParams a d) in
+              [newCoreData
+                 out
+                 nowhere
+                 (typeCanon owner)
+                 (V.len params)
+                 (V.map
+                    (\v ->
+                      newCoreDataCtor
+                        out
+                        nowhere
+                        (canon owner (bareNameText a (bareVariantName a v)))
+                        (resolved
+                           fields
                            (canon owner (bareNameText a (bareVariantName a v)))
-                           (resolved
-                              variants
-                              (canon owner (bareNameText a (bareVariantName a v)))
-                              (if bareVariantNamed a v then
-                                 V.map
-                                   (\f -> written a params (bareFieldTy a f))
-                                   (bareVariantFields a v)
-                               else V.map (\t -> written a params t) (bareVariantPositional a v))))
-                       (bareDeclDataVariants a d))])
-              else if kindBareDecl a d == BareDeclKind.Record then
-                (let owner = bareNameText a (bareDeclRecordName a d) in
-                 let params = V.map (\n -> bareNameText a n) (bareDeclRecordParams a d) in
-                 [newCoreData
+                           (if bareVariantNamed a v then
+                              V.map
+                                (\f -> written a params (bareFieldTy a f))
+                                (bareVariantFields a v)
+                            else V.map (\t -> written a params t) (bareVariantPositional a v))))
+                    (bareDeclDataVariants a d))])
+           else if kindBareDecl a d == BareDeclKind.Record then
+             (let owner = bareNameText a (bareDeclRecordName a d) in
+              let params = V.map (\n -> bareNameText a n) (bareDeclRecordParams a d) in
+              [newCoreData
+                 out
+                 nowhere
+                 (typeCanon owner)
+                 (V.len params)
+                 [newCoreDataCtor
                     out
                     nowhere
-                    (typeCanon owner)
-                    (V.len params)
-                    [newCoreDataCtor
-                       out
-                       nowhere
+                    (canon owner owner)
+                    (resolved
+                       fields
                        (canon owner owner)
-                       (resolved
-                          variants
-                          (canon owner owner)
-                          (V.map
-                             (\f -> written a params (bareFieldTy a f))
-                             (bareDeclRecordFields a d)))]])
-              else []))
+                       (V.map
+                          (\f -> written a params (bareFieldTy a f))
+                          (bareDeclRecordFields a d)))]])
+           else []))
         (bareModuleDecls a root)
 
 -- A constructor's fields' types as inference has them -- an alias what it
 -- stands for, which is what says how a field is represented: a type written
 -- `Node` that is an `Int` is an `Int` -- or as they were written, for one
 -- inference does not know.
-fun resolved (variants : [VariantSig]) (ctor : String) (written : [Type]) : [Type] =
-  match V.find (\(v : VariantSig) -> v.name == ctor) variants with
+fun resolved (variants : HashMap String VariantSig) (ctor : String) (written : [Type]) : [Type] =
+  match H.lookup ctor variants with
   | Just (v : VariantSig) -> if V.len v.fields == V.len written then v.fields else written
   | None -> written
 

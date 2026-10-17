@@ -39,6 +39,13 @@ use Std.Collections.Vector (Vector)
   getEnv : String -> Maybe String,
   setEnv : (String, String) -> (),
   removeEnv : String -> (),
+  -- How many places in the program this thread has reached, counted from
+  -- the first time it is asked or from the last asking with `True`, which
+  -- forgets them and answers 0. Between those it only grows, and grows when
+  -- the program gets somewhere it had not been: what `Std.Test.Fuzz` steers
+  -- by. On the bytecode machine, which from the first asking interprets this
+  -- thread and compiles none of it; a native program is always told 0.
+  covered : Bool -> Int,
   -- Calling C: what `Std.Ffi` is written over, and where to look for how to
   -- use these. A library and a function are addresses; an argument is
   -- `(kind, integer, float, text)` and an answer `(integer, float, text)`.
@@ -52,6 +59,9 @@ use Std.Collections.Vector (Vector)
   ffiWriteFloats : (Int, Int, Vector Float) -> Result String (),
   ffiReadFloats : (Int, Int, Int) -> Result String (Vector Float),
   ffiReadText : (Int, Int) -> String,
+  -- What the last call C made into this library failed with, once; empty
+  -- when none did.
+  ffiFailure : () -> String,
 }
 
 @pub fun command (program : a) : (a, [b], Maybe c, [d]) = (program, V.empty, None, V.empty)

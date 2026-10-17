@@ -49,6 +49,15 @@ impl Format {
         }
     }
 
+    /// What a shared library named `name` is called in this format.
+    pub fn library_name(self, name: &str) -> String {
+        match self {
+            Format::Coff => format!("{name}.dll"),
+            Format::MachO => format!("lib{name}.dylib"),
+            Format::Elf => format!("lib{name}.so"),
+        }
+    }
+
     /// What an executable in this format is called after its name.
     pub fn exe_suffix(self) -> &'static str {
         match self {

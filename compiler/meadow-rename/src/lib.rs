@@ -191,6 +191,9 @@ pub struct Resolver {
     /// and which: `Core.Expr` -> its path. What lets `Core.Expr.Int` be a
     /// constructor of the type `Expr` that module `Core` declares.
     qualifier_paths: HashMap<InternedString, Vec<InternedString>>,
+    /// The types each qualifier reaches, by how they are spelled: `M.Ty` in a
+    /// type is the type `Ty` of the module `M` qualifies, with its arity.
+    qualifier_types: HashMap<InternedString, HashMap<InternedString, (InternedString, usize)>>,
     /// How every operator binds that something declared: this unit's own
     /// `infixl 6 +` and its dependencies'. One table for the whole unit,
     /// because an operator's fixity goes by its spelling, not by which
@@ -600,6 +603,7 @@ impl Resolver {
             macro_vars: Vec::new(),
             qualifiers: HashMap::new(),
             qualifier_paths: HashMap::new(),
+            qualifier_types: HashMap::new(),
             fixities: HashMap::new(),
             prelude: HashMap::new(),
             errors: Vec::new(),
@@ -882,6 +886,7 @@ impl Resolver {
         self.scope.truncate(self.base_scope);
         self.qualifiers.clear();
         self.qualifier_paths.clear();
+        self.qualifier_types.clear();
         self.tycons = self.base_tycons.clone();
         self.visible_ctors = self.base_ctors.clone();
         self.module_ctors.clear();
@@ -1296,7 +1301,38 @@ impl Resolver {
     pub fn activate_child(&mut self, qualifier: InternedString, path: &[InternedString]) {
         let values = self.module_values(path);
         self.activate_module(qualifier, values);
+        self.activate_local_types(qualifier, path);
         self.qualifier_paths.insert(qualifier, path.to_vec());
+    }
+
+    /// Make the types `types` -- a used module's, by their canonical names --
+    /// reachable as `qualifier.Ty` in a type.
+    pub fn activate_module_types(&mut self, qualifier: InternedString, types: &[InternedString]) {
+        let reached = types
+            .iter()
+            .filter_map(|t| {
+                self.imported_arity(*t)
+                    .map(|a| (InternedString::from(hir::spelling(t)), (*t, a)))
+            })
+            .collect();
+        self.qualifier_types.insert(qualifier, reached);
+    }
+
+    /// [`Resolver::activate_module_types`] for the module of this unit at
+    /// `path`: the types it declares that this module may see.
+    pub fn activate_local_types(&mut self, qualifier: InternedString, path: &[InternedString]) {
+        let Some(frame) = self.frames.get(path) else {
+            return;
+        };
+        let here = self.current.clone();
+        let all = !self.any_vis;
+        let reached = frame
+            .tycons
+            .iter()
+            .filter(|(_, _, v)| all || v.reaches(path, &here))
+            .map(|(n, a, _)| (*n, (self.qualify_in(path, *n), *a)))
+            .collect();
+        self.qualifier_types.insert(qualifier, reached);
     }
 
     /// `Core.Expr.Int`: the constructor `name` of the type that `q` names
@@ -3168,7 +3204,24 @@ impl Resolver {
             },
             ast::TypeExpr::Con(n, args) => {
                 let name = *n.value();
-                let found = self.tycons.get(&name).cloned();
+                // `M.Ty`: the type `Ty` of the module `M` qualifies.
+                let found = match name.rsplit_once('.') {
+                    Some((q, ty)) => {
+                        let q = InternedString::from(q);
+                        match self.qualifier_types.get(&q) {
+                            Some(types) => types
+                                .get(&InternedString::from(ty))
+                                .map(|(c, a)| Named::One(*c, *a)),
+                            // A qualifier with no types: `unknown type` below.
+                            None if self.qualifiers.contains_key(&q) => None,
+                            None => {
+                                self.check_qualifier(&ast::Ident::new(q, n.span));
+                                return self.node(hir::TypeExpr::Error, t.span);
+                            }
+                        }
+                    }
+                    None => self.tycons.get(&name).cloned(),
+                };
                 let canonical = match &found {
                     Some(Named::One(c, _)) => *c,
                     _ => name,

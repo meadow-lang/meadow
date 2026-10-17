@@ -1256,8 +1256,13 @@ impl<'a> Expander<'a> {
                 // the macro wrote about it follows. A derive that is waiting
                 // for a name stays on it, to be run in a later round.
                 ast::Decl::Attributed(attrs, _) if attrs.iter().any(is_derive) => {
-                    let (made, pending) = self.derived(&d);
-                    record::decls(self.filename, d.span, "derived", &made);
+                    let (made, pending, ran) = self.derived(&d);
+                    // What the compiler's own derives wrote is not recorded:
+                    // MeadowBoot writes that itself (`Derive`), and reads a
+                    // record only of what a procedural macro had a hand in.
+                    if ran {
+                        record::decls(self.filename, d.span, "derived", &made);
+                    }
                     self.decl(&mut d);
                     out.push(keep_derives(d, &pending));
                     out.extend(made);
@@ -1278,14 +1283,16 @@ impl<'a> Expander<'a> {
     /// all, on the declaration and on its variants, which is where a derive of
     /// any substance keeps what it needs.
     ///
-    /// Answers what they wrote, and the derives that are waiting for a
-    /// compile-time binding and are to be run again in a later round.
-    fn derived(&mut self, d: &ast::LDecl) -> (Vec<ast::LDecl>, Vec<ast::Ident>) {
+    /// Answers what they wrote, the derives that are waiting for a
+    /// compile-time binding and are to be run again in a later round, and
+    /// whether any of them is a procedural macro.
+    fn derived(&mut self, d: &ast::LDecl) -> (Vec<ast::LDecl>, Vec<ast::Ident>, bool) {
         let ast::Decl::Attributed(attrs, inner) = &*d.value else {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), false);
         };
         let mut out = Vec::new();
         let mut pending = Vec::new();
+        let mut ran = false;
         for want in attrs.iter().filter(|a| is_derive(a)).flat_map(|a| &a.args) {
             let Some((pkg, name)) = self.deriving(want) else {
                 // No procedural macro of that name: one of the compiler's own,
@@ -1311,6 +1318,7 @@ impl<'a> Expander<'a> {
                 }
                 continue;
             };
+            ran = true;
             let Some(argument) = self.source_trees(d.span) else {
                 continue;
             };
@@ -1368,7 +1376,7 @@ impl<'a> Expander<'a> {
                 ),
             }
         }
-        (out, pending)
+        (out, pending, ran)
     }
 
     /// What a built-in derive wrote, parsed where the derive was written.

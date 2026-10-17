@@ -16,6 +16,7 @@ use Lingua.Make (
 )
 use Std.Fs (Fs, readToString, writeString)
 use Std.Time (monotonic)
+use Std.Thread (parMap)
 use Std.Console (writeError)
 use Std.Process (getEnv)
 use MeadowBoot.Types.Type.*
@@ -26,15 +27,37 @@ use MeadowBoot.Syntax
 use MeadowBoot.Parse (checkedTree)
 use MeadowBoot.Fixity (Fixity, Grouped, declare, grouped)
 use MeadowBoot.Unit (dependenciesOf, unitFilesOf, manifestOf, packageName, dependencyNames)
-use MeadowBoot.Lower (lowered)
-use MeadowBoot.Rename (mentionsOf)
-use MeadowBoot.Scopes (Source, Export, Renamed, DepExports, renameUnit)
+use MeadowBoot.Lower (lowered, loweredWith, Request, Cfg, shownCfg)
+use MeadowBoot.Expand (
+  Binding, MacroFun, Dep, Batch, scopeOf, procFor, visOf, writeRound, readAnswers
+)
+use MeadowBoot.Macros as Mc
+use MeadowBoot.Macros (Answer, Wire)
+use Std.Result as Res
+use MeadowBoot.Rules as Ru
+use MeadowBoot.Rules (Tok)
+use Std.Process as Proc
+use MeadowBoot.Ast (
+  AstProgram, AstAttr, AstDecl, AstDeclKind, AstBindKind, kindAstDecl, kindAstBind, astDeclBindBind,
+  astBindFunName, astAttrName, astAttrArgs, astNameText
+)
+use MeadowBoot.Rename (mentionsOf, Binder)
+use MeadowBoot.Scopes (
+  Source, Export, Renamed, DepExports, renameUnit, usesOf, macroFuns, saysVis, moduleFile,
+  builtinTyconNames, declsOf
+)
 use MeadowBoot.Infer (inferUnit, Inferred)
-use MeadowBoot.Elab (unitCore, defSymbol, Linked, DataSig, DefaultSig, Imported)
+use MeadowBoot.Elab (unitCore, defSymbol, Linked, Numbers, DataSig, DefaultSig, Imported, CExport)
 use MeadowBoot.Seq as Seq
 use MeadowBoot.Lint (lint)
+use MeadowBoot.Dictionaries as Dictionaries
+use MeadowBoot.Inline as Inline
+use MeadowBoot.Eta as Eta
+use MeadowBoot.Exhaust as Exhaust
+use MeadowBoot.Tests as Tests
+use MeadowBoot.Dictionaries (emptySummary)
 use MeadowBoot.Types
-use MeadowBoot.Core (CoreProgram)
+use MeadowBoot.Core (CoreProgram, joinedUnits)
 use MeadowBoot.Solve (TypeEnv, noTypes, Entry)
 use Std.Macro (Reflect)
 use Std.Json as J
@@ -61,7 +84,11 @@ use Std.Result.Result.*
   exports : [Export],
   anyVis : Bool,
   types : TypeEnv,
-  linked : Linked
+  linked : Linked,
+  -- The functions it marks `@macro`, and what its macro calls left for
+  -- later ones at compile time.
+  macros : [MacroFun],
+  bindings : [Binding]
 }
 
 -- An operator, and how it binds.
@@ -74,6 +101,11 @@ database! {
     | input files (unit : Int) : [String]
     | input imported (unit : Int) : [Interface]
     | input home (unit : Int) : String
+    -- What the unit's procedural macros answered when it was last built:
+    -- each call's file and key, where it stands, and what its macro wrote.
+    | input answers (unit : Int) : [(String, String, Int, Int, String)]
+    -- What a `@cfg` in the unit is decided by.
+    | input cfg (unit : Int) : Cfg
     | query parsed (file : String) : Result [(Int, String)] (Green Surface) =
         checkedTree (querySource file)
     | query fixities (unit : Int) : [Declared] =
@@ -84,6 +116,23 @@ database! {
              (modulesOf (queryFiles unit)))
     | query grouped (file : String) : Maybe (Green Grouped, [Diagnostic]) =
         groupedOf (queryFixities 0) (queryParsed file)
+    | query package (unit : Int) : String =
+        (match V.find (\f -> S.endsWith "Meadow.toml" f) (queryFiles unit) with
+         | Just f -> packageName (querySource f)
+         | None -> "")
+    | query expansions (unit : Int) : HashMap String (HashMap String Json) =
+        expansionsIn (V.map querySource (V.filter (\f -> S.endsWith ".json" f) (queryFiles unit)))
+    | query lowered (file : String) : Maybe (AstProgram, [Request], [(String, Int, Int)]) =
+        loweredOf
+          (queryCfg 0)
+          (queryPackage 0)
+          (queryHome 0)
+          file
+          (querySource file)
+          (queryGrouped file)
+          (queryExpansions 0)
+          (tableOf (queryFixities 0))
+          (answeredIn file (queryAnswers 0))
     | query renamed (unit : Int) : ([(String, [String])], [Export], Bool) =
         renamedOf
           (queryHome unit)
@@ -92,6 +141,12 @@ database! {
           (V.map
              (\f -> (f, querySource f, if S.endsWith ".mw" f then queryGrouped f else None))
              (queryFiles unit))
+          (V.concatMap
+             (\f ->
+               match queryLowered f with
+               | Just (ast, _, _) -> [(f, ast)]
+               | None -> [])
+             (modulesOf (queryFiles unit)))
     | query inferred (unit : Int) : ([(String, [String])], [Export], Bool, TypeEnv) =
         inferredOf
           (queryHome unit)
@@ -100,16 +155,63 @@ database! {
           (V.map
              (\f -> (f, querySource f, if S.endsWith ".mw" f then queryGrouped f else None))
              (queryFiles unit))
+          (V.concatMap
+             (\f ->
+               match queryLowered f with
+               | Just (ast, _, _) -> [(f, ast)]
+               | None -> [])
+             (modulesOf (queryFiles unit)))
     | query core (unit : Int) : Maybe CoreProgram =
         coreIn
           (checkedOf
+             shownCfg
              (queryHome unit)
              (queryImported unit)
              (tableOf (queryFixities 0))
              (V.map
                 (\f -> (f, querySource f, if S.endsWith ".mw" f then queryGrouped f else None))
                 (queryFiles unit))
+             (V.concatMap
+                (\f ->
+                  match queryLowered f with
+                  | Just (ast, _, _) -> [(f, ast)]
+                  | None -> [])
+                (modulesOf (queryFiles unit)))
              (Just "result")
+             True
+             False
+             False
+             False
+             False
+             False
+             False
+             (\x -> ()))
+    -- The same with no entry: every definition of the unit, for whoever runs
+    -- one of them -- a macro -- rather than the unit.
+    | query whole (unit : Int) : Maybe CoreProgram =
+        coreIn
+          (checkedOf
+             shownCfg
+             (queryHome unit)
+             (queryImported unit)
+             (tableOf (queryFixities 0))
+             (V.map
+                (\f -> (f, querySource f, if S.endsWith ".mw" f then queryGrouped f else None))
+                (queryFiles unit))
+             (V.concatMap
+                (\f ->
+                  match queryLowered f with
+                  | Just (ast, _, _) -> [(f, ast)]
+                  | None -> [])
+                (modulesOf (queryFiles unit)))
+             None
+             True
+             False
+             False
+             False
+             False
+             False
+             False
              (\x -> ()))
 }
 
@@ -149,8 +251,9 @@ fun renamedOf
     (imported : [Interface])
     (fx : HashMap String Fixity)
     (files : [(String, String, Maybe (Green Grouped, [Diagnostic]))])
+    (asts : [(String, AstProgram)])
     : ([(String, [String])], [Export], Bool) =
-  match unitOf dir imported fx files with
+  match unitOf shownCfg dir imported fx files asts with
   | (sources, r) ->
       let mentions = mentionsOf r.binders in
       (
@@ -167,8 +270,9 @@ fun inferredOf
     (imported : [Interface])
     (fx : HashMap String Fixity)
     (files : [(String, String, Maybe (Green Grouped, [Diagnostic]))])
+    (asts : [(String, AstProgram)])
     : ([(String, [String])], [Export], Bool, TypeEnv) =
-  match unitOf dir imported fx files with
+  match unitOf shownCfg dir imported fx files asts with
   | (sources, r) ->
       let deps =
         V.map
@@ -204,17 +308,29 @@ fun inferredOf
 -- exports, each with its scheme; whether it says; what it knows about
 -- types; and, entered at its `entry` if it is to have one -- or `None`, for
 -- one with nothing of that name -- its core, what the units after it are
--- lowered with, and its declarations of Cut as text.
+-- lowered with, and its declarations of Cut as text. Unless it is to `keep`
+-- them, a method asked of a dictionary in plain sight is the method
+-- (`Dictionaries`); and if it `inlines`, a call of a small function is the
+-- function's body (`Inline`).
 fun checkedOf
+    (cfg : Cfg)
     (dir : String)
     (imported : [Interface])
     (fx : HashMap String Fixity)
     (files : [(String, String, Maybe (Green Grouped, [Diagnostic]))])
+    (asts : [(String, AstProgram)])
     (entry : Maybe String)
+    (keep : Bool)
+    (inlines : Bool)
+    (generous : Bool)
+    (wholly : Bool)
+    (naming : Bool)
+    (checked : Bool)
+    (strict : Bool)
     (mark : String -> () ! e)
-    : ([Export], Bool, TypeEnv, Maybe (CoreProgram, Linked, Object)) ! e =
+    : ([Export], Bool, TypeEnv, Maybe (CoreProgram, Linked, Object), [String]) ! e =
   let m0 = mark "start" in
-  match unitOf dir imported fx files with
+  match unitOf cfg dir imported fx files asts with
   | (sources, r) ->
       let m1 = mark "renamed" in
       let deps =
@@ -235,6 +351,49 @@ fun checkedOf
                     | Just (_, src) -> [(fileOf src, text)]
                     | None -> []))
              files)
+      in
+      -- What the unit names that nothing binds, each where it names it: the
+      -- renamer gives such a name a binder of its own, declared nowhere.
+      let undefined =
+        if not checked then []
+        else
+          V.concatMap
+            (\(b : Binder) ->
+              -- A value nothing binds has a binder of its own, declared
+              -- nowhere; a type or a constructor nothing declares is a use
+              -- of the one binder that stands for every such name.
+              (let what =
+                 if S.startsWith "?" b.site and b.name != "?" then Just "undefined variable: "
+                 else if S.isEmpty b.name and b.site == "-" and b.kind == "t" and b.until < 0 then
+                   Just "unknown type "
+                 else if S.isEmpty b.name and b.site == "-" and b.kind == "c" then
+                   Just "unknown constructor "
+                 -- And a `use` of a module there is not is a use of another.
+                 else if S.isEmpty b.name and b.site == "-" and b.kind == "m" then Just "no module "
+                 else None
+               in match what with
+                  | None -> []
+                  | Just says ->
+                      V.concatMap
+                        (\used ->
+                          match used with
+                          | (file, start, stop) ->
+                              (let text = M.unwrapOr "" (H.lookup file texts) in
+                               let written =
+                                 if stop > stringByteLength text then ""
+                                 else stringSlice text start stop
+                               in
+                               -- The same binder is every type the language
+                               -- has without a declaration, `Int` or `()`:
+                               -- only a name that is none of those is unknown.
+                               if S.isEmpty b.name
+                                 and b.kind != "m"
+                                 and (not (named written) or V.elem written builtinTyconNames) then
+                                 []
+                               else
+                                 ["${file}:${placeIn text start}: ${says}${if S.isEmpty b.name then "`${written}`" else b.name}"]))
+                        b.uses))
+            r.binders
       in
       let pkg =
         M.unwrapOr
@@ -283,15 +442,182 @@ fun checkedOf
       in
       let cored = unitCore pkg r done theirs entry in
       let m3 = mark "core" in
+      -- `MEADOWBOOT_NAMES`: each definition's symbol beside the name it was
+      -- written with, for whoever reads a profile of what this compiles.
+      let named =
+        if naming then
+          V.foldl
+            (\u k ->
+              match V.get r.binders k with
+              | Just (b : Binder) -> mark "name ${defSymbol pkg k} ${b.name} ${b.site}"
+              | None -> ())
+            ()
+            (V.range 0 (V.len r.binders))
+        else ()
+      in
+      -- What is still wanted of the unit renamed and of its types inferred
+      -- is taken out here, so that neither is held while its core is made
+      -- better and written out: the two are most of what a unit is.
+      let anyVis = r.anyVis in
+      let types = done.types in
+      -- What inference says, each where it is about: the file of the module
+      -- it was in, and the line and column.
+      let placedSaid =
+        V.map
+          (\x ->
+            match x with
+            | ((m, at), why) ->
+                (match (if m < 0 or at < 0 then None else moduleFile r m) with
+                 | Just file ->
+                     "${file}:${placeIn (M.unwrapOr "" (H.lookup file texts)) at}: ${why}"
+                 | None -> why))
+          (V.zip done.saidAt done.said)
+      in
+      -- And, where the build is strict, each `match` that misses a value,
+      -- where it is: the file of the definition it is in, as its binder was
+      -- declared there.
+      let unmatched =
+        if not strict then []
+        else
+          (match cored with
+           | Just (written, _, _, _) ->
+               V.map
+                 (\x ->
+                   match x with
+                   | (owner, at, why) ->
+                       (let file =
+                          M.andThen
+                            (\(b : Binder) ->
+                              match S.indexOf "@" b.site with
+                              | Just k -> Just (S.take b.site k)
+                              | None -> None)
+                            (if owner >= 0 then V.get r.binders owner else None)
+                        in match file with
+                           | Just f ->
+                               "${f}:${placeIn (M.unwrapOr "" (H.lookup f texts)) at}: ${why}"
+                           | None -> why))
+                 (Exhaust.check written (V.append (sigsOf known) (Seq.datasOf written)))
+           | None -> [])
+      in
+      -- A value a module defines twice, at the second: where the Rust
+      -- renamer refuses it, which would otherwise be taken for an overload
+      -- of the first and fail as one.
+      let twice =
+        if not checked then []
+        else
+          V.concatMap
+            (\(e : Export) ->
+              if e.kind != "v" or not (S.isEmpty e.owner) or S.startsWith "$" e.name then []
+              else if V.any
+                (\(x : Export) ->
+                  x.kind == "v"
+                    and S.isEmpty x.owner
+                    and x.name == e.name
+                    and x.module == e.module
+                    and x.binder < e.binder)
+                r.exports then
+                (match M.andThen
+                   (\(b : Binder) ->
+                     match S.indexOf "@" b.site with
+                     | Just k ->
+                         Just (S.take b.site k, M.unwrapOr 0 (S.toInt (S.drop b.site (k + 1))))
+                     | None -> None)
+                   (V.get r.binders e.binder) with
+                 | Just (file, at) ->
+                     ["${file}:${placeIn (M.unwrapOr "" (H.lookup file texts)) at}: `${e.name}` is already defined in this module"]
+                 | None -> ["`${e.name}` is already defined in this module"])
+              else [])
+            r.exports
+      in
+      let problems =
+        if checked then V.concat [undefined, twice, placedSaid, unmatched] else done.problems
+      in
+      let program = isProgram r.exports in
+      -- What C may call: each function an `@export` is written on, with the
+      -- name C calls it by -- its own, or the one the attribute says -- and
+      -- what it answers, which has to be something C can take.
+      let cExported =
+        V.concatMap
+          (\s ->
+            match s with
+            | (_, (src : Source)) ->
+                V.concatMap
+                  (\x ->
+                    match x with
+                    | (attrs, d) -> exportOf src attrs d r.exports done.schemes)
+                  (declsOf src))
+          sources
+      in
+      let refused =
+        V.concatMap
+          (\(c : CExport) ->
+            if V.elem c.result passable then []
+            else
+              ["`@export` of `${c.name}`: what it answers is not something C can take, a number or `()`"])
+          cExported
+      in
+      let problems = V.append problems refused in
       (
         exports,
-        r.anyVis,
-        done.types,
+        anyVis,
+        types,
         M.map
           (\made ->
             match made with
-            | (core, dicts, defaults, aliases) ->
-                (let ownDatas =
+            | (written, dicts, defaults, aliases) ->
+                -- A definition generic in a number's type is copied for
+                -- each number type it is used at before anything else is
+                -- made of the unit: what is optimised, kept and lowered
+                -- from here on says nothing of number types.
+                (let theirNumbers =
+                   V.foldl
+                     (\acc (l : Linked) ->
+                       V.foldl
+                         (\acc2 (n : Numbers) ->
+                           if V.any
+                             (\(x : Numbers) ->
+                               Inline.packageOf x.program == Inline.packageOf n.program)
+                             acc2 then acc2
+                           else V.pushBack acc2 n)
+                         acc
+                         l.numbers)
+                     []
+                     linked
+                 in
+                 let ownNumbers = Inline.numbers written in
+                 let numbered =
+                   Inline.numbered
+                     written
+                     (V.map (\(n : Numbers) -> (n.program, V.zip n.vars n.fracs)) theirNumbers)
+                     done.numbers
+                 in
+                 -- And a definition that is a function is written with all
+                 -- its parameters before anything asks how many it has
+                 -- (`Eta`): what is optimised, lowered and told the units
+                 -- that import this one is its arity as it is used.
+                 let plain = if keep and not inlines then numbered else Eta.expanded numbered in
+                 let traits =
+                   Inline.traitsOf
+                     (V.append
+                        (V.map (\(e : Entry [String]) -> e.key) labelled)
+                        (V.map fst (Seq.namedOf plain)))
+                 in
+                 let core =
+                   if keep and not inlines then plain
+                   else
+                     Inline.program
+                       plain
+                       (V.map (\(l : Linked) -> l.bodies) linked)
+                       (V.map (\(l : Linked) -> l.summary) linked)
+                       (V.concatMap (\(l : Linked) -> l.arities) linked)
+                       traits
+                       labelled
+                       (not keep)
+                       inlines
+                       generous
+                 in
+                 let m4 = mark "optimised" in
+                 let ownDatas =
                    V.concatMap
                      (\d ->
                        match d with
@@ -328,7 +654,26 @@ fun checkedOf
                                    (\(l : Linked) ->
                                      V.filter (\(x : Entry Int) -> x.key == al.value) l.arities)
                                    linked)
-                               aliases)
+                               aliases),
+                        summary = Dictionaries.summary plain labelled,
+                        -- Kept for the units that import this one,
+                        -- and nothing imports a program: its bodies were
+                        -- most of what was written of it.
+                        bodies =
+                          if (keep and not inlines) or program then Inline.nothing ()
+                          else Inline.exports core traits inlines generous,
+                        numbers =
+                          if Inline.keepsAny ownNumbers then
+                            V.pushFront
+                              theirNumbers
+                              (Numbers {
+                                 program = ownNumbers,
+                                 vars = V.map fst done.numbers,
+                                 fracs = V.map snd done.numbers
+                               })
+                          else theirNumbers,
+                        whole = if wholly then plain else Inline.nothing (),
+                        cExports = cExported
                       },
                       Seq.declarations
                         core
@@ -336,7 +681,8 @@ fun checkedOf
                         (V.map (\(e : Entry [String]) -> (e.key, e.value)) labelled)
                         (V.filter (\p -> p != "Std") (V.pushBack packages pkg))
                     )))
-          cored
+          cored,
+        problems
       )
 
 -- Declared types as the lowering takes them.
@@ -357,7 +703,12 @@ fun emptyLinked () : Linked =
     dicts = [],
     defaults = [],
     aliases = [],
-    arities = []
+    arities = [],
+    summary = emptySummary (),
+    bodies = Inline.nothing (),
+    numbers = [],
+    whole = Inline.nothing (),
+    cExports = []
   }
 
 -- A unit's declarations of Cut, where its compiler writes them: its object.
@@ -368,7 +719,7 @@ fun objectIn (out : String) (pkg : String) : String = Path.join out "${pkg}.cut"
 -- its types play; after them, the definition it is entered at -- the root
 -- unit's `result`, or its `main` -- and what that shows a value with. A
 -- root with neither is a library, and has no program.
-fun linkProgram (l : Linking Interface) : Result String () ! { Fs | e } =
+fun linkProgram (o : UnitsOptions) (l : Linking Interface) : Result String () ! { Fs | e } =
   let units = linkUnits l in
   match V.get units (V.len units - 1) with
   | None -> Ok ()
@@ -379,95 +730,315 @@ fun linkProgram (l : Linking Interface) : Result String () ! { Fs | e } =
             (\(e : Export) ->
               e.kind == "v" and e.name == n and S.isEmpty e.owner and V.isEmpty e.module)
             root.exports
-      in (match (match named "result" with
-           | Just e -> Just e
-           | None -> named "main") with
-          | None -> Ok ()
-          | Just (e : Export) ->
-              (let sc =
-                 M.unwrapOr (Scheme { quant = [], preds = [], ty = Error, lacks = [] }) e.scheme
-               in
-               let (before, after) =
-                 Seq.around
+      in
+      let entry =
+        match (o.entry, named (M.unwrapOr "result" o.entry)) with
+        | (_, Just e) -> Ok (Just e)
+        | (Just n, None) -> Err "${root.package} has no value `${n}` at its root to enter at\n"
+        | (None, None) -> Ok (named "main")
+      in
+      -- What C may call: a library's, and its dependencies' too, as a
+      -- Rust `cdylib` exports every crate's `#[no_mangle]` functions; a
+      -- program's own only.
+      let library =
+        match entry with
+        | Ok None -> True
+        | _ -> not (V.isEmpty root.linked.cExports)
+      in
+      let exports =
+        if library then cExportsOf units else V.map (\c -> (root.package, c)) root.linked.cExports
+      in match (entry, clashOf exports) with
+         | (Err why, _) -> Err why
+         | (_, Just why) -> Err why
+         -- A library has no entry, and the first of what it exports
+         -- stands for one: nothing calls it.
+         | (Ok None, None) ->
+             (match V.get exports 0 with
+              | None -> Ok ()
+              | Just (pkg, (c : CExport)) ->
+                  linkAt o l units root exports pkg c.binder (Con "Unit" []) 0)
+         | (Ok (Just (e : Export)), None) ->
+             (let sc =
+                M.unwrapOr (Scheme { quant = [], preds = [], ty = Error, lacks = [] }) e.scheme
+              in linkAt
+                   o
+                   l
+                   units
+                   root
+                   exports
                    root.package
                    e.binder
                    sc.ty
-                   (V.len (V.filter (\k -> k == VarKind.Plain) sc.quant))
-                   (sigsOf root.linked.datas)
-                   (V.filter (\p -> p != "Std") root.linked.packages)
-               in
-               -- A package reached by two names is one package: its object
-               -- goes in once.
-               let once =
-                 V.foldl
-                   (\acc u ->
-                     match u with
-                     | (_, (i : Interface), _) ->
-                         if V.any (\x -> packageOfUnit x == i.package) acc then acc
-                         else V.pushBack acc u)
-                   []
-                   units
-               in
-               let objects =
-                 V.foldl
-                   (\acc u ->
-                     match (acc, u) with
-                     | (Err why, _) -> Err why
-                     | (Ok read, (_, (i : Interface), out)) ->
-                         (match (
-                            readToString (objectIn out i.package),
-                            readToString (indexIn out i.package)
-                          ) with
-                          | (Ok text, Ok index) -> Ok (V.pushBack read (text, indexed index))
-                          | _ -> Err "${i.package} wrote no object\n"))
-                   (Ok [])
-                   once
-               in match objects with
-                  | Err why -> Err why
-                  | Ok read ->
-                      -- Only what the entry reaches is part of the program
-                      -- (`meadow_core::prune`): every definition it mentions,
-                      -- and those they do.
-                      (let mentions =
-                         V.foldl
-                           (\h o ->
-                             V.foldl
-                               (\g x ->
-                                 match x with
-                                 | (symbol, _, _, refs) -> H.insert symbol refs g)
-                               h
-                               (snd o))
-                           H.empty
-                           read
-                       in
-                       let kept = reach mentions [defSymbol root.package e.binder] H.empty in
-                       let texts =
-                         V.concatMap
-                           (\o ->
-                             match o with
-                             | (text, parts) ->
-                                 -- Taken apart once, at the line between
-                                 -- its parts: what is always there, then
-                                 -- each definition's, as the index has them.
-                                 (let pieces = S.split parted text in
-                                  V.pushFront
-                                    (V.concatMap
-                                       (\k ->
-                                         match V.get parts k with
-                                         | Just (symbol, _, _, _) ->
-                                             if M.isSome (H.lookup symbol kept) then
-                                               [V.getOr "" pieces (k + 1)]
-                                             else []
-                                         | None -> [])
-                                       (V.range 0 (V.len parts)))
-                                    (V.getOr "" pieces 0)))
-                           read
-                       in match writeString (
-                            Path.join (linkOut l) "program.cut",
-                            concatStrings (V.toArray (V.concat [[before], texts, [after]]))
-                          ) with
-                          | Ok _ -> Ok ()
-                          | Err why -> Err "the program could not be written: ${why}\n")))
+                   (V.len (V.filter (\k -> k == VarKind.Plain) sc.quant)))
+
+-- Each unit's functions C may call, with its package: each package once,
+-- however many names it was reached by.
+fun cExportsOf (units : [(String, Interface, String)]) : [(String, CExport)] =
+  snd
+    (V.foldl
+       (\acc u ->
+         match (acc, u) with
+         | ((seen, out), (_, (i : Interface), _)) ->
+             if V.elem i.package seen then acc
+             else
+               (
+                 V.pushBack seen i.package,
+                 V.append out (V.map (\c -> (i.package, c)) i.linked.cExports)
+               ))
+       ([], [])
+       units)
+
+-- Why `exports` cannot all be C's: two of them under one name.
+fun clashOf (exports : [(String, CExport)]) : Maybe String =
+  V.foldl
+    (\found x ->
+      match (found, x) with
+      | (Just why, _) -> Just why
+      | (None, (pkg, (c : CExport))) ->
+          (match V.find
+             (\y ->
+               match y with
+               | (other, (d : CExport)) ->
+                   d.name == c.name and (other != pkg or d.binder != c.binder))
+             exports with
+           | Just (other, _) -> Just "`${c.name}` is exported to C by both ${pkg} and ${other}\n"
+           | None -> None))
+    None
+    exports
+
+-- The program the units link to, entered at `binder` of package `pkg`, of
+-- type `ty`, generic in `types` types; and `exports`, what C may call of it,
+-- each with its package.
+fun linkAt
+    (o : UnitsOptions)
+    (l : Linking Interface)
+    (units : [(String, Interface, String)])
+    (root : Interface)
+    (exports : [(String, CExport)])
+    (pkg : String)
+    (binder : Int)
+    (ty : Type)
+    (types : Int)
+    : Result String () ! { Fs | e } =
+  -- A package reached by two names is one package: its object
+  -- goes in once.
+  let once =
+    V.foldl
+      (\acc u ->
+        match u with
+        | (_, (i : Interface), _) ->
+            if V.any (\x -> packageOfUnit x == i.package) acc then acc else V.pushBack acc u)
+      []
+      units
+  in
+  -- Optimised as one program, the units are one object, and
+  -- the entry has the binder it was given there.
+  -- A library is not made one program yet: its exports name the
+  -- binders the units gave them.
+  let whole =
+    if o.whole and V.isEmpty exports then Just (wholeObject o root binder once) else None
+  in
+  let entered = M.unwrapOr binder (M.map fst whole) in
+  let (before, after) =
+    Seq.around
+      pkg
+      entered
+      ty
+      types
+      (sigsOf root.linked.datas)
+      (V.filter (\p -> p != "Std") root.linked.packages)
+  in
+  let objects =
+    if M.isSome whole then
+      Ok
+        (match whole with
+         | Just (_, object) ->
+             (match written object with
+              | (text, index) -> [(text, indexed index)])
+         | None -> [])
+    else
+      V.foldl
+        (\acc u ->
+          match (acc, u) with
+          | (Err why, _) -> Err why
+          | (Ok read, (_, (i : Interface), out)) ->
+              (match (
+                 readToString (objectIn out i.package),
+                 readToString (indexIn out i.package)
+               ) with
+               | (Ok text, Ok index) -> Ok (V.pushBack read (text, indexed index))
+               | _ -> Err "${i.package} wrote no object\n"))
+        (Ok [])
+        once
+  in match objects with
+     | Err why -> Err why
+     | Ok read ->
+         -- Only what the entry reaches is part of the program
+         -- (`meadow_core::prune`): every definition it mentions,
+         -- and those they do.
+         (let mentions =
+            V.foldl
+              (\h o ->
+                V.foldl
+                  (\g x ->
+                    match x with
+                    | (symbol, _, _, refs) -> H.insert symbol refs g)
+                  h
+                  (snd o))
+              H.empty
+              read
+          in
+          let exported =
+            V.concatMap
+              (\x ->
+                match x with
+                | (p, (c : CExport)) -> [defSymbol p c.binder, "${defSymbol p c.binder}f"])
+              exports
+          in
+          let kept = reach mentions (V.pushFront exported (defSymbol pkg entered)) H.empty in
+          let texts =
+            V.concatMap
+              (\o ->
+                match o with
+                | (text, parts) ->
+                    -- Taken apart once, at the line between
+                    -- its parts: what is always there, then
+                    -- each definition's, as the index has them.
+                    (let pieces = S.split parted text in
+                     V.pushFront
+                       (V.concatMap
+                          (\k ->
+                            match V.get parts k with
+                            | Just (symbol, _, _, _) ->
+                                if M.isSome (H.lookup symbol kept) then [V.getOr "" pieces (k + 1)]
+                                else []
+                            | None -> [])
+                          (V.range 0 (V.len parts)))
+                       (V.getOr "" pieces 0)))
+              read
+          in match writeString (
+               Path.join (linkOut l) "program.cut",
+               concatStrings (V.toArray (V.concat [[withExports before exports], texts, [after]]))
+             ) with
+             | Ok _ -> Ok ()
+             | Err why -> Err "the program could not be written: ${why}\n")
+
+-- The build's units as one program of core -- each as it was written, kept
+-- in its interface -- made better as one and lowered: the one object the
+-- program is, and the binder `entry`, the root's, has in it. What a unit
+-- optimised by itself cannot do is then done: a function is copied to a
+-- call or for a dictionary wherever in the program it and the call are, and
+-- a copy several units would each have made is made once.
+fun wholeObject
+    (o : UnitsOptions)
+    (root : Interface)
+    (entry : Int)
+    (units : [(String, Interface, String)])
+    : (Int, Object) =
+  let (joined, table) =
+    joinedUnits
+      root.package
+      (V.map (\u -> match u with | (_, (i : Interface), _) -> i.linked.whole) units)
+  in
+  let plain = if not (resolving o or inlining o) then joined else Eta.expanded joined in
+  let core =
+    if not (resolving o or inlining o) then plain
+    else
+      Inline.program
+        plain
+        []
+        []
+        (V.map (\x -> Entry { key = fst x, value = snd x }) (Seq.aritiesOf plain))
+        (Inline.traitsOf (V.map fst (Seq.namedOf plain)))
+        []
+        (resolving o)
+        (inlining o)
+        (o.opt == UnitsOpt.O3)
+  in (
+       M.unwrapOr entry (H.lookup (defSymbol root.package entry) table),
+       Seq.declarations core [] [] (V.filter (\p -> p != "Std") root.linked.packages)
+     )
+
+-- Whether `text` is one name of a type or a constructor: a capital, then
+-- letters and digits.
+fun named (text : String) : Bool =
+  let codes = V.map charCode (S.chars text) in
+  let capital = \c -> c >= 65 and c <= 90 in
+  let rest = \c -> capital c or (c >= 97 and c <= 122) or (c >= 48 and c <= 57) or c == 95 in
+  match V.get codes 0 with
+  | Just first -> capital first and V.all rest codes
+  | None -> False
+
+-- Where byte `offset` of `text` is, as a line and a column, each from one.
+fun placeIn (text : String) (offset : Int) : String =
+  if offset > stringByteLength text then "@${show offset}"
+  else
+    (let before = S.split "\n" (stringSlice text 0 offset) in
+     let line = V.getOr "" before (V.len before - 1) in
+     "${show (V.len before)}:${show (stringByteLength line + 1)}")
+
+-- The representations a value crosses into C as: numbers of each width,
+-- and `()` for `void`.
+def passable : [String] =
+  ["i64", "f64", "f32", "i8", "i16", "i32", "u8", "u16", "u32", "u64", "bool", "char", "unit"]
+
+-- The function declaration `d` of `src` exports to C, if its attributes say
+-- so: `@export` under its own name, `@export(cName)` under another.
+fun exportOf
+    (src : Source)
+    (attrs : [AstAttr])
+    (d : AstDecl)
+    (exports : [Export])
+    (schemes : HashMap Int Scheme)
+    : [CExport] =
+  match src.ast with
+  | AstProgram a _ ->
+      (match V.find (\at -> astNameText a (astAttrName a at) == "export") attrs with
+       | None -> []
+       | Just at ->
+           if kindAstDecl a d != AstDeclKind.Bind then []
+           else
+             (let b = astDeclBindBind a d in
+              if kindAstBind a b != AstBindKind.Fun then []
+              else
+                (let own = astNameText a (astBindFunName a b) in
+                 let called =
+                   M.unwrapOr own (M.map (\n -> astNameText a n) (V.get (astAttrArgs a at) 0))
+                 in match V.find
+                      (\(e : Export) -> e.name == own and e.kind == "v" and e.module == src.path)
+                      exports with
+                    | None -> []
+                    | Just (e : Export) ->
+                        (let ty =
+                           M.unwrapOr
+                             Error
+                             (M.map (\(sc : Scheme) -> sc.ty) (H.lookup e.binder schemes))
+                         in [CExport {
+                               name = called,
+                               binder = e.binder,
+                               result = Seq.repOf (answered ty)
+                             }]))))
+
+-- What a function of type `t` answers, all its parameters given.
+fun answered (t : Type) : Type =
+  match t with
+  | Fun _ result _ -> answered result
+  | other -> other
+
+-- A program's opening with a line for each of `exports`, a function C may call: each
+-- names the function's definition of all its parameters (`Seq.directly`).
+fun withExports (opening : String) (exports : [(String, CExport)]) : String =
+  let lines =
+    S.join
+      ""
+      (V.map
+         (\x ->
+           match x with
+           | (pkg, (c : CExport)) ->
+               "export " ++ show c.name ++ " = ${defSymbol pkg c.binder}f -> ${c.result}\n")
+         exports)
+  in if S.startsWith "cut 0\n" opening then "cut 0\n" ++ lines ++ S.drop opening 6
+     else lines ++ opening
 
 -- The symbols reached from `todo`, through what each mentions.
 fun reach (mentions : HashMap String [String]) (todo : [String]) (seen : HashMap String Bool)
@@ -535,26 +1106,44 @@ fun indexIn (out : String) (pkg : String) : String = Path.join out "${pkg}.idx"
 
 fun fst3 (t : (a, b, c)) : a = match t with | (x, _, _) -> x
 
-fun coreIn (c : ([Export], Bool, TypeEnv, Maybe (CoreProgram, Linked, Object)))
+fun coreIn (c : ([Export], Bool, TypeEnv, Maybe (CoreProgram, Linked, Object), [String]))
     : Maybe CoreProgram =
-  match c with | (_, _, _, made) -> M.map fst3 made
+  match c with | (_, _, _, made, _) -> M.map fst3 made
+
+-- Whether a unit that exports these is a program: it has a `main` at its
+-- root.
+fun isProgram (exports : [Export]) : Bool =
+  V.any
+    (\(e : Export) ->
+      e.kind == "v" and e.name == "main" and S.isEmpty e.owner and V.isEmpty e.module)
+    exports
 
 -- The unit at `dir` renamed: its modules, each with its path, and what
 -- renaming made of them.
 fun unitOf
+    (cfg : Cfg)
     (dir : String)
     (imported : [Interface])
     (fx : HashMap String Fixity)
     (files : [(String, String, Maybe (Green Grouped, [Diagnostic]))])
+    (asts : [(String, AstProgram)])
     : ([(String, Source)], Renamed) =
   let manifest = V.find (\x -> match x with | (p, _, _) -> S.endsWith "Meadow.toml" p) files in
+  let made = H.fromVec asts in
+  -- Only for a file whose syntax was not handed over: reading them is work.
   let expanded =
-    expansionsIn
-      (V.concatMap
-         (\x ->
-           match x with
-           | (p, text, _) -> (if S.endsWith ".json" p then [text] else []))
-         files)
+    if V.all
+      (\x ->
+        match x with
+        | (p, _, g) -> M.isNone g or M.isSome (H.lookup p made))
+      files then H.empty
+    else
+      expansionsIn
+        (V.concatMap
+           (\x ->
+             match x with
+             | (p, text, _) -> (if S.endsWith ".json" p then [text] else []))
+           files)
   in
   let pkg =
     (match manifest with
@@ -567,17 +1156,14 @@ fun unitOf
     V.concatMap
       (\x ->
         match x with
-        | (path, text, Just (g, _)) ->
+        | (path, text, tree) ->
             let file = "${pkg}/${relativeTo dir path}" in
-            [(
-              path,
-              Source {
-                path = modulePath isStd src path,
-                file,
-                ast = lowered pkg text g (M.unwrapOr H.empty (H.lookup file expanded)) fx
-              }
-            )]
-        | _ -> [])
+            let from = \ast -> [(path, Source { path = modulePath isStd src path, file, ast })] in
+            (match (H.lookup path made, tree) with
+             | (Just ast, _) -> from ast
+             | (None, Just (g, _)) ->
+                 from (lowered cfg path pkg text g (M.unwrapOr H.empty (H.lookup file expanded)) fx)
+             | (None, None) -> []))
       files
   in
   let deps =
@@ -587,6 +1173,34 @@ fun unitOf
         | (name, (i : Interface)) -> DepExports { name, exports = i.exports, anyVis = i.anyVis })
       (namedDeps files imported)
   in (sources, renameUnit pkg isStd (V.map snd sources) deps)
+
+-- The file at `path` of the unit at `dir`, package `pkg`, as abstract syntax:
+-- what `unitOf` makes of each, made of one alone -- so of each on a thread of
+-- its own.
+fun loweredOf
+    (cfg : Cfg)
+    (pkg : String)
+    (dir : String)
+    (path : String)
+    (text : String)
+    (grouped : Maybe (Green Grouped, [Diagnostic]))
+    (expanded : HashMap String (HashMap String Json))
+    (fx : HashMap String Fixity)
+    (answered : HashMap String [Tok])
+    : Maybe (AstProgram, [Request], [(String, Int, Int)]) =
+  match grouped with
+  | Just (g, _) ->
+      Just
+        (loweredWith
+           cfg
+           path
+           pkg
+           text
+           g
+           (M.unwrapOr H.empty (H.lookup "${pkg}/${relativeTo dir path}" expanded))
+           fx
+           answered)
+  | None -> None
 
 -- Each unit a unit imports with the name its manifest gives it, which a
 -- `use` knows it by: the manifest's dependencies in the order it lists
@@ -614,7 +1228,9 @@ fun emptyInterface () : Interface =
     exports = [],
     anyVis = False,
     types = noTypes,
-    linked = emptyLinked ()
+    linked = emptyLinked (),
+    macros = [],
+    bindings = []
   }
 
 fun fileOf (s : Source) : String = s.file
@@ -664,14 +1280,87 @@ fun modulePath (isStd : Bool) (src : String) (path : String) : [String] =
 
 -- A database for unit `u`: its files' texts, where it is, and what it
 -- imports, set.
+-- With what its procedural macros answered when it was built, which is
+-- where it kept it: a query of the unit sees the unit as it was compiled.
 @pub fun unitDatabase (u : Given Interface) =
+  unitDatabaseWith
+    u
+    shownCfg
+    (readKept (M.unwrapOr "" (Res.toMaybe (readToString (Path.join (unitOut u) "macros.kept")))))
+
+-- The same, with `kept` for what its macros answered.
+fun unitDatabaseWith
+    (u : Given Interface)
+    (cfg : Cfg)
+    (kept : [(String, String, Int, Int, String)]) =
   let db = newCompiler () in
-  let sources = unitSources u in
+  let sources = testedSources cfg.test u in
   let a = setCompilerFiles db 0 (V.map fst sources) in
   let b = setCompilerImported db 0 (V.map snd (unitImports u)) in
   let h = setCompilerHome db 0 (unitDir u) in
+  let k = setCompilerAnswers db 0 kept in
+  let g = setCompilerCfg db 0 cfg in
   let c = V.foldl (\acc s -> setCompilerSource db (fst s) (snd s)) () sources in
   db
+
+-- A unit's sources, and where it is being tested -- only the package asked
+-- for ever is -- each module with its tests listed at its end and the root
+-- with what runs them (`Tests`).
+fun testedSources (test : Bool) (u : Given Interface) : [(String, String)] =
+  let sources = unitSources u in
+  if not test then sources
+  else
+    (let pkg =
+       M.unwrapOr
+         ""
+         (M.map
+            (\s -> packageName (snd s))
+            (V.find (\s -> S.endsWith "Meadow.toml" (fst s)) sources))
+     in Tests.withTests pkg (unitDir u) sources)
+
+-- What a unit's macros answered, as it is kept: each call's file, key and
+-- place, and its answer as its macro wrote it, one `Wire` after another.
+fun writeKept (kept : [(String, String, Int, Int, String)]) : String =
+  S.join
+    ""
+    (V.map
+       (\x ->
+         match x with
+         | (file, key, from, to, said) ->
+             Mc.writeWire
+               (Wire.Node file [Wire.Text key, Wire.Whole from, Wire.Whole to, Wire.Text said]))
+       kept)
+
+fun readKept (text : String) : [(String, String, Int, Int, String)] =
+  V.concatMap
+    (\w ->
+      match w with
+      | Wire.Node file parts ->
+          (match (V.get parts 0, V.get parts 1, V.get parts 2, V.get parts 3) with
+           | (
+             Just (Wire.Text key),
+             Just (Wire.Whole from),
+             Just (Wire.Whole to),
+             Just (Wire.Text said)
+           ) -> [(file, key, from, to, said)]
+           | _ -> [])
+      | _ -> [])
+    (Mc.readWires text)
+
+-- The answers kept for `file`, each as the tokens it is, by key.
+fun answeredIn (file : String) (kept : [(String, String, Int, Int, String)])
+    : HashMap String [Tok] =
+  V.foldl
+    (\h x ->
+      match x with
+      | (f, key, from, to, said) ->
+          if f != file then h
+          else
+            match M.map (\w -> Mc.answerOf (fst w) (from, to)) (Mc.readWire said 0) with
+            | Just (Answer.Answered trees _) -> H.insert key (Ru.flatten trees) h
+            | _ -> h)
+    H.empty
+    kept
 
 -- --- the build ---------------------------------------------------------------
 
@@ -683,24 +1372,126 @@ make! {
     | files = unitFilesOf
     | compile = compileUnit
     | link = linkProgram
+    | options {
+      opt : O0
+        | O1
+        | O2
+        | O3 =
+            O1
+              "how hard to optimise: O0 nothing; from O1 known dictionaries are read; from O2 a small function is copied to where it is called; O3 copies larger functions for the types they are called at"
+      dictionaries : Bool =
+        True
+          "from O1, copy a function for the dictionaries a call names, and read a known dictionary's method out of it"
+      kind : Debug | Release = Debug "what `@cfg(debug)` and `@cfg(release)` hold of"
+      os : String = hostOs "the system `@cfg` answers for: windows, linux or macos"
+      arch : String = hostArch "the processor `@cfg` answers for: x86_64 or aarch64"
+      backend : String = "aot" "what `@cfg(backend = …)` holds of: vm, jit, aot, silo or cek"
+      test : Bool = False "whether `@cfg(test)` holds in the unit that was asked for"
+      flags : [String] = [] "the flags `@cfg` holds of, each a name or `name=value`"
+      macros : Off
+        | Cek
+        | Glade =
+            Glade
+              "what runs a procedural macro: nothing, the CEK machine, or Glade (the default: the program that serves a package's macros is built and run on it by `meadow cut`)"
+      whole : Bool =
+        False
+          "optimise the build's units as one program at the link, where each is otherwise optimised by itself"
+      strict : Bool =
+        False
+          "stop a build at a `match` that misses a value, as the release profile does: what `--strict` and `--lenient` say"
+      checked : Bool =
+        True
+          "stop a build at whatever is wrong with a unit -- a name nothing binds, types that do not agree -- where it otherwise stops only at a `main` that is not one"
+      entry : Maybe String =
+        None
+          "a value at the root the program answers, in place of `result` or of running `main`"
+          for
+          link
+    }
+    | profile debug {}
+    | profile release { opt = O2, kind = Release, strict = True }
+    | pinned = pinnedOf
 }
+
+-- The system and the processor this compiler was itself built for, which is
+-- what it builds for unless told another: whoever compiled it decided these
+-- `@cfg`s.
+@cfg(os = "linux")
+@pub def hostOs : String = "linux"
+
+@cfg(os = "macos")
+@pub def hostOs : String = "macos"
+
+@cfg(os = "windows")
+@pub def hostOs : String = "windows"
+
+@cfg(arch = "x86_64")
+def hostArch : String = "x86_64"
+
+@cfg(arch = "aarch64")
+def hostArch : String = "aarch64"
+
+-- What a build at these options decides a `@cfg` by.
+fun cfgOf (o : UnitsOptions) : Cfg =
+  Cfg {
+    os = o.os,
+    arch = o.arch,
+    profile = if o.kind == UnitsKind.Release then "release" else "debug",
+    backend = o.backend,
+    opt =
+      (match o.opt with
+       | UnitsOpt.O0 -> "0"
+       | UnitsOpt.O1 -> "1"
+       | UnitsOpt.O2 -> "2"
+       | UnitsOpt.O3 -> "3"),
+    test = o.test,
+    flags = o.flags
+  }
+
+-- What holds of a unit whatever the build was told. The standard library is
+-- compiled for the platform alone, as `meadow_compiler::Cfg::platform` has
+-- it, so one compile of it serves every program on that platform; and
+-- `@cfg(test)` holds only in the unit the build was asked for, so a library
+-- whose tests stopped compiling does not break what depends on it.
+fun pinnedOf (root : String) (dir : String) (manifest : String) (profile : String)
+    : [(String, String)] =
+  if packageName manifest == "Std" then
+    [("kind", "Debug"), ("backend", "jit"), ("test", "false"), ("flags", "")]
+  else if dir != root then [("test", "false")]
+  else []
+
+-- Whether a build at these options copies small functions to where they are
+-- called: `meadow_rt`'s `OptLevel::inlines`, which is O2's, and here O3's
+-- too.
+fun inlining (o : UnitsOptions) : Bool = o.opt == UnitsOpt.O2 or o.opt == UnitsOpt.O3
+
+-- Whether a build at these options reads a known dictionary's method out of
+-- it and copies a function for the dictionaries a call names: from O1, where
+-- `dictionaries` has not turned it off. O0 is the program as it was written,
+-- every method asked of its dictionary as it runs -- what to set a level's
+-- answer against when one is doubted.
+fun resolving (o : UnitsOptions) : Bool = o.dictionaries and o.opt != UnitsOpt.O0
 
 -- Compile unit `u`: every file parsed and grouped by the unit's fixities, and
 -- its interface -- or what is wrong, drawn.
-fun compileUnit (u : Given Interface) =
-  match toResult (\() -> compiling u) with
+fun compileUnit (o : UnitsOptions) (u : Given Interface) =
+  match toResult (\() -> compiling o u) with
   | Ok r -> r
   | Err why -> Err "${show why}\n"
 
-fun compiling (u : Given Interface) =
-  let timed = M.isSome (getEnv "MEADOWBOOT_TIMES") in
+fun compiling (o : UnitsOptions) (u : Given Interface) =
+  let timed = M.isSome (getEnv "MEADOWBOOT_TIMES") or M.isSome (getEnv "MEADOWBOOT_NAMES") in
   let mark =
     \what -> if timed then writeError "${show (monotonic ())} ${unitDir u} ${what}\n" else ()
   in
-  let db = unitDatabase u in
-  let sources = V.filter (\s -> S.endsWith ".mw" (fst s)) (unitSources u) in
+  let m0 = mark "given" in
+  -- A unit's files are parsed, and their operators grouped, each on a thread
+  -- of its own: neither needs what another file's comes to.
+  let db = parallelCompiler (unitDatabaseWith u (cfgOf o) []) in
+  let sources = V.filter (\s -> S.endsWith ".mw" (fst s)) (testedSources o.test u) in
   let files = V.map fst sources in
   let parsed = compilerParsedEach db files in
+  let m1 = mark "parsed" in
   let failed =
     V.concatMap
       (\i ->
@@ -712,6 +1503,7 @@ fun compiling (u : Given Interface) =
   in if not (V.isEmpty failed) then Err (S.join "" failed)
      else
        let groups = compilerGroupedEach db files in
+       let m2 = mark "grouped" in
        let wrong =
          V.concatMap
            (\i ->
@@ -722,25 +1514,121 @@ fun compiling (u : Given Interface) =
            (V.range 0 (V.len sources))
        in if not (V.isEmpty wrong) then Err (S.join "" wrong)
           else
+            -- Each file's abstract syntax, on a thread of its own as well.
+            -- What every file's is made with is asked for here first, so no
+            -- thread waits on another's answer to it.
+            let unitPkg = compilerPackage db 0 in
+            let expanded = compilerExpansions db 0 in
+            let lowerings = compilerLoweredEach db files in
+            let first =
+              V.concatMap
+                (\i ->
+                  match (V.get files i, V.get lowerings i) with
+                  | (Just f, Just (Just (ast, asked, _))) -> [(f, ast, asked)]
+                  | _ -> [])
+                (V.range 0 (V.len files))
+            in
+            -- A `@cfg` that could not be read.
+            let misread =
+              V.concatMap
+                (\i ->
+                  match (V.get files i, V.get lowerings i) with
+                  | (Just f, Just (Just (_, _, wrongs))) ->
+                      V.map
+                        (\w ->
+                          match w with
+                          | (why, from, _) -> "${f}: ${why}, at byte ${show from}\n")
+                        wrongs
+                  | _ -> [])
+                (V.range 0 (V.len files))
+            in
+            let m3 = mark "lowered" in
+            -- The last the unit's database is asked: what it holds -- every
+            -- file's tree as parsed, and as grouped -- goes when it does,
+            -- which is now and not when the unit is done.
+            let fixities = compilerFixities db 0 in
+            let closed = closeCompiler db in
+            -- Its procedural macros run, in rounds, and each file one of
+            -- them answered lowered again with what it said.
+            let (asts, bindings, unexpanded) =
+              (if o.macros == UnitsMacros.Off then
+                 (V.map (\x -> match x with | (f, ast, _) -> (f, ast)) first, [], [])
+               else
+                 let grouping =
+                   H.fromVec
+                     (V.concatMap
+                        (\i ->
+                          match (V.get sources i, V.get groups i) with
+                          | (Just (path, text), Just (Just (g, _))) -> [(path, (text, g))]
+                          | _ -> [])
+                        (V.range 0 (V.len sources)))
+                 in
+                 let done =
+                   rounds
+                     o
+                     u
+                     unitPkg
+                     expanded
+                     (tableOf fixities)
+                     grouping
+                     (Rounds {
+                        files = first,
+                        answers = H.empty,
+                        bindings = [],
+                        wrong = [],
+                        settled = False,
+                        kept = []
+                      })
+                     0
+                 in
+                 let w = writeString (Path.join (unitOut u) "macros.kept", writeKept done.kept) in
+                 (
+                   V.map (\x -> match x with | (f, ast, _) -> (f, ast)) done.files,
+                   done.bindings,
+                   done.wrong
+                 ))
+            in
+            let m3b = mark "expanded" in
+            let made = H.fromVec (V.map (\a -> (fst a, True)) asts) in
             -- Its types inferred once, and lowered: its declarations of Cut
             -- are its object, written where the link reads them.
             match checkedOf
+              (cfgOf o)
               (unitDir u)
               (V.map snd (unitImports u))
-              (tableOf (compilerFixities db 0))
+              (tableOf fixities)
               (V.map
                  (\s ->
                    (
                      fst s,
                      snd s,
-                     if S.endsWith ".mw" (fst s) then
+                     -- A file's tree goes on only where its syntax was not
+                     -- made of it already.
+                     if S.endsWith ".mw" (fst s) and M.isNone (H.lookup (fst s) made) then
                        M.unwrapOr None (V.get groups (indexOf files (fst s)))
                      else None
                    ))
-                 (unitSources u))
+                 (testedSources o.test u))
+              asts
               None
+              -- A unit of a build that is optimised as one program is
+              -- kept as it was written: the link makes the whole better.
+              (not (resolving o) or o.whole)
+              (inlining o and not o.whole)
+              (o.opt == UnitsOpt.O3)
+              o.whole
+              (M.isSome (getEnv "MEADOWBOOT_NAMES"))
+              o.checked
+              (o.checked and o.strict)
               mark with
-            | (exports, anyVis, types, made) ->
+            | _ if not (V.isEmpty misread and V.isEmpty unexpanded) ->
+                Err (S.join "" (V.append misread unexpanded))
+            -- A unit whose `main` is not one is not compiled, as the Rust
+            -- compiler does not compile it: a `main` that answers a number
+            -- would hand the runtime the number as the program's answer.
+            | (_, _, _, _, problems) if not (V.isEmpty problems) ->
+                Err (S.join "" (V.map (\p -> "${unitDir u}: ${p}\n") problems))
+            | (exports, anyVis, types, made, _) ->
                 let m9 = mark "cut" in
                 let manifest =
                   M.unwrapOr
@@ -785,17 +1673,302 @@ fun compiling (u : Given Interface) =
                        (let (text, index) = written object in
                         let w = writeString (objectIn (unitOut u) pkg, text) in
                         let x = writeString (indexIn (unitOut u) pkg, index) in
+                        let m8 = mark "written" in
                         l)
                    | None -> emptyLinked ())
                 in Ok
                      (Interface {
-                        fixities = compilerFixities db 0,
+                        fixities,
                         package = pkg,
                         exports,
                         anyVis,
                         types,
-                        linked
+                        linked,
+                        macros = macrosOf (unitDir u) pkg asts,
+                        bindings
                       })
+
+-- --- procedural macros ---------------------------------------------------------
+
+-- Where a unit's expansion has got to: each file's syntax and the calls in
+-- it nothing has answered; what each call that ran answered, by file and
+-- key; what they defined; what went wrong; and whether the next round is
+-- settled.
+record Rounds = {
+  files : [(String, AstProgram, [Request])],
+  answers : HashMap String (HashMap String [Tok]),
+  bindings : [Binding],
+  wrong : [String],
+  settled : Bool,
+  -- Each answer as it came, to be kept where the unit's build is.
+  kept : [(String, String, Int, Int, String)]
+}
+
+-- A file of the unit at `dir`, package `pkg`, as a module: for what its
+-- `use`s and its attributes say.
+fun moduleOf (dir : String) (pkg : String) (path : String) (ast : AstProgram) : Source =
+  Source {
+    path = modulePath (pkg == "Std") (Path.join dir "src") path,
+    file = "${pkg}/${relativeTo dir path}",
+    ast
+  }
+
+-- The functions the unit marks `@macro`.
+fun macrosOf (dir : String) (pkg : String) (asts : [(String, AstProgram)]) : [MacroFun] =
+  V.concatMap
+    (\x ->
+      let src = moduleOf dir pkg (fst x) (snd x) in
+      V.map (\name -> MacroFun { module = src.path, name }) (macroFuns src))
+    asts
+
+-- The units unit `u` depends on, as far as macros go.
+fun macroDeps (u : Given Interface) : [Dep] =
+  let imports = unitImports u in
+  let named = namedDeps (V.map (\s -> (fst s, snd s, None)) (unitSources u)) (V.map snd imports) in
+  V.concatMap
+    (\k ->
+      match (V.get imports k, V.get named k) with
+      | (Just (dir, _), Just (spelled, (i : Interface))) ->
+          [Dep { spelled, package = i.package, dir, macros = i.macros, bindings = i.bindings }]
+      | _ -> [])
+    (V.range 0 (V.len imports))
+
+-- Rounds of expansion from `st` on, `n` of them done: every call that
+-- names a macro its module can see and has no answer is run -- by another
+-- run of this program, `meadowboot expand`, which is handed the round
+-- written out and writes what each call answered -- and each file one of
+-- them answered is lowered again. Until a round has nothing to run.
+fun rounds
+    (o : UnitsOptions)
+    (u : Given Interface)
+    (pkg : String)
+    (expanded : HashMap String (HashMap String Json))
+    (fx : HashMap String Fixity)
+    (grouping : HashMap String (String, Green Grouped))
+    (st : Rounds)
+    (n : Int) =
+  let dir = unitDir u in
+  let timed = M.isSome (getEnv "MEADOWBOOT_TIMES") in
+  let mark =
+    \what ->
+      if timed then writeError "${show (monotonic ())} ${dir} round ${show n} ${what}\n" else ()
+  in
+  let cfg = cfgOf o in
+  let deps = macroDeps u in
+  let modules =
+    V.map
+      (\x ->
+        match x with
+        | (f, ast, asked) -> (f, moduleOf dir pkg f ast, asked))
+      st.files
+  in
+  let gated = V.any (\x -> match x with | (_, src, _) -> saysVis src) modules in
+  let batches =
+    V.concatMap
+      (\x ->
+        match x with
+        | (f, (src : Source), asked) ->
+            let sc = scopeOf pkg src.path (usesOf src) st.bindings deps in
+            let had = M.unwrapOr H.empty (H.lookup f st.answers) in
+            let calls =
+              V.concatMap
+                (\(r : Request) ->
+                  if M.isSome (H.lookup r.key had) then []
+                  else match procFor sc r with | Just p -> [(r, p)] | None -> [])
+                asked
+            in if V.isEmpty calls then []
+               else [(src.path, Batch { file = f, visible = sc.visible, calls })])
+      modules
+  in if V.isEmpty batches or n >= 64 then st
+     else
+       let given = Path.join (unitOut u) "macros.round" in
+       let said = Path.join (unitOut u) "macros.answers" in
+       let engine = if o.macros == UnitsMacros.Glade then "glade" else "cek" in
+       let w = writeString (given, writeRound st.settled deps (V.map snd batches)) in
+       let m0 = mark "asked" in
+       match Proc.run (Proc.currentExe ()) ["expand", engine, given, said] with
+       | Err why -> { st | wrong = ["${dir}: its macros could not be run: ${why}\n"] }
+       | Ok (code, _, err) ->
+           let m1 = (if timed then writeError err else ()) in
+           let m2 = mark "ran" in
+           (match (code, readToString said) with
+            | (0, Ok text) ->
+                let next =
+                  V.foldl
+                    (\(acc : (Rounds, Int)) answer ->
+                      match answer with
+                      | (file, key, result) ->
+                          (let asked =
+                             V.find
+                               (\b -> match b with | (_, (b2 : Batch)) -> b2.file == file)
+                               batches
+                           in
+                           let call =
+                             M.andThen
+                               (\b ->
+                                 match b with
+                                 | (path, (b2 : Batch)) ->
+                                     M.map
+                                       (\c -> (path, fst c))
+                                       (V.find
+                                          (\c -> (match fst c with | (r : Request) -> r.key == key))
+                                          b2.calls))
+                               asked
+                           in match (call, result) with
+                              | (None, _) -> acc
+                              | (Just (_, (r : Request)), Err why) ->
+                                  (
+                                    {
+                                      (fst acc)
+                                        | wrong =
+                                          V.pushBack
+                                            (fst acc).wrong
+                                            "${file}: `${r.name}!` could not be run: ${why}\n"
+                                    },
+                                    snd acc
+                                  )
+                              | (Just (path, (r : Request)), Ok wire) ->
+                                  (match M.map
+                                     (\w -> Mc.answerOf (fst w) (r.from, r.to))
+                                     (Mc.readWire wire 0) with
+                                   | Just (Answer.Answered trees defined) ->
+                                       (let had =
+                                          M.unwrapOr H.empty (H.lookup file (fst acc).answers)
+                                        in (
+                                             {
+                                               (fst acc)
+                                                 | answers =
+                                                   H.insert
+                                                     file
+                                                     (H.insert key (Ru.flatten trees) had)
+                                                     (fst acc).answers,
+                                               kept =
+                                                 V.pushBack (fst acc).kept (
+                                                   file,
+                                                   key,
+                                                   r.from,
+                                                   r.to,
+                                                   wire
+                                                 ),
+                                               bindings =
+                                                 V.append
+                                                   (fst acc).bindings
+                                                   (V.map
+                                                      (\d ->
+                                                        Binding {
+                                                          name = fst d,
+                                                          module = path,
+                                                          package = pkg,
+                                                          vis = visOf r.seen gated,
+                                                          value = Mc.writeWire (snd d)
+                                                        })
+                                                      defined)
+                                             },
+                                             snd acc
+                                           ))
+                                   | Just (Answer.Waiting _) -> (fst acc, snd acc + 1)
+                                   | Just (Answer.Failed why _) ->
+                                       (
+                                         {
+                                           (fst acc)
+                                             | wrong =
+                                               V.pushBack
+                                                 (fst acc).wrong
+                                                 "${file}: `${r.name}!`: ${why}\n"
+                                         },
+                                         snd acc
+                                       )
+                                   | None ->
+                                       (
+                                         {
+                                           (fst acc)
+                                             | wrong =
+                                               V.pushBack
+                                                 (fst acc).wrong
+                                                 "${file}: `${r.name}!` did not answer with tokens\n"
+                                         },
+                                         snd acc
+                                       ))))
+                    (st, 0)
+                    (readAnswers text)
+                in
+                let after = fst next in
+                let waiting = snd next in
+                let m3 = mark "answered" in
+                if not (V.isEmpty after.wrong) then after
+                else
+                  -- Each file a call of was answered, lowered again with
+                  -- every answer it has: what a macro wrote may call another.
+                  -- Each on a thread of its own, as they were lowered first, and
+                  -- handed its own file's text, tree and answers alone: a thread
+                  -- is given a copy of what it is given.
+                  let todo =
+                    V.concatMap
+                      (\x ->
+                        match x with
+                        | (f, _, _) ->
+                            (match (H.lookup f after.answers, H.lookup f grouping) with
+                             | (Just answered, Just (text, g)) ->
+                                 (if H.size answered
+                                    == H.size (M.unwrapOr H.empty (H.lookup f st.answers)) then []
+                                  else
+                                    [(
+                                      f,
+                                      text,
+                                      g,
+                                      M.unwrapOr
+                                        H.empty
+                                        (H.lookup "${pkg}/${relativeTo dir f}" expanded),
+                                      answered
+                                    )])
+                             | _ -> []))
+                      st.files
+                  in
+                  let again =
+                    H.fromVec
+                      (parMap
+                         (\job ->
+                           match job with
+                           | (f, text, g, recorded, answered) ->
+                               (match loweredWith cfg f pkg text g recorded fx answered with
+                                | (ast, more, _) -> (f, (ast, more))))
+                         todo)
+                  in
+                  let files =
+                    V.map
+                      (\x ->
+                        match x with
+                        | (f, ast, asked) ->
+                            (match H.lookup f again with
+                             | Just (redone, more) -> (f, redone, more)
+                             | None -> (f, ast, asked)))
+                      st.files
+                  in
+                  let m4 = mark "lowered again" in
+                  let defined = V.len after.bindings != V.len st.bindings in
+                  let answered =
+                    V.any
+                      (\x ->
+                        match x with
+                        | (f, _, _) ->
+                            M.map H.size (H.lookup f after.answers)
+                              != M.map H.size (H.lookup f st.answers))
+                      st.files
+                  in
+                  -- Nothing ran and nothing can: what still waits, waits
+                  -- for what is not coming.
+                  if not answered and st.settled then { after | files = files }
+                  else
+                    rounds
+                      o
+                      u
+                      pkg
+                      expanded
+                      fx
+                      grouping
+                      { after | files = files, settled = waiting > 0 and not defined }
+                      (n + 1)
+            | _ -> { st | wrong = ["${dir}: its macros could not be run:\n${err}\n"] })
 
 fun indexOf (xs : [String]) (x : String) : Int =
   M.unwrapOr (0 - 1) (V.find (\k -> V.get xs k == Just x) (V.range 0 (V.len xs)))

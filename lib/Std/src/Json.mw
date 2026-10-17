@@ -185,6 +185,37 @@ fun scanText (s : String) (n : Int) (from : Int) (i : Int) (pieces : [String]) :
         Read (if V.len pieces == 0 then piece else S.concatAll (V.pushBack pieces piece)) (i + 1))
      else if c == 92 then
        (if i + 1 >= n then Unread
+        else if byteAt s (i + 1) == 117 then
+          -- `\uXXXX`: a character by its code, or two of them for one past
+          -- `\uFFFF` -- a pair of surrogates. Half a pair is not read.
+          (let hi = hex4 s n (i + 2) in
+           if hi < 0 then Unread
+           else if hi >= 55296 and hi <= 56319 then
+             (let lo =
+                if i + 7 < n and byteAt s (i + 6) == 92 and byteAt s (i + 7) == 117 then
+                  hex4 s n (i + 8)
+                else 0 - 1
+              in if lo < 56320 or lo > 57343 then Unread
+                 else
+                   scanText
+                     s
+                     n
+                     (i + 12)
+                     (i + 12)
+                     (V.pushBack
+                        (V.pushBack pieces (stringSlice s from i))
+                        (charsToString
+                           #[charFromCode (65536 + (hi - 55296) * 1024 + (lo - 56320))])))
+           else if hi >= 56320 and hi <= 57343 then Unread
+           else
+             scanText
+               s
+               n
+               (i + 6)
+               (i + 6)
+               (V.pushBack
+                  (V.pushBack pieces (stringSlice s from i))
+                  (charsToString #[charFromCode hi])))
         else
           (match unescaped (byteAt s (i + 1)) with
            | Just e ->
@@ -196,6 +227,22 @@ fun scanText (s : String) (n : Int) (from : Int) (i : Int) (pieces : [String]) :
                  (V.pushBack (V.pushBack pieces (stringSlice s from i)) e)
            | None -> Unread))
      else scanText s n from (i + 1) pieces)
+
+-- The number the four hex digits of `s` at `i` write, or -1.
+fun hex4 (s : String) (n : Int) (i : Int) : Int =
+  if i + 4 > n then 0 - 1
+  else
+    V.foldl
+      (\acc k ->
+        (let d = hexValue (byteAt s (i + k)) in if acc < 0 or d < 0 then 0 - 1 else acc * 16 + d))
+      0
+      [0, 1, 2, 3]
+
+fun hexValue (c : Int) : Int =
+  if c >= 48 and c <= 57 then c - 48
+  else if c >= 97 and c <= 102 then c - 87
+  else if c >= 65 and c <= 70 then c - 55
+  else 0 - 1
 
 -- What the character after a backslash stands for: the escapes of `escapes`.
 fun unescaped (c : Int) : Maybe String =
@@ -329,9 +376,8 @@ fun number =
   let minus = P.option False (P.mapTo True (C.char '-')) in
   P.label "a number" (P.bind minus (\negative -> P.alt (float negative) (integer negative)))
 
--- Strings: `\uXXXX` is the one gap. Decoding one means UTF-16 surrogate
--- pairing, which belongs in `Std.String` rather than here, so for now such an
--- escape is rejected instead of half-handled.
+-- Strings. `\uXXXX` is read by the scanner above (`scanText`); this, which a
+-- string only reaches when that could not read it, has no rule for one.
 fun stringLit =
   let chars = P.skipThen (C.char '"') (P.manyTill (P.alt escape plainChar) (C.char '"')) in
   chars |> P.map (\cs -> charsToString (V.toArray cs)) |> P.label "a string"
@@ -354,19 +400,79 @@ fun escape = P.choice escapes |> P.label "an escape" |> P.skipThen (C.char '\\')
 
 -- --- rendering ---------------------------------------------------------------
 
--- Compact: no spaces, no newlines. `renderIndented` is below.
+-- Compact: no spaces, no newlines. `renderIndented` is below. A value's text
+-- is gathered a piece at a time into one growing table and joined once, so
+-- rendering takes time and room in the size of what it writes, whatever the
+-- depth it is nested to and whichever runtime it is on.
 @pub fun render (v : Json) : String =
-  match v with
-  | Null -> "null"
-  | Bool True -> "true"
-  | Bool False -> "false"
-  | Int n -> S.fromInt n
-  | Float x -> showFloat x
-  | String s -> quote s
-  | Array xs -> S.concatAll ["[", S.join "," (V.map render xs), "]"]
-  | Object fs -> S.concatAll ["{", S.join "," (V.map renderMember fs), "}"]
+  runSt (\() ->
+    let out = pieces () in
+    let u = emit out v in
+    concatStrings (gathered out))
 
-fun renderMember entry = S.concatAll [quote (fst entry), ":", render (snd entry)]
+-- The pieces of a text being written: a table of them that doubles when it
+-- is full, and how many it holds.
+data Pieces s
+  = Pieces (StRef s (StArray s String)) (StRef s Int)
+
+fun pieces () : Pieces s ! { St s | e } = Pieces (stNewRef (stNewArray 64 "")) (stNewRef 0)
+
+fun say (out : Pieces s) (x : String) : () ! { St s | e } =
+  match out with
+  | Pieces table count ->
+      let t = stGetRef table in
+      let n = stGetRef count in
+      let room = if n < stArrayLen t then t else doubled table t n in
+      let u = stSetArray room n x in
+      stSetRef count (n + 1)
+
+fun doubled table t (n : Int) =
+  let bigger = stNewArray (2 * n) "" in
+  let u = moved t bigger 0 n in
+  let w = stSetRef table bigger in
+  bigger
+
+fun moved from to (i : Int) (n : Int) =
+  if i >= n then () else (let u = stSetArray to i (stGetArray from i) in moved from to (i + 1) n)
+
+fun gathered (out : Pieces s) : #[String] ! { St s | e } =
+  match out with
+  | Pieces table count -> arraySlice (stFreeze (stGetRef table)) 0 (stGetRef count)
+
+fun emit (out : Pieces s) (v : Json) : () ! { St s | e } =
+  match v with
+  | Null -> say out "null"
+  | Bool True -> say out "true"
+  | Bool False -> say out "false"
+  | Int n -> say out (show n)
+  | Float x -> say out (showFloat x)
+  | String s -> emitString out s
+  | Array xs ->
+      let a = say out "[" in
+      let b = emitItems out (V.toArray xs) 0 in
+      say out "]"
+  | Object fs ->
+      let a = say out "{" in
+      let b = emitMembers out (V.toArray fs) 0 in
+      say out "}"
+
+fun emitItems (out : Pieces s) (xs : #[Json]) (i : Int) : () ! { St s | e } =
+  if i >= arrayLen xs then ()
+  else
+    (let a = (if i > 0 then say out "," else ()) in
+     let b = emit out (arrayGetOr Null xs i) in
+     emitItems out xs (i + 1))
+
+fun emitMembers (out : Pieces s) (fs : #[(String, Json)]) (i : Int) : () ! { St s | e } =
+  if i >= arrayLen fs then ()
+  else
+    (match arrayGetOr ("", Null) fs i with
+     | (name, value) ->
+         let a = (if i > 0 then say out "," else ()) in
+         let b = emitString out name in
+         let c = say out ":" in
+         let d = emit out value in
+         emitMembers out fs (i + 1))
 
 -- Two spaces per level, one element per line -- the shape `meadow fmt` uses for
 -- meadow itself.
@@ -403,20 +509,49 @@ fun pad depth = S.repeat "  " depth
 
 -- --- escaping ----------------------------------------------------------------
 
-@pub fun quote (s : String) : String = S.concatAll ["\"", escapeAll s, "\""]
+@pub fun quote (s : String) : String =
+  runSt (\() ->
+    let out = pieces () in
+    let u = emitString out s in
+    concatStrings (gathered out))
 
-fun escapeAll s =
-  s |> S.toBytes |> V.fromArray |> V.concatMap escapeByte |> V.toArray |> S.fromBytes
+-- `s` in its quotes: itself between them where nothing in it has to be
+-- escaped, which is nearly always, and otherwise what lies between the
+-- bytes that do, with each of those as its escape.
+fun emitString (out : Pieces s) (text : String) : () ! { St s | e } =
+  let a = say out "\"" in
+  let b = emitFrom out text (stringByteLength text) 0 in
+  say out "\""
 
-fun escapeByte b =
-  if b == 34 then V.fromArray #[92, 34]
-  else if b == 92 then V.fromArray #[92, 92]
-  else if b == 10 then V.fromArray #[92, 110]
-  else if b == 13 then V.fromArray #[92, 114]
-  else if b == 9 then V.fromArray #[92, 116]
-  else if b == 8 then V.fromArray #[92, 98]
-  else if b == 12 then V.fromArray #[92, 102]
-  else V.fromArray #[b]
+fun emitFrom (out : Pieces s) (text : String) (n : Int) (from : Int) : () ! { St s | e } =
+  let j = unsafeFrom text from n in
+  let a =
+    (if from == 0 and j >= n then say out text
+     else if j > from then say out (stringSlice text from j)
+     else ())
+  in if j >= n then ()
+     else (let b = say out (escapeOf (toInt (stringByteAt text j))) in emitFrom out text n (j + 1))
+
+-- Where the first byte of `s` at or after `i` that has to be escaped is: a
+-- quote, a backslash, or a control character, which no JSON string holds
+-- raw.
+fun unsafeFrom (s : String) (i : Int) (n : Int) : Int =
+  if i >= n then n
+  else
+    (let b = toInt (stringByteAt s i) in
+     if b == 34 or b == 92 or b < 32 then i else unsafeFrom s (i + 1) n)
+
+fun escapeOf (c : Int) : String =
+  if c == 34 then "\\\""
+  else if c == 92 then "\\\\"
+  else if c == 10 then "\\n"
+  else if c == 13 then "\\r"
+  else if c == 9 then "\\t"
+  else if c == 8 then "\\b"
+  else if c == 12 then "\\f"
+  else "\\u00${hexDigit (c / 16)}${hexDigit (c % 16)}"
+
+fun hexDigit (d : Int) : String = stringSlice "0123456789abcdef" d (d + 1)
 
 -- Meadow has no float formatter, so this renders the integer part and a fixed
 -- six fractional digits -- enough to round-trip the values this module's own
@@ -526,7 +661,7 @@ fun byGrammar (text : String) : Result String Json =
   let texts =
     [
       "", " ", "[1,", "[1,]", "{\"a\"}", "{\"a\":}", "{a:1}", "tru", "truex", "nul", "1 2", "1.",
-      "1e", "-", "--1", "\"open", "\"bad \\q escape\"", "\"\\u0041\"", "[1 2]", "{\"a\":1,}", "]",
+      "1e", "-", "--1", "\"open", "\"bad \\q escape\"", "\"\\ud800\"", "[1 2]", "{\"a\":1,}", "]",
       "1.5.2",
     ]
   in
@@ -543,6 +678,15 @@ fun byGrammar (text : String) : Result String Json =
   let e = assertEq (render (Object [("a", Int 1)])) "{\"a\":1}" "an object" in
   let text = "{\"a\":[1,2,3],\"b\":null,\"c\":\"x\"}" in
   assertEq (render (parsed text)) text "parse then render is the identity"
+
+@test fun unicodeEscapesAreRead () =
+  let a = assertEq (parsed "\"\\u0041\"") (String "A") "a letter by its code" in
+  assertEq (parsed "\"\\ud83d\\ude00\"") (String "😀") "a pair of surrogates"
+
+@test fun renderingEscapesControlCharacters () =
+  let esc = S.fromBytes #[toUInt8 97, toUInt8 27, toUInt8 98] in
+  let a = assertEq (render (String esc)) "\"a\\u001bb\"" "an escape character" in
+  assertEq (parsed (render (String esc))) (String esc) "and it reads back"
 
 @test fun renderingEscapesWhatItMust () =
   let a = assertEq (render (String "a\"b")) "\"a\\\"b\"" "a quote" in

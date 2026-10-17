@@ -1,0 +1,254 @@
+-- How many parameters a definition has, where it is not written with them
+-- all.
+--
+-- A definition's arity is the parameters it is written with: lowering makes
+-- of `fun f x y = e` a definition of both at once, and a call that gives
+-- `f` two arguments calls that directly (`Seq.known`). Everything else is a
+-- function as a value, given its arguments one at a time, each answer a
+-- function made for the next. So a definition that is a function without
+-- being written as one is called the slow way everywhere, however many
+-- arguments the call has:
+--
+--     fun both f xs = map f (map f xs)
+--     def twice = both           -- no parameter
+--     fun over xs = both inc     -- one, and answers a function
+--
+-- Here each such definition is written with the parameters it is missing --
+-- `twice` is `\f xs -> both f xs` -- and its arity is then what it is used
+-- as: eta-expansion. It is done only where it costs nothing and changes
+-- nothing. A definition's body, under the parameters it has, must be a
+-- definition in sight given fewer arguments than its arity, each of them a
+-- name or a literal: such a body does nothing when it is evaluated but make
+-- a function, so making that function where it is called instead runs
+-- nothing twice and nothing later. `def f = g (h 1)` is left alone -- `h 1`
+-- would be run at every call of `f` -- and so is a function whose body picks
+-- between functions, whose choosing would be.
+--
+-- One definition's arity is another's reason: with `def thrice = twice`,
+-- `thrice` has two parameters once `twice` has. So arities are asked for
+-- until a round changes none.
+
+use Lingua (pass!)
+use Lingua.Lang (Meta, spanMeta)
+use MeadowBoot.Core
+use MeadowBoot.Core (Core!)
+use MeadowBoot.Types
+use MeadowBoot.Types.Type.*
+use Std.Collections.Vector as V
+use Std.Collections.HashMap as H
+use Std.Collections.HashMap (HashMap)
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+
+def nowhere : Meta = spanMeta 0 0
+
+-- Where the names this pass makes start: below `Dictionaries`' and
+-- `Inline`'s, and clear of every unit's.
+def base : Int = 1900000000
+
+-- The most rounds arities are asked for in. One that stops here has
+-- definitions with fewer parameters than they might have, and none with
+-- more: a round gives a definition no more than the round before knew of.
+def rounds : Int = 32
+
+-- --- how many -----------------------------------------------------------------
+
+-- A definition under the type variables it is generic in.
+fun inside (a : CoreArena) (t : CoreTerm) : CoreTerm =
+  match viewCoreTerm a t with
+  | CoreTermView.TyLam r -> r.body
+  | _ -> t
+
+-- How many parameters a function is written with, after `n`, and its body.
+fun lams (a : CoreArena) (t : CoreTerm) (n : Int) : (Int, CoreTerm) =
+  match viewCoreTerm a t with
+  | CoreTermView.Lam r -> lams a r.body (n + 1)
+  | _ -> (n, t)
+
+-- How many arguments a value of type `t` can be given, one after another.
+fun arrows (t : Type) : Int =
+  match t with
+  | Fun params result _ -> if V.isEmpty params then 0 else V.len params + arrows result
+  | _ -> 0
+
+-- What a function of type `t` takes first, and what it is once it has it.
+fun applying (t : Type) : Maybe (Type, Type) =
+  match t with
+  | Fun params result eff ->
+      (match V.get params 0 with
+       | Just first ->
+           if V.len params == 1 then Just (first, result)
+           else Just (first, Fun (V.drop params 1) result eff)
+       | None -> None)
+  | _ -> None
+
+-- Whether evaluating `t` does nothing: it is a name, or a literal.
+fun atom (a : CoreArena) (t : CoreTerm) : Bool =
+  match viewCoreTerm a t with
+  | CoreTermView.Var _ -> True
+  | CoreTermView.Const _ -> True
+  | _ -> False
+
+-- The name `t` applies, at whatever types, and how many arguments after
+-- `given` it applies it to: if it is a name applied to nothing but names
+-- and literals.
+fun spine (a : CoreArena) (t : CoreTerm) (given : Int) : Maybe (Int, Int) =
+  match viewCoreTerm a t with
+  | CoreTermView.App r -> if atom a r.arg then spine a r.func (given + 1) else None
+  | CoreTermView.Var r -> Just (r.id, given)
+  | CoreTermView.TyApp r ->
+      (match viewCoreTerm a r.func with
+       | CoreTermView.Var v -> Just (v.id, given)
+       | _ -> None)
+  | _ -> None
+
+-- How many more parameters a definition whose body is `t` could be written
+-- with, the definitions in sight having the parameters `arity` says: those
+-- the function `t` applies still wants, if its type says it takes as many.
+fun wanted (a : CoreArena) (arity : HashMap Int Int) (t : CoreTerm) : Int =
+  match spine a t 0 with
+  | Just (f, given) ->
+      (let n = M.unwrapOr 0 (H.lookup f arity) in
+       let most = arrows (tyCoreTerm a t) in
+       if n <= given then 0 else if n - given > most then most else n - given)
+  | None -> 0
+
+-- `arity` once no definition of `shape` -- each its binder, the parameters
+-- it is written with, and its body under them -- could have more.
+fun settled (a : CoreArena) (shape : [(Int, Int, CoreTerm)]) (arity : HashMap Int Int) (left : Int)
+    : HashMap Int Int =
+  let (next, changed) =
+    V.foldl
+      (\acc d ->
+        match (acc, d) with
+        | ((h, c), (id, n, body)) ->
+            (let now = n + wanted a arity body in
+             if now != M.unwrapOr 0 (H.lookup id arity) then (H.insert id now h, True) else (h, c)))
+      (arity, False)
+      shape
+  in if changed and left > 0 then settled a shape next (left - 1) else arity
+
+-- For each definition of `p` that could be written with more parameters
+-- than it is, how many more.
+fun missing (p : CoreProgram) : HashMap Int Int =
+  let a = coreArena p in
+  let file = coreRoot p in
+  let shape =
+    V.map
+      (\d ->
+        match lams a (inside a (coreDefBody a d)) 0 with
+        | (n, body) -> (coreDefId a d, n, body))
+      (coreFileDefs a file)
+  in
+  let theirs =
+    V.foldl
+      (\h x ->
+        if coreExternArity a x > 0 then H.insert (coreExternId a x) (coreExternArity a x) h else h)
+      H.empty
+      (coreFileExterns a file)
+  in
+  let written =
+    V.foldl
+      (\h d ->
+        match d with
+        | (id, n, _) -> if n > 0 then H.insert id n h else h)
+      theirs
+      shape
+  in
+  let arity = settled a shape written rounds in
+  V.foldl
+    (\h d ->
+      match d with
+      | (id, n, _) ->
+          (let more = M.unwrapOr n (H.lookup id arity) - n in
+           if more > 0 then H.insert id more h else h))
+    H.empty
+    shape
+
+-- --- writing them ---------------------------------------------------------------
+
+-- How many more parameters each definition is to have, and the next name.
+record Wide s = {
+  more : HashMap Int Int,
+  next : StRef s Int
+}
+
+fun moreOf (cx : Wide s) (id : Int) : Int = M.unwrapOr 0 (H.lookup id cx.more)
+
+-- A definition's body with `n` more parameters: under the types it is
+-- generic in.
+fun widened out (cx : Wide s) (n : Int) body =
+  if n <= 0 then body
+  else
+    (match viewCoreTerm out body with
+     | CoreTermView.TyLam r ->
+         newCoreTermTyLam out nowhere r.vars r.nums (below out cx n r.body) (tyCoreTerm out body)
+     | _ -> below out cx n body)
+
+-- And under the parameters it has.
+fun below out (cx : Wide s) (n : Int) t =
+  match viewCoreTerm out t with
+  | CoreTermView.Lam r ->
+      newCoreTermLam out nowhere r.param r.paramTy (below out cx n r.body) (tyCoreTerm out t)
+  | _ -> given out cx n t
+
+-- `t`, a function, as one written with its next `n` parameters: `\x -> t x`,
+-- and so on.
+fun given out (cx : Wide s) (n : Int) t =
+  if n <= 0 then t
+  else
+    (match applying (tyCoreTerm out t) with
+     | Just (arg, rest) ->
+         (let v = stGetRef cx.next in
+          let u = stSetRef cx.next (v + 1) in
+          newCoreTermLam
+            out
+            nowhere
+            v
+            arg
+            (given
+               out
+               cx
+               (n - 1)
+               (newCoreTermApp out nowhere t (newCoreTermVar out nowhere v arg) rest))
+            (tyCoreTerm out t))
+     | None -> t)
+
+pass! {
+  widen : Core -> Core with cx from Def, Named, Data, Effect, Extern
+    | Def { id, body } -> Def { id, body = widened out cx (moreOf cx id) body }
+}
+
+-- `p` with every definition that is a function written as one: each with
+-- all the parameters the function it is takes. What reads a definition's
+-- arity off how it is written -- lowering, and what a unit tells the units
+-- that import it -- then reads what it is used as.
+@pub fun expanded (p : CoreProgram) : CoreProgram =
+  let more = missing p in
+  if H.isEmpty more then p
+  else
+    (let a = coreArena p in
+     let file = coreRoot p in
+     runSt (\() ->
+       let out = newCoreBuilder () in
+       let cx = Wide { more, next = stNewRef base } in
+       let defs = V.map (\d -> widenDef a out cx d) (coreFileDefs a file) in
+       let named = V.map (\n -> widenNamed a out cx n) (coreFileNamed a file) in
+       let datas = V.map (\d -> widenData a out cx d) (coreFileDatas a file) in
+       let effects = V.map (\e -> widenEffect a out cx e) (coreFileEffects a file) in
+       let externs = V.map (\x -> widenExtern a out cx x) (coreFileExterns a file) in
+       let root =
+         newCoreFile
+           out
+           nowhere
+           (coreFilePackage a file)
+           (coreFileEntry a file)
+           defs
+           named
+           datas
+           effects
+           externs
+       in CoreProgram (freezeCore out) root))
+
+-- How many definitions of `p` `expanded` writes with more parameters.
+@pub fun widenedIn (p : CoreProgram) : Int = H.size (missing p)

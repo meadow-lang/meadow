@@ -1272,6 +1272,7 @@ fn use_in(
             Some(a) => {
                 let values = resolver.module_values(&local);
                 resolver.activate_module(*a.value(), values);
+                resolver.activate_local_types(*a.value(), &local);
             }
             None => types_brought.extend(resolver.use_module(&local, &u.names)),
         }
@@ -1417,7 +1418,10 @@ fn use_in(
     match &u.alias {
         // `use M as C` — a qualifier and nothing else. `C.name` reaches the
         // module's exports; none of them are in scope unqualified.
-        Some(a) => resolver.activate_module(*a.value(), map.clone()),
+        Some(a) => {
+            resolver.activate_module(*a.value(), map.clone());
+            resolver.activate_module_types(*a.value(), &module_types(pkg, &segs, deps));
+        }
         // `use M` — bring every exported name into scope unqualified. Qualifying
         // is what `as` is for, so a bare `use` does not introduce one.
         None if u.names.is_empty() => {

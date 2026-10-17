@@ -1133,6 +1133,27 @@ fn a_new_name_has_to_be_one() {
     assert!(err.contains("is not a name"), "got: {err}");
 }
 
+/// `main` is `() -> () ! Eff` wherever an editor shows it, whatever less its
+/// body performs: the type its node has, which is what is listed and hinted,
+/// as well as its scheme.
+#[test]
+fn main_is_shown_at_the_effects_it_is_held_to() {
+    let src = "fun game () = println \"hi\"\n\nfun main () = game ()\n";
+    let a = STD.with(|s| s.analyse(src));
+    let shown: Vec<(&str, &str)> = a
+        .functions
+        .iter()
+        .map(|f| (f.name.as_str(), f.signature.as_str()))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            ("game", "() -> () ! { Console | e }"),
+            ("main", "() -> () ! Eff")
+        ]
+    );
+}
+
 /// What the editor offers to debug: each top-level definition, with how many
 /// arguments it takes and its type -- private ones included, since those are
 /// most of what a person wants to try on its own.

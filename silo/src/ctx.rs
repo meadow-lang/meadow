@@ -42,6 +42,35 @@ pub enum Wake {
     Fail(String),
 }
 
+/// A table keyed by an address. An address is spread over the table by one
+/// multiplication: the standard hasher is made to withstand keys chosen to
+/// collide, which these are not, and a program's every mention of a string
+/// literal looks one up -- a tenth of a compiler's time, hashing addresses.
+pub type ByAddress<V> = HashMap<usize, V, std::hash::BuildHasherDefault<AddressHasher>>;
+
+#[derive(Default)]
+pub struct AddressHasher(u64);
+
+impl std::hash::Hasher for AddressHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = (self.0 ^ u64::from(*b)).wrapping_mul(0x0100_0000_01B3);
+        }
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        // The high bits are the well-mixed ones, and a table takes its
+        // place from the low: turned round.
+        self.0 = (n as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .rotate_left(32);
+    }
+}
+
 /// Laid out as C would, for the first two words' sake: emitted code reads
 /// them off the context it is handed (`meadow_llvm::emit`'s `CTX`), so they
 /// must be where it looks.
@@ -54,6 +83,9 @@ pub struct Ctx {
     /// Here for a program with threads; one without keeps it in a global.
     pub shadow: Word,
     pub heap: Heap,
+    /// This thread's own counts of references into the regions it last
+    /// touched: see `crate::region::Tallies`.
+    pub regions: crate::region::Tallies,
     /// The segments running, innermost last: see `crate::segments`.
     pub running: Vec<*const ()>,
     /// Suspended segments, by the number their stack objects hold, with the
@@ -64,7 +96,7 @@ pub struct Ctx {
     pub(crate) parked: Vec<Parked>,
     pub next_handler: u32,
     /// String literals, made once per thread, by their bytes' address.
-    pub literals: HashMap<usize, Word>,
+    pub literals: ByAddress<Word>,
     /// Top-level values, once computed on this thread: see `GlobalGet`.
     pub globals: Vec<Option<(Word, i64)>>,
     /// What the leak check does not count: see `crate::prims::roots`.
@@ -82,6 +114,9 @@ pub struct Ctx {
     pub spill: Vec<Word>,
     /// The thread's number: 0 is `main`.
     pub tid: usize,
+    /// Inside a call C made into a library, on a segment of its own: a
+    /// failure ends the call, not the process. See `crate::sched::export_run`.
+    pub guarded: bool,
 }
 
 // Safety: a context is used by one OS thread at a time -- the one running its
@@ -94,11 +129,12 @@ impl Ctx {
             spill_at: std::ptr::null_mut(),
             shadow: 0,
             heap: Heap::new(),
+            regions: crate::region::Tallies::new(),
             running: Vec::new(),
             suspended: Vec::new(),
             parked: Vec::new(),
             next_handler: 1,
-            literals: HashMap::new(),
+            literals: ByAddress::default(),
             globals: Vec::new(),
             kept: Vec::new(),
             txn: None,
@@ -108,6 +144,7 @@ impl Ctx {
             // Safety: a constant the emitted module defines.
             spill: vec![0; unsafe { meadow_spill_words }.max(0) as usize],
             tid,
+            guarded: false,
         });
         c.spill_at = c.spill.as_mut_ptr();
         c
@@ -116,6 +153,7 @@ impl Ctx {
 
 impl Drop for Ctx {
     fn drop(&mut self) {
+        self.regions.settle();
         // Dropping a suspended segment unwinds it, which a runtime that aborts
         // on a panic cannot do: they are let go, and their memory with them.
         for s in self.suspended.drain(..).flatten() {
@@ -185,6 +223,22 @@ pub extern "C" fn meadow_ctx() -> *mut Ctx {
 #[inline(always)]
 pub fn given(c: *mut Ctx) -> *mut Ctx {
     if c.is_null() { get() } else { c }
+}
+
+/// The running thread's context, or null where none is running on this OS
+/// thread. Never inlined when threads move, as `current` is not.
+#[inline(always)]
+pub fn peek() -> *mut Ctx {
+    if !threaded() {
+        // Safety: as `get`.
+        return unsafe { ONLY };
+    }
+    current_or_none()
+}
+
+#[inline(never)]
+fn current_or_none() -> *mut Ctx {
+    CURRENT.with(Cell::get)
 }
 
 /// Whether there is a running thread's context on this OS thread.

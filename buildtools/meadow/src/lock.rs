@@ -233,10 +233,23 @@ pub fn dir_for(entry: &Path) -> PathBuf {
 pub fn source_id(source: &DepSource) -> Option<String> {
     match source {
         DepSource::Path(_) => None,
-        DepSource::Git { url, reference } => Some(match reference.written() {
-            Some(r) => format!("git+{url}?{r}"),
-            None => format!("git+{url}"),
-        }),
+        DepSource::Git {
+            url,
+            reference,
+            subdir,
+        } => {
+            // A directory of the repository is a package of its own: two from
+            // one repository are two sources.
+            let mut query: Vec<String> = reference.written().into_iter().collect();
+            if let Some(d) = subdir {
+                query.push(format!("subdir={d}"));
+            }
+            Some(if query.is_empty() {
+                format!("git+{url}")
+            } else {
+                format!("git+{url}?{}", query.join("&"))
+            })
+        }
     }
 }
 
@@ -387,12 +400,23 @@ mod tests {
         let with = source_id(&DepSource::Git {
             url: "https://example.com/j".to_string(),
             reference: GitRef::Tag("v1".to_string()),
+            subdir: None,
         });
         assert_eq!(with.as_deref(), Some("git+https://example.com/j?tag=v1"));
         let plain = source_id(&DepSource::Git {
             url: "https://example.com/j".to_string(),
             reference: GitRef::Default,
+            subdir: None,
         });
         assert_eq!(plain.as_deref(), Some("git+https://example.com/j"));
+        let under = source_id(&DepSource::Git {
+            url: "https://example.com/j".to_string(),
+            reference: GitRef::Tag("v1".to_string()),
+            subdir: Some("lib/j".to_string()),
+        });
+        assert_eq!(
+            under.as_deref(),
+            Some("git+https://example.com/j?tag=v1&subdir=lib/j")
+        );
     }
 }

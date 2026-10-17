@@ -42,6 +42,10 @@ pub enum Build {
     /// A `Std.Collections.Vector`, in the shape `Vector.fromArray` gives one --
     /// see [`vector_shape`].
     Vector(Vec<Build>),
+    /// A constructor of the program's own, by name, with its fields: what a
+    /// host answers with -- see [`crate::host`]. `Event.Clicked`, or
+    /// `Clicked` where only one constructor is called that.
+    Ctor(String, Vec<Build>),
 }
 
 /// How `Vector.fromArray` lays out `n` elements: nothing, one chunk, or a
@@ -88,12 +92,24 @@ pub(crate) fn vector_shape(n: usize) -> (i64, Vec<usize>) {
 pub(crate) const VECTOR_WIDTH: usize = 32;
 
 impl Build {
-    fn unit() -> Build {
+    pub fn unit() -> Build {
         Build::At(Value::Unit)
     }
 
-    fn int(n: i64) -> Build {
+    pub fn int(n: i64) -> Build {
         Build::At(Value::Int(n))
+    }
+
+    pub fn float(x: f64) -> Build {
+        Build::At(Value::Float(x))
+    }
+
+    pub fn bool(b: bool) -> Build {
+        Build::At(Value::Bool(b))
+    }
+
+    pub fn str(s: impl Into<String>) -> Build {
+        Build::Str(s.into())
     }
 
     fn ok(v: Build) -> Build {
@@ -110,7 +126,7 @@ impl Build {
         match self {
             Build::At(_) => 0,
             Build::Str(s) => crate::heap::Heap::packed_slots(s.len()),
-            Build::Data(_, xs) | Build::Tuple(xs) => {
+            Build::Data(_, xs) | Build::Tuple(xs) | Build::Ctor(_, xs) => {
                 size(Kind::Data, xs.len()) + xs.iter().map(Build::slots).sum::<usize>()
             }
             Build::Bytes(b) => crate::heap::Heap::packed_slots(b.len()) + size(Kind::Array, 0),
@@ -159,6 +175,11 @@ impl Vm<'_> {
             Build::Tuple(xs) => {
                 let fields: Vec<Value> = xs.into_iter().map(|x| self.build_here(x)).collect();
                 let tag = self.ctor_tag(TUPLE);
+                Value::Obj(self.heap.alloc(Kind::Data, tag, &fields))
+            }
+            Build::Ctor(name, xs) => {
+                let fields: Vec<Value> = xs.into_iter().map(|x| self.build_here(x)).collect();
+                let tag = self.host_ctor(&name).unwrap_or(u32::MAX);
                 Value::Obj(self.heap.alloc(Kind::Data, tag, &fields))
             }
             Build::Bytes(b) => Value::Obj(self.heap.alloc_bytes(&b)),
@@ -286,7 +307,8 @@ impl Vm<'_> {
             "Random" => self.native_random(op, arg)?,
             "Time" => self.native_time(op, arg)?,
             "Console" => self.native_console(op, arg)?,
-            _ => return Ok(None),
+            // Not the runtime's own: the host's, if this machine has one.
+            _ => return self.ask_host(effect, op, arg),
         };
         Ok(match built {
             Some(b) => Some(self.build(b)),
@@ -469,6 +491,9 @@ impl Vm<'_> {
                 }
                 Build::unit()
             }
+            // How much of the program this machine has reached: what a
+            // fuzzer steers by. See `Vm::reached`.
+            "covered" => Build::int(self.covered(matches!(arg, Value::Bool(true))) as i64),
             // Calling C, for `Std.Ffi`: see `meadow_rt::ffi`. Everything is
             // read out of the heap before the call and built after it.
             op if op.starts_with("ffi") => {
@@ -512,6 +537,7 @@ impl Vm<'_> {
                                 0 => ffi::Arg::Int(int(self, a[1])?),
                                 1 => ffi::Arg::Float(float(self, a[2])?),
                                 2 => ffi::Arg::Str(self.str_arg(&what, a[3])?.to_string()),
+                                3 => ffi::Arg::Float32(float(self, a[2])?),
                                 _ => return err(format!("{what}: no such kind of argument")),
                             });
                         }
@@ -586,6 +612,9 @@ impl Vm<'_> {
                         // Safety: as above.
                         Build::Str(unsafe { ffi::read_text(int(self, t[0])?, int(self, t[1])?) })
                     }
+                    // Only a library Silo builds is called by C: nothing here
+                    // has failed in such a call.
+                    "ffiFailure" => Build::Str(String::new()),
                     _ => return Ok(None),
                 }
             }

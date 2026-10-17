@@ -170,6 +170,19 @@ doubling's worth of allocation, and the memory is bounded rather than held to
 exit. Bounding that too would need the mark pass itself to be incremental,
 which needs a write barrier this runtime does not have.
 
+**A program that makes candidates and no cycles pays less and less.** The
+collector starts once 1,024 candidates have gathered. While its runs walk
+from candidates and free nothing, it waits for twice as many before the next
+round of runs, up to 262,144, and the first run that frees a cycle puts that
+back to 1,024. A candidate that died while it waited is freed without a walk,
+and in a program whose candidates are short-lived that is most of them: an
+interpreter whose every scope is a map of cells, shared with the scopes made
+from it, lets go of a shared cell at every return. MeadowBoot's CEK machine
+running one `lexer!` call spent 72% of 312 seconds in the collector, which
+freed nothing, and takes 54 seconds since. A doubling of the heap still starts
+a run whatever the count of candidates, so what waiting can cost in memory is
+bounded as before.
+
 **What it does not catch.** Only a `Ref` and a mutable array are kept as
 candidates, because every cycle contains one and the program must have been
 holding it to tie the knot. A cycle whose `Ref` is let go of while the cycle

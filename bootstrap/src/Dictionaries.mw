@@ -1,0 +1,161 @@
+-- Dictionaries, where they are known -- `meadow_core::dictionaries`, for a
+-- method asked of an `impl` in plain sight.
+--
+-- A trait is a dictionary and a method the function that reads itself out
+-- of one, so `x + 1` at `Int` is a call to a function that takes `impl Add
+-- Int`'s dictionary apart to find another function to call. Nothing in that
+-- is decided at run time. Where a method is asked of a dictionary that is
+-- **known** -- a definition that is a dictionary's constructor, an `impl`'s
+-- with no `where` and no types of its own -- the asking is the field it
+-- would find: the `impl`'s method, by name.
+--
+-- And `Std.Ops` defines the operators as methods, `impl Add Int { fun (+) a
+-- b = _primAdd a b }`, so that method is a function whose whole body is a
+-- primitive of its parameters. A call of one with all of them is that
+-- primitive of its arguments: `x + 1` at `Int` is the `AddI` it was before
+-- `+` was a method.
+--
+-- A unit is lowered apart from the ones it imports, so each says what the
+-- next need to know of it for this, its `Summary`: which of its definitions
+-- read a field out of a dictionary, which are known dictionaries and what
+-- each field of one is, and which are a primitive of their parameters.
+--
+-- This is what a unit says; `Inline` is where it is made use of.
+
+use Lingua (pass!)
+use Lingua.Lang (Meta, spanMeta)
+use Std.Macro (Reflect)
+use MeadowBoot.Core
+use MeadowBoot.Core (Core!)
+use MeadowBoot.Solve (Entry)
+use MeadowBoot.Types
+use MeadowBoot.Types.Type.*
+use Std.Collections.Vector as V
+use Std.Collections.HashMap as H
+use Std.Collections.HashMap (HashMap)
+use Std.String as S
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+
+-- A definition that is a primitive of its parameters, in their order: the
+-- operation, and how many they are.
+@derive(Reflect, Debug, PartialEq)
+@pub record Wrapper = {
+  op : String,
+  arity : Int
+}
+
+-- What a unit says of its definitions, each by its symbol: the label each
+-- selector reads, each known dictionary's fields -- a label and the symbol
+-- of the definition it holds -- and each wrapper of a primitive.
+@derive(Reflect, Debug, PartialEq)
+@pub record Summary = {
+  selectors : [Entry String],
+  dicts : [Entry [Entry String]],
+  wrappers : [Entry Wrapper]
+}
+
+@pub fun emptySummary () : Summary = Summary { selectors = [], dicts = [], wrappers = [] }
+
+def nowhere : Meta = spanMeta 0 0
+
+-- Where the binders this pass makes start, as `meadow_core`'s do: clear of
+-- every unit's.
+def base : Int = 1946157056
+
+fun symbolIn (pkg : String) (id : Int) : String =
+  if id < 0 then "meadow:${pkg}/impl${show (0 - id)}" else "meadow:${pkg}/d${show id}"
+
+-- A term under the types it is generic in, or at.
+fun peeled a t =
+  match viewCoreTerm a t with
+  | CoreTermView.TyLam r -> peeled a r.body
+  | CoreTermView.TyApp r -> peeled a r.func
+  | _ -> t
+
+-- The binder `t` names, if it is a name.
+fun named a t =
+  match viewCoreTerm a t with
+  | CoreTermView.Var r -> Just r.id
+  | _ -> None
+
+-- The label `body` reads out of its parameter, if that is all it does.
+fun selector a body : Maybe String =
+  match viewCoreTerm a body with
+  | CoreTermView.Lam r ->
+      (match viewCoreTerm a r.body with
+       | CoreTermView.Sel s -> if named a s.target == Just r.param then Just s.label else None
+       | _ -> None)
+  | _ -> None
+
+-- The primitive `body` is of its parameters, `params` so far, if that is
+-- all it is.
+fun wrapper a body (params : [Int]) : Maybe Wrapper =
+  match viewCoreTerm a body with
+  | CoreTermView.Lam r -> wrapper a r.body (V.pushBack params r.param)
+  | CoreTermView.Prim r ->
+      if not (V.isEmpty params)
+        and V.map (\x -> named a x) r.args == V.map (\p -> Just p) params then
+        Just (Wrapper { op = r.op, arity = V.len params })
+      else None
+  | _ -> None
+
+-- What `p` says of itself, for the units that import it. `theirs` are the
+-- labels of the constructors other units declare: a trait of another unit
+-- has its dictionary's fields named there.
+@pub fun summary (p : CoreProgram) (theirs : [Entry [String]]) : Summary =
+  let a = coreArena p in
+  let file = coreRoot p in
+  let pkg = coreFilePackage a file in
+  let defs = coreFileDefs a file in
+  let symbols =
+    V.foldl
+      (\h x -> H.insert (coreExternId a x) (coreExternSymbol a x) h)
+      (V.foldl (\h d -> H.insert (coreDefId a d) (symbolIn pkg (coreDefId a d)) h) H.empty defs)
+      (coreFileExterns a file)
+  in
+  let labels =
+    V.foldl
+      (\h n -> H.insert (coreNamedName a n) (coreNamedLabels a n) h)
+      (V.foldl (\h (e : Entry [String]) -> H.insert e.key e.value h) H.empty theirs)
+      (coreFileNamed a file)
+  in
+  let at = \d -> Entry { key = symbolIn pkg (coreDefId a d), value = d } in
+  Summary {
+    selectors =
+      V.concatMap
+        (\d ->
+          match selector a (coreDefBody a d) with
+          | Just label -> [Entry { key = symbolIn pkg (coreDefId a d), value = label }]
+          | None -> [])
+        defs,
+    dicts =
+      V.concatMap
+        (\d ->
+          match viewCoreTerm a (coreDefBody a d) with
+          | CoreTermView.Ctor r ->
+              if not (S.endsWith ".Dict" r.name) then []
+              else
+                (let ls = M.unwrapOr [] (H.lookup r.name labels) in
+                 [Entry {
+                    key = symbolIn pkg (coreDefId a d),
+                    value =
+                      V.concatMap
+                        (\k ->
+                          match M.andThen
+                            (\x -> M.andThen (\id -> H.lookup id symbols) (named a x))
+                            (V.get r.args k) with
+                          | Just s -> [Entry { key = V.getOr "" ls k, value = s }]
+                          | None -> [])
+                        (V.range 0 (V.len ls))
+                  }])
+          | _ -> [])
+        defs,
+    wrappers =
+      V.concatMap
+        (\d ->
+          match wrapper a (coreDefBody a d) [] with
+          | Just w -> [Entry { key = symbolIn pkg (coreDefId a d), value = w }]
+          | None -> [])
+        defs
+  }

@@ -1,4 +1,4 @@
-//! Calling C: what `Std.Ffi` asks of a runtime, the same for both.
+//! Calling C: what `Std.Ffi` asks of a runtime, the same for all three.
 //!
 //! A library is opened by name, a function found in it by name, and the
 //! function called with integers, floats, pointers and strings, answering
@@ -17,17 +17,32 @@
 //! arrange, and the call is refused. A struct by value and a variadic
 //! function are refused by not being expressible.
 //!
+//! **Windows on x86-64** passes the first four arguments by place, not by
+//! kind -- the second in `rdx` or `xmm1`, whichever its type says -- and the
+//! rest on the stack, eight bytes each whatever they are. So a call there is
+//! one of sixteen shapes, by which of the first four are floats, of sixteen
+//! words: what is past the fourth is the same eight bytes either way, and a
+//! function reads only the arguments it has.
+//!
+//! **A C `float`** is an `f32` in the low half of a float register, or of its
+//! stack slot, and the high half is not looked at: one is passed as a word
+//! whose low half is its bits, and one answered is the low half of what came
+//! back.
+//!
 //! Memory is C's: [`alloc`] and [`free`] are `malloc` and `free`, and numbers
 //! are written to and read from an address as so many bytes each. Nothing
 //! here is checked, and nothing could be.
 //!
-//! Unix only, so far.
+//! Unix, and Windows on x86-64.
 
 /// An argument, as the C function is to be handed it.
 pub enum Arg {
     /// An integer or a pointer.
     Int(i64),
+    /// A `double`.
     Float(f64),
+    /// A `float`.
+    Float32(f64),
     /// Text, as a NUL-terminated string that lasts as long as the call.
     Str(String),
 }
@@ -37,22 +52,67 @@ pub enum Arg {
 pub enum Ret {
     Unit,
     Int,
+    /// A `double`.
     Float,
     /// A `const char *`, copied; a null one is the empty string.
     Str,
+    /// A `float`.
+    Float32,
 }
 
 impl Ret {
-    /// As `Std.Ffi` numbers them: 0 unit, 1 integer or pointer, 2 float,
-    /// 3 string.
+    /// As `Std.Ffi` numbers them: 0 unit, 1 integer or pointer, 2 `double`,
+    /// 3 string, 4 `float`.
     pub fn from_code(code: i64) -> Option<Ret> {
         Some(match code {
             0 => Ret::Unit,
             1 => Ret::Int,
             2 => Ret::Float,
             3 => Ret::Str,
+            4 => Ret::Float32,
             _ => return None,
         })
+    }
+
+    /// Whether the answer comes back in a float register.
+    fn in_float(self) -> bool {
+        matches!(self, Ret::Float | Ret::Float32)
+    }
+}
+
+/// An argument as the word it is passed as, and whether it goes in a float
+/// register: a `float`'s bits in the low half of its word.
+fn word(a: &Arg, texts: &mut Vec<std::ffi::CString>) -> Result<(u64, bool), String> {
+    Ok(match a {
+        Arg::Int(n) => (*n as u64, false),
+        Arg::Float(x) => (x.to_bits(), true),
+        Arg::Float32(x) => (u64::from((*x as f32).to_bits()), true),
+        Arg::Str(s) => {
+            let c = std::ffi::CString::new(s.as_str())
+                .map_err(|_| "a NUL in a string argument".to_string())?;
+            texts.push(c);
+            (texts.last().expect("just pushed").as_ptr() as u64, false)
+        }
+    })
+}
+
+/// What came back -- the integer register, and the float register's bits --
+/// as `ret` says to read it.
+fn answer(ret: Ret, int: i64, float: u64) -> Answer {
+    match ret {
+        Ret::Unit => (0, 0.0, String::new()),
+        Ret::Int => (int, 0.0, String::new()),
+        Ret::Float => (0, f64::from_bits(float), String::new()),
+        Ret::Float32 => (0, f64::from(f32::from_bits(float as u32)), String::new()),
+        Ret::Str if int == 0 => (0, 0.0, String::new()),
+        // Safety: a C string the function answered, the caller says.
+        Ret::Str => (
+            0,
+            0.0,
+            unsafe { std::ffi::CStr::from_ptr(int as *const std::ffi::c_char) }
+                .to_string_lossy()
+                .into_owned(),
+        ),
     }
 }
 
@@ -63,7 +123,7 @@ pub type Answer = (i64, f64, String);
 #[cfg(unix)]
 mod sys {
     use super::{Answer, Arg, Ret};
-    use std::ffi::{CStr, CString, c_char, c_void};
+    use std::ffi::{CStr, CString, c_void};
 
     /// How many integer arguments travel in registers.
     const INTS: usize = if cfg!(target_arch = "x86_64") { 6 } else { 8 };
@@ -82,9 +142,31 @@ mod sys {
     }
 
     pub fn open(path: &str) -> Result<i64, String> {
+        if path.is_empty() {
+            return own();
+        }
         let name = CString::new(path).map_err(|_| "a NUL in the library's name".to_string())?;
         // Safety: a C string, and flags `dlopen` documents.
         let handle = unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+        if handle.is_null() {
+            Err(last_error())
+        } else {
+            Ok(handle as i64)
+        }
+    }
+
+    /// The library this code is linked into -- a program's own executable,
+    /// or the library a plugin is -- found by an address in it.
+    fn own() -> Result<i64, String> {
+        let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+        // Safety: an address in this module, and room for the answer.
+        let found = unsafe { libc::dladdr(own as *const c_void, &mut info) };
+        if found == 0 || info.dli_fname.is_null() {
+            return Err("this library's own path could not be found".to_string());
+        }
+        // Safety: the path the loader keeps for the module, and the flags
+        // `dlopen` documents: the module is loaded already.
+        let handle = unsafe { libc::dlopen(info.dli_fname, libc::RTLD_NOW | libc::RTLD_LOCAL) };
         if handle.is_null() {
             Err(last_error())
         } else {
@@ -113,32 +195,21 @@ mod sys {
         // The strings, kept until the call returns.
         let mut texts: Vec<CString> = Vec::new();
         for a in args {
-            match a {
-                Arg::Float(x) => {
-                    if nf == FLOATS {
-                        return Err(format!("more than {FLOATS} float arguments"));
-                    }
-                    floats[nf] = *x;
-                    nf += 1;
+            let (w, float) = super::word(a, &mut texts)?;
+            if float {
+                if nf == FLOATS {
+                    return Err(format!("more than {FLOATS} float arguments"));
                 }
-                Arg::Int(_) | Arg::Str(_) => {
-                    if ni == INTS {
-                        return Err(format!(
-                            "more than {INTS} integer, pointer and string arguments"
-                        ));
-                    }
-                    ints[ni] = match a {
-                        Arg::Int(n) => *n,
-                        Arg::Str(s) => {
-                            let c = CString::new(s.as_str())
-                                .map_err(|_| "a NUL in a string argument".to_string())?;
-                            texts.push(c);
-                            texts.last().expect("just pushed").as_ptr() as i64
-                        }
-                        Arg::Float(_) => unreachable!(),
-                    };
-                    ni += 1;
+                floats[nf] = f64::from_bits(w);
+                nf += 1;
+            } else {
+                if ni == INTS {
+                    return Err(format!(
+                        "more than {INTS} integer, pointer and string arguments"
+                    ));
                 }
+                ints[ni] = w as i64;
+                ni += 1;
             }
         }
         type Ints = extern "C" fn(
@@ -183,36 +254,24 @@ mod sys {
         // answered; that it is a function of these arguments answering this
         // is the caller's word. See the module's note on why the extra
         // registers are harmless.
-        let answer = unsafe {
-            if ret == Ret::Float {
+        let (int, float) = unsafe {
+            if ret.in_float() {
                 let f: Floats = std::mem::transmute(function as *const c_void);
-                (
-                    0,
-                    f(
-                        i0, i1, i2, i3, i4, i5, i6, i7, f0, f1, f2, f3, f4, f5, f6, f7,
-                    ),
-                    String::new(),
-                )
+                let x = f(
+                    i0, i1, i2, i3, i4, i5, i6, i7, f0, f1, f2, f3, f4, f5, f6, f7,
+                );
+                (0, x.to_bits())
             } else {
                 let f: Ints = std::mem::transmute(function as *const c_void);
                 let n = f(
                     i0, i1, i2, i3, i4, i5, i6, i7, f0, f1, f2, f3, f4, f5, f6, f7,
                 );
-                match ret {
-                    Ret::Str if n != 0 => (
-                        0,
-                        0.0,
-                        CStr::from_ptr(n as *const c_char)
-                            .to_string_lossy()
-                            .into_owned(),
-                    ),
-                    Ret::Str | Ret::Unit => (0, 0.0, String::new()),
-                    _ => (n, 0.0, String::new()),
-                }
+                (n, 0)
             }
         };
+        let answered = super::answer(ret, int, float);
         drop(texts);
-        Ok(answer)
+        Ok(answered)
     }
 
     pub fn alloc(bytes: i64) -> i64 {
@@ -226,7 +285,252 @@ mod sys {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod sys {
+    use super::{Answer, Arg, Ret};
+    use std::ffi::{CString, c_char, c_void};
+
+    unsafe extern "system" {
+        fn LoadLibraryW(name: *const u16) -> *mut c_void;
+        fn GetModuleHandleExW(flags: u32, name: *const u16, module: *mut *mut c_void) -> i32;
+        fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
+        fn GetLastError() -> u32;
+    }
+
+    unsafe extern "C" {
+        fn calloc(count: usize, size: usize) -> *mut c_void;
+        #[link_name = "free"]
+        fn c_free(at: *mut c_void);
+    }
+
+    /// How many words a call passes: four in registers and twelve on the
+    /// stack.
+    const WORDS: usize = 16;
+
+    pub fn open(path: &str) -> Result<i64, String> {
+        if path.is_empty() {
+            // The module this code is linked into -- a program's own
+            // executable, or the library a plugin is -- by an address in it,
+            // and not counted as one more load of it.
+            const FROM_ADDRESS: u32 = 0x4;
+            const UNCHANGED_REFCOUNT: u32 = 0x2;
+            let mut module: *mut c_void = std::ptr::null_mut();
+            // Safety: an address in this module, and room for the answer.
+            let ok = unsafe {
+                GetModuleHandleExW(
+                    FROM_ADDRESS | UNCHANGED_REFCOUNT,
+                    open as *const () as *const u16,
+                    &mut module,
+                )
+            };
+            return if ok == 0 || module.is_null() {
+                // Safety: none needed.
+                Err(format!(
+                    "this library could not be found: Windows error {}",
+                    unsafe { GetLastError() }
+                ))
+            } else {
+                Ok(module as i64)
+            };
+        }
+        let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        // Safety: a NUL-terminated wide string.
+        let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
+        if handle.is_null() {
+            // Safety: none needed.
+            Err(format!(
+                "`{path}` could not be loaded: Windows error {}",
+                unsafe { GetLastError() }
+            ))
+        } else {
+            Ok(handle as i64)
+        }
+    }
+
+    pub fn symbol(library: i64, name: &str) -> Result<i64, String> {
+        let c = CString::new(name).map_err(|_| "a NUL in the function's name".to_string())?;
+        // Safety: a handle `open` answered, and a C string.
+        let at = unsafe { GetProcAddress(library as *mut c_void, c.as_ptr()) };
+        if at.is_null() {
+            // Safety: none needed.
+            Err(format!("no `{name}`: Windows error {}", unsafe {
+                GetLastError()
+            }))
+        } else {
+            Ok(at as i64)
+        }
+    }
+
+    /// A word as the type of the place it is passed in.
+    trait Placed: Copy {
+        fn of(w: u64) -> Self;
+    }
+    impl Placed for i64 {
+        fn of(w: u64) -> i64 {
+            w as i64
+        }
+    }
+    impl Placed for f64 {
+        fn of(w: u64) -> f64 {
+            f64::from_bits(w)
+        }
+    }
+
+    /// The call, its first four arguments of types `A` to `D`: what came
+    /// back in the integer register and in the float register.
+    ///
+    /// # Safety
+    ///
+    /// `function` must be a C function of the arguments `w` holds.
+    unsafe fn placed<A: Placed, B: Placed, C: Placed, D: Placed>(
+        function: i64,
+        w: &[u64; WORDS],
+        float: bool,
+    ) -> (i64, u64) {
+        type Ints<A, B, C, D> = extern "C" fn(
+            A,
+            B,
+            C,
+            D,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) -> i64;
+        type Floats<A, B, C, D> = extern "C" fn(
+            A,
+            B,
+            C,
+            D,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) -> f64;
+        let r = |k: usize| w[k] as i64;
+        // Safety: the caller's.
+        unsafe {
+            if float {
+                let f: Floats<A, B, C, D> = std::mem::transmute(function as *const c_void);
+                let x = f(
+                    A::of(w[0]),
+                    B::of(w[1]),
+                    C::of(w[2]),
+                    D::of(w[3]),
+                    r(4),
+                    r(5),
+                    r(6),
+                    r(7),
+                    r(8),
+                    r(9),
+                    r(10),
+                    r(11),
+                    r(12),
+                    r(13),
+                    r(14),
+                    r(15),
+                );
+                (0, x.to_bits())
+            } else {
+                let f: Ints<A, B, C, D> = std::mem::transmute(function as *const c_void);
+                let n = f(
+                    A::of(w[0]),
+                    B::of(w[1]),
+                    C::of(w[2]),
+                    D::of(w[3]),
+                    r(4),
+                    r(5),
+                    r(6),
+                    r(7),
+                    r(8),
+                    r(9),
+                    r(10),
+                    r(11),
+                    r(12),
+                    r(13),
+                    r(14),
+                    r(15),
+                );
+                (n, 0)
+            }
+        }
+    }
+
+    pub fn call(function: i64, ret: Ret, args: &[Arg]) -> Result<Answer, String> {
+        if function == 0 {
+            return Err("a call to a null function".to_string());
+        }
+        if args.len() > WORDS {
+            return Err(format!("more than {WORDS} arguments"));
+        }
+        let mut w = [0u64; WORDS];
+        let mut mask = 0u8;
+        // The strings, kept until the call returns.
+        let mut texts: Vec<CString> = Vec::new();
+        for (k, a) in args.iter().enumerate() {
+            let (word, float) = super::word(a, &mut texts)?;
+            w[k] = word;
+            if float && k < 4 {
+                mask |= 1 << k;
+            }
+        }
+        let float = ret.in_float();
+        type I = i64;
+        type F = f64;
+        // Safety: none that can be checked; see `placed`.
+        let (int, bits) = unsafe {
+            match mask {
+                0 => placed::<I, I, I, I>(function, &w, float),
+                1 => placed::<F, I, I, I>(function, &w, float),
+                2 => placed::<I, F, I, I>(function, &w, float),
+                3 => placed::<F, F, I, I>(function, &w, float),
+                4 => placed::<I, I, F, I>(function, &w, float),
+                5 => placed::<F, I, F, I>(function, &w, float),
+                6 => placed::<I, F, F, I>(function, &w, float),
+                7 => placed::<F, F, F, I>(function, &w, float),
+                8 => placed::<I, I, I, F>(function, &w, float),
+                9 => placed::<F, I, I, F>(function, &w, float),
+                10 => placed::<I, F, I, F>(function, &w, float),
+                11 => placed::<F, F, I, F>(function, &w, float),
+                12 => placed::<I, I, F, F>(function, &w, float),
+                13 => placed::<F, I, F, F>(function, &w, float),
+                14 => placed::<I, F, F, F>(function, &w, float),
+                _ => placed::<F, F, F, F>(function, &w, float),
+            }
+        };
+        let answered = super::answer(ret, int, bits);
+        drop(texts);
+        Ok(answered)
+    }
+
+    pub fn alloc(bytes: i64) -> i64 {
+        // Safety: `calloc`, which answers null when it cannot.
+        unsafe { calloc(1, bytes.max(1) as usize) as i64 }
+    }
+
+    pub fn free(at: i64) {
+        // Safety: an address `alloc` or C answered, the caller says.
+        unsafe { c_free(at as *mut c_void) }
+    }
+}
+
+#[cfg(not(any(unix, all(windows, target_arch = "x86_64"))))]
 mod sys {
     use super::{Answer, Arg, Ret};
 
@@ -252,7 +556,8 @@ mod sys {
 }
 
 /// Open the library at `path` -- or of that name, wherever the system's
-/// loader looks -- answering a handle to it, or why not.
+/// loader looks -- answering a handle to it, or why not. The empty path is
+/// the library this code is in: the program itself, or the plugin it is.
 pub fn open(path: &str) -> Result<i64, String> {
     sys::open(path)
 }

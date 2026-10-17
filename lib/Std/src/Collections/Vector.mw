@@ -152,6 +152,39 @@ fun vNodeToArray node =
   | Leaf xs -> xs
   | Branch szs kids -> vaFoldl (\acc k -> arrayConcat acc (vNodeToArray k)) #[] kids
 
+-- --- walking a vector where it stands ----------------------------------
+--
+-- A fold or a search reads the five parts of a vector in turn, and the
+-- middle tree leaf by leaf: nothing is copied to do it, where `toArray`
+-- first is a copy of every element to read perhaps one.
+
+fun vNodeFoldl f z node =
+  match node with
+  | Leaf xs -> vaFoldl f z xs
+  | Branch szs kids -> vaFoldl (\acc k -> vNodeFoldl f acc k) z kids
+
+fun vNodeFoldr f z node =
+  match node with
+  | Leaf xs -> vaFoldr f z xs
+  | Branch szs kids -> vaFoldr (\k acc -> vNodeFoldr f acc k) z kids
+
+-- The first element of `xs` that `keep` holds of.
+fun vaFind keep xs =
+  let i = vaIndex keep xs 0 (arrayLen xs) in
+  if i < 0 then None else Just (arrayGet xs i)
+
+fun vNodeFind keep node =
+  match node with
+  | Leaf xs -> vaFind keep xs
+  | Branch szs kids -> vKidsFind keep kids 0
+
+fun vKidsFind keep kids i =
+  if i >= arrayLen kids then None
+  else
+    match vNodeFind keep (arrayGet kids i) with
+    | Just x -> Just x
+    | None -> vKidsFind keep kids (i + 1)
+
 -- --- append a full chunk at the bottom-right --------------------------
 
 fun vNewSpine shift chunk =
@@ -441,8 +474,8 @@ fun vPopChunkFront shift node =
 @pub fun append (l : [a]) (r : [a]) : [a] =
   match l with
   | Empty -> r
-  | Single _ -> vaFoldl (\v x -> pushBack v x) l (toArray r)
-  | Full _ _ _ _ _ _ _ -> vaFoldl (\v x -> pushBack v x) l (toArray r)
+  | Single _ -> foldl (\v x -> pushBack v x) l r
+  | Full _ _ _ _ _ _ _ -> foldl (\v x -> pushBack v x) l r
 
 @pub fun splitAt (v : [a]) (n : Int) : ([a], [a]) =
   let xs = toArray v in
@@ -452,9 +485,15 @@ fun vPopChunkFront shift node =
 @pub fun slice (v : [a]) (from : Int) (to : Int) : [a] =
   let xs = toArray v in fromArray (arraySlice xs from to)
 
-@pub fun take (v : [a]) (n : Int) : [a] = fst (splitAt v n)
+-- All but the last is the common `take`, and all but the first the common
+-- `drop` -- a stack popped, a list walked -- and each is what `popBack` and
+-- `popFront` do without reading the rest.
+@pub fun take (v : [a]) (n : Int) : [a] =
+  let have = len v in
+  if n >= have then v else if n == have - 1 and n >= 0 then popBack v else fst (splitAt v n)
 
-@pub fun drop (v : [a]) (n : Int) : [a] = snd (splitAt v n)
+@pub fun drop (v : [a]) (n : Int) : [a] =
+  if n <= 0 then v else if n == 1 then popFront v else snd (splitAt v n)
 
 @pub fun map (f : a -> b ! e) (v : [a]) : [b] ! e =
   match v with
@@ -467,12 +506,22 @@ fun vPopChunkFront shift node =
         | Branch szs kids -> Branch szs (vaMap mapNode kids)
       in Full len sh (vaMap f oF) (vaMap f iF) (mapNode mid) (vaMap f iB) (vaMap f oB)
 
-@pub fun foldl (f : a -> b -> a ! e) (z : a) (v : [b]) : a ! e = vaFoldl f z (toArray v)
+@pub fun foldl (f : a -> b -> a ! e) (z : a) (v : [b]) : a ! e =
+  match v with
+  | Empty -> z
+  | Single xs -> vaFoldl f z xs
+  | Full len sh oF iF mid iB oB ->
+      vaFoldl f (vaFoldl f (vNodeFoldl f (vaFoldl f (vaFoldl f z oF) iF) mid) iB) oB
 
-@pub fun foldr (f : a -> b -> b ! e) (z : b) (v : [a]) : b ! e = vaFoldr f z (toArray v)
+@pub fun foldr (f : a -> b -> b ! e) (z : b) (v : [a]) : b ! e =
+  match v with
+  | Empty -> z
+  | Single xs -> vaFoldr f z xs
+  | Full len sh oF iF mid iB oB ->
+      vaFoldr f (vaFoldr f (vNodeFoldr f (vaFoldr f (vaFoldr f z oB) iB) mid) iF) oF
 
 @pub fun filter (keep : a -> Bool ! e) (v : [a]) : [a] ! e =
-  fromArray (vaFoldl (\acc x -> if keep x then arrayPush acc x else acc) #[] (toArray v))
+  fromArray (foldl (\acc x -> if keep x then arrayPush acc x else acc) #[] v)
 
 @pub fun reverse (v : [a]) : [a] =
   v |> toArray |> vaFoldr (\x acc -> arrayPush acc x) #[] |> fromArray
@@ -480,7 +529,7 @@ fun vPopChunkFront shift node =
 @pub fun updateAt (v : [a]) (i : Int) (f : a -> a ! e) : [a] ! e =
   match get v i with | None -> v | Just x -> set v i (f x)
 
-@pub fun forEach (f : a -> () ! e) (v : [a]) : () ! e = vaFoldl (\u x -> f x) () (toArray v)
+@pub fun forEach (f : a -> () ! e) (v : [a]) : () ! e = foldl (\u x -> f x) () v
 
 -- The `[…]`-literal target: `[1, 2, 3]` desugars to `vecFromArray #[1, 2, 3]`.
 @pub fun vecFromArray (xs : #[a]) : [a] = fromArray xs
@@ -495,38 +544,61 @@ fun vPopChunkFront shift node =
   let rec go i acc = if i >= hi then acc else go (i + 1) (pushBack acc i) in
   go lo empty
 
-@pub fun elem (x : a) (v : [a]) : Bool =
-  let xs = toArray v in
-  vaIndex (\y -> x == y) xs 0 (arrayLen xs) >= 0
+@pub fun elem (x : a) (v : [a]) : Bool = any (\y -> x == y) v
 
 @pub fun notElem (x : a) (v : [a]) : Bool = if elem x v then False else True
 
-@pub fun sum (v : [n]) : n = vaFoldl (\a x -> a + x) 0 (toArray v)
+@pub fun sum (v : [n]) : n = foldl (\a x -> a + x) 0 v
 
-@pub fun product (v : [n]) : n = vaFoldl (\a x -> a * x) 1 (toArray v)
+@pub fun product (v : [n]) : n = foldl (\a x -> a * x) 1 v
 
-@pub fun sumBy (f : a -> n ! e) (v : [a]) : n ! e = vaFoldl (\a x -> a + f x) 0 (toArray v)
+@pub fun sumBy (f : a -> n ! e) (v : [a]) : n ! e = foldl (\a x -> a + f x) 0 v
 
 @pub fun all (keep : a -> Bool ! e) (v : [a]) : Bool ! e =
-  let xs = toArray v in
-  vaIndex (\x -> if keep x then False else True) xs 0 (arrayLen xs) < 0
+  match find (\x -> if keep x then False else True) v with
+  | Just _ -> False
+  | None -> True
 
 @pub fun any (keep : a -> Bool ! e) (v : [a]) : Bool ! e =
-  let xs = toArray v in vaIndex keep xs 0 (arrayLen xs) >= 0
+  match find keep v with | Just _ -> True | None -> False
 
+-- The first element `keep` holds of: a search that stops where it finds,
+-- and reads the vector where it stands.
 @pub fun find (keep : a -> Bool ! e) (v : [a]) : Maybe a ! e =
-  let xs = toArray v in
-  let i = vaIndex keep xs 0 (arrayLen xs) in
-  if i < 0 then None else Just (arrayGet xs i)
+  match v with
+  | Empty -> None
+  | Single xs -> vaFind keep xs
+  | Full len sh oF iF mid iB oB ->
+      match vaFind keep oF with
+      | Just x -> Just x
+      | None ->
+          match vaFind keep iF with
+          | Just x -> Just x
+          | None ->
+              match vNodeFind keep mid with
+              | Just x -> Just x
+              | None ->
+                  match vaFind keep iB with
+                  | Just x -> Just x
+                  | None -> vaFind keep oB
 
 -- Where in `xs` from `i` on, short of `n`, the first element `keep` holds of
 -- is, or -1: a search that stops where it finds, which a fold cannot.
 fun vaIndex (keep : a -> Bool ! e) (xs : #[a]) (i : Int) (n : Int) : Int ! e =
   if i >= n then 0 - 1 else if keep (arrayGet xs i) then i else vaIndex keep xs (i + 1) n
 
-@pub fun concat (vs : [[a]]) : [a] = vaFoldl (\acc v -> append acc v) empty (toArray vs)
+@pub fun concat (vs : [[a]]) : [a] = foldl (\acc v -> append acc v) empty vs
 
 @pub fun concatMap (f : a -> [b] ! e) (v : [a]) : [b] ! e = v |> map f |> concat
+
+-- `sep` between each two of `v`: `intersperse 0 [1, 2, 3]` is
+-- `[1, 0, 2, 0, 3]`.
+@pub fun intersperse (sep : a) (v : [a]) : [a] =
+  foldl (\acc x -> if isEmpty acc then pushBack acc x else pushBack (pushBack acc sep) x) empty v
+
+-- `sep` between each two of `vs`, and all of it one vector:
+-- `intercalate [0] [[1, 2], [3]]` is `[1, 2, 0, 3]`.
+@pub fun intercalate (sep : [a]) (vs : [[a]]) : [a] = concat (intersperse sep vs)
 
 @pub fun replicate (n : n) (x : a) : [a] =
   let rec go k acc = if k <= 0 then acc else go (k - 1) (pushBack acc x) in
@@ -701,6 +773,35 @@ use Std.Yield (Yield)
   let c = assertEq (get big 39) (Just 39) "last" in
   assertEq (toList (take big 3)) [0; 1; 2] "still indexable"
 
+@test fun aLargeVectorIsWalkedWhereItStands () =
+  -- 5,000 elements: every part of a vector, and a middle tree two levels deep.
+  let n = 5000 in
+  let big = pushFront (range 1 n) 0 in
+  let a =
+    assertEq (foldl (\acc x -> acc + x) 0 big) (n * (n - 1) / 2) "a left fold reads every element"
+  in
+  let b = assertEq (foldl (\acc x -> x) 0 big) (n - 1) "in order" in
+  let c = assertEq (foldr (\x acc -> x) 0 big) 0 "and a right fold from the other end" in
+  let d =
+    assertEq (find (\x -> x >= 2500) big) (Just 2500) "a search finds the first, in the middle"
+  in
+  let e = assertEq (find (\x -> x == n - 1) big) (Just (n - 1)) "or at the very end" in
+  let f = assertEq (find (\x -> x < 0) big) None "or nowhere" in
+  let g = assertTrue (elem 4999 big and notElem n big) "elem" in
+  let h = assertTrue (all (\x -> x >= 0) big and any (\x -> x == 3) big) "all and any" in
+  let i = assertEq (len (filter (\x -> x % 2 == 0) big)) (n / 2) "filter" in
+  -- Popped from the back until nothing is left, each element met once.
+  let rec back v acc =
+    if isEmpty v then acc else back (take v (len v - 1)) (acc + getOr 0 v (len v - 1))
+  in
+  let j = assertEq (back big 0) (n * (n - 1) / 2) "all but the last, over and over" in
+  let rec front v acc = if isEmpty v then acc else front (drop v 1) (acc + getOr 0 v 0) in
+  let k = assertEq (front big 0) (n * (n - 1) / 2) "all but the first, over and over" in
+  assertEq
+    (toList (append (take big 3) (drop big (n - 2))))
+    [0; 1; 2; n - 2; n - 1]
+    "and the ends agree"
+
 @test fun theQueryHelpers () =
   let a = assertEq (sum [1, 2, 3]) 6 "sum" in
   let b = assertEq (product [2, 3]) 6 "product" in
@@ -731,3 +832,11 @@ use Std.Yield (Yield)
   let b = assertEq (toList (dropWhile (\n -> n < 3) [1, 2, 3, 1])) [3; 1] "dropWhile" in
   let c = assertEq (toList (concat [[1, 2], [3]])) [1; 2; 3] "concat" in
   assertEq (toList (concatMap (\n -> [n, n]) [1, 2])) [1; 1; 2; 2] "concatMap"
+
+@test fun intersperseAndIntercalate () =
+  let a = assertEq (toList (intersperse 0 [1, 2, 3])) [1; 0; 2; 0; 3] "between each two" in
+  let b = assertEq (toList (intersperse 0 [7])) [7;] "one has nothing between" in
+  let c = assertTrue (isEmpty (intersperse 0 empty)) "none is none" in
+  let d =
+    assertEq (toList (intercalate [0, 0] [[1, 2], [3], [4]])) [1; 2; 0; 0; 3; 0; 0; 4] "joined"
+  in assertTrue (isEmpty (intercalate [0] empty)) "nothing to join"

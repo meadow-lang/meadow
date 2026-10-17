@@ -26,13 +26,18 @@ use Std.Collections.HashMap (HashMap)
 use Std.String as S
 use Std.Maybe as M
 use Std.Maybe.Maybe.*
+use Std.Result.Result.*
 use Std.St (St, runSt)
 use Std.Json as J
 use Std.Json (Json)
 use MeadowBoot.Syntax (parseSurfaceTokens)
 use MeadowBoot.Rules as Ru
-use MeadowBoot.Rules (Macro, Tok)
+use MeadowBoot.Rules (Macro, Tok, Tree)
+use Std.Char as Ch
 use MeadowBoot.Hygiene as Hy
+use MeadowBoot.Derive as D
+use MeadowBoot.Derive (Shape, Ctor)
+use MeadowBoot.Macros as Mc
 
 -- `input`'s grouped tree, a module of package `pkg`, as abstract syntax:
 -- each call of one of its `macro`s expanded here, and each other macro call
@@ -40,55 +45,165 @@ use MeadowBoot.Hygiene as Hy
 -- (`expr@120`), and each `@derive` what it wrote -- an operator chain in one
 -- grouped by the unit's fixities `fx`.
 @pub fun lowered
+    (cfg : Cfg)
+    (file : String)
     (pkg : String)
     (input : String)
     (tree : Green Grouped)
     (exps : HashMap String Json)
     (fx : HashMap String Fixity)
     : AstProgram =
+  match loweredWith cfg file pkg input tree exps fx H.empty with
+  | (program, _, _) -> program
+
+-- The same, with what the procedural macros called in it `answered` -- each
+-- call's tokens, under its key -- and, beside the syntax, every call it has
+-- no answer for: what a round of expansion is asked to run (`Compiler`).
+--
+-- What a `@cfg` switches off under `cfg` is left out here, before anything
+-- else sees the module, as `meadow_compiler::cfg::strip` takes it out: a
+-- declaration, a record's field, a constructor's named field, an effect's
+-- operation. It is not expanded, not resolved and not typed. A condition
+-- that cannot be read is the third thing answered: what is wrong, and the
+-- bytes it is at.
+@pub fun loweredWith
+    (cfg : Cfg)
+    (file : String)
+    (pkg : String)
+    (input : String)
+    (tree : Green Grouped)
+    (exps : HashMap String Json)
+    (fx : HashMap String Fixity)
+    (answered : HashMap String [Tok])
+    : (AstProgram, [Request], [(String, Int, Int)]) =
   runSt (\() ->
     let count = stNewRef 0 in
-    counting count (\() ->
-      let b = newAstBuilder () in
-      let bare =
-        Lc {
-          tokens = H.fromVec (V.map (\(l : Lexed) -> (l.from, l.token)) (lex input).tokens),
-          exps,
-          fx,
-          macros = H.empty
-        }
-      in
-      let top = R.root tree in
-      let c = { bare | macros = macrosOf bare pkg top } in
-      let decls = V.concatMap (decl c b) (childrenOf NodeDecl top) in
-      let root = newAstModule b (spanOf top) decls in
-      AstProgram (freezeAst b) root))
+    let asked = stNewRef [] in
+    let wrongs = stNewRef [] in
+    let program =
+      counting count asked wrongs (\() ->
+        let b = newAstBuilder () in
+        let bare =
+          Lc {
+            tokens = H.fromVec (V.map (\(l : Lexed) -> (l.from, l.token)) (lex input).tokens),
+            exps,
+            fx,
+            macros = H.empty,
+            answered,
+            under = "",
+            cfg,
+            input,
+            file
+          }
+        in
+        let top = R.root tree in
+        let c = { bare | macros = macrosOf bare pkg top } in
+        let decls = V.concatMap (decl c b) (childrenOf NodeDecl top) in
+        let root = newAstModule b (spanOf top) decls in
+        AstProgram (freezeAst b) root)
+    in (program, stGetRef asked, stGetRef wrongs))
+
+-- A call of a macro that is not the module's own, or a `@derive` of a
+-- trait: what would run it needs. Its key, which its answer comes back
+-- under; where it is -- `decls`, `expr`, `pat`, or `derived` for a derive;
+-- the name it is called by; its argument, as a `Wire` of token trees written
+-- out (`Macros`) -- a derive's is the declaration it is on; the bytes a
+-- token the macro makes up stands at; and what `@pub` on the call says of
+-- how far what it defines is seen -- `None` if it has none.
+@derive(Debug, PartialEq)
+@pub record Request = {
+  key : String,
+  kind : String,
+  name : String,
+  argument : String,
+  from : Int,
+  to : Int,
+  seen : Maybe [String]
+}
 
 -- Each token as the lexer read it, by where it is in the tree's text: what a
 -- literal is worth; what the module's other macro calls expanded to; the
 -- unit's fixities; and the module's `macro`s, by name.
+-- And what the procedural macros called here answered, by key, and what a
+-- key here starts with: nothing in the module itself, and inside what a
+-- macro wrote the key of the call that wrote it.
 record Lc = {
   tokens : HashMap Int Token,
   exps : HashMap String Json,
   fx : HashMap String Fixity,
-  macros : HashMap String Macro
+  macros : HashMap String Macro,
+  answered : HashMap String [Tok],
+  under : String,
+  cfg : Cfg,
+  -- The module's text, and what its file is called: what `line!` and
+  -- `file!` answer from.
+  input : String,
+  file : String
 }
+
+-- What a `@cfg` is decided by, as `meadow_compiler::Cfg` holds it: the system
+-- and the processor the program is for, whether the build is a `debug` or a
+-- `release` one, what runs the program, how hard it is optimised (`0` to
+-- `3`), whether its tests are being built, and the flags the build was given
+-- -- each a name, or `name=value`.
+@derive(Debug, PartialEq)
+@pub record Cfg = {
+  os : String,
+  arch : String,
+  profile : String,
+  backend : String,
+  opt : String,
+  test : Bool,
+  flags : [String]
+}
+
+-- The one build the commands that show a unit renamed or inferred answer
+-- for, wherever they run: the differential tests build the Rust compiler's
+-- side for it.
+@pub def shownCfg : Cfg =
+  Cfg {
+    os = "windows",
+    arch = "x86_64",
+    profile = "debug",
+    backend = "jit",
+    opt = "0",
+    test = False,
+    flags = []
+  }
+
+fun familyOf (c : Cfg) : String = if c.os == "windows" then "windows" else "unix"
 
 -- Each call of a `macro` expanded is numbered, in the order the Rust expander
 -- meets them -- a call, then what it wrote, then the next -- which is what
 -- the names its template writes are marked with.
+-- And a call nothing here can expand is asked for.
 effect Expanding {
   nextExpansion : () -> Int,
+  ask : Request -> (),
+  -- And something wrong said: what, and the bytes it is at.
+  wrong : (String, Int, Int) -> (),
 }
 
-fun counting (count : StRef s Int) (act : () -> a ! { Expanding, St s | e }) : a ! { St s | e } =
+fun counting
+    (count : StRef s Int)
+    (asked : StRef s [Request])
+    (wrongs : StRef s [(String, Int, Int)])
+    (act : () -> a ! { Expanding, St s | e })
+    : a ! { St s | e } =
   handle act () with {
     nextExpansion u k ->
       (let n = stGetRef count + 1 in
        let v = stSetRef count n in
        k n),
+    ask r k -> (let v = stSetRef asked (V.pushBack (stGetRef asked) r) in k ()),
+    wrong w k -> (let v = stSetRef wrongs (V.pushBack (stGetRef wrongs) w) in k ()),
     return x -> x
   }
+
+-- The key of the call, or the derive, at `s`: its place, and where its
+-- first token is in the text it was parsed from.
+fun keyOf (c : Lc) (kind : String) (s : GTree) : String =
+  "${c.under}${kind}@${show (fst (R.textRange s))}"
 
 -- What the call in position `kind` starting at `m` expanded to, if it did.
 fun expansion (c : Lc) (kind : String) (m : Meta) : Maybe Json =
@@ -98,34 +213,54 @@ fun expansion (c : Lc) (kind : String) (m : Meta) : Maybe Json =
 
 type GTree = Syntax Grouped
 
-fun kids (s : GTree) : [GTree] = V.filter (\x -> R.kindOf x != Unknown) (R.children s)
+-- A node's children are found by stepping from slot to slot (`Lingua.Red`):
+-- every form asks for a child or two of each node it reads, and a list of all
+-- of them made and filtered for each question was most of what lowering did.
+fun kids (s : GTree) : [GTree] = R.childrenWhere (\g c -> G.kindAt g c != Unknown) s
 
-fun nodeKids (s : GTree) : [GTree] = V.filter (\x -> not (R.isTokenOf x)) (kids s)
+fun nodeKids (s : GTree) : [GTree] =
+  R.childrenWhere (\g c -> not (G.isTokenAt g c) and G.kindAt g c != Unknown) s
 
-fun tokenKids (s : GTree) : [GTree] = V.filter R.isTokenOf (kids s)
+fun tokenKids (s : GTree) : [GTree] =
+  R.childrenWhere (\g c -> G.isTokenAt g c and G.kindAt g c != Unknown) s
 
-fun childOf (k : Grouped) (s : GTree) : Maybe GTree = V.find (\x -> R.kindOf x == k) (kids s)
+fun childOf (k : Grouped) (s : GTree) : Maybe GTree = R.childWhere (\g c -> G.kindAt g c == k) s
 
-fun childrenOf (k : Grouped) (s : GTree) : [GTree] = V.filter (\x -> R.kindOf x == k) (kids s)
+fun childrenOf (k : Grouped) (s : GTree) : [GTree] = R.childrenWhere (\g c -> G.kindAt g c == k) s
 
 fun has (k : Grouped) (s : GTree) : Bool = M.isSome (childOf k s)
 
-fun firstNode (s : GTree) : Maybe GTree = V.get (nodeKids s) 0
+fun firstNode (s : GTree) : Maybe GTree =
+  R.childWhere (\g c -> not (G.isTokenAt g c) and G.kindAt g c != Unknown) s
 
 fun must (k : Grouped) (s : GTree) : GTree = M.unwrapOr s (childOf k s)
 
-fun tokenIs (k : Grouped) (s : GTree) : Bool = V.any (\t -> R.kindOf t == k) (tokenKids s)
+fun tokenIs (k : Grouped) (s : GTree) : Bool =
+  M.isSome (R.childWhere (\g c -> G.isTokenAt g c and G.kindAt g c == k) s)
 
 -- The bytes `s` spans: its first token's start to its last's end -- where
 -- they stand, for a tree a macro wrote (`Lingua.Green`).
 fun spanOf (s : GTree) : Meta =
   match s with
   | Syntax g i ->
-      let toks =
-        V.filter (\j -> G.isTokenAt g j and G.kindAt g j != Unknown) (V.range i (G.after g i))
-      in (match (V.get toks 0, V.get toks (V.len toks - 1)) with
-          | (Just f, Just l) -> spanMeta (G.fromAt g f) (G.toAt g l)
-          | _ -> spanMeta (G.fromAt g i) (G.fromAt g i))
+      -- Looked for from each end: a tree is as many entries as everything
+      -- under it, and a span is asked of every one.
+      let last = G.after g i in
+      (match (tokenFrom g i last, tokenBefore g (last - 1) i) with
+       | (Just f, Just l) -> spanMeta (G.fromAt g f) (G.toAt g l)
+       | _ -> spanMeta (G.fromAt g i) (G.fromAt g i))
+
+-- The first token at `j` or after it, before `limit`.
+fun tokenFrom g (j : Int) (limit : Int) : Maybe Int =
+  if j >= limit then None
+  else if G.isTokenAt g j and G.kindAt g j != Unknown then Just j
+  else tokenFrom g (j + 1) limit
+
+-- The last token at `j` or before it, not before `least`.
+fun tokenBefore g (j : Int) (least : Int) : Maybe Int =
+  if j < least then None
+  else if G.isTokenAt g j and G.kindAt g j != Unknown then Just j
+  else tokenBefore g (j - 1) least
 
 fun join (a : Meta) (z : Meta) : Meta =
   spanMeta (min (metaStart a) (metaStart z)) (max (metaEnd a) (metaEnd z))
@@ -144,6 +279,19 @@ fun nameOf (t : GTree) : Nm = Nm { text = R.text t, at = spanOf t }
 
 fun named (text : String) (at : Meta) : Nm = Nm { text, at }
 
+-- A type's name under `s`: its first token, and each `.Name` after it --
+-- `M.Ty` -- as one name, dots and all, as `meadow-parser` keeps one.
+fun typeName (s : GTree) : Nm =
+  let first = firstName s in
+  let quals = childrenOf NodeTQual s in
+  if V.isEmpty quals then first
+  else
+    (let names = V.map (\q -> lastName q) quals in
+     let last = V.getOr first names (V.len names - 1) in
+     named
+       (V.foldl (\acc (n : Nm) -> "${acc}.${n.text}") first.text names)
+       (spanMeta (metaStart first.at) (metaEnd last.at)))
+
 fun firstName (s : GTree) : Nm =
   match s with
   | Syntax g i ->
@@ -154,7 +302,8 @@ fun firstName (s : GTree) : Nm =
        | None -> named "" (spanOf s))
 
 fun lastName (s : GTree) : Nm =
-  match V.get (tokenKids s) (V.len (tokenKids s) - 1) with
+  let tokens = tokenKids s in
+  match V.get tokens (V.len tokens - 1) with
   | Just t -> nameOf t
   | None -> firstName s
 
@@ -194,21 +343,30 @@ pass! {
     -- the module's `macro`s expanded here, and left a call if it cannot be.
     -- Anything else is what was written, and what a `@derive` on it wrote.
     | Decl { raw attrs, later item } ->
-        (let call =
-           only (\i -> R.kindOf i == NodeMacCall) (M.andThen firstNode (childOf NodeItem node))
-         in
-         let written = \u -> attributed c out node attrs (item c) in
-         match M.andThen (\i -> M.map (\m -> (i, m)) (rulesOf c i)) call with
-         | Just (i, m) -> M.unwrapOr (written ()) (expandedDecls c out m i)
-         | None ->
-             (match M.andThen (\i -> expansion c "decls" (spanOf node)) call with
-              | Just made -> V.map (jDecl c out) (jarr made)
-              | None ->
-                  V.append
-                    (written ())
-                    (V.map
-                       (jDecl c out)
-                       (M.unwrapOr [] (M.map jarr (expansion c "derived" (spanOf node)))))))
+        if not (cfgHolds c attrs) then []
+        else
+          (let call =
+             only (\i -> R.kindOf i == NodeMacCall) (M.andThen firstNode (childOf NodeItem node))
+           in
+           let written = \u -> attributed c out node attrs (item c) in
+           match M.andThen (\i -> M.map (\m -> (i, m)) (rulesOf c i)) call with
+           | Just (i, m) -> M.unwrapOr (written ()) (expandedDecls c out m i)
+           | None ->
+               (match M.andThen (\i -> H.lookup (keyOf c "decls" node) c.answered) call with
+                | Just toks -> splicedDecls c out (keyOf c "decls" node) toks
+                | None ->
+                    (match M.andThen (\i -> expansion c "decls" (spanOf node)) call with
+                     | Just made -> V.map (jDecl c out) (jarr made)
+                     | None ->
+                         let u =
+                           (match call with
+                            | Just i -> asking c "decls" (keyOf c "decls" node) i (seenBy attrs)
+                            | None -> ())
+                         in V.append
+                              (written ())
+                              (match expansion c "derived" (spanOf node) with
+                               | Just made -> V.map (jDecl c out) (jarr made)
+                               | None -> derivedDecls c out node attrs))))
     | Item {
       fixity, modDecl, useDecl, dataDecl, recordDecl, effectDecl, typeDecl, traitDecl, implDecl,
       macroDecl, macCall, funItem, defItem, patternDecl
@@ -253,7 +411,7 @@ pass! {
                name
                True
                []
-               (V.map (field c out) (childrenOf NodeFieldTy r))
+               (V.map (field c out) (fieldsThere c r))
          | None -> newAstVariant out (spanOf node) attrs name False (V.map (tatom c out) args) [])
     | Attr {} -> attr c out node
     | RecordDecl { raw fields } ->
@@ -264,7 +422,7 @@ pass! {
             (spanOf node)
             (declared out node)
             (taking out node)
-            (V.map (field c out) (childrenOf NodeFieldTy fields))
+            (V.map (field c out) (fieldsThere c fields))
         )]
     | EffectDecl { raw body } ->
         (match childOf NodeEffectAlias body with
@@ -286,7 +444,7 @@ pass! {
                  (spanOf node)
                  (declared out node)
                  (taking out node)
-                 (V.map (field c out) (childrenOf NodeFieldTy (must NodeRecTy body)))
+                 (V.map (field c out) (fieldsThere c (must NodeRecTy body)))
              )])
     | TypeDecl { raw ty } ->
         [(
@@ -825,7 +983,7 @@ pass! {
         (match V.get (V.concatMap asList [con, paren, array, brack, recTy]) 0 with
          | Just t -> t
          | _ -> newAstTypeVar out (spanOf node) (nm out (firstName node)))
-    | TCon { args } -> newAstTypeCon out (spanOf node) (nm out (firstName node)) args
+    | TCon { args } -> newAstTypeCon out (spanOf node) (nm out (typeName node)) args
     | TAtom { paren, array, brack, recTy } ->
         (match V.get (V.concatMap asList [paren, array, brack, recTy]) 0 with
          | Just t -> t
@@ -876,7 +1034,10 @@ fun asList (x : Maybe a) : [a] = match x with | Just v -> [v] | None -> []
 fun named_ out (s : GTree) =
   match V.get (tokenKids s) 0 with
   | Just t ->
-      if R.kindOf t == TokenUpperIdent or R.kindOf t == TokenMacUpper then
+      -- `M.Ty`: a constructor, qualified.
+      if not (V.isEmpty (childrenOf NodeTQual s)) then
+        newAstTypeCon out (spanOf s) (nm out (typeName s)) []
+      else if R.kindOf t == TokenUpperIdent or R.kindOf t == TokenMacUpper then
         newAstTypeCon out (spanOf s) (nm out (nameOf t)) []
       else newAstTypeVar out (spanOf s) (nm out (nameOf t))
   | None -> newAstTypeTuple out (spanOf s) []
@@ -2060,11 +2221,10 @@ fun holesIn (s : GTree) : [Int] =
     or k == NodeOpRef then []
   else if k == NodeHoleE then [metaStart (spanOf s)]
   else if k == NodeParen then
+    -- `(e)` is a section of its own: a `_` in it is its parameter, and none
+    -- of whoever is around it.
     (let elems = childrenOf NodeElem s in
-     if V.len elems == 1 then
-       (let inner = must NodeExpr (V.getOr s elems 0) in
-        if V.isEmpty (holesIn inner) then holesIn inner else [])
-     else V.concatMap (\e -> holesIn (must NodeExpr e)) elems)
+     if V.len elems == 1 then [] else V.concatMap (\e -> holesIn (must NodeExpr e)) elems)
   else if k == NodeMatchE then
     V.concatMap
       (\x ->
@@ -2101,6 +2261,212 @@ fun holesIn (s : GTree) : [Int] =
          (\x -> R.kindOf x != NodePat and R.kindOf x != NodeAnnot and R.kindOf x != NodeParam)
          (nodeKids s))
 
+-- --- `@cfg` -------------------------------------------------------------------
+
+-- Whether every `@cfg` among `attrs` holds for the build. One that cannot
+-- be read is said and taken to hold, so that it is the only thing wrong.
+fun cfgHolds (c : Lc) (attrs : [GTree]) : Bool ! { Expanding | e } =
+  V.all
+    (\a ->
+      if (firstName (must NodeAttrName a)).text != "cfg" then True
+      else
+        let metas =
+          (match childOf NodeAttrArgs a with
+           | Just args -> childrenOf NodeMeta args
+           | None -> [])
+        in match (V.len metas, V.get metas 0) with
+           | (1, Just m) ->
+               (match conditionHolds c m with
+                | Ok yes -> yes
+                | Err (why, at) -> (let u = wrong (why, metaStart at, metaEnd at) in True))
+           | _ ->
+               (let at = spanOf (must NodeAttrName a) in
+                let u =
+                  wrong (
+                    "`@cfg` takes one condition, as `@cfg(unix)` or `@cfg(all(unix, not(test)))`",
+                    metaStart at,
+                    metaEnd at
+                  )
+                in True))
+    attrs
+
+-- The fields of `r` that are there: a record's, a constructor's, or an
+-- effect's operations, each under its own `@cfg`s.
+fun fieldsThere (c : Lc) (r : GTree) : [GTree] ! { Expanding | e } =
+  V.filter (\f -> cfgHolds c (childrenOf NodeAttr f)) (childrenOf NodeFieldTy r)
+
+-- Whether one condition holds, as `meadow_compiler::cfg::holds` decides it:
+-- a name the build knows is asked of the build -- and can only be compared
+-- with what it could be -- and any other is a flag.
+fun conditionHolds (c : Lc) (m : GTree) : Result (String, Meta) Bool =
+  let cfg = c.cfg in
+  match m with
+  | GroupedMeta (Just text) _ _ ->
+      Err ("`\"${(stringName c text).text}\"` is not a condition", spanOf text)
+  | GroupedMeta _ (Just n) None ->
+      (let w = (firstName n).text in
+       Ok
+         (if w == "unix" or w == "windows" then familyOf cfg == w
+          else if w == "debug" or w == "release" then cfg.profile == w
+          else if w == "test" then cfg.test
+          else V.elem w cfg.flags))
+  | GroupedMeta _ (Just n) (Just rest) ->
+      (match rest with
+       | GroupedMetaRest (Just v) _ ->
+           (let key = (firstName n).text in
+            let value = (stringName c (must TokenStr v)).text in
+            let among =
+              \actual allowed ->
+                if V.elem value allowed then Ok (actual == value)
+                else
+                  Err (
+                    S.join "" [
+                      "`${key}` is never `\"${value}\"`; it is one of ",
+                      S.join ", " (V.map (\x -> "`\"${x}\"`") allowed)
+                    ],
+                    spanOf v
+                  )
+            in if key == "os" then among cfg.os ["windows", "linux", "macos"]
+               else if key == "arch" then among cfg.arch ["x86_64", "aarch64"]
+               else if key == "family" then among (familyOf cfg) ["unix", "windows"]
+               else if key == "profile" then among cfg.profile ["debug", "release"]
+               else if key == "backend" then among cfg.backend ["vm", "jit", "aot", "silo", "cek"]
+               else if key == "opt_level" then among cfg.opt ["0", "1", "2"]
+               else Ok (V.elem "${key}=${value}" cfg.flags))
+       | GroupedMetaRest _ (Just args) ->
+           (let name = (firstName n).text in
+            let each =
+              V.foldl
+                (\acc x ->
+                  match (acc, conditionHolds c x) with
+                  | (Err e, _) -> Err e
+                  | (_, Err e) -> Err e
+                  | (Ok ys, Ok y) -> Ok (V.pushBack ys y))
+                (Ok [])
+                (childrenOf NodeMeta args)
+            in match each with
+               | Err e -> Err e
+               | Ok ys ->
+                   if name == "all" then Ok (V.all (\y -> y) ys)
+                   else if name == "any" then Ok (V.any (\y -> y) ys)
+                   else if name == "not" then
+                     (if V.len ys == 1 then Ok (not (V.getOr True ys 0))
+                      else Err ("`not` takes exactly one condition", spanOf n))
+                   else
+                     Err (
+                       "there is no `${name}(…)`; conditions combine with `all`, `any` and `not`",
+                       spanOf n
+                     ))
+       | _ -> Ok True)
+  | _ -> Ok True
+
+-- --- derives -----------------------------------------------------------------
+--
+-- What the compiler's own derives write (`Derive`) is read here, where the
+-- `@derive` is: source, lexed, every token standing at the derive's name and
+-- taking up none of it, and every lowercase name -- and `Datum` -- under the
+-- prelude's mark, so that what it binds it binds apart and what it mentions
+-- is the prelude's. Parsed and lowered as a template's tokens are, the marks
+-- then taken off what is not a local.
+
+-- What each built-in derive written on declaration `s` wrote, in order.
+fun derivedDecls (c : Lc) b (s : GTree) (attrs : [GTree]) =
+  match M.andThen (shapeOf c) (M.andThen firstNode (childOf NodeItem s)) with
+  | None -> []
+  | Just shape ->
+      let wants =
+        V.concatMap
+          wanted
+          (V.filter (\a -> (firstName (must NodeAttrName a)).text == "derive") attrs)
+      in V.concatMap
+           (\k ->
+             match V.get wants k with
+             | None -> []
+             | Just (want : Nm) ->
+                 -- A procedural macro of the name is found first; the
+                 -- compiler's own derive is what there is until one answers.
+                 let key = "${keyOf c "derived" s}#${show k}" in
+                 (match H.lookup key c.answered with
+                  | Just toks -> splicedDecls c b key toks
+                  | None ->
+                      let u = askingDerive c key want.text s in
+                      (match D.builtin want.text shape with
+                       | Just text -> derivedText c b (metaStart want.at) text
+                       | None -> [])))
+           (V.range 0 (V.len wants))
+
+-- The names a `@derive(…)` asks for.
+fun wanted (a : GTree) : [Nm] =
+  match childOf NodeAttrArgs a with
+  | Just args ->
+      V.concatMap
+        (\m -> if has NodeMetaRest m or has TokenStr m then [] else [firstName m])
+        (childrenOf NodeMeta args)
+  | None -> []
+
+fun derivedText (c : Lc) b (at : Int) (text : String) =
+  let toks =
+    V.map
+      (\(l : Lexed) ->
+        let written = S.slice text l.from l.to in
+        match l.token with
+        | Token.LowerIdent n ->
+            Tok { token = Token.LowerIdent "${n}#0", text = "${written}#0", from = at, to = at }
+        | Token.UpperIdent "Datum" ->
+            Tok { token = Token.UpperIdent "Datum#0", text = "Datum#0", from = at, to = at }
+        | t -> Tok { token = t, text = written, from = at, to = at })
+      (lex text).tokens
+  in match reparsed c [] toks [] with
+     | (inner, root) ->
+         let ds = V.concatMap (decl inner b) (childrenOf NodeDecl root) in
+         let u = Hy.stripItems b ds in
+         ds
+
+-- What a derive needs of a `data` or a `record`, and nothing of anything
+-- else.
+fun shapeOf (c : Lc) (item : GTree) =
+  let name = (nameOf (must TokenUpperIdent item)).text in
+  let params = V.map (\p -> (nameOf p).text) (childrenOf TokenLowerIdent item) in
+  let names = \r -> V.map (\f -> (nameOf (must TokenLowerIdent f)).text) (fieldsThere c r) in
+  if R.kindOf item == NodeDataDecl then
+    Just
+      (Shape {
+         name,
+         params,
+         isRecord = False,
+         ctors =
+           V.map
+             (\v ->
+               let args = childrenOf NodeTAtom v in
+               -- Named as lowering has it: a brace list of at least one
+               -- field, and no `| r`, first after the name.
+               let fieldList =
+                 M.andThen
+                   (\a ->
+                     only
+                       (\r -> V.len (childrenOf NodeFieldTy r) > 0 and not (has NodeRowTail r))
+                       (childOf NodeRecTy a))
+                   (V.get args 0)
+               in
+               let ctor = (nameOf (must TokenUpperIdent v)).text in
+               match fieldList with
+               | Just r ->
+                   (let fields = names r in
+                    Ctor { name = ctor, named = True, fields, count = V.len fields })
+               | None -> Ctor { name = ctor, named = False, fields = [], count = V.len args })
+             (childrenOf NodeVariant item)
+       })
+  else if R.kindOf item == NodeRecordDecl then
+    (let fields = names (must NodeRecTy item) in
+     Just
+       (Shape {
+          name,
+          params,
+          isRecord = True,
+          ctors = [Ctor { name, named = True, fields, count = V.len fields }]
+        }))
+  else None
+
 -- --- expansions --------------------------------------------------------------
 --
 -- What the Rust compiler's macros expanded to (`meadow_compiler::expand::record`):
@@ -2110,20 +2476,36 @@ fun holesIn (s : GTree) : [Int] =
 -- fixities, as the fixity pass groups one in a tree.
 
 fun exprCall (c : Lc) b (m : Meta) (call : GTree) =
-  match rulesOf c call with
-  | Just r -> M.unwrapOr (newAstExprMacCall b m (macCall b call)) (expandedExpr c b r call)
-  | None ->
-      (match expansion c "expr" m with
-       | Just made -> jExpr c b made
-       | None -> newAstExprMacCall b m (macCall b call))
+  match (builtIn c call, rulesOf c call) with
+  | (Just toks, _) ->
+      M.unwrapOr
+        (newAstExprMacCall b m (macCall b call))
+        (exprFrom c b "${keyOf c "expr" call}/" toks)
+  | (_, Just r) -> M.unwrapOr (newAstExprMacCall b m (macCall b call)) (expandedExpr c b r call)
+  | (None, None) ->
+      let key = keyOf c "expr" call in
+      (match M.andThen (\toks -> exprFrom c b "${key}/" toks) (H.lookup key c.answered) with
+       | Just e -> e
+       | None ->
+           (match expansion c "expr" m with
+            | Just made -> jExpr c b made
+            | None ->
+                (let u = asking c "expr" key call None in newAstExprMacCall b m (macCall b call))))
 
 fun patCall (c : Lc) b (m : Meta) (call : GTree) =
-  match rulesOf c call with
-  | Just r -> M.unwrapOr (newAstPatMacCall b m (macCall b call)) (expandedPat c b r call)
-  | None ->
-      (match expansion c "pat" m with
-       | Just made -> jPat c b made
-       | None -> newAstPatMacCall b m (macCall b call))
+  match (builtIn c call, rulesOf c call) with
+  | (Just toks, _) ->
+      M.unwrapOr (newAstPatMacCall b m (macCall b call)) (patFrom c b "${keyOf c "pat" call}/" toks)
+  | (_, Just r) -> M.unwrapOr (newAstPatMacCall b m (macCall b call)) (expandedPat c b r call)
+  | (None, None) ->
+      let key = keyOf c "pat" call in
+      (match M.andThen (\toks -> patFrom c b "${key}/" toks) (H.lookup key c.answered) with
+       | Just p -> p
+       | None ->
+           (match expansion c "pat" m with
+            | Just made -> jPat c b made
+            | None ->
+                (let u = asking c "pat" key call None in newAstPatMacCall b m (macCall b call))))
 
 -- --- `macro`s ----------------------------------------------------------------
 --
@@ -2175,13 +2557,14 @@ fun rulesOf (c : Lc) (call : GTree) : Maybe Macro =
        M.andThen (\x -> H.lookup (Hy.stripOnce (firstName x).text) c.macros) (V.get segs 0)
      else None
 
--- What a call of `macro` `m` wrote, if a rule matches it.
+-- What a call of `macro` `m` wrote, if a rule matches it, and the
+-- expansion it is.
 fun expandCall (c : Lc) (m : Macro) (call : GTree) =
   let n = nextExpansion () in
   match V.find isGroup (nodeKids call) with
   | Just g ->
       (match Ru.expand m (Ru.treeOf (tokenOf c) g) n with
-       | Ok toks -> Just toks
+       | Ok toks -> Just (n, toks)
        | Err _ -> None)
   | None -> None
 
@@ -2225,60 +2608,249 @@ fun reparsed (c : Lc) (before : [(Token, String)]) (toks : [Tok]) (after : [(Tok
          (match grouped c.fx (R.root g) with
           | (gg, _) -> ({ c | tokens = tokens }, R.root gg))
 
+-- What a call of the module's own `macro` wrote is keyed apart from the
+-- module's own text, by the expansion it is.
+fun inside (c : Lc) (n : Int) : String = "${c.under}m${show n}/"
+
 fun expandedDecls (c : Lc) b (m : Macro) (call : GTree) =
-  M.map
-    (\toks ->
-      match reparsed c [] toks [] with
-      | (inner, root) ->
-          let ds = V.concatMap (decl inner b) (childrenOf NodeDecl root) in
-          let u = Hy.stripItems b ds in
-          ds)
-    (expandCall c m call)
+  M.map (\x -> declsFrom c b (inside c (fst x)) (snd x)) (expandCall c m call)
 
 fun expandedExpr (c : Lc) b (m : Macro) (call : GTree) =
-  M.andThen
-    (\toks ->
-      match reparsed
-        c
-        [(Token.Def, "def"), (Token.LowerIdent "x", "x"), (Token.Eq, "=")]
-        toks
-        [] with
-      | (inner, root) ->
-          M.map
-            (\body ->
-              let e = expr inner b (must NodeExpr body) in
-              let u = Hy.stripInExpr b e in
-              e)
-            (M.andThen
-               (childOf NodeBody)
-               (M.andThen firstNode (M.andThen (childOf NodeItem) (childOf NodeDecl root)))))
-    (expandCall c m call)
+  M.andThen (\x -> exprFrom c b (inside c (fst x)) (snd x)) (expandCall c m call)
 
 fun expandedPat (c : Lc) b (m : Macro) (call : GTree) =
-  M.andThen
-    (\toks ->
-      match reparsed
-        c
-        [
-          (Token.Def, "def"),
-          (Token.LowerIdent "x", "x"),
-          (Token.Eq, "="),
-          (Token.Match, "match"),
-          (Token.LParen, "("),
-          (Token.RParen, ")"),
-          (Token.With, "with"),
-          (Token.Bar, "|")
-        ]
-        toks
-        [(Token.RArrow, "->"), (Token.LParen, "("), (Token.RParen, ")")] with
-      | (inner, root) ->
-          M.map
-            (\arm ->
-              let p = pat inner b (must NodePat arm) in
-              let u = Hy.stripInPat b p in
-              p)
-            (firstOfKind NodeArm root))
-    (expandCall c m call)
+  M.andThen (\x -> patFrom c b (inside c (fst x)) (snd x)) (expandCall c m call)
+
+-- What a procedural macro answered where declarations go.
+fun splicedDecls (c : Lc) b (key : String) (toks : [Tok]) = declsFrom c b "${key}/" toks
+
+-- Tokens a macro wrote, parsed as declarations and lowered: a call in them
+-- is keyed `under` the one that wrote them.
+fun declsFrom (c : Lc) b (under : String) (toks : [Tok]) =
+  match reparsed c [] toks [] with
+  | (inner, root) ->
+      let ds = V.concatMap (decl { inner | under = under } b) (childrenOf NodeDecl root) in
+      let u = Hy.stripItems b ds in
+      ds
+
+-- The same as an expression: parsed inside `def x = …`.
+fun exprFrom (c : Lc) b (under : String) (toks : [Tok]) =
+  match reparsed c [(Token.Def, "def"), (Token.LowerIdent "x", "x"), (Token.Eq, "=")] toks [] with
+  | (inner, root) ->
+      M.map
+        (\body ->
+          let e = expr { inner | under = under } b (must NodeExpr body) in
+          let u = Hy.stripInExpr b e in
+          e)
+        (M.andThen
+           (childOf NodeBody)
+           (M.andThen firstNode (M.andThen (childOf NodeItem) (childOf NodeDecl root))))
+
+-- And as a pattern: parsed as a match's arm.
+fun patFrom (c : Lc) b (under : String) (toks : [Tok]) =
+  match reparsed
+    c
+    [
+      (Token.Def, "def"),
+      (Token.LowerIdent "x", "x"),
+      (Token.Eq, "="),
+      (Token.Match, "match"),
+      (Token.LParen, "("),
+      (Token.RParen, ")"),
+      (Token.With, "with"),
+      (Token.Bar, "|")
+    ]
+    toks
+    [(Token.RArrow, "->"), (Token.LParen, "("), (Token.RParen, ")")] with
+  | (inner, root) ->
+      M.map
+        (\arm ->
+          let p = pat { inner | under = under } b (must NodePat arm) in
+          let u = Hy.stripInPat b p in
+          p)
+        (firstOfKind NodeArm root)
+
+-- --- the built-in macros ------------------------------------------------------
+--
+-- Always there, and found before a `macro` of the name: `line!()` is the
+-- line the call is written on, `file!()` the name of the file it is in,
+-- `stringify!(…)` its argument written back as text, and `concat!(a, b, …)`
+-- its literal arguments joined into one string. Each answers one literal,
+-- standing where the call's argument is.
+
+-- What the call wrote, if it is of a built-in macro and is one it takes.
+fun builtIn (c : Lc) (call : GTree) : Maybe [Tok] =
+  let pathNode =
+    M.unwrapOr
+      call
+      (V.find (\x -> R.kindOf x == NodeMacPath or R.kindOf x == NodeArgPath) (nodeKids call))
+  in
+  let segs =
+    V.filter (\x -> R.kindOf x == NodeAnySeg or R.kindOf x == NodeArgSeg) (nodeKids pathNode)
+  in match (V.len segs, V.get segs 0, V.find isGroup (nodeKids call)) with
+     | (1, Just seg, Just g) ->
+         let name = Hy.stripOnce (firstName seg).text in
+         let arg = Ru.treeOf (tokenOf c) g in
+         let trees = Ru.treesIn arg in
+         let one =
+           \token text ->
+             (match Ru.spanOfTree arg with
+              | (from, to) -> Just [Tok { token, text, from, to }])
+         in if name == "line" then
+              (if V.isEmpty trees then
+                 (let n = lineOf c.input (metaStart (firstName seg).at) in
+                  one (Token.Int n) (show n))
+               else None)
+            else if name == "file" then
+              (if V.isEmpty trees then one (Token.Str c.file) "\"\"" else None)
+            else if name == "stringify" then
+              (let text = S.join "" (rendered (Ru.flatten trees) 0 []) in
+               one (Token.Str text) "\"\"")
+            else if name == "concat" then
+              M.andThen (\text -> one (Token.Str text) "\"\"") (concatenated trees)
+            else None
+     | _ -> None
+
+-- The line byte `at` of `text` is on, the first being 1.
+fun lineOf (text : String) (at : Int) : Int =
+  V.len (S.split "\n" (S.take text (min at (stringByteLength text))))
+
+-- Tokens written back as text, each a piece: a space before one unless it
+-- closes something or follows what opens something (`meadow_lexer::tt`'s
+-- `render`).
+fun rendered (toks : [Tok]) (i : Int) (acc : [String]) : [String] =
+  match V.get toks i with
+  | None -> acc
+  | Just (t : Tok) ->
+      let last = M.unwrapOr "" (V.last acc) in
+      let tightBefore =
+        (match t.token with
+         | Token.Comma -> True
+         | Token.SemiColon -> True
+         | Token.Period -> True
+         | Token.RParen -> True
+         | Token.RBrack -> True
+         | Token.RBrace -> True
+         | Token.InterpMid _ -> True
+         | Token.InterpEnd _ -> True
+         | _ -> False)
+      in
+      let tightAfter = last == "(" or last == "[" or last == "{" or last == "." in
+      if V.isEmpty acc or tightBefore or tightAfter then
+        rendered toks (i + 1) (V.pushBack acc t.text)
+      else rendered toks (i + 1) (V.pushBack (V.pushBack acc " ") t.text)
+
+-- The text of each literal among `trees`, commas between them, joined --
+-- or `None` if one of them is not a literal.
+fun concatenated (trees : [Tree]) : Maybe String =
+  V.foldl
+    (\acc piece ->
+      match (acc, piece) with
+      | (None, _) -> None
+      | (Just text, []) -> Just text
+      | (Just text, _) ->
+          (match (V.len piece, V.get piece 0) with
+           | (1, Just (Tree.Leaf (k : Tok))) ->
+               (match k.token with
+                | Token.Str s -> Just (text ++ s)
+                | Token.Char code -> Just (text ++ S.fromChars [Ch.fromCode code])
+                | Token.Int _ -> Just (text ++ k.text)
+                | Token.Real _ -> Just (text ++ k.text)
+                | _ -> None)
+           | _ -> None))
+    (Just "")
+    (V.foldl
+       (\pieces t ->
+         match t with
+         | Tree.Leaf (k : Tok) ->
+             (match k.token with
+              | Token.Comma -> V.pushBack pieces []
+              | _ -> onLast pieces t)
+         | _ -> onLast pieces t)
+       [[]]
+       trees)
+
+fun onLast (pieces : [[Tree]]) (t : Tree) : [[Tree]] =
+  match V.last pieces with
+  | Just p -> V.pushBack (V.take pieces (V.len pieces - 1)) (V.pushBack p t)
+  | None -> [[t]]
+
+-- --- procedural macros ---------------------------------------------------------
+--
+-- A call that is not of one of the module's `macro`s is not expanded here:
+-- it is asked for (`Request`), and whoever lowers the module runs what can
+-- be run and lowers it again with the answers (`Compiler`).
+
+-- Ask for the call `call`, which is in a `kind`'s place.
+fun asking (c : Lc) (kind : String) (key : String) (call : GTree) (seen : Maybe [String])
+    : () ! { Expanding | e } =
+  let pathNode =
+    M.unwrapOr
+      call
+      (V.find (\x -> R.kindOf x == NodeMacPath or R.kindOf x == NodeArgPath) (nodeKids call))
+  in
+  let segs =
+    V.map
+      (\x -> Hy.stripOnce (firstName x).text)
+      (V.filter (\x -> R.kindOf x == NodeAnySeg or R.kindOf x == NodeArgSeg) (nodeKids pathNode))
+  in match V.find isGroup (nodeKids call) with
+     | None -> ()
+     | Just g ->
+         let arg = Ru.treeOf (tokenOf c) g in
+         (match Ru.spanOfTree arg with
+          | (from, to) ->
+              ask
+                (Request {
+                   key,
+                   kind,
+                   name = S.join "." segs,
+                   argument = Mc.writeWire (Mc.treesWire True (Ru.treesIn arg)),
+                   from,
+                   to,
+                   seen
+                 }))
+
+-- Ask for the derive of `name` on the declaration `s`: its argument is the
+-- declaration, attributes and all, and what it makes up stands at the
+-- declaration under them.
+fun askingDerive (c : Lc) (key : String) (name : String) (s : GTree) : () ! { Expanding | e } =
+  match Mc.treesOf (tokensIn c s) with
+  | None -> ()
+  | Just trees ->
+      let at = spanOf (must NodeItem s) in
+      ask
+        (Request {
+           key,
+           kind = "derived",
+           name,
+           argument = Mc.writeWire (Mc.treesWire True trees),
+           from = metaStart at,
+           to = metaEnd at,
+           seen = None
+         })
+
+-- Every token of `s`, in order.
+fun tokensIn (c : Lc) (s : GTree) : [Tok] =
+  V.concatMap
+    (\x ->
+      if R.isTokenOf x then
+        [Tok {
+           token = M.unwrapOr (Token.OpIdent (R.text x)) (tokenOf c x),
+           text = R.text x,
+           from = R.offset x,
+           to = R.endOffset x
+         }]
+      else tokensIn c x)
+    (R.childrenWhere (\g k -> G.kindAt g k != Unknown) s)
+
+-- What a `@pub` among `attrs` says: its arguments, or `None` with none.
+fun seenBy (attrs : [GTree]) : Maybe [String] =
+  M.map
+    (\a ->
+      match childOf NodeAttrArgs a with
+      | Just args -> V.map (\m -> (firstName m).text) (childrenOf NodeMeta args)
+      | None -> [])
+    (V.find (\a -> (firstName (must NodeAttrName a)).text == "pub") attrs)
 
 -- The first node of kind `k` in `s`, reading down and left to right.
 fun firstOfKind (k : Grouped) (s : GTree) : Maybe GTree =

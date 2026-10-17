@@ -141,14 +141,14 @@ fn use_name_list_completes_that_modules_exports() {
 #[test]
 fn a_bare_use_completes_its_names_unqualified() {
     // `use M` imports everything unqualified, so that is what Tab must offer.
-    // `intercalate` is `List`-only — the prelude's sequence API is `Vector`'s.
+    // `lookupAssoc` is `List`-only — the prelude's sequence API is `Vector`'s.
     let bare = std_names();
-    assert!(!complete_at(&bare, "inter").contains(&"intercalate".to_string()));
+    assert!(!complete_at(&bare, "lookup").contains(&"lookupAssoc".to_string()));
 
     let n = names_with_uses(&["use Std.Collections.List"]);
-    let got = complete_at(&n, "inter");
+    let got = complete_at(&n, "lookup");
     assert!(
-        got.contains(&"intercalate".to_string()),
+        got.contains(&"lookupAssoc".to_string()),
         "a bare `use` should complete its names unqualified, got {got:?}"
     );
 }
@@ -184,7 +184,7 @@ fn an_alias_is_what_completes() {
 #[test]
 fn an_alias_imports_nothing_unqualified() {
     let n = names_with_uses(&["use Std.Collections.List as L"]);
-    assert!(!complete_at(&n, "inter").contains(&"intercalate".to_string()));
+    assert!(!complete_at(&n, "lookup").contains(&"lookupAssoc".to_string()));
 }
 
 #[test]

@@ -1,0 +1,324 @@
+-- Std.Num.Float: the functions of a `Float` a program draws or simulates with
+-- -- square roots, sines and cosines, and angles -- written in Meadow, from
+-- the four operations, so every runtime answers the same.
+--
+--   use Std.Num.Float as F
+--
+--   F.sin (F.pi /. 6.0)         -- 0.5, to the last bit or so
+--   F.atan2 1.0 (0.0 -. 1.0)    -- 3π/4
+--
+-- Each is good to a unit or two in the last place where its argument is not
+-- huge: `sin` and `cos` reduce theirs by π/2 in three parts, which stays
+-- exact while it is under a million or so, and grows less so after. `floor`
+-- is built in, from any float to an `Int`; `ceil` and `round` are here, to
+-- the same.
+
+use Std.Bool (not)
+
+-- π, and the whole turn.
+@pub def pi : Float = 3.141592653589793
+@pub def tau : Float = 6.283185307179586
+
+@pub fun abs (x : Float) : Float = if x <. 0.0 then 0.0 -. x else x
+
+-- The least whole number at or above `x`.
+@pub fun ceil (x : Float) : Int = let f = floor x in if toFloat f <. x then f + 1 else f
+
+-- The whole number nearest `x`, a half away from zero.
+@pub fun round (x : Float) : Int = if x <. 0.0 then 0 - floor (0.5 -. x) else floor (x +. 0.5)
+
+-- Whether `x` is a number, and a finite one.
+@pub fun isNaN (x : Float) : Bool = x != x
+
+@pub fun isFinite (x : Float) : Bool = x -. x == 0.0
+
+-- The square root: what is not a number for `x` below zero.
+@pub fun sqrt (x : Float) : Float =
+  if x == 0.0 or not (isFinite x) then (if x <. 0.0 then 0.0 /. 0.0 else x)
+  else if x <. 0.0 then 0.0 /. 0.0
+  else scaled x 1.0
+
+-- `x` brought into [1, 4) by fours, its root's scale kept in `s`, which the
+-- root there -- by Newton's method from a guess within a half -- is put back
+-- at.
+fun scaled (x : Float) (s : Float) : Float =
+  if x >=. 4.0 then scaled (x /. 4.0) (s *. 2.0)
+  else if x <. 1.0 then scaled (x *. 4.0) (s /. 2.0)
+  else newton x ((1.0 +. x) /. 2.0) 6 *. s
+
+fun newton (x : Float) (y : Float) (n : Int) : Float =
+  if n == 0 then y else newton x ((y +. x /. y) /. 2.0) (n - 1)
+
+-- π/2 in three parts, each exact in fewer bits than a float has, so that
+-- `x - k·π/2` loses nothing for the `k` an argument of moderate size gives:
+-- fdlibm's `pio2_1`, `pio2_2` and `pio2_2t`.
+def halfPi1 : Float = 1.5707963267341256
+def halfPi2 : Float = 0.000000000060771005063039659766
+def halfPi3 : Float = 0.00000000000000000000202226624879595063154
+def twoOverPi : Float = 0.6366197723675814
+
+-- `x` as a quarter turn `k`, mod 4, and what is left, in [-π/4, π/4].
+fun quadrant (x : Float) : (Int, Float) =
+  let k = round (x *. twoOverPi) in
+  let kf = toFloat k in
+  let r = ((x -. kf *. halfPi1) -. kf *. halfPi2) -. kf *. halfPi3 in
+  (((k % 4) + 4) % 4, r)
+
+-- Sine and cosine on [-π/4, π/4], by their series to the nineteenth power
+-- and the eighteenth, where the next term is under a part in 10^19.
+fun sinNear (r : Float) : Float =
+  let r2 = r *. r in
+  r
+    *. (1.0
+       +. r2
+       *. (0.0
+          -. 1.0
+          /. 6.0
+          +. r2
+          *. (1.0
+             /. 120.0
+             +. r2
+             *. (0.0
+                -. 1.0
+                /. 5040.0
+                +. r2
+                *. (1.0
+                   /. 362880.0
+                   +. r2
+                   *. (0.0
+                      -. 1.0
+                      /. 39916800.0
+                      +. r2
+                      *. (1.0
+                         /. 6227020800.0
+                         +. r2
+                         *. (0.0
+                            -. 1.0
+                            /. 1307674368000.0
+                            +. r2
+                            *. (1.0 /. 355687428096000.0 -. r2 /. 121645100408832000.0)))))))))
+
+fun cosNear (r : Float) : Float =
+  let r2 = r *. r in
+  1.0
+    +. r2
+    *. (0.0
+       -. 0.5
+       +. r2
+       *. (1.0
+          /. 24.0
+          +. r2
+          *. (0.0
+             -. 1.0
+             /. 720.0
+             +. r2
+             *. (1.0
+                /. 40320.0
+                +. r2
+                *. (0.0
+                   -. 1.0
+                   /. 3628800.0
+                   +. r2
+                   *. (1.0
+                      /. 479001600.0
+                      +. r2
+                      *. (0.0
+                         -. 1.0
+                         /. 87178291200.0
+                         +. r2
+                         *. (1.0 /. 20922789888000.0 -. r2 /. 6402373705728000.0))))))))
+
+@pub fun sin (x : Float) : Float =
+  if not (isFinite x) then 0.0 /. 0.0
+  else
+    match quadrant x with
+    | (0, r) -> sinNear r
+    | (1, r) -> cosNear r
+    | (2, r) -> 0.0 -. sinNear r
+    | (_, r) -> 0.0 -. cosNear r
+
+@pub fun cos (x : Float) : Float =
+  if not (isFinite x) then 0.0 /. 0.0
+  else
+    match quadrant x with
+    | (0, r) -> cosNear r
+    | (1, r) -> 0.0 -. sinNear r
+    | (2, r) -> 0.0 -. cosNear r
+    | (_, r) -> sinNear r
+
+@pub fun tan (x : Float) : Float = sin x /. cos x
+
+-- tan(π/12), and √3.
+def tanTwelfth : Float = 0.2679491924311227
+def root3 : Float = 1.7320508075688772
+
+-- The angle whose tangent is `x`, in (-π/2, π/2): brought to [0, 1] by
+-- atan x = π/2 - atan (1/x), then to [0, tan(π/12)] by
+-- atan x = π/6 + atan ((x√3 - 1) / (x + √3)), where its series has what it
+-- needs in sixteen terms.
+@pub fun atan (x : Float) : Float =
+  if isNaN x then x else if x <. 0.0 then 0.0 -. atanPositive (0.0 -. x) else atanPositive x
+
+fun atanPositive (x : Float) : Float =
+  if x >. 1.0 then pi /. 2.0 -. atanSmall (1.0 /. x) else atanSmall x
+
+fun atanSmall (x : Float) : Float =
+  if x >. tanTwelfth then pi /. 6.0 +. atanSeries ((x *. root3 -. 1.0) /. (x +. root3))
+  else atanSeries x
+
+fun atanSeries (x : Float) : Float = let x2 = x *. x in x *. atanTerms x2 15
+
+-- 1 - x²/3 + x⁴/5 - …, to the term of `n`, by Horner's rule from the last.
+fun atanTerms (x2 : Float) (n : Int) : Float = atanFrom x2 n 0.0
+
+fun atanFrom (x2 : Float) (n : Int) (acc : Float) : Float =
+  if n < 0 then acc
+  else
+    (let term = 1.0 /. toFloat (2 * n + 1) in
+     let signed = if n % 2 == 0 then term else 0.0 -. term in
+     atanFrom x2 (n - 1) (signed +. x2 *. acc))
+
+-- The angle of the point (`x`, `y`) from the positive x-axis, in (-π, π]:
+-- `y` first, as C's `atan2` has it.
+@pub fun atan2 (y : Float) (x : Float) : Float =
+  if isNaN x or isNaN y then 0.0 /. 0.0
+  else if x >. 0.0 then atan (y /. x)
+  else if x <. 0.0 then (if y <. 0.0 then atan (y /. x) -. pi else atan (y /. x) +. pi)
+  else if y >. 0.0 then pi /. 2.0
+  else if y <. 0.0 then 0.0 -. pi /. 2.0
+  else 0.0
+
+-- The length of (`x`, `y`).
+@pub fun hypot (x : Float) (y : Float) : Float = sqrt (x *. x +. y *. y)
+
+-- The angle whose sine is `x`, in [-π/2, π/2], and the one whose cosine is,
+-- in [0, π]: what is not a number outside [-1, 1].
+@pub fun asin (x : Float) : Float =
+  if not (abs x <=. 1.0) then 0.0 /. 0.0 else atan2 x (sqrt ((1.0 -. x) *. (1.0 +. x)))
+
+@pub fun acos (x : Float) : Float =
+  if not (abs x <=. 1.0) then 0.0 /. 0.0 else atan2 (sqrt ((1.0 -. x) *. (1.0 +. x))) x
+
+-- ln 2 in two parts, the first exact in fewer bits than a float has:
+-- fdlibm's `ln2_hi` and `ln2_lo`.
+def ln2Hi : Float = 0.6931471803691238
+def ln2Lo : Float = 0.00000000019082149292705877
+def ln2 : Float = 0.6931471805599453
+def root2 : Float = 1.4142135623730951
+
+-- e to the `x`: `x` as `k` ln 2 and what is left, within ln 2 / 2, whose
+-- series is summed to its twentieth term and scaled by 2 to the `k`.
+@pub fun exp (x : Float) : Float =
+  if isNaN x then x
+  else if x >. 709.782712893384 then 1.0 /. 0.0
+  else if x <. 0.0 -. 745.1332191019411 then 0.0
+  else
+    (let k = round (x /. ln2) in
+     let kf = toFloat k in
+     let r = (x -. kf *. ln2Hi) -. kf *. ln2Lo in
+     timesTwoTo (expFrom r 20 1.0) k)
+
+-- 1 + r (1 + r/2 (1 + r/3 (…))), from the term of `n` in.
+fun expFrom (r : Float) (n : Int) (acc : Float) : Float =
+  if n == 0 then acc else expFrom r (n - 1) (1.0 +. r *. acc /. toFloat n)
+
+-- `x` times 2 to the `k`, a factor of two at a time: exact while what it
+-- makes is a normal float.
+fun timesTwoTo (x : Float) (k : Int) : Float =
+  if k > 0 then timesTwoTo (x *. 2.0) (k - 1)
+  else if k < 0 then timesTwoTo (x /. 2.0) (k + 1)
+  else x
+
+-- The natural logarithm: `x` as 2 to the `k` times `m`, `m` within a factor
+-- of √2 of 1, whose logarithm is 2 atanh ((m - 1) / (m + 1)) by its series.
+-- What is not a number below zero, and minus infinity at it.
+@pub fun ln (x : Float) : Float =
+  if isNaN x or x <. 0.0 then 0.0 /. 0.0
+  else if x == 0.0 then 0.0 -. 1.0 /. 0.0
+  else if not (isFinite x) then x
+  else lnFrom x 0
+
+fun lnFrom (m : Float) (k : Int) : Float =
+  if m >=. root2 then lnFrom (m /. 2.0) (k + 1)
+  else if m <. root2 /. 2.0 then lnFrom (m *. 2.0) (k - 1)
+  else
+    (let s = (m -. 1.0) /. (m +. 1.0) in
+     let kf = toFloat k in
+     kf *. ln2Hi +. (kf *. ln2Lo +. 2.0 *. s *. atanhTerms (s *. s) 12 0.0))
+
+-- 1 + s²/3 + s⁴/5 + …, to the term of `n`, by Horner's rule from the last.
+fun atanhTerms (s2 : Float) (n : Int) (acc : Float) : Float =
+  if n < 0 then acc else atanhTerms s2 (n - 1) (1.0 /. toFloat (2 * n + 1) +. s2 *. acc)
+
+-- `x` to the `y`: e to the `y` ln `x`; a negative `x` only to a whole `y`.
+@pub fun pow (x : Float) (y : Float) : Float =
+  if y == 0.0 then 1.0
+  else if isNaN x or isNaN y then 0.0 /. 0.0
+  else if x >. 0.0 then exp (y *. ln x)
+  else if x == 0.0 then (if y >. 0.0 then 0.0 else 1.0 /. 0.0)
+  else if toFloat (floor y) == y and abs y <. 9007199254740992.0 then
+    (let p = exp (y *. ln (0.0 -. x)) in if floor y % 2 == 0 then p else 0.0 -. p)
+  else 0.0 /. 0.0
+
+-- --- tests -------------------------------------------------------------------
+
+use Std.Test (assertTrue, assertEq)
+
+fun near (want : Float) (got : Float) : Bool =
+  abs (want -. got) <=. 0.000000000000001 *. (1.0 +. abs want)
+
+@test fun squareRootsAreRoots () =
+  let a = assertTrue (near 2.0 (sqrt 4.0)) "of 4" in
+  let b = assertTrue (near 1.4142135623730951 (sqrt 2.0)) "of 2" in
+  let c = assertTrue (near 1000.0 (sqrt 1000000.0)) "of a million" in
+  let d = assertTrue (near 0.001 (sqrt 0.000001)) "of a millionth" in
+  let e = assertTrue (sqrt 0.0 == 0.0) "of 0" in
+  assertTrue (isNaN (sqrt (0.0 -. 1.0))) "of -1 is not a number"
+
+@test fun sinesAndCosinesAreRightAroundTheCircle () =
+  let a = assertTrue (near 0.5 (sin (pi /. 6.0))) "sin 30°" in
+  let b = assertTrue (near 0.5 (cos (pi /. 3.0))) "cos 60°" in
+  let c = assertTrue (near 0.7071067811865476 (sin (pi /. 4.0))) "sin 45°" in
+  let d = assertTrue (near 1.0 (sin (pi /. 2.0))) "sin 90°" in
+  let e = assertTrue (near (0.0 -. 1.0) (cos pi)) "cos 180°" in
+  let f = assertTrue (abs (sin pi) <. 0.000000000000001) "sin 180°" in
+  let g = assertTrue (near (0.0 -. 0.8414709848078965) (sin (0.0 -. 1.0))) "sin -1" in
+  let h = assertTrue (near 0.5403023058681398 (cos 1.0)) "cos 1" in
+  let i = assertTrue (near (0.0 -. 0.5063656411097588) (sin 100.0)) "sin 100" in
+  assertTrue (near 0.8623188722876839 (cos 100.0)) "cos 100"
+
+@test fun anglesComeBack () =
+  let a = assertTrue (near (pi /. 4.0) (atan 1.0)) "atan 1" in
+  let b = assertTrue (near (pi /. 3.0) (atan 1.7320508075688772)) "atan √3" in
+  let c = assertTrue (near 0.4636476090008061 (atan 0.5)) "atan 0.5" in
+  let d = assertTrue (near (0.0 -. 1.4711276743037347) (atan (0.0 -. 10.0))) "atan -10" in
+  let e = assertTrue (near (3.0 *. pi /. 4.0) (atan2 1.0 (0.0 -. 1.0))) "second quadrant" in
+  let f = assertTrue (near (0.0 -. 3.0 *. pi /. 4.0) (atan2 (0.0 -. 1.0) (0.0 -. 1.0))) "third" in
+  let g = assertTrue (near (pi /. 2.0) (atan2 1.0 0.0)) "straight up" in
+  assertTrue (near 5.0 (hypot 3.0 4.0)) "3-4-5"
+
+-- Within a part in 10^13: what `pow` makes through `exp` and `ln`.
+fun close (want : Float) (got : Float) : Bool =
+  abs (want -. got) <=. 0.0000000000001 *. (1.0 +. abs want)
+
+@test fun inversesAndLogarithmsComeBack () =
+  let a = assertTrue (near (pi /. 6.0) (asin 0.5)) "asin 0.5" in
+  let b = assertTrue (near (pi /. 3.0) (acos 0.5)) "acos 0.5" in
+  let c = assertTrue (isNaN (asin 1.5)) "asin past 1" in
+  let d = assertTrue (near 2.718281828459045 (exp 1.0)) "e" in
+  let e = assertTrue (exp 0.0 == 1.0) "exp 0" in
+  let f = assertTrue (near 0.00004539992976248485 (exp (0.0 -. 10.0))) "exp -10" in
+  let g = assertTrue (near 2.302585092994046 (ln 10.0)) "ln 10" in
+  let h = assertTrue (near 7.5 (exp (ln 7.5))) "exp of ln" in
+  let i = assertTrue (near (0.0 -. 6.907755278982137) (ln 0.001)) "ln 0.001" in
+  let j = assertTrue (close 1024.0 (pow 2.0 10.0)) "2^10" in
+  let k = assertTrue (close 1.4142135623730951 (pow 2.0 0.5)) "2^0.5" in
+  assertTrue (close (0.0 -. 8.0) (pow (0.0 -. 2.0) 3.0)) "(-2)^3"
+
+@test fun roundingGoesTheRightWay () =
+  let a = assertEq (ceil 1.2) 2 "ceil up" in
+  let b = assertEq (ceil (0.0 -. 1.2)) (0 - 1) "ceil of a negative" in
+  let c = assertEq (ceil 3.0) 3 "ceil of a whole" in
+  let d = assertEq (round 2.5) 3 "half away from zero" in
+  let e = assertEq (round (0.0 -. 2.5)) (0 - 3) "and below it" in
+  assertEq (round 2.4) 2 "round down"

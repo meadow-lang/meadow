@@ -1,0 +1,315 @@
+-- Derive: the derives the compiler has built in, for the standard library's
+-- own traits -- `Debug`, `Display`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`,
+-- `Std.String.Parse`'s `VisualStream` and `Std.Macro`'s `Reflect` --
+-- `meadow_compiler::expand::derive`, function for function.
+--
+-- Each writes Meadow source for the `impl`, which is read where the derive
+-- was written (`Lower`): the same text the Rust compiler writes, so the same
+-- tokens.
+
+use Std.Collections.Vector as V
+use Std.String as S
+use Std.Maybe.Maybe.*
+
+-- A constructor: its name, and its fields -- by name if they have names,
+-- and how many.
+@pub record Ctor = {
+  name : String,
+  named : Bool,
+  fields : [String],
+  count : Int
+}
+
+-- What a derive needs of a declaration: its name, its type parameters, its
+-- constructors, and whether it is a `record`, whose one constructor is the
+-- type's own name.
+@pub record Shape = {
+  name : String,
+  params : [String],
+  ctors : [Ctor],
+  isRecord : Bool
+}
+
+-- The source of the `impl` the built-in derive `name` writes for a
+-- declaration of shape `s`, if `name` is one.
+@pub fun builtin (name : String) (s : Shape) : Maybe String =
+  if name == "Debug" then Just (render s "Debug" "debug")
+  else if name == "Display" then Just (render s "Display" "display")
+  else if name == "PartialEq" then Just (partialEq s)
+  else if name == "Eq" then Just (eq s)
+  else if name == "PartialOrd" then Just (ordering s "PartialOrd" "partialCmp" "isEqualPartial")
+  else if name == "Ord" then Just (ordering s "Ord" "compare" "isEqualOrdering")
+  else if name == "VisualStream" then Just (visual s)
+  else if name == "Reflect" then Just (reflect s)
+  else None
+
+-- `T a b`, in brackets when it has parameters.
+fun headOf (s : Shape) : String =
+  if V.isEmpty s.params then s.name else "(${s.name} ${S.join " " s.params})"
+
+-- `where Tr a, Tr b`, or nothing.
+fun contextOf (s : Shape) (tr : String) : String =
+  if V.isEmpty s.params then "" else " where ${S.join ", " (V.map (\p -> "${tr} ${p}") s.params)}"
+
+fun quoted (text : String) : String = "\"${text}\""
+
+fun upTo (n : Int) : [Int] = V.range 0 n
+
+fun text (parts : [String]) : String = S.join "" parts
+
+-- A constructor as it is written in an expression or a pattern.
+fun construct (s : Shape) (c : Ctor) : String = if s.isRecord then c.name else "${s.name}.${c.name}"
+
+-- Constructor `c` as a pattern, its fields bound to `{prefix}0`,
+-- `{prefix}1`, … -- or to `_` when `prefix` is empty.
+fun patternOf (s : Shape) (c : Ctor) (prefix : String) : String =
+  let var = \i -> if S.isEmpty prefix then "_" else "${prefix}${show i}" in
+  if c.named then
+    text [
+      construct s c,
+      " { ",
+      S.join ", " (V.map (\i -> "${V.getOr "" c.fields i} = ${var i}") (upTo c.count)),
+      " }"
+    ]
+  else if c.count == 0 then construct s c
+  else "${construct s c} ${S.join " " (V.map var (upTo c.count))}"
+
+-- `impl Tr T { fun method v = match v with | … }`, each constructor rendered
+-- as `Name(field, field)` -- as the runtime shows values -- with its fields
+-- by `method`.
+fun render (s : Shape) (tr : String) (method : String) : String =
+  let arm =
+    \(c : Ctor) ->
+      let body =
+        (if c.count == 0 then quoted c.name
+         else
+           text [
+             "concatStrings #[",
+             quoted "${c.name}(",
+             ", ",
+             S.join ", \", \", " (V.map (\i -> "${method} f${show i}") (upTo c.count)),
+             ", \")\"]"
+           ])
+      in "    | ${patternOf s c "f"} -> ${body}\n"
+  in
+  let arms = if V.isEmpty s.ctors then "    | _ -> \"\"\n" else S.join "" (V.map arm s.ctors) in
+  "impl ${tr} ${headOf s}${contextOf s tr} {\n  fun ${method} v =\n    match v with\n${arms}}\n"
+
+-- `impl PartialEq T`: the same constructor, and each field equal. A type
+-- whose constructors have no fields is compared by where each constructor
+-- is in the declaration.
+fun partialEq (s : Shape) : String =
+  match enumerationRank s "_eqRankOf" with
+  | Just rank ->
+      text [
+        "impl PartialEq ${headOf s}${contextOf s "PartialEq"} {\n",
+        "  fun (==) x y = _eqRankOf${s.name} x == _eqRankOf${s.name} y\n}\n\n",
+        rank
+      ]
+  | None ->
+      let arm =
+        \(c : Ctor) ->
+          let body =
+            (if c.count == 0 then "True"
+             else S.join " and " (V.map (\i -> "f${show i} == g${show i}") (upTo c.count)))
+          in "    | (${patternOf s c "f"}, ${patternOf s c "g"}) -> ${body}\n"
+      in
+      let arms =
+        "${S.join "" (V.map arm s.ctors)}${if V.len s.ctors != 1 then "    | _ -> False\n" else ""}"
+      in text [
+           "impl PartialEq ${headOf s}${contextOf s "PartialEq"} {\n",
+           "  fun (==) x y =\n    match (x, y) with\n",
+           arms,
+           "}\n"
+         ]
+
+-- `impl Eq T {}` -- `Eq` has no methods -- and a private function that asks
+-- of every field that it is `Eq` too, so that `@derive(Eq)` over a `Float`
+-- is refused.
+fun eq (s : Shape) : String =
+  let arm =
+    \(c : Ctor) ->
+      let body =
+        (if c.count == 0 then "()"
+         else
+           V.foldl
+             (\body i -> "let _ = requireEq f${show i} in ${body}")
+             "requireEq f${show (c.count - 1)}"
+             (V.reverse (upTo (c.count - 1))))
+      in "    | ${patternOf s c "f"} -> ${body}\n"
+  in
+  let arms = if V.isEmpty s.ctors then "    | _ -> ()\n" else S.join "" (V.map arm s.ctors) in
+  text [
+    "impl Eq ${headOf s}${contextOf s "Eq"} {\n}\n\n",
+    "fun _eqFieldsOf${s.name} v =\n  match v with\n",
+    arms
+  ]
+
+-- Where each constructor of an enumeration -- more than one constructor,
+-- none with fields -- is in its declaration, as a function called
+-- `{prefix}{name}`; `None` for any other type.
+fun enumerationRank (s : Shape) (prefix : String) : Maybe String =
+  if V.len s.ctors < 2 or V.any (\(c : Ctor) -> c.count != 0) s.ctors then None
+  else
+    let arms =
+      S.join
+        ""
+        (V.map
+           (\i ->
+             match V.get s.ctors i with
+             | Just c -> "  | ${patternOf s c ""} -> ${show i}\n"
+             | None -> "")
+           (upTo (V.len s.ctors)))
+    in Just "fun ${prefix}${s.name} v =\n  match v with\n${arms}"
+
+-- `impl PartialOrd T` or `impl Ord T`: by constructor, in the order they are
+-- declared, then by field, left to right -- each field compared only if the
+-- ones before it were equal. `method` is the comparison, `equal` the test of
+-- its answer. An enumeration is compared by position alone.
+fun ordering (s : Shape) (tr : String) (method : String) (equal : String) : String =
+  let prefix = "_${S.toLower tr}RankOf" in
+  match enumerationRank s prefix with
+  | Just rank ->
+      text [
+        "impl ${tr} ${headOf s}${contextOf s tr} {\n",
+        "  fun ${method} x y = ${method} (${prefix}${s.name} x) (${prefix}${s.name} y)\n}\n\n",
+        rank
+      ]
+  | None ->
+      let arm =
+        \(c : Ctor) ->
+          let last =
+            (if c.count == 0 then "${method} 0 0"
+             else "${method} f${show (c.count - 1)} g${show (c.count - 1)}")
+          in
+          let body =
+            V.foldl
+              (\body i ->
+                let n = show i in
+                "(let c${n} = ${method} f${n} g${n} in if ${equal} c${n} then ${body} else c${n})")
+              last
+              (V.reverse (upTo (c.count - 1)))
+          in "    | (${patternOf s c "f"}, ${patternOf s c "g"}) -> ${body}\n"
+      in
+      let several = V.len s.ctors != 1 in
+      let ranks =
+        S.join
+          " "
+          (V.map
+             (\i ->
+               match V.get s.ctors i with
+               | Just c -> "| ${patternOf s c ""} -> ${show i}"
+               | None -> "")
+             (upTo (V.len s.ctors)))
+      in
+      let rank = if several then "    let rank = \\v -> match v with ${ranks} in\n" else "" in
+      let arms =
+        text [
+          S.join "" (V.map arm s.ctors),
+          if several then "    | _ -> ${method} (rank x) (rank y)\n" else ""
+        ]
+      in text [
+           "impl ${tr} ${headOf s}${contextOf s tr} {\n",
+           "  fun ${method} x y =\n",
+           rank,
+           "    match (x, y) with\n",
+           arms,
+           "}\n"
+         ]
+
+-- `impl VisualStream T { fun showToken _ t = display t }`: a stream whose
+-- tokens read in a message as they display.
+fun visual (s : Shape) : String =
+  "impl VisualStream ${headOf s}${contextOf s "Display"} {\n  fun showToken _ t = display t\n}\n"
+
+-- `impl Reflect T`: a constructor is a `Tag` of its name and its fields --
+-- named fields as one `Rec` -- and a `record` is a `Rec`. Reading one back
+-- says which field was wrong.
+fun reflect (s : Shape) : String =
+  let write =
+    \(c : Ctor) ->
+      let value =
+        (if c.named then
+           (let fields = namedDatum c.fields in
+            if s.isRecord then fields else "Datum.Tag ${quoted c.name} [${fields}]")
+         else
+           text [
+             "Datum.Tag ${quoted c.name} [",
+             S.join ", " (V.map (\i -> "toDatum f${show i}") (upTo c.count)),
+             "]"
+           ])
+      in "    | ${patternOf s c "f"} -> ${value}\n"
+  in
+  let read =
+    \(c : Ctor) ->
+      if c.named then
+        (let binds =
+           S.join ", " (V.map (\i -> "${V.getOr "" c.fields i} = g${show i}") (upTo c.count))
+         in
+         let body = namedFrom c.fields "${construct s c} { ${binds} }" in
+         let whole = if s.isRecord then "    | Datum.Rec rs -> ${body}\n" else "" in
+         text [
+           whole,
+           "    | Datum.Tag ${quoted c.name} fs -> ",
+           "(match get fs 0 with | Just (Datum.Rec rs) -> ${body} ",
+           "| _ -> Err \"`${c.name}` takes its fields by name\")\n"
+         ])
+      else
+        (let built =
+           (if c.count == 0 then construct s c
+            else "${construct s c} ${S.join " " (V.map (\i -> "g${show i}") (upTo c.count))}")
+         in "    | Datum.Tag ${quoted c.name} fs -> ${positionalFrom c.name c.count built}\n")
+  in
+  let tos =
+    if V.isEmpty s.ctors then "    | _ -> Datum.List []\n" else S.join "" (V.map write s.ctors)
+  in
+  let froms = "${S.join "" (V.map read s.ctors)}    | _ -> Err \"expected a `${s.name}`\"\n" in
+  text [
+    "impl Reflect ${headOf s}${contextOf s "Reflect"} {\n",
+    "  fun toDatum v =\n    match v with\n",
+    tos,
+    "  fun fromDatum d =\n    match d with\n",
+    froms,
+    "}\n"
+  ]
+
+-- `Datum.Rec [("x", toDatum f0), …]`.
+fun namedDatum (names : [String]) : String =
+  let fields =
+    V.map (\i -> "(${quoted (V.getOr "" names i)}, toDatum f${show i})") (upTo (V.len names))
+  in "Datum.Rec [${S.join ", " fields}]"
+
+-- Read the `n` datums of `fs` into `g0` … and answer `built`, or the first
+-- thing that was wrong.
+fun positionalFrom (ctor : String) (n : Int) (built : String) : String =
+  if n == 0 then "Ok ${built}"
+  else
+    let body =
+      V.foldl
+        (\body i -> "(match fromDatum d${show i} with | Err e -> Err e | Ok g${show i} -> ${body})")
+        "Ok (${built})"
+        (V.reverse (upTo n))
+    in
+    let gets = V.map (\i -> "get fs ${show i}") (upTo n) in
+    let justs = V.map (\i -> "Just d${show i}") (upTo n) in
+    let scrutinee = if n == 1 then S.join "" gets else "(${S.join ", " gets})" in
+    let pattern = if n == 1 then S.join "" justs else "(${S.join ", " justs})" in
+    text [
+      "(match ${scrutinee} with | ${pattern} -> ${body} ",
+      "| _ -> Err \"`${ctor}` takes ${show n} field${if n == 1 then "" else "s"}\")"
+    ]
+
+-- Read the fields `names` of the record fields `rs` into `g0` … and answer
+-- `built`, or say which one was missing or wrong.
+fun namedFrom (names : [String]) (built : String) : String =
+  V.foldl
+    (\body i ->
+      let n = V.getOr "" names i in
+      let k = show i in
+      text [
+        "(match find (\\p -> fst p == ${quoted n}) rs with ",
+        "| None -> Err \"no field `${n}`\" ",
+        "| Just p${k} -> (match fromDatum (snd p${k}) with | Err e -> Err e | Ok g${k} -> ${body}))"
+      ])
+    "Ok (${built})"
+    (V.reverse (upTo (V.len names)))

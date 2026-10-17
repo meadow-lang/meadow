@@ -5,10 +5,18 @@
 -- prints is what that test compares.
 
 mod Lex
+mod Derive
+mod Macros
+mod Expand
 mod Core
 mod Cut
 mod Seq
 mod Lint
+mod Dictionaries
+mod Inline
+mod Eta
+mod Exhaust
+mod Tests
 mod Cek
 mod Syntax
 mod Parse
@@ -22,18 +30,24 @@ mod Scopes
 
 use Lingua (cli!)
 use MeadowBoot.Lex (lex, dump)
-use MeadowBoot.Core (program, erase)
+use MeadowBoot.Core (program, erase, linkedUnits, CoreProgram, coreFilePackage)
+use MeadowBoot.Expand (Call, readRound, writeAnswers, callText, seenAfter)
+use MeadowBoot.Scopes (Export)
+use Lingua.Make (unitImports, Given)
+use Std.Result.Result.*
 use MeadowBoot.Cek as Cek
+use MeadowBoot.Cek (Machine)
 use MeadowBoot.Seq as Seq
+use MeadowBoot.Tests as Tests
 use MeadowBoot.Parse (parsed, checked)
 use MeadowBoot.Fixity (chainsOf)
-use MeadowBoot.Unit (packageOf, absolute)
+use MeadowBoot.Unit (packageOf, absolute, packageName)
 use Std.Result as Res
 use MeadowBoot.Compiler (
   unitDatabase, buildUnits, givenUnits, setCompilerSource, compilerGrouped, compilerRenamed,
-  compilerInferred, compilerCore
+  compilerInferred, compilerCore, compilerWhole, Interface, hostOs
 )
-use Lingua.Make (linkDir)
+use Lingua.Make (linkDirIn)
 use Std.Path as Path
 use Lingua.Red as R
 use Lingua.Lang (metaStart, metaEnd)
@@ -44,14 +58,258 @@ use Std.String as S
 use Std.Maybe as M
 use Std.Maybe.Maybe.*
 use Std.Collections.Vector as V
-use Std.Fs (Fs, readToString)
-use Std.Console (writeOutput)
+use Std.Fs (Fs, readToString, writeString, createDirAll, copy, exists)
+use Std.Console (writeOutput, writeError)
 use Std.Exn (catch)
 use Lingua.Query (QueryError)
-use Std.Process (exit)
+use Std.Process (exit, getEnv)
+use Std.Process as Proc
+use Std.Time (monotonic)
+use Std.Thread (parMap)
+use MeadowBoot.Macros as Mc
+use MeadowBoot.Macros (Wire)
 
+-- The command line is `meadow`'s, command for command and flag for flag
+-- (`buildtools/meadow/src/main.rs`): whoever runs one runs the other the
+-- same way, and `a_command_takes_what_meadow_s_takes` in
+-- `buildtools/meadow/tests/bootstrap.rs` holds the two together. What several
+-- commands take is declared once, so they cannot come to take it differently.
+-- After those are the commands only MeadowBoot has: each pass's output, for
+-- the tests that set it against the Rust compiler's.
 cli! {
-  pub Cli "meadowboot" "Meadow's compiler, written in Meadow"
+  pub
+    Cli
+    "meadowboot"
+    "Meadow's compiler, written in Meadow"
+    version
+    "0.3.0-dev"
+    default
+    repl
+    unnamed
+    options
+    {
+      offline
+        : Flag
+          "Never fetch a dependency. What is already in the cache is used; anything else is an error saying what would have had to be fetched"
+      locked : Flag "Refuse anything that would change `Meadow.lock`"
+    }
+    options
+    Build
+    {
+      release : Flag "Build with the release profile: `-O2`, and `match` must be exhaustive"
+      debug : Flag "Build with the debug profile (the default)"
+      optLevel
+        : Option Int "Optimization level: 0, 1 or 2. Overrides the profile" short "O" value "LEVEL"
+      strict : Flag "Reject a non-exhaustive `match`, whatever the profile says"
+      lenient : Flag "Allow a non-exhaustive `match`, whatever the profile says"
+      runtime
+        : Option
+          ("glade" | "silo")
+          "The runtime system: `glade` (the default), bytecode and a garbage collector, or `silo`, compiled all the way down by LLVM and counting references"
+          value
+          "RUNTIME"
+      backend
+        : Option
+          ("vm" | "jit" | "aot")
+          "How Glade runs the program: the bytecode interpreter, the JIT, or machine code compiled ahead of time"
+          value
+          "BACKEND"
+      jit : Flag "`--backend jit`"
+      aot : Flag "`--backend aot`: Glade, compiled ahead of time into an executable" alias "native"
+      cfg
+        : Option
+          [String]
+          "Turn on a flag for `@cfg(…)` to test: `--cfg fast`, `--cfg feature=gpu`. Repeat it for more"
+          value
+          "FLAG"
+      noPrune
+        : Flag
+          "Compile every definition of the package and its dependencies, not only what `main` reaches"
+      target
+        : Option
+          String
+          "The architecture a native build compiles for: `aarch64` or `x86_64`"
+          value
+          "ARCH"
+      threads : Option Int "How many OS threads run the program's green threads" short "j" value "N"
+      nursery
+        : Option
+          String
+          "How large Glade's collector lets a thread's nursery grow: `8M`, `512K`, `1G`, or bytes"
+          value
+          "SIZE"
+      leaks : Flag "After running, report the blocks the program left behind"
+      features
+        : Option
+          String
+          "Features of the package to build with, by the names its `[features]` gives them: `--features gpu,simd`"
+          value
+          "FEATURES"
+      noDefaultFeatures : Flag "Build without the package's `default` features"
+      allFeatures : Flag "Build with every feature the package has"
+    }
+    options
+    Members
+    {
+      package
+        : Option
+          [String]
+          "In a workspace: the member to use, by name. Repeat it for more"
+          short
+          "p"
+          value
+          "NAME"
+      workspace : Flag "Every member of the workspace" alias "all"
+      exclude
+        : Option
+          [String]
+          "With `--workspace`: leave this member out. Repeat it for more"
+          value
+          "NAME"
+    }
+    | build
+      "Type-check and link a package, printing the annotated result"
+      {
+        path : Maybe String "Package directory (or a single `.mw` file), or a workspace"
+        types : Flag "Print the type of every top-level binding in your packages"
+        annotations : Flag "Also print every node's inferred type"
+        emit
+          : Option
+            [String]
+            "What to write, in place of what a build writes by default: `image`, `bytecode`, `asm`, `exe`, or `expanded`. Comma-separated, or repeated"
+            split
+            ","
+            value
+            "KIND"
+      }
+      with
+      Members,
+        Build
+    | run
+      "Build a package, then evaluate its `main` entry point"
+      {
+        path : Maybe String "Package directory (or a single `.mw` file), or a workspace"
+        args
+          : [String]
+            "Arguments for the program, after `--`: what `Process.argv` gives it"
+            after
+            "--"
+        types : Flag "Print the type of every top-level binding in your packages first"
+        package : Option String "In a workspace: the member to run" short "p" value "NAME"
+        cek : Flag "Evaluate with the CEK machine rather than the bytecode VM"
+        gcStats : Flag "After running, report what the garbage collector did (VM only)"
+        profileTo
+          : Option
+            String
+            "Sample where the program spends itself and write folded stacks to this file"
+            value
+            "FILE"
+        sampleEvery : Option Int "Block entries between samples, with `--profile-to`" value "N"
+        sampleHz : Option Int = 1000 "Samples a second, for the profile of time" value "HZ"
+        train
+          : Flag
+            "Run on the JIT and write what each call site was seen to enter, for an `aot` build to guard its calls on"
+        gc : Option ("generational" | "copying") "Which collector the VM uses" value "GC"
+      }
+      with
+      Build
+    | exec
+      "Run a bytecode image: what `meadow build` writes under `target/<profile>/bytecode/`, or what a compiler written in Meadow emits"
+      {
+        image : String "The image"
+        args : [String] "Arguments for the program, after `--`" after "--"
+        backend : Option String "How to run it: `vm` or `jit`" value "BACKEND"
+        optLevel : Option Int "How hard the JIT optimises: 0, 1 or 2" short "O" value "LEVEL"
+      }
+    | link "Compile a bytecode image to machine code and link it into an executable" {
+      image : String "The image"
+      output : Option String "Where to write the executable" short "o" value "FILE"
+      emit : Option [String] "What to write: `exe` or `asm`" split "," value "KIND"
+      optLevel : Option Int "Optimization level: 0, 1 or 2" short "O" value "LEVEL"
+      target : Option String "The architecture to compile for" value "ARCH"
+      threads : Option Int "How many OS threads run the program's green threads" short "j" value "N"
+      nursery : Option String "How large the collector lets a thread's nursery grow" value "SIZE"
+      leaks : Flag "After running, report the blocks the program left behind"
+      features : Option String "Features of the package to build with" value "FEATURES"
+      noDefaultFeatures : Flag "Build without the package's `default` features"
+      allFeatures : Flag "Build with every feature the package has"
+    }
+    | test
+      "Build a package and run its `@test` functions"
+      {
+        path : Maybe String "Package directory (or a single `.mw` file)"
+        filter : Maybe String "Only run tests whose name contains this"
+        exact : Flag "Only the test whose name is exactly FILTER"
+        std : Flag "Also run the standard library's own tests"
+        testThreads : Option Int "How many tests run at once" value "N"
+        noCapture : Flag "Write what tests print as they print it" alias "nocapture"
+        cek : Flag "Evaluate with the CEK machine rather than the bytecode VM"
+      }
+      with
+      Members,
+        Build
+    | dis
+      "Disassemble a package: the bytecode the VM would run"
+      {
+        path : Maybe String "Package directory (or a single `.mw` file), or a workspace"
+        asm : Flag "The machine code an `aot` build would link, as text"
+      }
+      with
+      Members,
+        Build
+    | lsp "Run the language server, speaking LSP over stdin and stdout" {
+      stdio : Flag "Ignored: clients pass this to select the stdio transport, the only one spoken"
+      clientProcessId
+        : Option Int "Ignored: the editor's process id" as "clientProcessId" value "PID"
+      fetch : Flag "Fetch what a package depends on when a file of it is opened, as a build would"
+    }
+    | dap "Run the debug adapter, speaking the Debug Adapter Protocol over stdin and stdout" {}
+    | fmt "Re-indent `.mw` sources in place" {
+      paths : [String] "Files or directories to format. Defaults to the current directory"
+      check : Flag "List the files that would change and exit 1, without writing"
+      stdout : Flag "Write the result to stdout instead of back to the file"
+      width : Option Int = 100 "How many characters a line may be" value "COLUMNS"
+    }
+    | init "Create a package: a `Meadow.toml` and a `src/Main.mw` that runs" {
+      path : Maybe String "Where to make it"
+      name : Option String "The package's name, where the directory's is not it" value "NAME"
+      workspace : Flag "A workspace, rather than a package"
+    }
+    | add "Add a dependency to a package's manifest" {
+      what : String "The dependency: a name, a path or a repository"
+      branch : Option String "The branch to follow" value "NAME"
+      tag : Option String "The tag to pin" value "NAME"
+      rev : Option String "The commit to pin" value "COMMIT"
+      rename : Option String "The name the package knows it by" value "NAME"
+      path : Option String "The package whose manifest to change" value "DIR"
+    }
+    | cut
+      "Run a program of Cut, the IR a front end hands the back end (`docs/CUT.md`): lowered to AxCut and run on Glade, or built for Silo and run as an executable"
+      {
+        file : String "The program, as the text `docs/CUT.md` describes"
+        args : [String] "What the program is given, after `--`: what its `argv` answers" after "--"
+        runtime : Option String =
+          "glade" "`glade`, on its bytecode, or `silo`, as native code" value "NAME"
+        aot : Flag "On Glade, compile the bytecode to machine code ahead of time and run that"
+        optLevel : Option Int =
+          2 "How hard an executable is optimised: 0, 1 or 2" short "O" value "LEVEL"
+        noRun : Flag "Build what would be run -- the bytecode image, or the executable -- and stop"
+      }
+    | clean
+      "Remove what a build wrote: the package's `target` directory, with the images, executables and incremental cache in it"
+      {
+        path : Maybe String "The package, or a workspace, whose `target` to remove"
+        profile : Option String "Only this profile's, rather than all of them" value "NAME"
+        dryRun : Flag "Say what would be removed without removing it"
+      }
+    | update
+      "Bring a package's dependencies forward to what their branches and tags now name, rewriting `Meadow.lock`"
+      {
+        names : [String] "The dependencies to bring forward: all of them, if none is named"
+        path : Option String "The package whose dependencies they are" value "DIR"
+        dryRun : Flag "Say what would change without changing it"
+      }
+    | repl "Read entries and evaluate them" {}
     | lex "Each file's tokens, one a line, and then what is wrong in them" {
       files : [String] "the files to read"
     }
@@ -82,15 +340,38 @@ cli! {
           : [String]
             "the files to read, each in a package; the standard library's sources are where `MEADOWBOOT_STD` says"
       }
-    | run
+    | cek
       "Compile each file's unit to core, run its `result` with the CEK machine, and say its value"
       { files : [String] "the files to read, each in a package" }
-    | cut
+    | lower
       "Compile each file's unit to Cut, and write the program that answers its `result` as text"
-      { files : [String] "the files to read, each in a package" }
+      {
+        files : [String] "the files to read, each in a package"
+        profile : Option String "the profile to build with: `debug`, or `release`"
+        opt : Option String "how hard to optimise, over the profile's: `O0` to `O3`"
+        set
+          : Option
+            [String]
+            "options over the profile's, `name=value`: with commas between, or repeated"
+            split
+            ","
+        cfg
+          : Option
+            [String]
+            "the flags `@cfg` holds of, each a name or `name=value`: with commas between, or repeated"
+            split
+            ","
+      }
+    | expand
+      "Run a round of a unit's procedural macro calls, as a build asks it of another run of this program"
+      {
+        files
+          : [String]
+            "what runs them, `cek` or `glade`; the round, written out; and where to write what each call answered"
+      }
 }
 
-fun main () = catch failed (\() -> run (argsCli ()))
+fun main () = catch failed (\() -> match argsCli () with | (every, cli) -> run every cli)
 
 -- A query read before it was set, or one that needs itself: a mistake of the
 -- compiler's rather than of what it read. It is said, and the run fails.
@@ -100,17 +381,187 @@ fun failure (e : QueryError k) : String =
   match e with
   | QueryError.Unset _ -> "meadowboot: a query was read before it was set\n"
   | QueryError.Cycle ks -> "meadowboot: ${S.fromInt (V.len ks)} queries need each other\n"
+  | QueryError.Interrupted -> "meadowboot: it was told to stop\n"
 
-fun run (cli : Cli) =
+fun run (every : CliOptions) (cli : Cli) =
   match cli with
+  | Cli.Build r -> driven r.path r.build None
+  | Cli.Run r -> driven r.path r.build (Just r.args)
+  -- The standard library's own tests are `meadow`'s to run, for now.
+  | Cli.Test r if r.std -> handedOn ()
+  | Cli.Test r ->
+      let said =
+        V.foldl
+          (\u flag -> writeError "meadowboot: `${flag}` is not acted on yet\n")
+          ()
+          (V.concat [
+             if M.isSome r.testThreads then ["--test-threads"] else [],
+             if r.noCapture then ["--no-capture"] else [],
+             if r.cek then ["--cek"] else []
+           ])
+      in driven
+           r.path
+           r.build
+           (Just
+              (V.concat [
+                 ["--test"],
+                 M.unwrapOr [] (M.map (\f -> [f]) r.filter),
+                 if r.exact then ["--exact"] else []
+               ]))
   | Cli.Lex r -> finish (V.foldl (\ok p -> lexFile p and ok) True r.files)
   | Cli.Eval r -> finish (V.foldl (\ok p -> evalFile p and ok) True r.files)
   | Cli.Parse r -> finish (V.foldl (\ok p -> parseFile p and ok) True r.files)
   | Cli.Fixity r -> finish (fixityFiles r.files)
   | Cli.Rename r -> finish (renameFiles r.files)
   | Cli.Infer r -> finish (inferFiles r.files)
-  | Cli.Run r -> finish (runFiles r.files)
-  | Cli.Cut r -> finish (cutFiles r.files)
+  | Cli.Cek r -> finish (runFiles r.files)
+  | Cli.Lower r ->
+      finish
+        (cutFiles
+           (M.unwrapOr "debug" r.profile)
+           (pairsOf
+              r.opt
+              (if V.isEmpty r.set then None else Just (S.join "," r.set))
+              (if V.isEmpty r.cfg then None else Just (S.join "," r.cfg)))
+           r.files)
+  | Cli.Expand r -> finish (expandRound r.files)
+  -- What is not MeadowBoot's yet is `meadow`'s, asked the same way.
+  | _ -> handedOn ()
+
+-- The Rust compiler's `meadow`: where `MEADOW` says, the one beside this
+-- program -- as a release of it has them -- or the one on the path.
+fun meadow () =
+  match getEnv "MEADOW" with
+  | Just m -> m
+  | None ->
+      (let named = if hostOs == "windows" then "meadow.exe" else "meadow" in
+       match Path.parent (Proc.currentExe ()) with
+       | Just dir ->
+           (let beside = Path.join dir named in if exists beside then beside else "meadow")
+       | None -> "meadow")
+
+-- This command line as it was written, given to `meadow`, and its answer
+-- this program's: the tools MeadowBoot does not have yet, behind the command
+-- line it will have them at.
+fun handedOn () =
+  match Proc.runInherit (meadow ()) (Proc.argv ()) with
+  | Ok code -> exit code
+  | Err why -> (let u = writeError "meadowboot: `meadow` could not be run: ${why}\n" in exit 1)
+
+-- What `meadow` is told that MeadowBoot's build does not act on yet: said,
+-- so that nobody takes a flag for honoured because it was accepted.
+fun unheeded (b : CliBuild) : [String] =
+  V.concatMap (\x -> if fst x then [snd x] else []) [
+    (b.noPrune, "--no-prune"),
+    (M.isSome b.target, "--target"),
+    (M.isSome b.nursery, "--nursery"),
+    (b.leaks, "--leaks"),
+    (M.isSome b.features, "--features"),
+    (b.noDefaultFeatures, "--no-default-features"),
+    (b.allFeatures, "--all-features")
+  ]
+
+-- `build` and `run`: the package at `path` compiled to Cut by this compiler
+-- -- its macros run on Glade -- and that handed to the back end, `meadow
+-- cut`, to build, or to run with `args` where there are any to give.
+fun driven (path : Maybe String) (b : CliBuild) (args : Maybe [String]) =
+  -- `test` is a build with `@cfg(test)` holding, entered at what runs the
+  -- tests (`Tests`), and what follows `--test` is that program's.
+  let testing = M.unwrapOr False (M.map (\xs -> V.getOr "" xs 0 == "--test") args) in
+  let theirs = if testing then V.drop (M.unwrapOr [] args) 1 else M.unwrapOr [] args in
+  let place = absolute (M.unwrapOr "." path) in
+  let root = if S.endsWith ".mw" place then packageOf place else Just place in
+  let said =
+    V.foldl (\u flag -> writeError "meadowboot: `${flag}` is not acted on yet\n") () (unheeded b)
+  in match root with
+     | None -> (let u = writeError "meadowboot: `${place}` is in no package\n" in exit 1)
+     | Just r ->
+         let profile = if b.release then "release" else "debug" in
+         let level = M.unwrapOr (if b.release then 2 else 1) b.optLevel in
+         let pairs =
+           V.concat [
+             [("opt", "O${show (if level > 2 then 2 else level)}"), ("macros", "Glade")],
+             (if V.isEmpty b.cfg then [] else [("flags", S.join "," b.cfg)]),
+             (if b.strict then [("strict", "true")]
+              else if b.lenient then [("strict", "false")]
+              else []),
+             (if testing then [("test", "true"), ("entry", Tests.runner)] else []),
+             told ()
+           ]
+         in if not (buildUnits profile pairs r) then exit 1
+            else
+              (let program = Path.join (linkDirIn r profile) "program.cut" in
+               let ahead =
+                 b.aot
+                   or b.backend == Just "aot"
+                   or (b.release and not b.jit and M.isNone b.backend)
+               in
+               let threaded =
+                 match b.threads with
+                 | Just n -> Proc.setEnv ("MEADOW_THREADS", show n)
+                 | None -> ()
+               in
+               -- A program that exports functions to C is a library of them,
+               -- built native, and not run.
+               let library =
+                 match readToString program with
+                 | Ok text -> S.contains "\nexport " text
+                 | Err _ -> False
+               in
+               let back =
+                 if library then ["cut", program, "--runtime", "silo", "-O", show level, "--no-run"]
+                 else
+                   V.concat [
+                     ["cut", program, "--runtime", M.unwrapOr "glade" b.runtime, "-O", show level],
+                     (if ahead and b.runtime != Just "silo" then ["--aot"] else []),
+                     (if M.isNone args then ["--no-run"] else V.pushFront theirs "--")
+                   ]
+               in match Proc.runInherit (meadow ()) back with
+                  | Ok 0 ->
+                      if not library then exit 0
+                      else
+                        (match placed r profile library with
+                         | Ok at -> (let u = writeError "      Copied ${at}\n" in exit 0)
+                         | Err why ->
+                             (let u =
+                                writeError
+                                  "meadowboot: what was built could not be put in place: ${why}\n"
+                              in exit 1))
+                  | Ok code -> exit code
+                  | Err why ->
+                      (let u = writeError "meadowboot: the back end could not be run: ${why}\n" in
+                       exit 1))
+
+-- What the back end built natively for the package at `r` -- a library of
+-- what it exports, or a program -- named for the package and put where `meadow
+-- build` puts a native program, `target/<profile>/native/silo`, so that two
+-- packages' do not share a name. A library is put there; a program is not yet.
+fun placed (r : String) (profile : String) (library : Bool) : Result String String ! { Fs | e } =
+  let name =
+    match readToString (Path.join r "Meadow.toml") with
+    | Ok text -> packageName text
+    | Err _ -> "program"
+  in
+  let fileOf =
+    \n ->
+      if library then
+        (if hostOs == "windows" then "${n}.dll"
+         else if hostOs == "macos" then "lib${n}.dylib"
+         else "lib${n}.so")
+      else if hostOs == "windows" then "${n}.exe"
+      else n
+  in
+  let built =
+    Path.join (Path.join (linkDirIn r profile) "target/release/native/silo") (fileOf "program")
+  in
+  let dir = Path.join r "target/${profile}/native/silo" in
+  let dest = Path.join dir (fileOf name) in
+  match createDirAll dir with
+  | Err why -> Err why
+  | Ok _ ->
+      (match copy (built, dest) with
+       | Ok _ -> Ok dest
+       | Err why -> Err why)
 
 -- Each of `files`, its names resolved with every other of its unit's -- a
 -- package, built with the units it depends on first -- under a line naming
@@ -127,7 +578,7 @@ fun renameFiles (files : [String]) =
       []
       files
   in
-  let built = V.map (\r -> buildUnits r) roots in
+  let built = V.map (\r -> buildUnits "debug" (told ()) r) roots in
   let named =
     V.map
       (\r ->
@@ -135,7 +586,7 @@ fun renameFiles (files : [String]) =
           r,
           M.map
             (\u -> (let db = unitDatabase u in fst3 (compilerRenamed db 0)))
-            (Res.toMaybe (givenUnits r r))
+            (Res.toMaybe (givenUnits "debug" r r))
         ))
       roots
   in V.foldl (\ok f -> renameFile named f and ok) True files
@@ -155,7 +606,7 @@ fun inferFiles (files : [String]) =
       []
       files
   in
-  let built = V.map (\r -> buildUnits r) roots in
+  let built = V.map (\r -> buildUnits "debug" (told ()) r) roots in
   let named =
     V.map
       (\r ->
@@ -163,7 +614,7 @@ fun inferFiles (files : [String]) =
           r,
           M.map
             (\u -> (let db = unitDatabase u in fst4 (compilerInferred db 0)))
-            (Res.toMaybe (givenUnits r r))
+            (Res.toMaybe (givenUnits "debug" r r))
         ))
       roots
   in V.foldl (\ok f -> renameFile named f and ok) True files
@@ -183,12 +634,32 @@ fun runFiles (files : [String]) =
       []
       files
   in
-  let built = V.map (\r -> buildUnits r) roots in
+  let built = V.map (\r -> buildUnits "debug" (told ()) r) roots in
   V.foldl (\ok f -> runFile f and ok) True files
 
 -- Each of `files`, its unit lowered to Cut, under a line naming it: the
 -- program, as `meadow_cut` reads one, or `not compiled`.
-fun cutFiles (files : [String]) =
+-- What the commands that have no flags for it build with, over the debug
+-- profile's: `MEADOWBOOT_SET`, written as `--set` is.
+fun told () = pairsOf None (getEnv "MEADOWBOOT_SET") None
+
+-- The options a command line gives over its profile's: `--opt`, each
+-- `name=value` of `--set`, and `--cfg`'s flags, which are one option.
+fun pairsOf (opt : Maybe String) (set : Maybe String) (cfg : Maybe String) : [(String, String)] =
+  V.concat [
+    (match opt with | Just level -> [("opt", level)] | None -> []),
+    (match cfg with
+     | Just flags -> [("flags", flags)]
+     | None -> []),
+    V.concatMap
+      (\pair ->
+        match S.indexOf "=" pair with
+        | Just k -> [(S.take pair k, S.drop pair (k + 1))]
+        | None -> if S.isEmpty pair then [] else [(pair, "true")])
+      (S.split "," (M.unwrapOr "" set))
+  ]
+
+fun cutFiles (profile : String) (pairs : [(String, String)]) (files : [String]) =
   let roots =
     V.foldl
       (\acc f ->
@@ -198,24 +669,31 @@ fun cutFiles (files : [String]) =
       []
       files
   in
-  let built = V.map (\r -> buildUnits r) roots in
-  V.foldl (\ok f -> cutFile f and ok) True files
+  -- A package that did not build has no program: what an earlier build of
+  -- it linked is not this one's, and the command says it failed.
+  let failed = V.concatMap (\r -> if buildUnits profile pairs r then [] else [r]) roots in
+  V.foldl (\ok f -> cutFile profile failed f and ok) True files
 
-fun cutFile (path : String) =
+fun cutFile (profile : String) (failed : [String]) (path : String) =
   let file = absolute path in
+  let root = packageOf file in
+  let broken = M.unwrapOr False (M.map (\r -> V.elem r failed) root) in
   let program =
-    M.andThen
-      (\r -> Res.toMaybe (readToString (Path.join (linkDir r) "program.cut")))
-      (packageOf file)
+    if broken then None
+    else
+      M.andThen
+        (\r -> Res.toMaybe (readToString (Path.join (linkDirIn r profile) "program.cut")))
+        root
   in match program with
-     | None -> (let u = writeOutput "== ${path}\nnot compiled\n" in True)
+     | None -> (let u = writeOutput "== ${path}\nnot compiled\n" in not broken)
      | Just text -> (let u = writeOutput "== ${path}\n${text}" in True)
 
 fun runFile (path : String) =
   let file = absolute path in
   let core =
     M.andThen
-      (\r -> M.andThen (\u -> compilerCore (unitDatabase u) 0) (Res.toMaybe (givenUnits r r)))
+      (\r ->
+        M.andThen (\u -> compilerCore (unitDatabase u) 0) (Res.toMaybe (givenUnits "debug" r r)))
       (packageOf file)
   in match core with
      | None -> (let u = writeOutput "== ${path}\nnot compiled\n" in True)
@@ -259,9 +737,9 @@ fun fixityFiles (files : [String]) =
       []
       files
   in
-  let built = V.map (\r -> buildUnits r) roots in
+  let built = V.map (\r -> buildUnits "debug" (told ()) r) roots in
   -- One database a unit, which each of its files is asked of.
-  let dbs = V.map (\r -> (r, M.map unitDatabase (Res.toMaybe (givenUnits r r)))) roots in
+  let dbs = V.map (\r -> (r, M.map unitDatabase (Res.toMaybe (givenUnits "debug" r r)))) roots in
   V.foldl (\ok f -> fixityFile dbs f and ok) True files
 
 fun fixityFile dbs (path : String) =
@@ -310,3 +788,369 @@ fun lexFile (path : String) : Bool ! { Fs, Console | e } =
   match readToString path with
   | Err why -> (let u = writeOutput "== ${path}\n! cannot read it: ${why}\n" in False)
   | Ok text -> (let u = writeOutput "== ${path}\n${dump (lex text)}" in True)
+
+-- --- running macros ------------------------------------------------------------
+--
+-- A build that meets a procedural macro runs this program again, `expand`,
+-- with a round of calls written out (`Expand`): each module's calls in
+-- order, each naming the unit its macro is in. They are run here, where
+-- that unit can be built and read whole, and what each answered is written
+-- back.
+
+fun expandRound (args : [String]) =
+  match (V.get args 0, V.get args 1, V.get args 2) with
+  | (Just engine, Just given, Just said) ->
+      (match readToString given with
+       | Err why -> (let u = writeOutput "meadowboot: cannot read ${given}: ${why}\n" in False)
+       | Ok text ->
+           (match readRound text with
+            | (settled, modules, macros) ->
+                let answers =
+                  (if engine == "cek" then cekRound settled modules
+                   else gladeRound settled macros said modules [] 0)
+                in
+                let w = writeString (said, writeAnswers answers) in
+                True))
+  | _ ->
+      (let u = writeOutput "meadowboot expand: an engine, a round's file and the answers' file\n" in
+       False)
+
+-- A unit's macros ready to run on the CEK machine: the unit and every unit
+-- it is made with as one program, loaded; where each definition is, by its
+-- symbol; and each unit's package with what it exports.
+record Loaded = {
+  machine : Machine,
+  table : HashMap String Int,
+  units : [(String, [Export])]
+}
+
+-- Every call of a round run on the CEK machine, a module's in order, each
+-- seeing what the ones before it in its module defined.
+fun cekRound (settled : Bool) (modules : [(String, [(String, String)], [Call])]) =
+  fst
+    (V.foldl
+       (\acc m ->
+         match m with
+         | (file, visible, calls) ->
+             (match V.foldl
+                (\inner (c : Call) ->
+                  match inner with
+                  | (answers, loaded, seen) ->
+                      (let l =
+                         (match H.lookup c.dir loaded with
+                          | Just had -> had
+                          | None -> loadCek c.dir)
+                       in
+                       let result =
+                         (match l with
+                          | Err why -> Err why
+                          | Ok ready -> cekCall ready c (callText settled seen c.argument))
+                       in (
+                            V.pushBack answers (file, c.key, result),
+                            H.insert c.dir l loaded,
+                            match result with
+                            | Ok text -> seenAfter seen text (c.from, c.to)
+                            | Err _ -> seen
+                          )))
+                (fst acc, snd acc, visible)
+                calls with
+              | (answers, loaded, _) -> (answers, loaded)))
+       ([], H.empty)
+       modules)
+
+-- The unit at `root`, built, and it and every unit it is made with as one
+-- program of core.
+fun loadCek (root : String) =
+  if not (buildUnits "debug" [("macros", "Cek")] root) then Err "${root} did not build"
+  else
+    let made =
+      V.concatMap
+        (\dir ->
+          match givenUnits "debug" root dir with
+          | Ok u ->
+              (let db = unitDatabase u in
+               match (compilerWhole db 0, compilerInferred db 0) with
+               | (Just core, (_, exports, _, _)) -> [Ok (core, exports)]
+               | _ -> [Err "${dir} has no core"])
+          | Err why -> [Err "${dir}: ${why}"])
+        (unitsUnder root [root] [])
+    in
+    let missing = V.concatMap (\x -> match x with | Err why -> [why] | Ok _ -> []) made in
+    let units = V.concatMap (\x -> match x with | Ok y -> [y] | Err _ -> []) made in
+    if not (V.isEmpty missing) then Err (S.join "; " missing)
+    else
+      match linkedUnits (V.map fst units) with
+      | (whole, table) ->
+          Ok
+            (Loaded {
+               machine = Cek.machine whole,
+               table,
+               units =
+                 V.map
+                   (\x ->
+                     match x with
+                     | (CoreProgram a file, exports) -> (coreFilePackage a file, exports))
+                   units
+             })
+
+-- Every unit the units `todo` of the build at `root` are made with, and
+-- they themselves, each once.
+fun unitsUnder (root : String) (todo : [String]) (seen : [String]) =
+  match V.get todo 0 with
+  | None -> seen
+  | Just dir ->
+      if V.elem dir seen then unitsUnder root (V.drop todo 1) seen
+      else
+        let more =
+          (match givenUnits "debug" root dir with
+           | Ok (u : Given Interface) -> V.map fst (unitImports u)
+           | Err _ -> [])
+        in unitsUnder root (V.append (V.drop todo 1) more) (V.pushBack seen dir)
+
+-- Where the value `name` of module `module` of package `pkg` is in the
+-- program.
+fun placeOf (l : Loaded) (pkg : String) (module : [String]) (name : String) : Maybe Int =
+  M.andThen
+    (\u ->
+      M.andThen
+        (\(e : Export) -> H.lookup "meadow:${pkg}/d${show e.binder}" l.table)
+        (V.find (\(e : Export) -> e.kind == "v" and e.name == name and e.module == module) (snd u)))
+    (V.find (\u -> fst u == pkg) l.units)
+
+-- A call's macro run on what it is handed, written out: `Std.Macro.Serve`'s
+-- `answering` applied to the macro and that text.
+fun cekCall (l : Loaded) (c : Call) (handed : String) =
+  match (placeOf l c.package c.module c.name, placeOf l "Std" ["Macro", "Serve"] "answering") with
+  | (Just f, Just answering) ->
+      (match Cek.call l.machine f [] with
+       | Err why -> Err why
+       | Ok run ->
+           (match Cek.call l.machine answering [run, Cek.text handed] with
+            | Ok v ->
+                (match Cek.textOf v with
+                 | Just said -> Ok said
+                 | None -> Err "the macro did not answer with text")
+            | Err why -> Err why))
+  | (None, _) -> Err "`${c.package}` has no macro `${c.name}`"
+  | (_, None) -> Err "the standard library has no `Std.Macro.Serve.answering`"
+
+-- --- on Glade ------------------------------------------------------------------
+--
+-- A unit's macros as a program: one that depends on the unit, is handed a
+-- file of calls -- each named for its macro -- and writes a file of what
+-- each answered (`Std.Macro.Serve.answeringAll`). MeadowBoot compiles it as
+-- it compiles any program, and the back end runs it: `meadow cut`, on Glade.
+
+-- When something of a round happened, for `MEADOWBOOT_TIMES`.
+fun stamp (what : String) =
+  if M.isSome (getEnv "MEADOWBOOT_TIMES") then writeError "${show (monotonic ())} expand ${what}\n"
+  else ()
+
+-- What names a macro among its unit's: its module and its name.
+fun served (module : [String]) (name : String) : String = "${S.join "." module}/${name}"
+
+-- The program that serves the macros `macros` of package `pkg`, as source.
+fun serverSource (pkg : String) (macros : [([String], String)]) : String =
+  let uses =
+    V.map
+      (\k ->
+        match V.get macros k with
+        | Just (module, _) -> "use ${S.join "." (V.pushFront module pkg)} as M${show k}\n"
+        | None -> "")
+      (V.range 0 (V.len macros))
+  in
+  let entries =
+    V.map
+      (\k ->
+        match V.get macros k with
+        | Just (module, name) -> "(\"${served module name}\", M${show k}.${name})"
+        | None -> "")
+      (V.range 0 (V.len macros))
+  in S.join
+       ""
+       (V.concat [
+          [
+            "use Std.Fs (readToString, writeString)\n",
+            "use Std.Process (argv)\n",
+            "use Std.Macro.Serve (answeringAll)\n",
+            "use Std.Collections.Vector as V\n",
+            "use Std.Maybe.Maybe.*\n",
+            "use Std.Result.Result.*\n"
+          ],
+          uses,
+          [
+            "\nfun main () =\n", "  let args = argv () in\n",
+            "  match (V.get args 0, V.get args 1) with\n", "  | (Just given, Just said) ->\n",
+            "      (match readToString given with\n", "       | Ok text ->\n",
+            "           (let u = writeString (said, answeringAll [${S.join ", " entries}] text) in ())\n",
+            "       | Err _ -> ())\n", "  | _ -> ()\n"
+          ]
+        ])
+
+-- The program serving the macros of the unit at `dir`, built: where its Cut
+-- is. It is kept beside the unit's own build, and built again only when the
+-- unit, or which macros it has, changed.
+fun serverFor (dir : String) (macros : [(String, String, [String], String)]) =
+  let mine = V.filter (\m -> match m with | (d, _, _, _) -> d == dir) macros in
+  match V.get mine 0 with
+  | None -> Err "${dir} has no macros"
+  | Just (_, pkg, _, _) ->
+      let home = Path.join (Path.join dir "target") "macro-server" in
+      let manifest =
+        "[package]\nname = \"MacroServer\"\nversion = \"0.1.0\"\n\n[dependencies]\n${pkg} = { path = \"${dir}\" }\n"
+      in
+      let source =
+        serverSource pkg (V.map (\m -> match m with | (_, _, module, name) -> (module, name)) mine)
+      in
+      let main = Path.join (Path.join home "src") "Main.mw" in
+      let fresh =
+        readToString main == Ok source
+          and readToString (Path.join home "Meadow.toml") == Ok manifest
+      in
+      let w =
+        (if fresh then ()
+         else
+           let d = createDirAll (Path.join home "src") in
+           let a = writeString (Path.join home "Meadow.toml", manifest) in
+           let b = writeString (main, source) in
+           ())
+      in if buildUnits "release" [("macros", "Glade")] home then
+           Ok (Path.join (linkDirIn home "release") "program.cut")
+         else Err "the program that serves `${pkg}`'s macros did not build"
+
+-- A round's calls run on Glade, `wave` runs in. Every call still to run
+-- goes in one run of its unit's program; and since a call sees what the
+-- ones before it in its module defined, the calls after the first of a
+-- module to define anything are run again in the next wave, seeing it.
+fun gladeRound
+    (settled : Bool)
+    (macros : [(String, String, [String], String)])
+    (scratch : String)
+    (modules : [(String, [(String, String)], [Call])])
+    (done : [(String, String, Result String String)])
+    (wave : Int) =
+  let calls =
+    V.concatMap
+      (\m ->
+        match m with
+        | (file, visible, cs) -> V.map (\(c : Call) -> (file, visible, c)) cs)
+      modules
+  in if V.isEmpty calls or wave >= 64 then done
+     else
+       let dirs =
+         V.foldl
+           (\acc x ->
+             match x with
+             | (_, _, (c : Call)) -> if V.elem c.dir acc then acc else V.pushBack acc c.dir)
+           []
+           calls
+       in
+       -- Each unit's calls in one run, and what each answered, by module and key.
+       -- Each unit on a thread of its own: its program is built, the first time, there.
+       let ran =
+         V.concat
+           (parMap
+              (\k ->
+                let dir = V.getOr "" dirs k in
+                let theirs =
+                  V.filter (\x -> match x with | (_, _, (c : Call)) -> c.dir == dir) calls
+                in
+                let given = "${scratch}.${show wave}.${show k}.calls" in
+                let said = "${scratch}.${show wave}.${show k}.said" in
+                let failing =
+                  \why ->
+                    V.map
+                      (\x ->
+                        match x with
+                        | (file, _, (c : Call)) -> (file, c.key, Err why))
+                      theirs
+                in
+                let m0 = stamp "wave ${show wave} ${dir} serving" in
+                match serverFor dir macros with
+                | Err why -> failing why
+                | Ok program ->
+                    let m1 = stamp "wave ${show wave} ${dir} served" in
+                    let text =
+                      S.join
+                        ""
+                        (V.map
+                           (\x ->
+                             match x with
+                             | (_, visible, (c : Call)) ->
+                                 Mc.writeWire
+                                   (Wire.Node
+                                      (served c.module c.name)
+                                      [Wire.Text (callText settled visible c.argument)]))
+                           theirs)
+                    in
+                    let w = writeString (given, text) in
+                    let x = writeString (said, "") in
+                    (match Proc.run (meadow ()) ["cut", program, "--", given, said] with
+                     | Err why -> failing "the back end could not be run: ${why}"
+                     | Ok (code, out, err) ->
+                         let m2 = stamp "wave ${show wave} ran ${show (V.len theirs)} calls" in
+                         let answers =
+                           Mc.readWires (M.unwrapOr "" (Res.toMaybe (readToString said)))
+                         in if V.len answers != V.len theirs then
+                              failing
+                                "the program that serves `${dir}`'s macros answered ${show (V.len answers)} of ${show (V.len theirs)} calls: ${out}${err}"
+                            else
+                              V.map
+                                (\i ->
+                                  match (V.get theirs i, V.get answers i) with
+                                  | (Just (file, _, (c : Call)), Just (Wire.Text t)) ->
+                                      (file, c.key, Ok t)
+                                  | (Just (file, _, (c : Call)), _) ->
+                                      (file, c.key, Err "it did not answer")
+                                  | _ -> ("", "", Err ""))
+                                (V.range 0 (V.len theirs))))
+              (V.range 0 (V.len dirs)))
+       in
+       -- Each module's answers up to and with the first to define anything are
+       -- what they are; the calls after it wait for the next wave.
+       let sorted =
+         V.map
+           (\m ->
+             match m with
+             | (file, visible, cs) ->
+                 V.foldl
+                   (\acc (c : Call) ->
+                     match acc with
+                     | (kept, seen, later, stopped) ->
+                         if stopped then (kept, seen, V.pushBack later c, True)
+                         else
+                           let result =
+                             M.unwrapOr
+                               (Err "it was not run")
+                               (M.map
+                                  (\r -> match r with | (_, _, x) -> x)
+                                  (V.find
+                                     (\r -> match r with | (f, k, _) -> f == file and k == c.key)
+                                     ran))
+                           in
+                           let after =
+                             (match result with
+                              | Ok t -> seenAfter seen t (c.from, c.to)
+                              | Err _ -> seen)
+                           in (
+                                V.pushBack kept (file, c.key, result),
+                                after,
+                                later,
+                                V.len after != V.len seen
+                              ))
+                   ([], visible, [], False)
+                   cs)
+           modules
+       in gladeRound
+            settled
+            macros
+            scratch
+            (V.concatMap
+               (\i ->
+                 match (V.get modules i, V.get sorted i) with
+                 | (Just (file, _, _), Just (_, seen, later, _)) ->
+                     if V.isEmpty later then [] else [(file, seen, later)]
+                 | _ -> [])
+               (V.range 0 (V.len modules)))
+            (V.append done (V.concatMap (\x -> match x with | (kept, _, _, _) -> kept) sorted))
+            (wave + 1)

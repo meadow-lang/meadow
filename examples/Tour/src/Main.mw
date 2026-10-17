@@ -46,8 +46,9 @@ fun primesBelow (n : Int) =
 
 -- --- sequences and maps ------------------------------------------------------
 
--- How often each word appears.
-fun wordCounts text =
+-- How often each word appears. A type of a module named with `as` is
+-- written through it, as its functions are: `H.HashMap`.
+fun wordCounts (text : String) : H.HashMap String Int =
   V.foldl (\counts w -> H.insert w (H.getOr 0 w counts + 1) counts) H.empty (S.split " " text)
 
 -- --- main --------------------------------------------------------------------

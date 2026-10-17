@@ -39,6 +39,9 @@
 -- `"a" ++ "b"`: string concatenation, `Std.String.concat` by another name.
 @pub use Std.String (++)
 
+-- Strings joined with one between each two: `intercalate ", " names`.
+@pub use Std.String (intercalate)
+
 -- Printing is `Std.Console`'s `writeOutput` underneath -- `eprintln`'s is
 -- `writeError`, to standard error -- so a handler can capture it; these are in
 -- scope everywhere all the same.

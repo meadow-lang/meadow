@@ -1,0 +1,379 @@
+-- Expand: what a unit's procedural macros are run with, and what running
+-- them comes to -- `meadow_compiler::expand`'s rounds, as far as they concern
+-- a macro that is a function of another package.
+--
+-- Lowering a module asks for each call it cannot expand (`Lower.Request`).
+-- A round runs every call that names a macro the module can see, each
+-- handed the compile-time bindings its module can see; what one answers is
+-- tokens, which the module is lowered again with, and what it defines is a
+-- binding the calls after it see. A call that looks up a name nothing has
+-- defined yet is set aside and run again in the next round, and when a
+-- round defines nothing with calls still waiting, the next is settled: a
+-- lookup of an unknown name is answered `None`, so every call finishes.
+
+use MeadowBoot.Scopes (Vis, Using)
+use MeadowBoot.Scopes.Vis.*
+use MeadowBoot.Lower (Request)
+use MeadowBoot.Macros as Mc
+use MeadowBoot.Macros (Answer)
+use MeadowBoot.Macros (Wire)
+use MeadowBoot.Macros.Wire.*
+use Std.Collections.Vector as V
+use Std.Collections.HashMap as H
+use Std.Collections.HashMap (HashMap)
+use Std.String as S
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+use Std.Macro (Reflect)
+
+-- A value a macro left for a later one: its name, the module and the
+-- package of the call that defined it, how far it is seen, and the `Datum`
+-- it is, as a `Wire` written out.
+@derive(Reflect, Debug, PartialEq)
+@pub record Binding = {
+  name : String,
+  module : [String],
+  package : String,
+  vis : Vis,
+  value : String
+}
+
+-- A function a unit marks `@macro`: the module it is in, and its name.
+@derive(Reflect, Debug, PartialEq)
+@pub record MacroFun = {
+  module : [String],
+  name : String
+}
+
+-- A unit this one depends on, as far as macros go: the name this unit calls
+-- it by, its package, where it is, and the macros and bindings it exports.
+@pub record Dep = {
+  spelled : String,
+  package : String,
+  dir : String,
+  macros : [MacroFun],
+  bindings : [Binding]
+}
+
+-- A procedural macro a module can call: the unit it is in, and what it is
+-- there.
+@pub record Proc = {
+  dir : String,
+  package : String,
+  made : MacroFun
+}
+
+-- What a module's calls are run with: each procedural macro it can call, by
+-- the name it calls it by, and each binding it can look up, by the name it
+-- knows it by -- the latest last.
+@pub record Scope = {
+  procs : HashMap String Proc,
+  visible : [(String, String)]
+}
+
+-- How far what `@pub` says is seen -- `seen` its arguments, `None` with no
+-- `@pub` at all -- in a unit that is `gated`: one that says `@pub`
+-- somewhere, and so means it everywhere.
+@pub fun visOf (seen : Maybe [String]) (gated : Bool) : Vis =
+  if not gated then Exported
+  else
+    match seen with
+    | None -> Private
+    | Just args ->
+        (match V.get args 0 with
+         | None -> Exported
+         | Just w -> if w == "super" then Super else InPkg)
+
+-- Whether something `vis` in `module` of `package` may be named by the
+-- module at `path` of `pkg`.
+fun visibleTo (vis : Vis) (package : String) (module : [String]) (pkg : String) (path : [String])
+    : Bool =
+  match vis with
+  | Exported -> True
+  | InPkg -> pkg == package
+  | Super -> pkg == package and startsWith (V.take module (V.len module - 1)) path
+  | Private -> pkg == package and path == module
+
+fun startsWith (prefix : [String]) (path : [String]) : Bool =
+  V.len prefix <= V.len path and V.take path (V.len prefix) == prefix
+
+-- What the module at `path` of package `pkg` may call and look up, given
+-- its `use`s, every binding the unit has, and the units it depends on. Its
+-- own bindings are there without asking; everything else arrives through a
+-- `use`, as a value does -- a bare `use M` brings what `M` can show it,
+-- `use M (name!)` brings that one, and `use M as A` puts them behind `A.`.
+@pub fun scopeOf
+    (pkg : String)
+    (path : [String])
+    (uses : [Using])
+    (known : [Binding])
+    (deps : [Dep])
+    : Scope =
+  let own =
+    V.concatMap
+      (\(b : Binding) -> if b.package == pkg and b.module == path then [(b.name, b.value)] else [])
+      known
+  in V.foldl
+       (\(sc : Scope) (u : Using) ->
+         let called = \name -> (match u.alias with | Just a -> "${a}.${name}" | None -> name) in
+         let bound =
+           V.filter
+             (\(b : Binding) -> visibleTo b.vis b.package b.module pkg path)
+             (bindingsAt pkg u.path known deps)
+         in
+         let written = procsAt pkg u.path deps in
+         if V.isEmpty u.macros then
+           -- A bare `use M` brings every name; one that selects values says
+           -- nothing about macros.
+           (if u.selects then sc
+            else
+              Scope {
+                procs =
+                  V.foldl (\h (p : Proc) -> H.insert (called p.made.name) p h) sc.procs written,
+                visible =
+                  V.append sc.visible (V.map (\(b : Binding) -> (called b.name, b.value)) bound)
+              })
+         else
+           V.foldl
+             (\(acc : Scope) want ->
+               match V.find (\(b : Binding) -> b.name == want) bound with
+               | Just b -> { acc | visible = V.pushBack acc.visible (called b.name, b.value) }
+               | None ->
+                   (match V.find (\(p : Proc) -> p.made.name == want) written with
+                    | Just p -> { acc | procs = H.insert (called want) p acc.procs }
+                    | None -> acc))
+             sc
+             u.macros)
+       (Scope { procs = H.empty, visible = own })
+       uses
+
+-- `use Pkg.a.b` inside `Pkg` is the local module `a.b`, and so is a bare
+-- `use a.b`.
+fun localOf (pkg : String) (segs : [String]) : [String] =
+  if V.get segs 0 == Just pkg then V.drop segs 1 else segs
+
+-- The compile-time bindings of the module a `use` path names, wherever it
+-- lives.
+fun bindingsAt (pkg : String) (segs : [String]) (known : [Binding]) (deps : [Dep]) : [Binding] =
+  if V.isEmpty segs then []
+  else
+    let local = localOf pkg segs in
+    V.append
+      (V.filter (\(b : Binding) -> b.package == pkg and b.module == local) known)
+      (V.concatMap
+         (\(d : Dep) ->
+           if S.join "." local == d.spelled or S.join "." segs == d.spelled then d.bindings
+           else if V.get segs 0 == Just d.spelled then
+             V.filter (\(b : Binding) -> b.module == V.drop segs 1) d.bindings
+           else [])
+         deps)
+
+-- The macros of the module a `use` path names: a function marked `@macro`
+-- in a unit this one depends on.
+fun procsAt (pkg : String) (segs : [String]) (deps : [Dep]) : [Proc] =
+  if V.isEmpty segs then []
+  else
+    let local = localOf pkg segs in
+    V.concatMap
+      (\(d : Dep) ->
+        let whole = S.join "." local == d.spelled or S.join "." segs == d.spelled in
+        V.concatMap
+          (\(m : MacroFun) ->
+            if whole or (V.get segs 0 == Just d.spelled and m.module == V.drop segs 1) then
+              [Proc { dir = d.dir, package = d.package, made = m }]
+            else [])
+          d.macros)
+      deps
+
+-- The macro a request names, if the module can call one of that name: a
+-- call by the name it is written with, and a derive by its own name or --
+-- a macro being a function, and functions lower-case -- with its first
+-- letter small, so that `@derive(Lexer)` finds `lexer`.
+@pub fun procFor (sc : Scope) (r : Request) : Maybe Proc =
+  match H.lookup r.name sc.procs with
+  | Just p -> Just p
+  | None ->
+      if r.kind == "derived" then
+        H.lookup "${S.toLower (S.take r.name 1)}${S.drop r.name 1}" sc.procs
+      else None
+
+-- --- what a run is handed, and hands back --------------------------------------
+--
+-- A round's calls go to whoever runs them (`meadowboot expand`) written
+-- out: whether it is settled, then each module with the bindings it sees
+-- and its calls in order -- each its key, the unit its macro is in and that
+-- macro's module and name, where what it makes up stands, and its argument.
+-- What comes back is each call's key and what it answered, as its macro
+-- wrote it. A call sees what the calls before it in its module defined.
+
+-- One module's calls: its name, what it sees, and each call with its macro.
+@pub record Batch = {
+  file : String,
+  visible : [(String, String)],
+  calls : [(Request, Proc)]
+}
+
+@pub fun writeRound (settled : Bool) (deps : [Dep]) (batches : [Batch]) : String =
+  Mc.writeWire
+    (Node "" [
+       Whole (if settled then 1 else 0),
+       Node
+         ""
+         (V.map
+            (\(b : Batch) ->
+              Node b.file [
+                Node "" (V.map (\x -> Node (fst x) [Text (snd x)]) b.visible),
+                Node
+                  ""
+                  (V.map
+                     (\x ->
+                       match x with
+                       | ((r : Request), (p : Proc)) ->
+                           Node r.key [
+                             Text p.dir,
+                             Text p.package,
+                             Text (S.join "." p.made.module),
+                             Text p.made.name,
+                             Whole r.from,
+                             Whole r.to,
+                             Text r.argument
+                           ])
+                     b.calls)
+              ])
+            batches),
+       -- Every macro the unit could call, by the unit it is in: what a
+       -- program that serves one unit's macros serves.
+       Node
+         ""
+         (V.concatMap
+            (\(d : Dep) ->
+              V.map
+                (\(m : MacroFun) ->
+                  Node d.dir [Text d.package, Text (S.join "." m.module), Text m.name])
+                d.macros)
+            deps)
+     ])
+
+-- A call as whoever runs it reads it.
+@pub record Call = {
+  key : String,
+  dir : String,
+  package : String,
+  module : [String],
+  name : String,
+  from : Int,
+  to : Int,
+  argument : String
+}
+
+-- A round read back: whether it is settled, and each module's name, what it
+-- sees and its calls.
+@pub fun readRound (text : String)
+    : (Bool, [(String, [(String, String)], [Call])], [(String, String, [String], String)]) =
+  match Mc.readWire text 0 with
+  | Just (Node _ parts, _) ->
+      (
+        wholeAt parts 0 == 1,
+        V.concatMap
+          (\m ->
+            match m with
+            | Node file inner ->
+                [(
+                  file,
+                  V.concatMap
+                    (\b ->
+                      match b with
+                      | Node name vs -> [(name, textAt vs 0)]
+                      | _ -> [])
+                    (kids (V.get inner 0)),
+                  V.concatMap
+                    (\c ->
+                      match c with
+                      | Node key fs ->
+                          [Call {
+                             key,
+                             dir = textAt fs 0,
+                             package = textAt fs 1,
+                             module =
+                               (let m = textAt fs 2 in if S.isEmpty m then [] else S.split "." m),
+                             name = textAt fs 3,
+                             from = wholeAt fs 4,
+                             to = wholeAt fs 5,
+                             argument = textAt fs 6
+                           }]
+                      | _ -> [])
+                    (kids (V.get inner 1))
+                )]
+            | _ -> [])
+          (kids (V.get parts 1)),
+        V.concatMap
+          (\m ->
+            match m with
+            | Node dir fs ->
+                [(
+                  dir,
+                  textAt fs 0,
+                  (let path = textAt fs 1 in if S.isEmpty path then [] else S.split "." path),
+                  textAt fs 2
+                )]
+            | _ -> [])
+          (kids (V.get parts 2))
+      )
+  | _ -> (False, [], [])
+
+fun kids (w : Maybe Wire) : [Wire] = match w with | Just (Node _ xs) -> xs | _ -> []
+
+fun textAt (ws : [Wire]) (i : Int) : String = match V.get ws i with | Just (Text s) -> s | _ -> ""
+
+fun wholeAt (ws : [Wire]) (i : Int) : Int = match V.get ws i with | Just (Whole n) -> n | _ -> 0
+
+-- What each call answered, written out: its module, its key, and the
+-- answer as its macro wrote it -- or, for one that could not be run, why.
+@pub fun writeAnswers (answers : [(String, String, Result String String)]) : String =
+  Mc.writeWire
+    (Node
+       ""
+       (V.map
+          (\x ->
+            match x with
+            | (file, key, Ok said) -> Node file [Text key, Whole 1, Text said]
+            | (file, key, Err why) -> Node file [Text key, Whole 0, Text why])
+          answers))
+
+@pub fun readAnswers (text : String) : [(String, String, Result String String)] =
+  match Mc.readWire text 0 with
+  | Just (Node _ parts, _) ->
+      V.concatMap
+        (\p ->
+          match p with
+          | Node file fs ->
+              [(
+                file,
+                textAt fs 0,
+                if wholeAt fs 1 == 1 then Ok (textAt fs 2) else Err (textAt fs 2)
+              )]
+          | _ -> [])
+        parts
+  | _ -> []
+
+-- What a macro is handed for a call, written out (`Macros.callWire`, of
+-- parts that are written out already): whether the round is settled, the
+-- bindings the call sees -- the latest first, since the first found is the
+-- one read -- and its argument.
+@pub fun callText (settled : Bool) (visible : [(String, String)]) (argument : String) : String =
+  S.join
+    ""
+    (V.concat [
+       ["N0:3;W${if settled then "1" else "0"};N0:${show (V.len visible)};"],
+       V.map (\b -> "N${show (stringByteLength (fst b))}:${fst b}1;${snd b}") (V.reverse visible),
+       [argument]
+     ])
+
+-- What a call sees once the one before it in its module has answered
+-- `said`: what it saw, and what that one defined.
+@pub fun seenAfter (visible : [(String, String)]) (said : String) (at : (Int, Int))
+    : [(String, String)] =
+  match M.map (\w -> Mc.answerOf (fst w) at) (Mc.readWire said 0) with
+  | Just (Answer.Answered _ defined) ->
+      V.append visible (V.map (\d -> (fst d, Mc.writeWire (snd d))) defined)
+  | _ -> visible

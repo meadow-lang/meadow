@@ -1231,9 +1231,10 @@ impl Infer {
     /// answers -- [`THREAD_EFFECTS`], which `Std.Eff` names -- since once it
     /// runs there is nothing above it to answer anything else.
     ///
-    /// Held to that after it is generalized, as a use of it would be: its
-    /// scheme is what it was inferred to be, and only has to fit. At most, not
-    /// exactly: a `main` that prints nothing, or nothing at all, is a `main`.
+    /// Held to that after it is generalized, as a use of it would be: what it
+    /// was inferred to be only has to fit -- at most, not exactly: a `main`
+    /// that prints nothing, or nothing at all, is a `main` -- and one that
+    /// fits is `() -> () ! Eff` from then on, whatever less its body performs.
     pub fn check_main(&mut self, main: VarId, span: Span) {
         let Some(scheme) = self.generalized.get(&main).map(|g| g.scheme.clone()) else {
             return;
@@ -1263,6 +1264,49 @@ impl Infer {
                     .map(|(l, _)| format!("`{}`", hir::spelling(&l)))
                     .collect();
                 if unanswered.is_empty() {
+                    // It fits, so `Eff` is what it is: `main` is not generic
+                    // in what else it might perform -- nothing runs it at
+                    // another row -- and whatever `Eff` names may be
+                    // performed where it is called from.
+                    // The row it was inferred at is closed to the same: what
+                    // an editor reads of `main` and of what is in it is each
+                    // node's type, and those are written with the variable
+                    // the row ended in, which is `Eff`'s other effects now.
+                    if let Some(g) = self.generalized.get(&main).cloned()
+                        && let Type::Fun(_, _, row) = &g.scheme.ty
+                    {
+                        let (present, tail) = row_parts(row);
+                        if let Some(Type::Bound(i)) = tail
+                            && let Some(var) = g.vars.get(i as usize)
+                        {
+                            let others = THREAD_EFFECTS
+                                .iter()
+                                .rev()
+                                .filter(|e| !present.iter().any(|(l, _)| &**l == **e))
+                                .fold(Type::RowEmpty, |rest, e| {
+                                    Type::RowExtend(
+                                        InternedString::from(*e),
+                                        Box::new(Type::Tuple(vec![])),
+                                        Box::new(rest),
+                                    )
+                                });
+                            let _ = self.arena.unify(Type::Var(*var), others);
+                        }
+                    }
+                    let fixed = Scheme::mono(Type::Fun(
+                        vec![Type::unit()],
+                        Box::new(Type::unit()),
+                        Box::new(thread_body_row()),
+                    ));
+                    if let Some(g) = self.generalized.get_mut(&main) {
+                        g.scheme = fixed.clone();
+                        g.vars = Vec::new();
+                    }
+                    // And what the unit says of it to whoever asks: a package
+                    // that names it, `--types`.
+                    if self.env.contains_key(&main) {
+                        self.env.insert(main, fixed);
+                    }
                     return;
                 }
                 let list = unanswered.join(", ");
@@ -5143,6 +5187,15 @@ fn write_effect_suffix(
     }
     if labels.is_empty() {
         return write!(out, " ! {}", tail.unwrap()); // `a -> b ! e`
+    }
+    // Every effect the runtime answers, and no other: `Std.Eff`'s name for it.
+    if tail.is_none()
+        && labels.len() == THREAD_EFFECTS.len()
+        && labels
+            .iter()
+            .all(|(l, args)| args.is_empty() && THREAD_EFFECTS.contains(&&**l))
+    {
+        return out.write_str(" ! Eff");
     }
     out.write_str(" ! ")?;
     let braces = labels.len() != 1 || tail.is_some();

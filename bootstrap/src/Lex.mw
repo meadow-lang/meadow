@@ -737,3 +737,37 @@ fun escapeFrom (s : String) (run : Int) (i : Int) (acc : [String]) : [String] =
 fun twoHex (n : Int) : String =
   let digit = \d -> stringSlice "0123456789ABCDEF" d (d + 1) in
   digit (n / 16) ++ digit (n % 16)
+
+-- --- tests -------------------------------------------------------------------
+
+use Std.Test (assertTrue)
+use Std.Test.Fuzz (fuzzGuided)
+
+-- Text close to Meadow, and not Meadow: whatever the lexer is given it
+-- answers, and its tokens are where the text is -- each within it, none
+-- starting before the one ahead of it does, and none ending before it starts.
+@test fun theLexerAnswersWhateverItIsGiven () =
+  fuzzGuided
+    [
+      "fun f x = x + 1\n",
+      "def s = \"a ${show (1, 'c')} b\"\n",
+      "-- a comment\ndata T = A Int | B { x : Float }\n",
+      "let xs = [1, 2.5, 0x1F] in\n  match xs with\n  | [a; b] -> a\n",
+      "@pub effect E { op : () -> () }\nuse Std.Maybe.Maybe.*\n"
+    ]
+    ["\"", "${", "}", "'", "--", "\\", "\n", "0x", "1e", ".", "{-", "-}", "@", "#[", "|>"]
+    (\src ->
+      let l = lex src in
+      let most = stringByteLength src in
+      let last =
+        V.foldl
+          (\at (t : Lexed) ->
+            let a = assertTrue (t.from <= t.to) "a token ends before it starts, in ${show src}" in
+            let b =
+              assertTrue (t.from >= at) "a token starts before the last did, in ${show src}"
+            in
+            let c = assertTrue (t.to <= most) "a token ends past the text, in ${show src}" in
+            t.from)
+          0
+          l.tokens
+      in assertTrue (last <= most) "tokens within the text")

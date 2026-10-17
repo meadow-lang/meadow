@@ -290,6 +290,22 @@ enum Cmd {
         /// `glade`, on its bytecode, or `silo`, as native code.
         #[arg(long, default_value = "glade", value_name = "NAME")]
         runtime: String,
+        /// On Glade, compile the bytecode to machine code ahead of time and
+        /// run that executable, rather than interpreting it.
+        #[arg(long)]
+        aot: bool,
+        /// How hard an executable is optimised: 0, 1 or 2.
+        #[arg(
+            short = 'O',
+            long = "opt-level",
+            default_value = "2",
+            value_name = "LEVEL"
+        )]
+        opt: u8,
+        /// Build what would be run -- the bytecode image, or the executable
+        /// -- and stop: what a front end's `build` asks for.
+        #[arg(long)]
+        no_run: bool,
         /// What the program is given, after `--`: what its `argv` answers.
         #[arg(last = true, value_name = "ARGS")]
         args: Vec<String>,
@@ -994,9 +1010,34 @@ fn command() {
         Some(Cmd::Cut {
             file,
             runtime,
+            aot: ahead,
+            opt,
+            no_run,
             args,
         }) => {
+            let opt = match opt {
+                0 => meadow_compiler::OptLevel::O0,
+                1 => meadow_compiler::OptLevel::O1,
+                _ => meadow_compiler::OptLevel::O2,
+            };
             let ran = match aot::Runtime::named(&runtime) {
+                Some(aot::Runtime::Glade) if no_run && ahead => {
+                    meadow::cut::build_for_glade(&file, opt).map(|_| 0)
+                }
+                Some(aot::Runtime::Glade) if no_run => {
+                    meadow::cut::kept_for_glade(&file).map(|()| 0)
+                }
+                Some(aot::Runtime::Silo) if no_run => {
+                    meadow::cut::build_for_silo(&file, opt).map(|_| 0)
+                }
+                Some(aot::Runtime::Glade) if ahead => meadow::cut::build_for_glade(&file, opt)
+                    .and_then(|exe| {
+                        std::process::Command::new(&exe)
+                            .args(&args)
+                            .status()
+                            .map(|s| s.code().unwrap_or(1))
+                            .map_err(|e| format!("{}: {e}", exe.display()))
+                    }),
                 Some(aot::Runtime::Glade) => {
                     // The process is `meadow`, not the program: what the
                     // program was given is what followed `--`.
@@ -1004,15 +1045,21 @@ fn command() {
                     meadow::cut::run_on_glade(&file).map(|()| 0)
                 }
                 Some(aot::Runtime::Silo) => {
-                    meadow::cut::build_for_silo(&file, meadow_compiler::OptLevel::O2).and_then(
-                        |exe| {
-                            std::process::Command::new(&exe)
-                                .args(&args)
-                                .status()
-                                .map(|s| s.code().unwrap_or(1))
-                                .map_err(|e| format!("{}: {e}", exe.display()))
-                        },
-                    )
+                    meadow::cut::build_for_silo(&file, opt).and_then(|exe| {
+                        // A library is built, and there is nothing to run.
+                        if matches!(
+                            exe.extension().and_then(|e| e.to_str()),
+                            Some("dll" | "so" | "dylib")
+                        ) {
+                            meadow::status::status("Built", exe.display().to_string());
+                            return Ok(0);
+                        }
+                        std::process::Command::new(&exe)
+                            .args(&args)
+                            .status()
+                            .map(|s| s.code().unwrap_or(1))
+                            .map_err(|e| format!("{}: {e}", exe.display()))
+                    })
                 }
                 None => Err(format!("`{runtime}` is not a runtime: `glade` or `silo`")),
             };

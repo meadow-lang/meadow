@@ -123,3 +123,15 @@ use Lingua (lang!)
   Ret + Ret { pat : Pat, body : Expr }
   ExprField + ExprField { name : Name, value : Expr }
 }
+
+-- A file's abstract syntax is the answer to a query, which wants its answers
+-- compared and printed. Nothing is asked of that one that a comparison would
+-- save, so no two are taken for the same -- the answer that is never wrong --
+-- and one prints as nothing much.
+impl PartialEq AstProgram {
+  fun (==) a b = False
+}
+
+impl Debug AstProgram {
+  fun debug p = "<syntax>"
+}

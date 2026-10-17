@@ -282,10 +282,13 @@ fun innerState (ar : Arena s) (field : Type) (level : Int) : Bool ! { St s | e }
   | RowExtend l f rest -> RowExtend l (zonk ar f) (zonk ar rest)
   | other -> other
 
--- `t` as the tree a program is lowered from holds it: zonked, and a number
--- nothing settled the type of an `Int`, a fraction a `Float` -- which is what
--- one is where nothing says otherwise. A definition generic in its number is
--- so its `Int` copy, and the only one until lowering makes the others.
+-- `t` as the tree a program is lowered from holds it: zonked. A number
+-- nothing settled the type of is an `Int` by now, and a fraction a `Float`
+-- (`defaultNumVars`), but for the variables a binding is generic in, which
+-- are still variables here: a definition generic in its number is lowered
+-- knowing which of its types are the number's, so that a copy can be made
+-- of it for each number type it is used at (`Inline.numbered`) -- its `Int`
+-- copy is the definition itself, with what `numberKind` says of each.
 @pub fun settled (ar : Arena s) (t : Type) : Type ! { St s | e } =
   match prune ar t with
   | Con name args -> Con name (V.map (settled ar) args)
@@ -293,12 +296,18 @@ fun innerState (ar : Arena s) (field : Type) (level : Int) : Bool ! { St s | e }
   | Tuple items -> Tuple (V.map (settled ar) items)
   | Record row -> Record (settled ar row)
   | RowExtend l f rest -> RowExtend l (settled ar f) (settled ar rest)
-  | Var id ->
-      (match slotKind ar id with
-       | Num -> Con "Int" []
-       | Frac -> Con "Float" []
-       | _ -> Var id)
   | other -> other
+
+-- Whether variable `id` is over number types, and if so whether over
+-- fractions: `Just False` an integer's, `Just True` a fraction's.
+@pub fun numberKind (ar : Arena s) (id : Int) : Maybe Bool ! { St s | e } =
+  match prune ar (Var id) with
+  | Var now ->
+      (match slotKind ar now with
+       | Num -> Just False
+       | Frac -> Just True
+       | _ -> None)
+  | _ -> None
 
 -- The unbound variables of `t`, after `out`, each once, in the order met.
 @pub fun freeVars (ar : Arena s) (t : Type) (out : [Int]) : [Int] ! { St s | e } =
@@ -371,7 +380,7 @@ fun undo (ar : Arena s) (to : Int) : () ! { St s | e } =
 
 -- `b` with only its first `n` slots.
 fun truncate (b : Buf s a) (n : Int) : () ! { St s | e } =
-  match b with | Buf _ count -> stSetRef count n
+  match b with | Buf _ count _ -> stSetRef count n
 
 -- Require that `row` has none of `labels`: an error for one it has, and for
 -- its unknown rest a promise, kept by the variable it ends in.
@@ -801,6 +810,10 @@ fun writeEach (nm : Namer) (ts : [Type]) (prec : Int) (hidden : [Int]) (sep : St
 -- ` ! e` after an arrow whose effect is not pure: `Console`, `State Int`,
 -- `{ Console, State Int }`, `{ Console | e }` -- one closed label needs no
 -- braces, and a lone hidden variable is nothing.
+-- The effects the runtime answers itself, which `Std.Eff` names.
+@pub def runtimeRow : [String] =
+  ["Thread", "Console", "Fs", "Process", "Random", "Time", "Test", "Mut"]
+
 fun effectSuffix (nm : Namer) (eff : Type) (hidden : [Int]) : (String, Namer) =
   match rowLabels eff with
   | (labels, tail) ->
@@ -816,6 +829,14 @@ fun effectSuffix (nm : Namer) (eff : Type) (hidden : [Int]) : (String, Namer) =
                   (match named with
                    | Just tn -> (" ! " ++ tn, n2)
                    | None -> ("", n2))
+                -- Every effect the runtime answers, and no other: `Std.Eff`'s
+                -- name for it.
+                else if M.isNone named
+                  and V.len labels == V.len runtimeRow
+                  and V.all
+                    (\(lab : (String, [Type])) ->
+                      V.isEmpty (snd lab) and V.elem (fst lab) runtimeRow)
+                    labels then (" ! Eff", n2)
                 else
                   let braces = V.len labels != 1 or M.isSome named in
                   (let scrutinee =

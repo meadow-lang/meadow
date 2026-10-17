@@ -22,7 +22,8 @@
 --
 --   C                               here
 --   int, long, size_t, a pointer    Arg.Int, Arg.Ptr   callInt, callPtr
---   double, float                   Arg.Float          callFloat
+--   double                          Arg.Float          callFloat
+--   float                           Arg.Float32        callFloat32
 --   const char *                    Arg.String         callString
 --   void                                               callUnit
 --
@@ -33,9 +34,15 @@
 -- check it against, so what is passed and which `call…` is used are taken at
 -- their word, and a call that says it wrongly does whatever the C does --
 -- usually crash. A call takes at most eight integers, pointers and strings
--- (six on x86-64) and eight floats; a struct passed by value, a variadic
--- function such as `printf`, and a C function calling back into Meadow are
--- not expressible.
+-- (six on x86-64) and eight floats, and on Windows sixteen arguments of any
+-- kind; a struct passed by value, a variadic function such as `printf`, and
+-- a C function calling back into Meadow are not expressible.
+--
+-- A function need not be found by name: one whose address is in memory --
+-- in a table of them that a C library hands its plugins -- is called through
+-- `functionAt`. And C's structs are laid out here as C lays them out, by
+-- `CType`: `offsetOf`, `sizeOf` and `alignOf` say where a field is, and
+-- `readInt`, `writeFloat` and the rest read and write one value there.
 --
 -- A `Ptr` is an address and nothing more: it is never followed or freed by
 -- the runtime. Memory C is to fill is `alloc`ed and `free`d by hand, or lent
@@ -43,15 +50,16 @@
 -- it and read back as so many bytes each: `writeFloats p 4 xs` writes each
 -- as a C `float`.
 --
--- Unix only, so far: on Windows `open` answers `Err`.
+-- On Unix, and on Windows on x86-64.
 
 use Std.Process (
   Process, ffiOpen, ffiSymbol, ffiCall, ffiAlloc, ffiFree, ffiWriteInts, ffiReadInts,
-  ffiWriteFloats, ffiReadFloats, ffiReadText
+  ffiWriteFloats, ffiReadFloats, ffiReadText, ffiFailure
 )
 use Std.Collections.Vector as V
 use Std.Collections.Vector (vecFromArray)
 use Std.Result.Result.*
+use Std.Maybe.Maybe.*
 
 -- A library, opened.
 @pub data Library = Library Int
@@ -63,8 +71,13 @@ use Std.Result.Result.*
 @derive(Debug, PartialEq)
 @pub data Ptr = Ptr Int
 
--- An argument to a call.
-@pub data Arg = Int Int | Float Float | String String | Ptr Ptr
+-- An argument to a call: `Float` a C `double`, `Float32` a C `float`.
+@pub data Arg
+  = Int Int
+  | Float Float
+  | Float32 Float
+  | String String
+  | Ptr Ptr
 
 -- The pointer to nothing.
 @pub def null : Ptr = Ptr 0
@@ -84,6 +97,21 @@ use Std.Result.Result.*
   | Ok at -> Ok (Library at)
   | Err why -> Err why
 
+-- The library this program is: its own executable, or the library a plugin
+-- is -- where the functions it exports to C are found, to hand C their
+-- addresses.
+@pub fun own () : Result String Library ! { Process | e } = open ""
+
+-- What the last call C made into this library failed with -- an `error`, a
+-- division by zero -- if one has since this was last asked. A failure in a
+-- function the library exports ends that call, which answers C zero, and not
+-- the program C is. A function that calls another of the library's through
+-- C, by its address, gets control back when that one fails, and asks this
+-- why: what a plugin does to report a failure to its host.
+@pub fun failure () : Maybe String ! { Process | e } =
+  let why = ffiFailure () in
+  if why == "" then None else Just why
+
 -- The function `name` in `library`.
 @pub fun function (library : Library) (name : String) : Result String Function ! { Process | e } =
   match library with
@@ -98,6 +126,7 @@ fun wire (a : Arg) : (Int, Int, Float, String) =
   | Arg.Ptr p -> (0, address p, 0.0, "")
   | Arg.Float x -> (1, 0, x, "")
   | Arg.String s -> (2, 0, 0.0, s)
+  | Arg.Float32 x -> (3, 0, x, "")
 
 fun invoke (f : Function) (answer : Int) (args : [Arg])
     : Result String (Int, Float, String) ! { Process | e } =
@@ -122,12 +151,25 @@ fun invoke (f : Function) (answer : Int) (args : [Arg])
   | Ok (n, _, _) -> Ok (Ptr n)
   | Err why -> Err why
 
--- Call a function that answers a `double`. One that answers a `float` cannot
--- be called this way: its answer is half the size.
+-- Call a function that answers a `double`. One that answers a `float` is
+-- `callFloat32`'s: its answer is half the size.
 @pub fun callFloat (f : Function) (args : [Arg]) : Result String Float ! { Process | e } =
   match invoke f 2 args with
   | Ok (_, x, _) -> Ok x
   | Err why -> Err why
+
+-- Call a function that answers a `float`.
+@pub fun callFloat32 (f : Function) (args : [Arg]) : Result String Float ! { Process | e } =
+  match invoke f 4 args with
+  | Ok (_, x, _) -> Ok x
+  | Err why -> Err why
+
+-- The function whose address `p` is: one read out of a table of them, as a
+-- C library hands its plugins what they may call.
+@pub fun functionAt (p : Ptr) : Function = Function (address p)
+
+-- The address of a function, to hand to C.
+@pub fun addressOf (f : Function) : Ptr = match f with | Function at -> Ptr at
 
 -- Call a function that answers a C string, which is copied.
 @pub fun callString (f : Function) (args : [Arg]) : Result String String ! { Process | e } =
@@ -178,22 +220,139 @@ fun invoke (f : Function) (answer : Int) (args : [Arg])
 @pub fun readText (p : Ptr) (bytes : Int) : String ! { Process | e } =
   ffiReadText (address p, bytes)
 
+-- Run `body` with `text` in C's memory: its address and how many bytes it
+-- is, for a function that takes a pointer and a length. A NUL follows it, for
+-- one that wants that instead; it is freed after.
+@pub fun withText (text : String) (body : Ptr -> Int -> a ! { Process | e }) : a ! { Process | e } =
+  let bytes = V.map toInt64 (vecFromArray (stringToBytes text)) in
+  withBuffer (V.len bytes + 1) (\p -> (let _ = writeInts p 1 bytes in body p (V.len bytes)))
+
+-- --- C's types, and where a struct's fields are ---------------------------------
+
+-- A C type, as far as where it goes and how much room it takes: an integer
+-- of so many bytes, signed or not; `size_t`; a `float` or a `double`; a
+-- pointer; an array of so many; a struct of fields in order; or a type
+-- aligned more than its own say, as `_Alignas` does.
+@pub data CType
+  = U8
+  | U16
+  | U32
+  | U64
+  | I8
+  | I16
+  | I32
+  | I64
+  | Usize
+  | F32
+  | F64
+  | Pointer
+  | ArrayOf CType Int
+  | StructOf [CType]
+  | Aligned Int CType
+
+use CType.*
+
+-- How many bytes a value of type `t` takes, its padding at the end included.
+@pub fun sizeOf (t : CType) : Int =
+  match t with
+  | U8 -> 1
+  | I8 -> 1
+  | U16 -> 2
+  | I16 -> 2
+  | U32 -> 4
+  | I32 -> 4
+  | F32 -> 4
+  | U64 -> 8
+  | I64 -> 8
+  | Usize -> 8
+  | F64 -> 8
+  | Pointer -> 8
+  | ArrayOf e n -> sizeOf e * n
+  | StructOf fields -> roundUp (fieldsEnd fields 0 U8) (alignOf t)
+  | Aligned n inner -> roundUp (sizeOf inner) (alignOf t)
+
+-- Where a value of type `t` may start: at a multiple of this.
+@pub fun alignOf (t : CType) : Int =
+  match t with
+  | ArrayOf e _ -> alignOf e
+  | StructOf fields -> V.foldl (\a f -> if alignOf f > a then alignOf f else a) 1 fields
+  | Aligned n inner -> if n > alignOf inner then n else alignOf inner
+  | other -> sizeOf other
+
+-- Where field `i` of a struct of `fields` starts, from the struct's start.
+@pub fun offsetOf (fields : [CType]) (i : Int) : Int =
+  fieldsEnd (V.take fields i) 0 (V.getOr U8 fields i)
+
+-- Where the fields after `at` end, laid out from `at`, and then where one of
+-- type `next` would start.
+fun fieldsEnd (fields : [CType]) (at : Int) (next : CType) : Int =
+  match V.get fields 0 with
+  | Just f -> fieldsEnd (V.drop fields 1) (roundUp at (alignOf f) + sizeOf f) next
+  | None -> roundUp at (alignOf next)
+
+fun roundUp (n : Int) (to : Int) : Int = if to <= 1 then n else ((n + to - 1) / to) * to
+
+-- Field `i` of the struct of `fields` at `p`.
+@pub fun field (p : Ptr) (fields : [CType]) (i : Int) : Ptr = offset p (offsetOf fields i)
+
+-- Read the integer of type `t` at `p`: signed for `I8` to `I64`, and a
+-- pointer's address for `Pointer`. A `U64` past what an `Int` holds comes
+-- back as the negative number of the same bits.
+@pub fun readInt (p : Ptr) (t : CType) : Result String Int ! { Process | e } =
+  let signed =
+    match t with
+    | I8 -> True
+    | I16 -> True
+    | I32 -> True
+    | I64 -> True
+    | _ -> False
+  in match ffiReadInts (address p, sizeOf t, signed, 1) with
+     | Ok xs -> Ok (V.getOr 0 xs 0)
+     | Err why -> Err why
+
+-- Write `n` at `p` as an integer of type `t`.
+@pub fun writeInt (p : Ptr) (t : CType) (n : Int) : Result String () ! { Process | e } =
+  ffiWriteInts (address p, sizeOf t, [n])
+
+-- Read the pointer at `p`.
+@pub fun readPtr (p : Ptr) : Result String Ptr ! { Process | e } =
+  match readInt p Pointer with
+  | Ok at -> Ok (Ptr at)
+  | Err why -> Err why
+
+-- Write the pointer `q` at `p`.
+@pub fun writePtr (p : Ptr) (q : Ptr) : Result String () ! { Process | e } =
+  writeInt p Pointer (address q)
+
+-- Read the `F32` or `F64` at `p`.
+@pub fun readFloat (p : Ptr) (t : CType) : Result String Float ! { Process | e } =
+  match ffiReadFloats (address p, sizeOf t, 1) with
+  | Ok xs -> Ok (V.getOr 0.0 xs 0)
+  | Err why -> Err why
+
+-- Write `x` at `p` as an `F32` or `F64`.
+@pub fun writeFloat (p : Ptr) (t : CType) (x : Float) : Result String () ! { Process | e } =
+  ffiWriteFloats (address p, sizeOf t, [x])
+
 -- --- tests -------------------------------------------------------------------
 --
--- Against the C library, which every system has: by one name on macOS, and
--- by another on Linux.
+-- Against the C library, which every system has: by one name on macOS,
+-- another on Linux, and another on Windows.
 
 use Std.Test (assertEq, assertTrue)
 
 -- The tests that call C are for where there is a C library to call, which
--- `hasC` finds out as it runs: where there is none -- Windows, so far --
--- each has nothing to check. The last two are for everywhere: what is not
+-- `hasC` finds out as it runs: where there is none, each has nothing to
+-- check. The last two are for everywhere: what is not
 -- there is an error, and never a crash.
 
 fun libc () =
   match open "libSystem.dylib" with
   | Ok l -> Ok l
-  | Err _ -> open "libc.so.6"
+  | Err _ ->
+      (match open "libc.so.6" with
+       | Ok l -> Ok l
+       | Err _ -> open "ucrtbase.dll")
 
 -- Whether there is C to call at all: a null answer from `alloc` says not.
 fun hasC () = withBuffer 1 (\p -> address p != 0)
@@ -204,6 +363,21 @@ fun noC (why : String) (what : String) = if hasC () then assertEq why "" what el
 
 fun cFunction (name : String) =
   match libc () with
+  | Err why -> Err why
+  | Ok l -> function l name
+
+-- Where C's maths functions are: the C library on macOS and Windows, but a
+-- library of their own on Linux, `floorf` among them.
+fun libm () =
+  match open "libSystem.dylib" with
+  | Ok l -> Ok l
+  | Err _ ->
+      (match open "libm.so.6" with
+       | Ok l -> Ok l
+       | Err _ -> open "ucrtbase.dll")
+
+fun mathFunction (name : String) =
+  match libm () with
   | Err why -> Err why
   | Ok l -> function l name
 
@@ -284,3 +458,81 @@ fun cFunction (name : String) =
   let _ = assertEq (writeInts nowhere 4 [1, 2]) (Err "the null address") "not written" in
   let _ = assertEq (readInts nowhere 4 2) (Err "the null address") "not read" in
   assertEq (readText nowhere 8) "" "and no text is there"
+
+@test fun aFloatGoesInAndComesBackAsAFloat () =
+  match mathFunction "floorf" with
+  | Err why -> noC why "the C maths library has floorf"
+  | Ok floorf -> assertEq (callFloat32 floorf [Arg.Float32 2.75]) (Ok 2.0) "a C float, both ways"
+
+@test fun floatsAndIntegersMixedGoWhereTheyShould () =
+  match cFunction "ldexp" with
+  | Err why -> noC why "the C library has ldexp"
+  | Ok ldexp ->
+      assertEq (callFloat ldexp [Arg.Float 1.5, Arg.Int 3]) (Ok 12.0) "1.5 times two cubed"
+
+@test fun aFunctionIsCalledThroughItsAddressInMemory () =
+  match cFunction "labs" with
+  | Err why -> noC why "the C library has labs"
+  | Ok labs ->
+      let got =
+        withBuffer 8 (\table ->
+          let _ = writePtr table (addressOf labs) in
+          match readPtr table with
+          | Ok at -> callInt (functionAt at) [Arg.Int (0 - 9)]
+          | Err why -> Err why)
+      in assertEq got (Ok 9) "read out of a table, and called"
+
+@test fun textGoesToCAsAPointerAndALength () =
+  match cFunction "strlen" with
+  | Err why -> noC why "the C library has strlen"
+  | Ok strlen ->
+      assertEq
+        (withText "héllo" (\p n -> (callInt strlen [Arg.Ptr p], n)))
+        (Ok 6, 6)
+        "its bytes, and a NUL after them"
+
+@test fun structsAreLaidOutAsCLaysThemOut () =
+  let s = [U8, U32, U8, F64, U16] in
+  let _ =
+    assertEq
+      (V.map (\i -> offsetOf s i) (V.range 0 5))
+      [0, 4, 8, 16, 24]
+      "each field after the padding it needs"
+  in
+  let _ =
+    assertEq
+      (sizeOf (StructOf s), alignOf (StructOf s))
+      (32, 8)
+      "and the whole rounded to its alignment"
+  in
+  let transform = Aligned 16 (StructOf [ArrayOf F32 3, ArrayOf F32 4, ArrayOf F32 3]) in
+  let _ =
+    assertEq
+      (sizeOf transform, alignOf transform)
+      (48, 16)
+      "an over-aligned struct, as mira's transform is"
+  in assertEq
+       (offsetOf [U8, transform] 1, sizeOf (StructOf [U8, transform]))
+       (16, 64)
+       "and one inside another"
+
+@test fun aFieldIsReadAndWrittenWhereItIs () =
+  if hasC () then
+    let s = [U32, F32, Pointer, I16] in
+    let got =
+      withBuffer (sizeOf (StructOf s)) (\p ->
+        let _ = writeInt (field p s 0) U32 4000000000 in
+        let _ = writeFloat (field p s 1) F32 0.5 in
+        let _ = writePtr (field p s 2) (Ptr 4096) in
+        let _ = writeInt (field p s 3) I16 (0 - 3) in
+        (
+          readInt (field p s 0) U32,
+          readFloat (field p s 1) F32,
+          readPtr (field p s 2),
+          readInt (field p s 3) I16
+        ))
+    in assertEq
+         got
+         (Ok 4000000000, Ok 0.5, Ok (Ptr 4096), Ok (0 - 3))
+         "each at its offset and width"
+  else ()

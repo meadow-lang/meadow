@@ -221,7 +221,20 @@ struct Copies {
     made: Vec<(Label, Label, Vec<bool>)>,
     /// The next label free.
     next: u32,
+    /// How many copies each block has.
+    per: HashMap<Label, usize>,
 }
+
+/// The most copies one block may have. A copy is asked for by the set of
+/// parameters a caller hands over for good, so a block of `n` borrowed
+/// parameters can be asked for two to the `n` of them, each of which is
+/// linearized again whenever the block is and may ask for copies of what it
+/// calls in its turn: a definition with a dozen parameters and callers that
+/// each owned a different few was enough for a build never to end. Past
+/// this many, a caller that would want one more has the block own what it
+/// hands over instead, which is what is done where there are no copies at
+/// all.
+const COPIES: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
@@ -867,7 +880,14 @@ impl<'p> Pass<'p> {
         let mut copies = copies.borrow_mut();
         let copy = match copies.of.get(&(label, owns.clone())) {
             Some(l) => *l,
+            None if copies.per.get(&label).copied().unwrap_or(0) >= COPIES => {
+                for (i, _) in &hold {
+                    self.forced.push((label, *i));
+                }
+                return L::Jump { label, args };
+            }
             None => {
+                *copies.per.entry(label).or_default() += 1;
                 let l = Label(copies.next);
                 copies.next += 1;
                 copies.of.insert((label, owns.clone()), l);

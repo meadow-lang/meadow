@@ -270,6 +270,7 @@ fn a_manifest_can_name_every_way_of_choosing_a_commit() {
         source: DepSource::Git {
             url: format!("https://e.com/{name}"),
             reference: r,
+            subdir: None,
         },
         features: Vec::new(),
         default_features: true,
@@ -736,9 +737,104 @@ fn a_version_dependency_reads_back_as_one() {
             source: DepSource::Git {
                 url: "https://e.com/a".to_string(),
                 reference: GitRef::Version(meadow::semver::Req::parse("1.2.0").unwrap()),
+                subdir: None,
             },
             features: Vec::new(),
             default_features: true,
         }
+    );
+}
+
+/// A repository whose package is a directory of it, `lib/Greet`, and not all
+/// of it: a monorepo's member.
+fn repo_with_package_under(what: &str) -> Option<PathBuf> {
+    let dir = scratch(what);
+    let pkg = dir.join("lib").join("Greet");
+    std::fs::create_dir_all(pkg.join("src")).ok()?;
+    std::fs::write(dir.join("README.md"), "not a package\n").ok()?;
+    std::fs::write(
+        pkg.join("Meadow.toml"),
+        "[package]\nname = \"Greet\"\nversion = \"0.1.0\"\n",
+    )
+    .ok()?;
+    std::fs::write(pkg.join("src/Lib.mw"), "@pub fun greeting = \"from lib\"\n").ok()?;
+    let d = dir.display().to_string();
+    let ok = git(&["init", "--quiet", "-b", "main", &d])
+        && git(&["-C", &d, "add", "-A"])
+        && git(&[
+            "-C",
+            &d,
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--quiet",
+            "-m",
+            "first",
+        ])
+        && git(&["-C", &d, "tag", "v1.0.0"]);
+    ok.then_some(dir)
+}
+
+/// A package depending on the package at `subdir` of `repo`.
+fn app_using_subdir(what: &str, repo: &Path, subdir: &str) -> PathBuf {
+    let dir = scratch(what);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("Meadow.toml"),
+        format!(
+            "[package]\nname = \"App\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nGreet = {{ git = \"{}\", tag = \"v1.0.0\", subdir = \"{subdir}\" }}\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("src/Main.mw"),
+        "use Greet (greeting)\ndef result = greeting\n",
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn a_git_dependency_may_be_a_directory_of_its_repository() {
+    let Some(repo) = repo_with_package_under("repo-sub") else {
+        eprintln!("skipped: no usable git");
+        return;
+    };
+    let app = app_using_subdir("app-sub", &repo, "lib/Greet");
+    let out = build_in(&app, "sub", |_| {});
+    assert!(
+        out.diagnostics.is_empty(),
+        "{:?}",
+        out.diagnostics.iter().map(|d| &d.msg).collect::<Vec<_>>()
+    );
+    let linked = out.linked.expect("linked program");
+    assert_eq!(
+        eval::run(&linked.program).unwrap().to_string(),
+        "\"from lib\""
+    );
+    // Its directory is part of where it came from: two packages of one
+    // repository are two sources.
+    let lock = Lock::load(&app);
+    assert_eq!(lock.packages.len(), 1, "{:?}", lock.packages);
+    assert!(
+        lock.packages[0]
+            .source
+            .ends_with("?tag=v1.0.0&subdir=lib/Greet"),
+        "{}",
+        lock.packages[0].source
+    );
+
+    // A directory with no package in it is said, with where it looked.
+    let wrong = app_using_subdir("app-sub-wrong", &repo, "lib");
+    let out = build_in(&wrong, "sub-wrong", |_| {});
+    let said: Vec<&String> = out.diagnostics.iter().map(|d| &d.msg).collect();
+    assert!(
+        said.iter()
+            .any(|m| m.contains("has no `Meadow.toml` in `lib`")),
+        "{said:?}"
     );
 }

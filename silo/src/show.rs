@@ -179,6 +179,27 @@ fn fields_of(v: Word) -> Vec<(Word, i64)> {
 
 /// The elements of a `Std.Collections.Vector`, if `v` is one.
 pub fn vector_elems(v: Word) -> Option<Vec<(Word, i64)>> {
+    // Asked of everything compared, hashed or shown, and nearly always of
+    // what is not a vector: which constructors are a vector's is worked out
+    // once, so that saying no costs no name.
+    static VECTORS: std::sync::OnceLock<Vec<bool>> = std::sync::OnceLock::new();
+    let tag = if v & 1 == 1 {
+        (v >> 1) as usize
+    } else if heap::is_block(v) && heap::kind(v) == heap::DATA {
+        heap::meta(v) as usize
+    } else {
+        return None;
+    };
+    let vectors = VECTORS.get_or_init(|| {
+        names()
+            .ctors
+            .iter()
+            .map(|c| c.as_deref().is_some_and(is_vector_ctor))
+            .collect()
+    });
+    if !vectors.get(tag).copied().unwrap_or(false) {
+        return None;
+    }
     let name = ctor_of(v)?;
     if !is_vector_ctor(&name) {
         return None;

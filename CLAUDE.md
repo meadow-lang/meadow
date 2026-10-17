@@ -1,1 +1,0 @@
-Make sure to run default formatters on all files before committing. Also when you change files, try re-running only the tests for those modules before a commit. The full test suites take too long.

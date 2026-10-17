@@ -240,9 +240,19 @@ fn drive(
     mut shadow: Word,
 ) -> Word {
     let here = crate::shadow::head();
+    // Where this frame's part of the parked segments begins: those above it
+    // were parked by the frames inside `segment`, and go into a continuation
+    // taken here. It is counted from the top, not kept as a place, wherever
+    // this frame is itself suspended and resumed -- the frames inside take
+    // theirs back only once they run again, after this one has, and a
+    // continuation may be resumed with more or fewer parked beneath it. Read
+    // afresh after each resume instead, it counted segments the frames inside
+    // were still to take back as beneath this one: a thread made to give way
+    // under two handlers, and then performing the outer one's operation, cut
+    // the list past its end.
+    let mut mark = cx().parked.len();
+    cx().parked.append(&mut nested);
     loop {
-        let mark = cx().parked.len();
-        cx().parked.append(&mut nested);
         crate::shadow::set(shadow);
         let result = segment.resume(down);
         shadow = crate::shadow::head();
@@ -273,23 +283,27 @@ fn drive(
                     return run(then, k);
                 }
                 let Some(y) = innermost() else { escaped() };
+                let inside = cx().parked.len() - mark;
                 cx().parked.push(Parked {
                     segment: SendSegment(segment),
                     shadow,
                 });
                 down = suspend(y, Up::Detach { target, then });
                 (segment, shadow) = unpark();
+                mark = cx().parked.len() - inside;
             }
             CoroutineResult::Yield(Up::Park) => {
                 let Some(y) = innermost() else {
                     crate::fail("a thread waited outside every thread")
                 };
+                let inside = cx().parked.len() - mark;
                 cx().parked.push(Parked {
                     segment: SendSegment(segment),
                     shadow,
                 });
                 down = suspend(y, Up::Park);
                 (segment, shadow) = unpark();
+                mark = cx().parked.len() - inside;
             }
         }
     }

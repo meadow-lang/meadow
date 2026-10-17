@@ -25,6 +25,12 @@ pub struct Parcel {
     /// pointer it is and nothing inside it is copied -- which is what
     /// `Std.Compact` promises. See [`crate::region`].
     regions: Vec<*const crate::region::Region>,
+    /// The threads this parcel carries a `Task` of, one per `Task`: while
+    /// it is in flight it is a way to the thread's answer, like a `Task` in
+    /// a heap -- see `crate::sched::held`.
+    tasks: Vec<u32>,
+    /// And the `TVar`s it carries a handle to, by their cells' addresses.
+    vars: Vec<usize>,
 }
 
 // Safety: what a parcel holds is a copy belonging to no heap, and a region it
@@ -39,10 +45,18 @@ impl Clone for Parcel {
             // Safety: this parcel holds a reference to each.
             unsafe { crate::region::retain(*r) };
         }
+        for t in &self.tasks {
+            crate::sched::held(*t);
+        }
+        for v in &self.vars {
+            crate::sched::held_var(*v);
+        }
         Parcel {
             root: self.root,
             blocks: self.blocks.clone(),
             regions: self.regions.clone(),
+            tasks: self.tasks.clone(),
+            vars: self.vars.clone(),
         }
     }
 }
@@ -52,6 +66,12 @@ impl Drop for Parcel {
         for r in &self.regions {
             // Safety: as above, and given up here.
             unsafe { crate::region::release(*r) };
+        }
+        for t in &self.tasks {
+            crate::sched::let_go(*t);
+        }
+        for v in &self.vars {
+            crate::sched::let_go_var(*v);
         }
     }
 }
@@ -74,11 +94,15 @@ impl Parcel {
         let mut blocks: Vec<Lifted> = Vec::new();
         let mut index: HashMap<Word, usize> = HashMap::new();
         let mut regions = Vec::new();
+        let mut tasks = Vec::new();
+        let mut vars = Vec::new();
         if d != desc::REF || !heap::is_block(v) {
             return Ok(Parcel {
                 root: (v, d),
                 blocks,
                 regions,
+                tasks,
+                vars,
             });
         }
         let mut todo = vec![v];
@@ -89,6 +113,16 @@ impl Parcel {
             let first = heap::first_field(b);
             let raw = heap::kind(b) == heap::STRING || heap::kind(b) == heap::BIGINT;
             if raw {
+                continue;
+            }
+            if heap::kind(b) == heap::TASK {
+                crate::sched::held(heap::meta(b));
+                tasks.push(heap::meta(b));
+                continue;
+            }
+            if heap::kind(b) == heap::TVAR {
+                crate::sched::held_var(heap::field(b, 0) as usize);
+                vars.push(heap::field(b, 0) as usize);
                 continue;
             }
             // A compact crosses as itself: its region belongs to no thread,
@@ -128,6 +162,8 @@ impl Parcel {
             root: (0, d),
             blocks,
             regions,
+            tasks,
+            vars,
         })
     }
 
@@ -155,6 +191,13 @@ impl Parcel {
                 // that block holds two references into it: its own, given up
                 // when the block dies, and the one its field holds, given up
                 // where that field is erased.
+                // A `Task` arrived is one more way to its thread's answer.
+                if heap::kind(v) == heap::TASK {
+                    crate::sched::held(heap::meta(v));
+                }
+                if heap::kind(v) == heap::TVAR {
+                    crate::sched::held_var(heap::field(v, 0) as usize);
+                }
                 if heap::kind(v) == heap::COMPACT {
                     let r = heap::field(v, 1) as *const crate::region::Region;
                     // Safety: the parcel holds a reference to it, so it is

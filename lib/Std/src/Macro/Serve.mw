@@ -34,13 +34,40 @@ use Std.Macro.Wire.*
 @pub fun serve (run : [TokenTree] -> [TokenTree] ! { Expand | e }) : () ! { Console | e } =
   match readLine () with
   | None -> ()
-  | Just given ->
-      match fst (readWire given 0) with
-      | Node _ parts ->
-          let settled = wholeOf (arrayGet parts 0) == 1 in
-          let scope = V.map binding (V.fromArray (childrenOf (arrayGet parts 1))) in
-          writeOutput (writeWire (expanding settled scope run (treesOf (arrayGet parts 2))))
-      | _ -> ()
+  | Just given -> writeOutput (answering run given)
+
+-- What the macro `run` answers a call written out as `given`, written out:
+-- for whoever runs a macro without its being a program of its own.
+@pub fun answering (run : [TokenTree] -> [TokenTree] ! { Expand | e }) (given : String)
+    : String ! e =
+  match fst (readWire given 0) with
+  | Node _ parts ->
+      let settled = wholeOf (arrayGet parts 0) == 1 in
+      let scope = V.map binding (V.fromArray (childrenOf (arrayGet parts 1))) in
+      writeWire (expanding settled scope run (treesOf (arrayGet parts 2)))
+  | _ -> ""
+
+-- Several calls answered in one run: `given` is each call written out one
+-- after another -- a node named for its macro, holding the call as text --
+-- and what comes back is each answer, as text, in the same order. A call of
+-- a macro that is none of `macros` is answered with nothing.
+@pub fun answeringAll
+    (macros : [(String, [TokenTree] -> [TokenTree] ! { Expand | e })])
+    (given : String)
+    : String ! e =
+  S.join "" (answersFrom macros given 0 V.empty)
+
+fun answersFrom macros (given : String) (i : Int) (acc : [String]) =
+  if i >= stringByteLength given then acc
+  else
+    match readWire given i with
+    | (Node name parts, next) ->
+        let said =
+          (match V.find (\m -> fst m == name) macros with
+           | Just m -> answering (snd m) (textOf (arrayGet parts 0))
+           | None -> "")
+        in answersFrom macros given next (V.pushBack acc (writeWire (Text said)))
+    | (_, next) -> if next <= i then acc else answersFrom macros given next acc
 
 -- `w` as text.
 @pub fun writeWire (w : Wire) : String = S.join "" (pieces w V.empty)

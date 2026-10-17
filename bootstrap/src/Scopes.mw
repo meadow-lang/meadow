@@ -139,39 +139,58 @@ fun visOf (a : AstArena) (attrs : [AstAttr]) : Maybe Vis =
     None
     attrs
 
--- Whether a declaration's `@cfg`s hold here: on Windows, x86-64, a debug
--- build that is not a test's.
-fun enabled (a : AstArena) (attrs : [AstAttr]) : Bool =
-  V.all (\at -> nameText a (astAttrName a at) != "cfg" or V.all (holds a) (astAttrMetas a at)) attrs
-
-fun holds (a : AstArena) (m : AstAttrMeta) : Bool =
-  let k = kindAstAttrMeta a m in
-  if k == AstAttrMetaKind.Word then
-    (let w = nameText a (astAttrMetaWordName a m) in w == "windows" or w == "debug")
-  else if k == AstAttrMetaKind.Value then
-    (let key = nameText a (astAttrMetaValueName a m) in
-     let v = nameText a (astAttrMetaValueValue a m) in
-     (key == "os" and v == "windows")
-       or (key == "family" and v == "windows")
-       or (key == "arch" and v == "x86_64")
-       or (key == "profile" and v == "debug")
-       or (key == "opt_level" and v == "0"))
-  else if k == AstAttrMetaKind.List then
-    (let n = nameText a (astAttrMetaListName a m) in
-     let args = astAttrMetaListMetas a m in
-     if n == "all" then V.all (holds a) args
-     else if n == "any" then V.any (holds a) args
-     else if n == "not" then not (V.all (holds a) args)
-     else False)
-  else False
-
--- Whether declaration `d` is there at all: every `@cfg` on it holds here.
-@pub fun declHolds (a : AstArena) (d : AstDecl) : Bool = enabled a (fst (peel a d))
-
--- The declarations of a module that hold here, each with its attributes.
+-- The declarations of a module, each with its attributes. What a `@cfg`
+-- switches off is not among them: lowering left it out (`Lower`).
 @pub fun declsOf (src : Source) : [([AstAttr], AstDecl)] =
   match src.ast with
-  | AstProgram a root -> V.filter (\x -> enabled a (fst x)) (V.map (peel a) (astModuleDecls a root))
+  | AstProgram a root -> V.map (peel a) (astModuleDecls a root)
+
+-- What a `use` says, as far as macros go: the module it names, whether it
+-- picks values out -- by name, or all of them with `.*` -- the macros it
+-- picks, each `name!`, and what it calls the module.
+@pub record Using = {
+  path : [String],
+  selects : Bool,
+  macros : [String],
+  alias : Maybe String
+}
+
+-- Each `use` of a module that holds here.
+@pub fun usesOf (src : Source) : [Using] =
+  match src.ast with
+  | AstProgram a root ->
+      V.concatMap
+        (\x ->
+          let d = snd x in
+          if kindAstDecl a d == AstDeclKind.Use then
+            [Using {
+               path = V.map (nameText a) (astDeclUsePath a d),
+               selects = astDeclUseGlob a d or not (V.isEmpty (astDeclUseNames a d)),
+               macros = V.map (nameText a) (astDeclUseMacros a d),
+               alias = M.map (nameText a) (astDeclUseAlias a d)
+             }]
+          else [])
+        (declsOf src)
+
+-- The functions a module marks `@macro`: what a unit that depends on its
+-- package may call as macros.
+@pub fun macroFuns (src : Source) : [String] =
+  match src.ast with
+  | AstProgram a root ->
+      V.concatMap
+        (\x ->
+          let d = snd x in
+          if V.any (\at -> nameText a (astAttrName a at) == "macro") (fst x)
+            and kindAstDecl a d == AstDeclKind.Bind
+            and kindAstBind a (astDeclBindBind a d) == AstBindKind.Fun then
+            [nameText a (astBindFunName a (astDeclBindBind a d))]
+          else [])
+        (declsOf src)
+
+-- Whether a module says how far anything of its is seen.
+@pub fun saysVis (src : Source) : Bool =
+  match src.ast with
+  | AstProgram a root -> V.any (\x -> M.isSome (visOf a (fst x))) (declsOf src)
 
 fun siteIn (src : Source) (m : Meta) : String = "${src.file}@${show (metaStart m)}"
 
@@ -358,8 +377,8 @@ def primNames : [String] =
 def stdOrder : [String] =
   [
     "Lib", "Ops", "Display", "Debug", "Test", "Bool", "Ref", "Ordering", "Function", "Tuple", "Num",
-    "Num.Int", "Maybe", "Cmp", "Char", "Result", "Num.Bits", "Bytes", "Yield", "Collections",
-    "Collections.Vector", "Collections.List", "Collections.Tree", "Collections.Set",
+    "Num.Int", "Maybe", "Cmp", "Char", "Result", "Num.Bits", "Num.Float", "Bytes", "Yield",
+    "Collections", "Collections.Vector", "Collections.List", "Collections.Tree", "Collections.Set",
     "Collections.Map", "Either", "St", "Sort", "Collections.HashMap", "Collections.HashTable",
     "Compact", "Thread", "Stm", "State", "Exn", "Stream", "Random", "Fs", "Process", "String",
     "String.Parse", "String.Parse.Char", "String.Parse.Lexer", "Path", "Json", "Macro",
@@ -372,7 +391,7 @@ def flatModules : [String] = ["Ops", "Display", "Debug", "Cmp"]
 
 -- The types every module can name without asking (`meadow-rename`'s
 -- `builtin_tycons`).
-def builtinTyconNames : [String] =
+@pub def builtinTyconNames : [String] =
   [
     "Int", "BigInt", "Float", "String", "Char", "Bool", "Int64", "Int32", "Int16", "Int8", "UInt64",
     "UInt32", "UInt16", "UInt8", "Float64", "Float32", "Unit", "List", "Array", "Ref", "StRef",
@@ -393,12 +412,22 @@ record Layers = {
   types : [(String, Int)],
   ctors : [(String, Int)],
   quals : [(String, HashMap String Int)],
+  -- And the types each qualifies, which `M.Ty` in a type reaches.
+  qualTypes : [(String, HashMap String Int)],
   reexports : [Item],
   refs : [(Meta, Int)]
 }
 
 def noLayers : Layers =
-  Layers { values = [], types = [], ctors = [], quals = [], reexports = [], refs = [] }
+  Layers {
+    values = [],
+    types = [],
+    ctors = [],
+    quals = [],
+    qualTypes = [],
+    reexports = [],
+    refs = []
+  }
 
 fun withRefs (acc : Layers) (refs : [(Meta, Int)]) : Layers =
   { acc | refs = V.append acc.refs refs }
@@ -440,6 +469,28 @@ fun withType (items : [Item]) (t : Item) : [Item] =
     (if t.owner == "trait" then
        V.filter (\(i : Item) -> i.kind == "t" and i.owner == "assoc:" ++ t.name) items
      else [])
+  ]
+
+-- A module's items by kind and owner -- `c:Shape` the constructors of
+-- `Shape` -- each kept in the order it is among them: what `withTypeIn`
+-- finds a type's own by, where `withType` reads every item for each.
+fun owned (items : [Item]) : HashMap String [Item] =
+  V.foldl
+    (\h (i : Item) ->
+      (let key = "${i.kind}:${i.owner}" in
+       H.insert key (V.pushBack (M.unwrapOr [] (H.lookup key h)) i) h))
+    H.empty
+    items
+
+-- `withType`, of a module whose items are `by` kind and owner.
+fun withTypeIn (by : HashMap String [Item]) (t : Item) : [Item] =
+  let of = \key -> M.unwrapOr [] (H.lookup key by) in
+  V.concat [
+    [t],
+    V.filter (\(i : Item) -> i.name == t.name) (of "c:${t.name}"),
+    (if t.owner == "trait" then of "v:${t.name}" else []),
+    (if t.owner == "effect" then of "v:op:${t.name}" else []),
+    (if t.owner == "trait" then of "t:assoc:${t.name}" else [])
   ]
 
 -- `use Ty`, `use Ty (C, D)`, `use Ty.*` for a type among `items`: the type
@@ -494,6 +545,15 @@ fun indexIn (x : String) (xs : [String]) : Int =
 
 fun depHas (d : Dep) (path : [String]) : Bool = V.any (\x -> fst x == path) d.items
 
+-- The types of `items` a qualifier reaches: what they declare, not a
+-- trait's associated types.
+fun typesMap (items : [Item]) : HashMap String Int =
+  V.foldl
+    (\m (i : Item) ->
+      if i.kind == "t" and not (S.startsWith "assoc" i.owner) then H.insert i.name i.id m else m)
+    H.empty
+    items
+
 fun valuesMap (items : [Item]) : HashMap String Int =
   V.foldl (\m (i : Item) -> if i.kind == "v" then H.insert i.name i.id m else m) H.empty items
 
@@ -501,9 +561,10 @@ fun valuesMap (items : [Item]) : HashMap String Int =
 -- with what each brings, and -- at a package's root -- the constructors it
 -- re-exports.
 fun bareUse (items : [Item]) (root : Bool) : [Item] =
+  let by = owned items in
   V.concat [
     V.filter (\(i : Item) -> i.kind == "v") items,
-    V.concatMap (withType items) (V.filter (\(i : Item) -> i.kind == "t") items),
+    V.concatMap (withTypeIn by) (V.filter (\(i : Item) -> i.kind == "t") items),
     (if root then V.filter (\(i : Item) -> i.kind == "c" and i.flat) items else [])
   ]
 
@@ -530,14 +591,18 @@ fun namedRefs (items : [Item]) (names : [(String, Meta)]) : [(Meta, Int)] =
       | Just i -> [(snd n, i.id)]
       | None ->
           -- A pattern synonym is its matcher and builder, and is itself a use
-          -- of neither.
-          if V.any (\(i : Item) -> i.kind == "v" and partOfSynonym i.name (fst n)) items then []
-          else
-            (match V.find (\(i : Item) -> i.name == fst n and i.kind == "t") items with
-             | Just t -> [(snd n, t.id)]
-             -- A capital nothing declares: an effect the language has, named.
-             | None -> (if isCapital (fst n) then [(snd n, 0 - 1)] else [])))
+          -- of neither; a type of its name is still the type.
+          (let synonym =
+             V.any (\(i : Item) -> i.kind == "v" and partOfSynonym i.name (fst n)) items
+           in match V.find (\(i : Item) -> i.name == fst n and i.kind == "t") items with
+              | Just t -> [(snd n, t.id)]
+              -- A capital nothing declares: an effect the language has, named.
+              | None -> (if not synonym and isCapital (fst n) then [(snd n, 0 - 1)] else [])))
     names
+
+-- What a `use` of a module there is not refers to, among a module's
+-- references: no binder's number.
+def noModule : Int = 0 - 2
 
 -- One `use` of module `m`, on top of what the ones before it brought.
 fun applyUse (cx : UnitCx) (m : ModFrame) (acc : Layers) (one : (AstDecl, Vis)) : Layers =
@@ -568,12 +633,29 @@ fun applyUse (cx : UnitCx) (m : ModFrame) (acc : Layers) (one : (AstDecl, Vis)) 
           let root = V.len segs == 1 and V.getOr "" segs 0 != cx.pkg in
           (match alias with
            | Just q ->
-               (let qualified = { acc | quals = V.pushBack acc.quals (q, valuesMap items) } in
-                if V.isEmpty names then qualified
-                else withRefs (bring qualified vis (namedIn items names)) (namedRefs items written))
+               (let qualified =
+                  {
+                    acc | quals = V.pushBack acc.quals (q, valuesMap items),
+                    qualTypes = V.pushBack acc.qualTypes (q, typesMap items)
+                  }
+                in if V.isEmpty names then qualified
+                   else
+                     withRefs (bring qualified vis (namedIn items names)) (namedRefs items written))
            | None ->
                if V.isEmpty names then bring acc vis (bareUse items root)
                else withRefs (bring acc vis (namedIn items names)) (namedRefs items written))
+      in
+      -- A path that names no module: a use of what stands for one
+      -- (`noModule`), spanning the path, for whoever says so.
+      let missing =
+        withRefs
+          acc
+          [(
+            spanMeta
+              (metaStart (M.unwrapOr lastAt (M.map (metaAstName a) (V.get (astDeclUsePath a u) 0))))
+              (metaEnd lastAt),
+            noModule
+          )]
       in
       -- `use Ty ...` for a type this very module declares.
       match (if V.len segs == 1 then typeIn m.items else None) with
@@ -587,7 +669,10 @@ fun applyUse (cx : UnitCx) (m : ModFrame) (acc : Layers) (one : (AstDecl, Vis)) 
                  useType acc vis (siblingItems cx localOwner here) t lastAt written glob cx.isStd
              | None ->
                  (match V.find (\(d : Dep) -> d.name == V.getOr "" segs 0) cx.deps with
-                  | None -> acc
+                  -- One name with something asked of it may be a type in
+                  -- sight already; anything else names no module.
+                  | None ->
+                      if V.len segs == 1 and (glob or not (V.isEmpty names)) then acc else missing
                   | Just d ->
                       let path = V.drop segs 1 in
                       if depHas d path then moduleUse (depItems d path)
@@ -595,7 +680,7 @@ fun applyUse (cx : UnitCx) (m : ModFrame) (acc : Layers) (one : (AstDecl, Vis)) 
                         (let items = depItems d (V.drop owner 1) in
                          match typeIn items with
                          | Just t -> useType acc vis items t lastAt written glob True
-                         | None -> acc)))
+                         | None -> missing)))
 
 -- The base every module of the unit shares: the primitives, then the
 -- prelude. For a module of the standard library, the modules before it whose
@@ -698,6 +783,7 @@ fun scopeOf (cx : UnitCx) (sh : Shared) (m : ModFrame) : (Scope, [Item], [(Meta,
       values = firstFirst,
       base = lastWins base.values,
       quals = lastWins used.quals,
+      qualTypes = lastWins used.qualTypes,
       types = lastWins (V.concat [sh.builtinTypes, base.types, used.types]),
       -- A constructor written bare is every one of its name the module's
       -- own declarations and its `use`s bring, in order -- several are an
@@ -748,6 +834,10 @@ fun scopeOf (cx : UnitCx) (sh : Shared) (m : ModFrame) : (Scope, [Item], [(Meta,
   path : [String],
   items : [Item]
 }
+
+-- The file module `m` of a renamed unit is, as a dump names it.
+@pub fun moduleFile (r : Renamed) (m : Int) : Maybe String =
+  M.map (\(d : Declared) -> d.file) (V.get r.modules m)
 
 -- Rename unit `pkg` -- the standard library when `isStd` -- its modules
 -- `sources`, against what its dependencies export.
@@ -921,6 +1011,12 @@ fun renaming (pkg : String) (isStd : Bool) (sources : [Source]) (deps : [DepExpo
       ctorFields
     }
   in
+  -- What a `use` of a module there is not is a use of.
+  let missingModule = declareBinder "" "m" "-" in
+  -- And what a capital a `use` names that no type is: an effect, which is
+  -- not an unknown type, so not a use of what stands for those. It is told
+  -- from that by where its name ends, which that has none of.
+  let namedEffect = declareBinderTo "" "t" "-" 0 in
   let done =
     V.map
       (\(f : ModFrame) ->
@@ -928,7 +1024,13 @@ fun renaming (pkg : String) (isStd : Bool) (sources : [Source]) (deps : [DepExpo
          | (sc, re, refs) ->
              (let u =
                 V.foldl
-                  (\z r -> useOf f.src.file (if snd r < 0 then builtinType else snd r) (fst r))
+                  (\z r ->
+                    useOf
+                      f.src.file
+                      (if snd r == noModule then missingModule
+                       else if snd r < 0 then namedEffect
+                       else snd r)
+                      (fst r))
                   ()
                   refs
               in (f, sc, re))))

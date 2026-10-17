@@ -68,12 +68,12 @@ fun round () =
       else
         match parseChoice answer with
         | None ->
-            let _ = println (S.concat "I do not know what that is: " answer) in
+            let _ = println "I do not know what that is: ${answer}" in
             round ()
         | Just you ->
             let me = randomChoice () in
             let o = judge you me in
-            let _ = println (S.concatAll ["I played ", choiceName me, ". ", outcomeLine o]) in
+            let _ = println "I played ${choiceName me}. ${outcomeLine o}" in
             Just o
 
 fun tally wins losses draws =
@@ -86,10 +86,8 @@ fun tally wins losses draws =
 fun game () =
   let _ = println "Rock paper scissors. Ctrl-D or `quit` to stop." in
   let (wins, losses, draws) = tally 0 0 0 in
-  let _ =
-    println
-      (S.concatAll ["\nYou won ", show wins, ", lost ", show losses, ", drew ", show draws, "."])
-  in ()
+  let _ = println "\nYou won ${show wins}, lost ${show losses}, drew ${show draws}." in
+  ()
 
 fun main () = game ()
 

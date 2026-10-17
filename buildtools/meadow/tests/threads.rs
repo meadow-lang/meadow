@@ -11,9 +11,7 @@ fn the_thread_api_has_the_thread_effect_in_its_types() {
     let out =
         schemes_std("use Std.Thread as T\ndef s = T.spawn\ndef a = T.await\ndef r = T.receive\n");
     assert!(
-        out.contains(
-            "s : forall a e. (() -> a ! { Thread, Console, Fs, Process, Random, Time, Test, Mut }) -> Task a ! { Thread | e }"
-        ),
+        out.contains("s : forall a e. (() -> a ! Eff) -> Task a ! { Thread | e }"),
         "{out}"
     );
     assert!(

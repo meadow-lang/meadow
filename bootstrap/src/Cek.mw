@@ -25,6 +25,8 @@
 use MeadowBoot.Core
 use Std.Collections.Map as Map
 use Std.Collections.Map (Map)
+use Std.Collections.HashMap as H
+use Std.Collections.HashMap (HashMap)
 use Std.Collections.Vector as V
 use Std.Collections.List as L
 use Std.String as S
@@ -81,6 +83,8 @@ use Control.*
 @pub data Frame
   = EvalArg ErasedTerm (Map (Ref Value))
   | ApplyTo Value
+  -- An argument a caller of the machine has in hand, for the function on its way.
+  | Give Value
   | If ErasedTerm ErasedTerm (Map (Ref Value))
   | Bind Int ErasedTerm (Map (Ref Value))
   -- The scope, the bindings still to evaluate -- the first is under way -- and
@@ -108,31 +112,48 @@ data Control = Eval ErasedTerm (Map (Ref Value)) | Ret Value
 
 -- What does not change as the machine runs: the program's tables, the
 -- definitions, each a cell, and each constructor's named fields.
-record Machine = {
+--
+-- The definitions are in a table by their hash and a scope is a tree by
+-- order: a program has thousands of definitions, numbered as they come, and
+-- a tree they are put in one after another is a list, searched to its end
+-- for every mention of one. A scope is the few names a function binds.
+@pub record Machine = {
   arena : ErasedArena,
-  root : Map (Ref Value),
+  root : HashMap Int (Ref Value),
   fields : [(String, [String])]
 }
 
 -- `p`'s entry point evaluated, or what went wrong: `meadow_eval::run`.
 @pub fun run (p : ErasedProgram) =
+  let m = machine p in
+  let entry = erasedFileEntry (erasedArena p) (erasedRoot p) in
+  if entry < 0 then Ok Unit else variable m entry Map.empty [;]
+
+-- A machine for `p`, its definitions loaded: one to `call` into as often as
+-- wanted, a definition evaluated the first time it is asked for and kept.
+@pub fun machine (p : ErasedProgram) : Machine ! { Mut | e } =
   let a = erasedArena p in
   let file = erasedRoot p in
   let root =
     V.foldl
-      (\env d -> Map.insert (erasedDefId a d) (newRef (loaded a (erasedDefBody a d))) env)
-      Map.empty
+      (\env d -> H.insert (erasedDefId a d) (newRef (loaded a (erasedDefBody a d))) env)
+      H.empty
       (erasedFileDefs a file)
-  in
-  let m =
-    Machine {
-      arena = a,
-      root,
-      fields = V.map (\n -> (erasedNamedName a n, erasedNamedLabels a n)) (erasedFileNamed a file)
-    }
-  in
-  let entry = erasedFileEntry a file in
-  if entry < 0 then Ok Unit else variable m entry Map.empty [;]
+  in Machine {
+       arena = a,
+       root,
+       fields = V.map (\n -> (erasedNamedName a n, erasedNamedLabels a n)) (erasedFileNamed a file)
+     }
+
+-- A text as a value, and a value's text if it is one: what a caller of
+-- the machine hands it and reads back.
+@pub fun text (s : String) : Value = Str s
+
+@pub fun textOf (v : Value) : Maybe String = match v with | Str s -> Just s | _ -> None
+
+-- Definition `f` applied to `args`, each in turn, or what went wrong.
+@pub fun call (m : Machine) (f : Int) (args : [Value]) =
+  variable m f Map.empty (V.foldr (\x acc -> Give x :: acc) [;] args)
 
 -- A definition as the machine keeps it: a function made, anything else left
 -- to be evaluated where it is first used.
@@ -150,7 +171,7 @@ fun go (m : Machine) (c : Control) (k : List Frame) =
 fun lookup (m : Machine) (env : Map (Ref Value)) (v : Int) : Maybe (Ref Value) =
   match Map.lookup v env with
   | Just r -> Just r
-  | None -> Map.lookup v m.root
+  | None -> H.lookup v m.root
 
 fun define (env : Map (Ref Value)) (v : Int) (x : Value) = Map.insert v (newRef x) env
 
@@ -228,6 +249,7 @@ fun ret (m : Machine) (v : Value) (f : Frame) (k : List Frame) =
   match f with
   | EvalArg x env -> go m (Eval x env) (ApplyTo v :: k)
   | ApplyTo func -> apply m func v k
+  | Give x -> apply m v x k
   | If y n env ->
       (match v with
        | Bool True -> go m (Eval y env) k
@@ -294,7 +316,7 @@ fun ret (m : Machine) (v : Value) (f : Frame) (k : List Frame) =
   | PerformWith e o -> perform m e o v k
   | Cache var ->
       let u =
-        (match Map.lookup var m.root with
+        (match H.lookup var m.root with
          | Just r -> setRef r v
          | None -> ())
       in go m (Ret v) k
@@ -548,6 +570,25 @@ fun prim (op : String) (args : [Value]) : Result String Value ! { Mut | e } =
            if C.isScalar n then Ok (Char (C.fromCode n))
            else Err "charFromCode: ${show n} is not a Unicode scalar value"
        | other -> Err "charFromCode: expected an Int, got ${display other}")
+  | "StringByteAt" ->
+      (match (a, b) with
+       | (Str s, Int i) ->
+           if i < 0 or i >= stringByteLength s then
+             Err "stringByteAt: index ${show i} out of bounds (len ${show (stringByteLength s)})"
+           else Ok (U8 (stringByteAt s i))
+       | _ -> Err "stringByteAt: expected a String and an Int")
+  | "StringToBytes" ->
+      (match a with
+       | Str s -> Ok (Array (V.map U8 (V.fromArray (stringToBytes s))))
+       | other -> Err "stringToBytes: expected a String, got ${display other}")
+  | "BytesToString" ->
+      (match a with
+       | Array xs ->
+           Ok
+             (Str
+                (bytesToString
+                   (V.toArray (V.map (\x -> match x with | U8 n -> n | _ -> toUInt8 0) xs))))
+       | other -> Err "bytesToString: expected an Array, got ${display other}")
   | "StringToChars" ->
       (match a with
        | Str s -> Ok (Array (V.map Char (V.fromArray (stringToChars s))))

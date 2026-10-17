@@ -551,6 +551,42 @@ fn a_thread_waits_inside_a_handler() {
     );
 }
 
+/// A thread that waits under two handlers and then performs the outer one's
+/// operation: each handler's frame parks the segment it was driving while the
+/// thread waits, and the outer one resumes before the inner one has taken
+/// its own back. It counted that one as beneath it, and the operation that
+/// followed cut the list of parked segments past its end.
+#[test]
+fn a_thread_waits_inside_two_handlers() {
+    // The thread says it has started, and `main` works a while before it
+    // sends, so that the thread is waiting by then.
+    assert_eq!(
+        run_checked(
+            "wait_in_two_handlers",
+            "effect Ask { ask : () -> Int }
+             effect Tell { tell : () -> Int }
+             fun fib (n : Int) : Int = if n < 2 then n else fib (n - 1) + fib (n - 2)
+             def result =
+               let ch = channelNew () in
+               let started = channelNew () in
+               let t = threadSpawn (\\() ->
+                 handle
+                   (let x =
+                      handle
+                        (let _ = channelSend started (toInt 0) in channelReceive ch + tell ())
+                      with { tell u k -> k 1 + 1000 } in
+                    x + ask () + ask ())
+                 with { ask u k -> k 1 + 100 }) in
+               let _ = channelReceive started in
+               let _ = fib 27 in
+               let _ = channelSend ch (toInt 40) in
+               threadAwait t",
+            false
+        ),
+        "1243"
+    );
+}
+
 // --- cycles ------------------------------------------------------------------
 //
 // Counting alone leaves a cycle behind, so the runtime collects them by trial
@@ -1232,6 +1268,77 @@ fn reading_a_compact_in_a_loop_leaves_nothing_behind() {
          def result = loop 500 0"
     );
     both("compact_loop", &src, "105000");
+    assert_eq!(
+        run_regions("compact_loop_regions", &src, true),
+        ("105000".into(), 0)
+    );
+}
+
+/// [`run`], and how many compact regions were still live at exit.
+#[track_caller]
+fn run_regions(name: &str, src: &str, check: bool) -> (String, usize) {
+    let (got, stderr) = run_full(name, src, check, meadow_core::OptLevel::O2);
+    let live = stderr
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("aot: ")?
+                .strip_suffix(" regions live at exit")?
+                .parse()
+                .ok()
+        })
+        .expect("the run says how many regions are live");
+    (got, live)
+}
+
+/// A thread counts the references it takes into a region for itself, and the
+/// region's own count hears of them when the thread has touched other
+/// regions or ends (`silo/src/region.rs`). Threads that read one compact side
+/// by side, and a `main` that reads several, leave none behind.
+#[test]
+fn regions_read_by_several_threads_are_all_freed() {
+    let src = format!(
+        "{COMPACTED}data Ts = Done | More (Task Int) Ts
+         use Ts.*
+         fun reads (c : Compact L) (n : Int) (acc : Int) : Int =
+           if n == 0 then acc else reads c (n - 1) (acc + sum (getCompact c))
+         fun spawned (c : Compact L) (n : Int) acc =
+           if n == 0 then acc else spawned c (n - 1) (More (threadSpawn (\\() -> reads c 200 0)) acc)
+         fun awaited ts (acc : Int) =
+           match ts with | Done -> acc | More t rest -> awaited rest (acc + threadAwait t)
+         fun several (i : Int) (acc : Int) : Int =
+           if i == 0 then acc else several (i - 1) (acc + sum (getCompact (compact (build i))))
+         def result =
+           let c = compact (build 20) in
+           awaited (spawned c 8 Done) 0 + several 12 0"
+    );
+    assert_eq!(
+        run_regions("regions_by_threads", &src, false),
+        ("336364".into(), 0)
+    );
+}
+
+/// What a thread answers is kept for `await` -- for as long as there is a
+/// `Task` of the thread to await it with, and no longer. Kept for good, a
+/// compact a thread answered with held its region to the end of the program.
+#[test]
+fn what_a_thread_answered_goes_when_nothing_can_await_it() {
+    let src = format!(
+        "{COMPACTED}data Ts = Done | More (Task (Compact L)) Ts
+         use Ts.*
+         fun spawned (n : Int) acc =
+           if n == 0 then acc else spawned (n - 1) (More (threadSpawn (\\() -> compact (build n))) acc)
+         fun awaited ts (acc : Int) =
+           match ts with
+           | Done -> acc
+           | More t rest ->
+               -- Awaited twice: the answer is there for as long as the `Task` is.
+               awaited rest (acc + sum (getCompact (threadAwait t)) + sum (getCompact (threadAwait t)))
+         def result = awaited (spawned 12 Done) 0"
+    );
+    assert_eq!(
+        run_regions("answers_let_go", &src, false),
+        ("728".into(), 0)
+    );
 }
 
 // --- what an abandoned continuation's frames held -----------------------------

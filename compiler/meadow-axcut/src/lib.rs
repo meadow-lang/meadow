@@ -370,8 +370,21 @@ pub struct Def {
     pub block: Block,
 }
 
+/// A block C may call, by the name it calls it: what a library built of the
+/// program exports. The block takes `params` and then the continuation it
+/// answers through, and answers `result`.
+#[derive(Debug, Clone)]
+pub struct Export {
+    pub name: String,
+    pub label: Label,
+    pub params: Vec<Rep>,
+    pub result: Rep,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Program {
+    /// What C may call, where the program is built as a library.
+    pub exports: Vec<Export>,
     pub defs: Vec<Def>,
     /// Where execution starts.
     pub entry: Option<Label>,

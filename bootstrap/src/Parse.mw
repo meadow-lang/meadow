@@ -83,24 +83,28 @@ record Cx = {
 type Syn = Syntax Surface
 
 -- `s`'s children, but for the text between tokens.
-fun kids (s : Syn) : [Syn] = V.filter (\x -> R.kindOf x != Unknown) (R.children s)
+fun kids (s : Syn) : [Syn] = R.childrenWhere (\g c -> G.kindAt g c != Unknown) s
 
-fun nodeKids (s : Syn) : [Syn] = V.filter (\x -> not (R.isTokenOf x)) (kids s)
+fun nodeKids (s : Syn) : [Syn] =
+  R.childrenWhere (\g c -> not (G.isTokenAt g c) and G.kindAt g c != Unknown) s
 
-fun tokenKids (s : Syn) : [Syn] = V.filter R.isTokenOf (kids s)
+fun tokenKids (s : Syn) : [Syn] =
+  R.childrenWhere (\g c -> G.isTokenAt g c and G.kindAt g c != Unknown) s
 
-fun childOf (k : Surface) (s : Syn) : Maybe Syn = V.find (\x -> R.kindOf x == k) (kids s)
+fun childOf (k : Surface) (s : Syn) : Maybe Syn = R.childWhere (\g c -> G.kindAt g c == k) s
 
-fun childrenOf (k : Surface) (s : Syn) : [Syn] = V.filter (\x -> R.kindOf x == k) (kids s)
+fun childrenOf (k : Surface) (s : Syn) : [Syn] = R.childrenWhere (\g c -> G.kindAt g c == k) s
 
 fun has (k : Surface) (s : Syn) : Bool = M.isSome (childOf k s)
 
-fun firstNode (s : Syn) : Maybe Syn = V.get (nodeKids s) 0
+fun firstNode (s : Syn) : Maybe Syn =
+  R.childWhere (\g c -> not (G.isTokenAt g c) and G.kindAt g c != Unknown) s
 
 -- `s`'s one child of kind `k`, which the grammar says is there.
 fun must (k : Surface) (s : Syn) : Syn = M.unwrapOr s (childOf k s)
 
-fun tokenIs (k : Surface) (s : Syn) : Bool = V.any (\t -> R.kindOf t == k) (tokenKids s)
+fun tokenIs (k : Surface) (s : Syn) : Bool =
+  M.isSome (R.childWhere (\g c -> G.isTokenAt g c and G.kindAt g c == k) s)
 
 -- The bytes `s` spans: its first token's start to its last's end, the text
 -- around and between them not counted -- what a span is to `meadow-parser`.
@@ -124,9 +128,12 @@ fun tokenOf (c : Cx) (t : Syn) : Maybe Token = H.lookup (R.offset t) c.tokens
 fun descendants (k : Surface) (s : Syn) : [Syn] =
   match s with
   | Syntax g i ->
+      -- `s` itself counts, as it did when this read every slot from `s` on.
       V.map
         (\j -> Syntax g j)
-        (V.filter (\j -> G.kindAt g j == k and not (G.isTokenAt g j)) (V.range i (G.after g i)))
+        (V.append
+           (if G.kindAt g i == k and not (G.isTokenAt g i) then [i] else [])
+           (V.filter (\j -> not (G.isTokenAt g j)) (G.slotsWhere (\x -> x == k) g i)))
 
 -- --- writing -----------------------------------------------------------------
 --
@@ -143,6 +150,19 @@ type Out = Int -> [String]
 fun nameOf (t : Syn) : Name = Name { text = R.text t, at = spanOf t }
 
 fun named (text : String) (at : Meta) : Name = Name { text, at }
+
+-- A type's name under `s`: its first token, and each `.Name` after it --
+-- `M.Ty` -- as one name, dots and all, as `meadow-parser` keeps one.
+fun typeName (s : Syn) : Name =
+  let first = firstName s in
+  let quals = childrenOf NodeTQual s in
+  if V.isEmpty quals then first
+  else
+    (let names = V.map (\q -> lastName q) quals in
+     let last = V.getOr first names (V.len names - 1) in
+     named
+       (V.foldl (\acc (n : Name) -> "${acc}.${n.text}") first.text names)
+       (spanMeta (metaStart first.at) (metaEnd last.at)))
 
 -- The first token under `s`, however deep, as a name.
 fun firstName (s : Syn) : Name =
@@ -754,7 +774,7 @@ fun sigDecl (c : Cx) (s : Syn) (isFun : Bool) (n : Name) (annot : Syn) (clauses 
 fun boundsOf (t : Syn) : [(Name, [Syn])] =
   match (childOf NodeArrow t, firstNode (must NodeTHead t)) with
   | (None, Just h) ->
-      if R.kindOf h == NodeTCon then [(firstName h, childrenOf NodeTAtom h)]
+      if R.kindOf h == NodeTCon then [(typeName h, childrenOf NodeTAtom h)]
       else if R.kindOf h == NodeTParen then V.concatMap boundsOf (childrenOf NodeType h)
       else []
   | _ -> []
@@ -1036,7 +1056,7 @@ fun thead (c : Cx) (d : Int) (s : Syn) : [String] =
         "TCon"
         (spanOf con)
         (V.append
-           (ident (d + 1) (firstName con))
+           (ident (d + 1) (typeName con))
            (many (d + 1) "args" (each (tatom c) (childrenOf NodeTAtom con))))
   | None -> tatom c d s
 
@@ -1047,7 +1067,10 @@ fun tatom (c : Cx) (d : Int) (s : Syn) : [String] =
   match firstNode s with
   | Just n ->
       let k = R.kindOf n in
-      if k == NodeTParen then tparen c d n
+      -- A qualified name: its first token, then its `.Name`s.
+      if k == NodeTQual then
+        node d "TCon" m (V.append (ident (d + 1) (typeName s)) (many (d + 1) "args" []))
+      else if k == NodeTParen then tparen c d n
       else if k == NodeTArray then
         node
           d

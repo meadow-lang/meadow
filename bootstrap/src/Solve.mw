@@ -81,6 +81,9 @@ use Std.Macro (Reflect)
   assocParams : [[Int]],
   ownAssocs : Int,
   methods : [String],
+  -- Those of its methods it says how to do itself: an `impl` may leave
+  -- them out.
+  defaulted : [String],
   dict : String,
   labels : [String]
 }
@@ -271,6 +274,10 @@ use Sol.*
   -- variable now is tied to its region after all.
   settlingJoins : StRef s Bool,
   errors : StRef s [String],
+  -- Where inference is: the module, and the byte its node starts at (-1
+  -- for none), as `Infer.placed` marks it; and where each of `errors` was.
+  at : StRef s (Int, Int),
+  errorsAt : StRef s [(Int, Int)],
   runSt : Int,
   stLevels : StRef s [Int],
   entries : [Int],
@@ -297,6 +304,7 @@ use Sol.*
 }
 
 @pub fun report (i : Inf s) (msg : String) : () ! { St s | e } =
+  let u = stSetRef i.errorsAt (V.pushBack (stGetRef i.errorsAt) (stGetRef i.at)) in
   stSetRef i.errors (V.pushBack (stGetRef i.errors) msg)
 
 @pub fun schemeOf (i : Inf s) (v : Int) : Maybe Scheme ! { St s | e } = H.lookup v (stGetRef i.env)
@@ -337,7 +345,7 @@ fun describe (i : Inf s) (err : UnifyError) : String ! { St s | e } =
 -- --- schemes -----------------------------------------------------------------
 
 @pub fun instantiate (i : Inf s) (sc : Scheme) : Type ! { St s | e } =
-  substBound sc.ty (freshQuantifiers i.ar sc)
+  if V.isEmpty sc.quant then sc.ty else substBound sc.ty (freshQuantifiers i.ar sc)
 
 -- `sc` instantiated, and its `where` over the same fresh variables.
 @pub fun instantiateWithPreds (i : Inf s) (sc : Scheme) : (Type, [Pred]) ! { St s | e } =
@@ -421,9 +429,8 @@ fun insertLacking (acc : [Lacking]) (l : Lacking) : [Lacking] =
 
 -- The arena variable behind each quantifier, in quantifier order.
 fun varsOf (q : Quantified) : [Int] =
-  V.map
-    (\k -> M.unwrapOr 0 (M.map fst (V.find (\kv -> snd kv == k) (H.toVec q.map))))
-    (V.range 0 (V.len q.kinds))
+  let behind = H.fromVec (V.map (\kv -> (snd kv, fst kv)) (H.toVec q.map)) in
+  V.map (\k -> M.unwrapOr 0 (H.lookup k behind)) (V.range 0 (V.len q.kinds))
 
 -- A binding not generalized, recorded as one.
 @pub fun recordMono (i : Inf s) (vid : Int) (sc : Scheme) : () ! { St s | e } =

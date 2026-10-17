@@ -1567,11 +1567,21 @@ impl Heap {
         }
         // A detached segment nothing named any more is dead, chunks and all.
         // One cut after the cycle began is black: it stays whatever the marker
-        // saw.
+        // saw. The marker only reads the old generation, so it can only judge a
+        // segment whose object is there and was there unmarked: one whose
+        // object is still young -- or not yet made -- is the nursery
+        // collection's to judge, and one whose object was promoted while the
+        // cycle ran was allocated marked, which the marker never reads. Freeing
+        // either left a resumption with nothing to put back ("continuation
+        // resumed more than once").
         let named = job.stacks();
+        let old = &self.old;
         let mut dead = Vec::new();
         self.detached.retain(|d| {
-            let keep = d.epoch >= job.epoch || named.contains(&d.top);
+            let young = d.obj < OLD_BASE;
+            let promoted =
+                d.obj >= OLD_BASE && d.obj < REGION_BASE && old.is_marked(d.obj, job.epoch);
+            let keep = d.epoch >= job.epoch || named.contains(&d.top) || young || promoted;
             if !keep {
                 dead.push(d.top);
             }

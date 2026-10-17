@@ -258,12 +258,24 @@ pub struct Heap {
     /// without letting cyclic garbage pile up -- the program runs between one
     /// run and the next, since that is where allocation happens.
     draining: bool,
+    /// How many candidates must gather before the collector runs: [`crate::
+    /// cycles::TRIGGER`] to begin with, and more while its runs find nothing
+    /// -- see [`Heap::paced`].
+    trigger: usize,
+    /// Runs in a row that walked from a candidate and freed nothing.
+    futile: u32,
     /// Blocks the collector has freed, for its tally.
     freed: u64,
     /// The memory it has: chunks, and blocks too big for a size class --
     /// what dropping it gives back.
     chunks: Vec<(*mut Word, usize)>,
-    large: std::collections::HashMap<usize, usize>,
+    large: crate::ctx::ByAddress<usize>,
+    /// Under `MEADOW_SILO_MEMORY`: the words in this heap's blocks that are
+    /// in use.
+    held: usize,
+    /// Under `MEADOW_SILO_PRIMS`: how many blocks of each kind this heap has
+    /// erased, by what makes them -- a constructor, a closure's code.
+    erased: Option<std::collections::HashMap<(u64, u32), u64>>,
 }
 
 impl Heap {
@@ -281,9 +293,13 @@ impl Heap {
             oversized_mark: usize::MAX,
             run_at: usize::MAX,
             draining: false,
+            trigger: crate::cycles::TRIGGER,
+            futile: 0,
             freed: 0,
             chunks: Vec::new(),
-            large: std::collections::HashMap::new(),
+            large: crate::ctx::ByAddress::default(),
+            held: 0,
+            erased: crate::prims::counting().then(std::collections::HashMap::new),
         }
     }
 }
@@ -294,14 +310,155 @@ impl Default for Heap {
     }
 }
 
+/// Under `MEADOW_SILO_PRIMS`: of the blocks let go of whole -- the last
+/// reference dropped by code that had not taken the block apart -- one in
+/// every [`EVERY`], by what the block was and which function of the program
+/// dropped it.
+static DROPPED: std::sync::Mutex<Option<std::collections::HashMap<(u64, u32, String), u64>>> =
+    std::sync::Mutex::new(None);
+static DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const EVERY: u64 = 1024;
+
+#[cold]
+fn dropped(v: Word) {
+    let n = DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n % EVERY != 0 {
+        return;
+    }
+    // The innermost frame that is the program's own code: emitted functions
+    // are named `mw.` and then what they are.
+    let trace = std::backtrace::Backtrace::force_capture().to_string();
+    let who = trace
+        .lines()
+        .filter_map(|l| l.trim().split_once(": ").map(|(_, name)| name))
+        .find(|name| name.starts_with("mw."))
+        .unwrap_or("the runtime")
+        .to_string();
+    let mut all = DROPPED.lock().unwrap_or_else(|e| e.into_inner());
+    *all.get_or_insert_with(std::collections::HashMap::new)
+        .entry((kind(v), meta(v), who))
+        .or_default() += EVERY;
+}
+
+/// Under `MEADOW_SILO_PRIMS`: of the arrays made, one in every [`EVERY`], by
+/// how long it was made (up to eight, then "more") and which function of the
+/// program made it.
+static MADE: std::sync::Mutex<Option<std::collections::HashMap<(usize, String), u64>>> =
+    std::sync::Mutex::new(None);
+static MAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cold]
+fn made(n: usize) {
+    let k = MAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if k % EVERY != 0 {
+        return;
+    }
+    let trace = std::backtrace::Backtrace::force_capture().to_string();
+    let who = trace
+        .lines()
+        .filter_map(|l| l.trim().split_once(": ").map(|(_, name)| name))
+        .find(|name| name.starts_with("mw."))
+        .unwrap_or("the runtime")
+        .to_string();
+    let mut all = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    *all.get_or_insert_with(std::collections::HashMap::new)
+        .entry((n.min(9), who))
+        .or_default() += EVERY;
+}
+
+/// The arrays made, as sampled: how long, by whom, and about how many.
+pub fn made_by() -> (u64, Vec<((usize, String), u64)>) {
+    let all = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<((usize, String), u64)> =
+        all.iter().flatten().map(|(k, n)| (k.clone(), *n)).collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    (MAKES.load(std::sync::atomic::Ordering::Relaxed), out)
+}
+
+/// The blocks dropped whole, as sampled: what each was, who dropped it, and
+/// about how many, most first.
+pub fn dropped_by() -> Vec<((u64, u32, String), u64)> {
+    let all = DROPPED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<((u64, u32, String), u64)> =
+        all.iter().flatten().map(|(k, n)| (k.clone(), *n)).collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out
+}
+
+/// Under `MEADOW_SILO_LEAKS`: the blocks threads ended still holding, by
+/// kind and what made them, over every thread that has ended.
+static ENDED_WITH: std::sync::Mutex<Option<std::collections::HashMap<(u64, u32), u64>>> =
+    std::sync::Mutex::new(None);
+
+/// What threads that have ended were still holding, most first.
+pub fn ended_with() -> Vec<((u64, u32), u64)> {
+    let all = ENDED_WITH.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<((u64, u32), u64)> = all.iter().flatten().map(|(k, n)| (*k, *n)).collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out
+}
+
+/// What every heap that has gone erased, by kind: see [`Heap::erased`].
+static ERASED: std::sync::Mutex<Option<std::collections::HashMap<(u64, u32), u64>>> =
+    std::sync::Mutex::new(None);
+
+/// The blocks erased so far, by kind and what made them, most first: the
+/// running thread's and every finished one's.
+pub fn erased() -> Vec<((u64, u32), u64)> {
+    with(|h| h.tell());
+    let all = ERASED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<((u64, u32), u64)> = all.iter().flatten().map(|(k, n)| (*k, *n)).collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out
+}
+
+impl Heap {
+    /// This heap's counts into the program's.
+    fn tell(&mut self) {
+        if let Some(mine) = &mut self.erased {
+            let mut all = ERASED.lock().unwrap_or_else(|e| e.into_inner());
+            let all = all.get_or_insert_with(std::collections::HashMap::new);
+            for (k, n) in mine.drain() {
+                *all.entry(k).or_default() += n;
+            }
+        }
+    }
+}
+
 impl Drop for Heap {
     fn drop(&mut self) {
+        self.tell();
+        // Under the leak check: what this heap's thread ended still holding,
+        // by kind -- blocks that go with the heap unerased, and so without
+        // giving up what they held outside it.
+        if let Some(blocks) = &self.blocks {
+            if !blocks.is_empty() {
+                let mut all = ENDED_WITH.lock().unwrap_or_else(|e| e.into_inner());
+                let all = all.get_or_insert_with(std::collections::HashMap::new);
+                for b in blocks {
+                    let v = *b as Word;
+                    let key = (
+                        kind(v),
+                        if kind(v) == DATA || kind(v) == CLOSURE {
+                            meta(v)
+                        } else {
+                            0
+                        },
+                    );
+                    *all.entry(key).or_default() += 1;
+                }
+            }
+        }
+        // What this heap still held goes with it.
+        crate::memory::LIVE.fetch_sub(self.held, std::sync::atomic::Ordering::Relaxed);
         let words = |n: usize| std::alloc::Layout::array::<Word>(n).expect("a block fits memory");
         for (p, n) in self.chunks.drain(..) {
+            crate::memory::HEAPS.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
             // Safety: allocated with this layout in `take`.
             unsafe { std::alloc::dealloc(p as *mut u8, words(n)) };
         }
         for (p, n) in self.large.drain() {
+            crate::memory::HEAPS.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
             // Safety: likewise.
             unsafe { std::alloc::dealloc(p as *mut u8, words(n)) };
         }
@@ -489,6 +646,9 @@ fn died(v: Word) {
 /// [`died`], in context `c`'s heap.
 #[inline]
 pub fn died_in(c: *mut crate::ctx::Ctx, v: Word) {
+    if crate::prims::counting() {
+        dropped(v);
+    }
     if crate::cycles::possible() && buffered(v) {
         // Black and dead: what the collector must not mistake for a
         // candidate with a reference left, since the count it reads is the
@@ -543,6 +703,10 @@ pub fn tracking() -> bool {
 impl Heap {
     fn take(&mut self, words: usize) -> Word {
         let h = self;
+        if crate::memory::on() {
+            h.held += words;
+            crate::memory::LIVE.fetch_add(words, std::sync::atomic::Ordering::Relaxed);
+        }
         let want = words < CLASSES;
         if !want {
             let layout = std::alloc::Layout::array::<Word>(words).expect("a block fits memory");
@@ -551,6 +715,7 @@ impl Heap {
             if p.is_null() {
                 std::alloc::handle_alloc_error(layout);
             }
+            crate::memory::HEAPS.fetch_add(words, std::sync::atomic::Ordering::Relaxed);
             h.large.insert(p as usize, words);
             return p as Word;
         }
@@ -561,6 +726,10 @@ impl Heap {
             return p as Word;
         }
         if h.left < words {
+            // Before more is asked of the system: what can be given back.
+            if crate::sched::vars_waiting() {
+                crate::sched::forget_vars();
+            }
             let size = h
                 .chunks
                 .last()
@@ -571,6 +740,7 @@ impl Heap {
             if p.is_null() {
                 std::alloc::handle_alloc_error(layout);
             }
+            crate::memory::HEAPS.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
             h.chunks.push((p, size));
             h.chunk = p;
             h.left = size;
@@ -619,7 +789,7 @@ impl Heap {
     /// than it already was. Never further -- a mark that moved with the heap
     /// would never be reached.
     fn schedule(&mut self) {
-        if self.candidates.len() >= crate::cycles::TRIGGER {
+        if self.candidates.len() >= self.trigger {
             self.run_at = 0;
         } else if self.run_at == usize::MAX {
             self.run_at = (2 * self.live.max(0) as usize).max(FLOOR);
@@ -637,12 +807,39 @@ impl Heap {
         }
         let want = if self.candidates.is_empty() {
             usize::MAX
-        } else if self.draining || self.candidates.len() >= crate::cycles::TRIGGER {
+        } else if self.draining || self.candidates.len() >= self.trigger {
             0
         } else {
             (2 * self.live.max(0) as usize).max(FLOOR)
         };
         self.run_at = want.min(self.oversized_mark);
+    }
+
+    /// A run has just finished, having walked from `walked` candidates and
+    /// freed `freed` blocks of garbage: how many candidates the next round of
+    /// runs waits for.
+    ///
+    /// A program that makes candidates by the million and cycles never -- an
+    /// interpreter, whose every scope is a map of cells shared with the
+    /// scopes made from it -- would otherwise spend most of its time here:
+    /// each candidate walked is everything its cell reaches, and proves
+    /// nothing. So while the runs free nothing the collector waits for twice
+    /// as many candidates as before, up to [`crate::cycles::TRIGGER_MOST`],
+    /// and by then most of them have died where they waited and are freed
+    /// without a walk. The first run that does free a cycle puts it back. A
+    /// doubling of the heap still starts a run whatever this says, so what
+    /// waiting costs is bounded as it always was.
+    pub(crate) fn paced(&mut self, walked: usize, freed: u64) {
+        if freed > 0 {
+            self.trigger = crate::cycles::TRIGGER;
+            self.futile = 0;
+        } else if walked > 0 {
+            self.futile += 1;
+            if self.futile >= crate::cycles::FUTILE {
+                self.futile = 0;
+                self.trigger = (self.trigger * 2).min(crate::cycles::TRIGGER_MOST);
+            }
+        }
     }
 
     pub(crate) fn has_candidates(&self) -> bool {
@@ -741,12 +938,17 @@ impl Heap {
 
     fn clean_block(&mut self, p: *mut Word, words: usize) {
         self.live -= 1;
+        if crate::memory::on() {
+            self.held = self.held.saturating_sub(words);
+            crate::memory::LIVE.fetch_sub(words, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(b) = &mut self.blocks {
             b.remove(&(p as usize));
         }
         if words >= CLASSES {
             let layout = std::alloc::Layout::array::<Word>(words).expect("a block fits memory");
             self.large.remove(&(p as usize));
+            crate::memory::HEAPS.fetch_sub(words, std::sync::atomic::Ordering::Relaxed);
             // Safety: allocated alone, with this layout, in `acquire`.
             unsafe { std::alloc::dealloc(p as *mut u8, layout) };
             return;
@@ -800,12 +1002,22 @@ impl Heap {
             if kind(v) == STACK {
                 crate::segments::discard(meta(v));
             }
+            // One fewer that could await the thread: see `crate::sched::held`.
+            if kind(v) == TASK {
+                crate::sched::let_go(meta(v));
+            }
+            if kind(v) == TVAR {
+                crate::sched::let_go_var(field(v, 0) as usize);
+            }
             // The last reference to a compact: its region loses the one this
             // block held, and goes with it if that was the last. Everything
             // inside it is freed there, all at once, and never here.
             if kind(v) == COMPACT {
                 // Safety: a `Compact` block whose fields are still in it.
                 unsafe { crate::region::forget(v) };
+            }
+            if let Some(erased) = &mut self.erased {
+                *erased.entry((kind(v), meta(v))).or_default() += 1;
             }
             let words = size(v);
             self.clean_block(p, words);
@@ -824,6 +1036,25 @@ pub fn settle() {
     });
     // Erasing what a cycle held can make candidates of its own.
     with(|h| crate::cycles::collect_all(h));
+}
+
+/// Erase everything this thread has let go of, which is ending: its heap
+/// goes all at once, but what its dead blocks hold outside it -- a reference
+/// into a compact's region -- is given up only by erasing them. Left, each
+/// such region outlived the program.
+///
+/// That is the blocks waiting to be erased, and also the ones that died
+/// while the cycle collector had them down as candidates: those are only
+/// marked, for the collector to free when it next runs -- which, for a
+/// thread that ends first, was never. A `Ref` written under a handler is
+/// one, and what a query's thread keeps its answers in.
+pub fn finish() {
+    settle();
+    with(|h| {
+        while !h.pending.is_empty() {
+            h.step();
+        }
+    });
 }
 
 /// Blocks acquired on this thread so far.
@@ -871,6 +1102,9 @@ pub fn build(kind: u64, meta: u32, fields: &[Word], descs: &[i64]) -> Word {
 /// A uniform block of `kind` and `meta` of `n` words, every one described by
 /// `d`, the words for the caller to write.
 pub fn build_uniform(kind: u64, meta: u32, n: usize, d: i64) -> Word {
+    if kind == ARRAY && crate::prims::counting() {
+        made(n);
+    }
     let v = acquire(2 + if kind == ARRAY { array_room(n) } else { n });
     set_word(v, 0, (n as u64) << 32);
     set_word(

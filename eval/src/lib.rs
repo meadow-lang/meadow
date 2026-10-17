@@ -2259,6 +2259,9 @@ fn native_process(op: &str, arg: Value) -> Result<Value, RuntimeError> {
             Ok(st) => ok(Value::Int(st.code().unwrap_or(-1) as i64)),
             Err(e) => errv(e.to_string()),
         },
+        // The reference machine notes nothing of what it reaches: a fuzzer
+        // that asks is told nothing is new.
+        "covered" => Value::Int(0),
         "exit" => {
             let code = as_int(&arg)?;
             std::process::exit(code as i32);
@@ -2309,6 +2312,7 @@ fn native_process(op: &str, arg: Value) -> Result<Value, RuntimeError> {
                     0 => ffi::Arg::Int(as_int(&a[1])?),
                     1 => ffi::Arg::Float(as_float(&a[2])?),
                     2 => ffi::Arg::Str(as_str(&a[3])?.to_string()),
+                    3 => ffi::Arg::Float32(as_float(&a[2])?),
                     _ => return err("Process.ffiCall: no such kind of argument".to_string()),
                 });
             }
@@ -2365,6 +2369,8 @@ fn native_process(op: &str, arg: Value) -> Result<Value, RuntimeError> {
             // Safety: as above.
             sv(unsafe { ffi::read_text(as_int(&t[0])?, as_int(&t[1])?) })
         }
+        // Only a library Silo builds is called by C.
+        "ffiFailure" => sv(String::new()),
         other => return err(format!("unhandled effect Process.{other}")),
     })
 }

@@ -86,14 +86,24 @@ fn meadowboot(args: &[String]) -> String {
     c.args(args);
     // Where the standard library's sources are, for the passes that build a
     // file's unit and the units it depends on.
-    // `run` and `cut` are of programs written with no library, as the glade
+    // `cek` and `lower` are of programs written with no library, as the glade
     // cases are.
-    if !matches!(args.first().map(String::as_str), Some("run" | "cut")) {
+    if !matches!(args.first().map(String::as_str), Some("cek" | "lower")) {
         c.env("MEADOWBOOT_STD", repo().join("lib").join("Std"));
     }
-    // And what the Rust compiler's macros expanded to, where the rename test
-    // wrote it.
-    c.env("MEADOWBOOT_EXPANSIONS", expansions_dir());
+    // MeadowBoot runs the procedural macros itself, as a program it compiles
+    // and the back end runs on Glade, so what it makes of them is part of
+    // what is compared. `MEADOWBOOT_RECORDED` goes back to handing it what
+    // the Rust compiler's macros expanded to, where the rename test wrote
+    // it: what there was before MeadowBoot could run one, and what tells a
+    // fault in running them from one in what is done with what they wrote.
+    if std::env::var_os("MEADOWBOOT_RECORDED").is_some() {
+        c.env("MEADOWBOOT_EXPANSIONS", expansions_dir());
+    } else {
+        c.env_remove("MEADOWBOOT_EXPANSIONS");
+        c.env("MEADOWBOOT_SET", "macros=Glade");
+        c.env("MEADOW", meadow());
+    }
     let out = c.output().expect("MeadowBoot runs");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
@@ -101,6 +111,15 @@ fn meadowboot(args: &[String]) -> String {
         "MeadowBoot printed nothing:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // A unit that did not build is said so in place of what was asked of it,
+    // and why is on stderr: without it a failure reads only "not compiled".
+    if stdout.contains("\nnot compiled\n") {
+        eprintln!(
+            "MeadowBoot did not compile something of {:?}:\n{}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
     stdout
 }
 
@@ -201,7 +220,11 @@ fn per_file_with(args: &[String], files: &[PathBuf]) -> Vec<(PathBuf, String)> {
                             let mut argv = args.to_vec();
                             argv.extend(run.iter().map(|p| p.display().to_string()));
                             let text = meadowboot(&argv);
-                            let _ = std::fs::write(&at, &text);
+                            // What did not build is not kept: the next
+                            // run tries it again, and says why once more.
+                            if !text.contains("\nnot compiled\n") {
+                                let _ = std::fs::write(&at, &text);
+                            }
                             text
                         }
                     };
@@ -2395,7 +2418,7 @@ fn glade_cases_compiled_by_meadowboot_evaluate_as_the_rust_compiler_has_them() {
     let cases = run_cases(&dir);
     let wants: std::collections::HashMap<PathBuf, String> = cases.iter().cloned().collect();
     let files: Vec<PathBuf> = cases.iter().map(|(f, _)| f.clone()).collect();
-    let theirs = per_file("run", &files);
+    let theirs = per_file("cek", &files);
     let bad = differences(&theirs, |p| format!("{}\n", wants[p]));
     let _ = std::fs::remove_dir_all(&dir);
     let agreeing = files.len() - bad.len();
@@ -2510,7 +2533,7 @@ fn a_program_of_two_units_lowered_by_meadowboot_answers_as_the_rust_compiler_has
         "Main.mw",
         APP,
     );
-    let lowered = per_file("cut", &[main]);
+    let lowered = per_file("lower", &[main]);
     let text = &lowered[0].1;
     let want = "(6, 7, 1, 13, 41, 11, 8, 2)";
     let (interpreted, on_axcut) = (cut_answer(text), axcut_answer(text));
@@ -2559,7 +2582,7 @@ fn a_program_with_the_standard_library_lowered_by_meadowboot_answers_as_the_rust
     let main = dir.join("src").join("Main.mw");
     std::fs::write(&main, WITH_STD).expect("a source file");
     let out = Command::new(meadowboot_exe())
-        .arg("cut")
+        .arg("lower")
         .arg(&main)
         .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
         // With no macro expanded: what a macro of the library's writes is not
@@ -2581,6 +2604,1002 @@ fn a_program_with_the_standard_library_lowered_by_meadowboot_answers_as_the_rust
     assert_eq!(
         axcut_answer(&text),
         r#"([2, 4, 6], 6, Just(8), "ab", "12", [1; 2], Just(2), "x, y", "3 and True")"#
+    );
+}
+
+/// Functions written once for any number type, used at several: one that
+/// calls itself, one that calls another, one over fractions, and one that
+/// hands a function generic in its number to the standard library.
+const WITH_NUMBERS: &str = r#"use Std.Collections.Vector as V
+
+fun factorial n = if n == 0 then 1 else n * factorial (n - 1)
+
+fun next n = n + 1
+
+fun twiceNext n = next n + next 10
+
+fun half x = x *. 0.5
+
+fun bumped xs = V.map (\x -> x + 300) xs
+
+def result =
+  (
+    factorial 30,
+    factorial (toBigInt 30),
+    factorial (toUInt8 5),
+    twiceNext (toBigInt 0),
+    half (toFloat32 1.0),
+    half 3.0,
+    bumped [toUInt8 0, toUInt8 1],
+    bumped [toBigInt 0]
+  )
+"#;
+
+/// A definition generic in a number's type is copied for each number type it
+/// is used at, so that a literal in it is of that type -- the `1` of
+/// `factorial` a `BigInt` where its argument is one, and not the `Int` the
+/// definition as it is written makes it. Without the copies the first of
+/// these wraps and is right, and the rest are not numbers at all.
+#[test]
+fn a_function_generic_in_its_number_is_right_at_each_number_type_it_is_used_at() {
+    let want = "(-8764578968847253504, 265252859812191058636308480000000, 120, 12, 0.5, 1.5, \
+                [44, 45], [300])";
+    for opt in ["O1", "O2", "O3"] {
+        let cut = cut_of(&format!("numbers-{opt}"), WITH_NUMBERS, &["--opt", opt]);
+        assert_eq!(axcut_answer(&cut), want, "at {opt}");
+    }
+}
+
+/// Definitions that are functions without being written with their
+/// parameters: another function by another name, one given some of its
+/// arguments, one that is such a definition in its turn -- and one whose
+/// argument is a call, which is run once where it stands and must stay so.
+const WITH_ARITIES: &str = r#"fun add3 x y z = x + y + z
+
+def plus = add3
+
+fun from1 x = add3 1 x
+
+def from12 = add3 1 2
+
+def again = from12
+
+fun next n = n + 1
+
+def held = add3 (next 1) 2
+
+def result = (plus 1 2 4, from1 3 5, again 9, (from1 2) 3, held 3)
+"#;
+
+/// A definition's arity is how many parameters the function it is takes, not
+/// how many it happens to be written with: from O1 one that is a function in
+/// sight given too few arguments, each a name or a literal, is written with
+/// the parameters it is missing, and a call that gives them all is then a
+/// direct one. O0 leaves a program as it was written. Every level answers
+/// the same.
+#[test]
+fn a_definition_that_is_a_function_has_the_parameters_the_function_takes() {
+    // Whether `symbol`'s definition of all its parameters is there, with `n`.
+    let entry = |cut: &str, n: usize| {
+        cut.lines().any(|line| {
+            line.starts_with("def meadow:Levels/d")
+                && line.matches("v19000000").count() == n
+                && line.contains("f (")
+        })
+    };
+    for opt in ["O0", "O1", "O2", "O3"] {
+        let cut = cut_of(&format!("arities-{opt}"), WITH_ARITIES, &["--opt", opt]);
+        assert_eq!(axcut_answer(&cut), "(7, 9, 12, 6, 7)", "at {opt}");
+        if opt == "O0" {
+            assert!(
+                !cut.contains("v19000000"),
+                "O0 gave a definition parameters"
+            );
+        }
+        if opt == "O1" {
+            // `plus` is given three, and `from1`, `from12` and `again` one.
+            assert!(entry(&cut, 3), "no definition was given three parameters");
+            assert!(entry(&cut, 1), "no definition was given one parameter");
+        }
+    }
+}
+
+/// A program each level does something to that the level under it does not:
+/// an operator and `show` at a known type, a small function, and a function
+/// that takes a dictionary and is too large to be copied for it below O3 --
+/// its body is `show x` a hundred and sixty times over.
+fn with_levels() -> String {
+    format!(
+        "use Std.Collections.Vector as V\n\nfun double x = x * 2\n\nfun big x = {}\n\n\
+         def result = (V.map double [1, 2, 3], stringByteLength (big 7))\n",
+        vec!["show x"; 160].join(" ++ ")
+    )
+}
+
+/// What MeadowBoot's `lower` writes of the program `source`, told `args`: the
+/// package is made in a directory named for `name`.
+fn cut_of(name: &str, source: &str, args: &[&str]) -> String {
+    let dir = std::env::temp_dir().join(format!("meadowboot-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("src")).expect("a package directory");
+    std::fs::write(
+        dir.join("Meadow.toml"),
+        "[package]
+name = \"Levels\"
+version = \"0.1.0\"
+",
+    )
+    .expect("a manifest");
+    let main = dir.join("src").join("Main.mw");
+    std::fs::write(&main, source).expect("a source file");
+    let out = Command::new(meadowboot_exe())
+        .arg("lower")
+        .args(args)
+        .arg(&main)
+        .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+        .env_remove("MEADOWBOOT_EXPANSIONS")
+        .output()
+        .expect("MeadowBoot runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .split_once(
+            "
+cut 0
+",
+        )
+        .map(|(_, rest)| {
+            format!(
+                "cut 0
+{rest}"
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no program of {name}:
+{stdout}
+{}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
+}
+
+/// What MeadowBoot's `lower` writes of [`with_levels`] at level `opt`.
+fn cut_at(opt: &str) -> String {
+    cut_of(opt, &with_levels(), &["--opt", opt])
+}
+
+/// A build told `whole` optimises its units as one program at the link, where
+/// each is otherwise optimised by itself: every unit is kept as it was
+/// written, the link joins them, and what is made better is the program. It
+/// answers as the program a unit at a time does, at the levels that do
+/// anything, with the standard library and without a call of it left out.
+#[test]
+fn a_program_optimised_as_one_answers_as_one_optimised_a_unit_at_a_time() {
+    for opt in ["O1", "O2", "O3"] {
+        let cut = cut_of(
+            &format!("whole-{opt}"),
+            WITH_STD,
+            &["--opt", opt, "--set", "whole=true"],
+        );
+        assert_eq!(
+            axcut_answer(&cut),
+            r#"([2, 4, 6], 6, Just(8), "ab", "12", [1; 2], Just(2), "x, y", "3 and True")"#,
+            "at {opt}"
+        );
+    }
+    let cut = cut_of(
+        "whole-levels",
+        &with_levels(),
+        &["--opt", "O2", "--set", "whole=true"],
+    );
+    assert_eq!(axcut_answer(&cut), "([2, 4, 6], 160)");
+}
+
+/// Each level MeadowBoot optimises at is a level of its own: O0 leaves every
+/// method to be asked of its dictionary, O1 reads the known ones, O2 copies
+/// small functions to their calls, and O3 copies larger functions for the types
+/// they are called at. So each writes a
+/// program the level under it does not -- and all four answer the same.
+#[test]
+fn each_level_meadowboot_optimises_at_writes_its_own_program_and_the_same_answer() {
+    let levels = ["O0", "O1", "O2", "O3"];
+    let cuts: Vec<String> = levels.iter().map(|o| cut_at(o)).collect();
+    for (level, cut) in levels.iter().zip(&cuts) {
+        assert_eq!(axcut_answer(cut), "([2, 4, 6], 160)", "at {level}");
+    }
+    for pair in 0..levels.len() - 1 {
+        assert_ne!(
+            cuts[pair],
+            cuts[pair + 1],
+            "{} and {} write the same program",
+            levels[pair],
+            levels[pair + 1]
+        );
+    }
+}
+
+const WITH_CFG: &str = r#"@cfg(os = "linux")
+def system = "linux"
+
+@cfg(os = "macos")
+def system = "macos"
+
+@cfg(os = "windows")
+def system = "windows"
+
+@cfg(unix)
+def family = "unix"
+
+@cfg(windows)
+def family = "windows"
+
+@cfg(debug)
+def build = "debug"
+
+@cfg(release)
+def build = "release"
+
+@cfg(any(fast, feature = "quick"))
+def speed = "fast"
+
+@cfg(not(any(fast, feature = "quick")))
+def speed = "slow"
+
+@cfg(all(opt_level = "2", backend = "aot", not(test)))
+def level = "two"
+
+@cfg(not(all(opt_level = "2", backend = "aot", not(test))))
+def level = "other"
+
+-- A field is there or not as a declaration is, and a derive sees the record
+-- that is left.
+@derive(Debug)
+record Shape = {
+  @cfg(unix)
+  round : Int,
+  @cfg(windows)
+  square : Int
+}
+
+@cfg(unix)
+def shape = Shape { round = 1 }
+
+@cfg(windows)
+def shape = Shape { square = 2 }
+
+def result = (system, family, build, speed, level, debug shape)
+"#;
+
+/// What MeadowBoot's `lower` answers of [`WITH_CFG`], told `args`.
+fn cfg_answer(name: &str, args: &[&str]) -> String {
+    let dir = std::env::temp_dir().join(format!("meadowboot-cfg-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("src")).expect("a package directory");
+    std::fs::write(
+        dir.join("Meadow.toml"),
+        "[package]\nname = \"WithCfg\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("a manifest");
+    let main = dir.join("src").join("Main.mw");
+    std::fs::write(&main, WITH_CFG).expect("a source file");
+    let out = Command::new(meadowboot_exe())
+        .arg("lower")
+        .args(args)
+        .arg(&main)
+        .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+        .env_remove("MEADOWBOOT_EXPANSIONS")
+        .output()
+        .expect("MeadowBoot runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let text = stdout
+        .split_once("\ncut 0\n")
+        .map(|(_, rest)| format!("cut 0\n{rest}"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no program:\n{stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+    axcut_answer(&text)
+}
+
+/// What a `@cfg` holds of is the build's options: the system and processor
+/// MeadowBoot was itself built for unless it is told another, the profile's
+/// kind and level, and the flags of `--cfg`.
+#[test]
+fn a_cfg_is_decided_by_the_options_meadowboot_builds_with() {
+    let os = std::env::consts::OS;
+    let family = if os == "windows" { "windows" } else { "unix" };
+    assert_eq!(
+        cfg_answer("host", &[]),
+        format!(
+            r#"("{os}", "{family}", "debug", "slow", "other", "Shape({})")"#,
+            if os == "windows" { 2 } else { 1 }
+        )
+    );
+    assert_eq!(
+        cfg_answer(
+            "told",
+            &[
+                "--profile",
+                "release",
+                "--set",
+                "os=windows",
+                "--cfg",
+                "fast"
+            ]
+        ),
+        r#"("windows", "windows", "release", "fast", "two", "Shape(2)")"#
+    );
+    assert_eq!(
+        cfg_answer(
+            "flag",
+            &[
+                "--set",
+                "os=linux,test=true",
+                "--opt",
+                "O2",
+                "--cfg",
+                "feature=quick"
+            ]
+        ),
+        r#"("linux", "unix", "debug", "fast", "other", "Shape(1)")"#
+    );
+    // And the value the program answers is an option of the link's.
+    assert_eq!(
+        cfg_answer("entry", &["--set", "entry=speed", "--cfg", "fast"]),
+        r#""fast""#
+    );
+}
+
+/// A package of procedural macros: one that writes its argument twice, one
+/// that leaves a number at compile time under the name it is given, and one
+/// that reads it back.
+const MACROS_LIB: &str = r#"use Std.Macro (TokenTree, Loc, Expand, Datum, lookup, define)
+use Std.Macro.TokenTree.*
+use Std.Macro.Loc.*
+use Std.Macro.Delim.*
+use Std.Collections.Vector as V
+use Std.Maybe.Maybe.*
+
+@macro
+@pub fun twice (ts : [TokenTree]) : [TokenTree] ! { Expand | e } =
+  V.concat [[Group Paren ts Nowhere], [Punct "+" Nowhere], [Group Paren ts Nowhere]]
+
+@macro
+@pub fun remember (ts : [TokenTree]) : [TokenTree] ! { Expand | e } =
+  match V.get ts 0 with
+  | Just (Word name _) -> (let u = define (name, Datum.Int 20) in [])
+  | _ -> [Fail "remember! takes a name" Nowhere]
+
+@macro
+@pub fun recalled (ts : [TokenTree]) : [TokenTree] ! { Expand | e } =
+  match V.get ts 0 with
+  | Just (Word name _) ->
+      (match lookup name with
+       | Just (Datum.Int n) -> [Num (n + 1) Nowhere]
+       | _ -> [Num 0 Nowhere])
+  | _ -> [Fail "recalled! takes a name" Nowhere]
+"#;
+
+/// A program that calls them: `first` looks up what a call written after it
+/// defines, so it waits a round.
+const MACROS_APP: &str = r#"use Mac (twice!, remember!, recalled!)
+
+def first = recalled!(kept)
+
+remember!(kept)
+
+def result = (twice!(first), twice!(1 + 2))
+"#;
+
+/// What [`MACROS_APP`] answers, compiled by MeadowBoot with its macros run
+/// on `engine`.
+fn macros_answer(engine: &str) -> String {
+    let dir =
+        std::env::temp_dir().join(format!("meadowboot-macros-{engine}-{}", std::process::id()));
+    for (pkg, manifest, file, text) in [
+        (
+            "Mac",
+            "[package]\nname = \"Mac\"\nversion = \"0.1.0\"\n",
+            "Lib.mw",
+            MACROS_LIB,
+        ),
+        (
+            "App",
+            "[package]\nname = \"App\"\nversion = \"0.1.0\"\n\n[dependencies]\nMac = { path = \"../Mac\" }\n",
+            "Main.mw",
+            MACROS_APP,
+        ),
+    ] {
+        std::fs::create_dir_all(dir.join(pkg).join("src")).expect("a package directory");
+        std::fs::write(dir.join(pkg).join("Meadow.toml"), manifest).expect("a manifest");
+        std::fs::write(dir.join(pkg).join("src").join(file), text).expect("a source file");
+    }
+    let out = Command::new(meadowboot_exe())
+        .arg("lower")
+        .arg("--set")
+        .arg(format!("macros={engine}"))
+        .arg(dir.join("App").join("src").join("Main.mw"))
+        .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+        .env("MEADOW", meadow())
+        // Nothing recorded: what the macros write is what MeadowBoot runs
+        // them to find out.
+        .env_remove("MEADOWBOOT_EXPANSIONS")
+        .output()
+        .expect("MeadowBoot runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let text = stdout
+        .split_once("\ncut 0\n")
+        .map(|(_, rest)| format!("cut 0\n{rest}"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no program:\n{stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+    axcut_answer(&text)
+}
+
+/// MeadowBoot runs a procedural macro itself -- a function of a package the
+/// program depends on -- on its CEK machine, and as a program it compiles
+/// and the back end runs on Glade: each answers what the Rust compiler does,
+/// a call that waits for a compile-time binding among them.
+#[test]
+fn a_procedural_macro_is_run_by_meadowboot_on_either_engine() {
+    assert_eq!(macros_answer("Cek"), "(42, 6)");
+    assert_eq!(macros_answer("Glade"), "(42, 6)");
+}
+
+/// The macros every module has: the line a call is on, its argument written
+/// back as text, and literals joined into one string -- as
+/// `meadow_compiler::expand` answers them.
+#[test]
+fn the_built_in_macros_answer_in_meadowboot() {
+    let dir = std::env::temp_dir().join(format!("meadowboot-builtin-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("src")).expect("a package directory");
+    std::fs::write(
+        dir.join("Meadow.toml"),
+        "[package]\nname = \"BuiltIn\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("a manifest");
+    let main = dir.join("src").join("Main.mw");
+    std::fs::write(
+        &main,
+        "def first = line!()\n\ndef result =\n  (first, line!(), stringify!(a + (b), [1, 2]), concat!(\"a\", 1, \"c\"))\n",
+    )
+    .expect("a source file");
+    let out = Command::new(meadowboot_exe())
+        .arg("lower")
+        .arg(&main)
+        .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+        .env_remove("MEADOWBOOT_EXPANSIONS")
+        .output()
+        .expect("MeadowBoot runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let text = stdout
+        .split_once("\ncut 0\n")
+        .map(|(_, rest)| format!("cut 0\n{rest}"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no program:\n{stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+    assert_eq!(axcut_answer(&text), r#"(1, 4, "a + (b), [1, 2]", "a1c")"#);
+}
+
+/// A built-in name of `@cfg` can only be compared with what it could be: a
+/// value it never has is a mistake, said where it is written, and not a
+/// condition that is quietly never true.
+#[test]
+fn a_cfg_that_could_never_hold_is_refused_by_meadowboot() {
+    let dir = std::env::temp_dir().join(format!("meadowboot-cfg-never-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("src")).expect("a package directory");
+    std::fs::write(
+        dir.join("Meadow.toml"),
+        "[package]\nname = \"Never\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("a manifest");
+    let main = dir.join("src").join("Main.mw");
+    std::fs::write(
+        &main,
+        "@cfg(os = \"linx\")\ndef only = 1\n\ndef result = 2\n",
+    )
+    .expect("a source file");
+    let out = Command::new(meadowboot_exe())
+        .arg("lower")
+        .arg(&main)
+        .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+        .env_remove("MEADOWBOOT_EXPANSIONS")
+        .output()
+        .expect("MeadowBoot runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        said.contains("`os` is never `\"linx\"`") && said.contains("not compiled"),
+        "{said}"
+    );
+}
+
+/// A `match` that misses a value is refused where the build is strict -- the
+/// release profile, or `--strict` -- saying a value it misses, as the Rust
+/// compiler says it; a build that is not strict compiles it. A guard covers
+/// nothing, since it may fail, and a `match` that covers everything is not
+/// refused, however its patterns are nested.
+#[test]
+fn a_match_that_misses_a_value_is_refused_where_the_build_is_strict() {
+    let strict = ["--set", "strict=true"];
+    let missed = [
+        (
+            "ctor",
+            "data T = A | B | C
+
+use T.*
+
+fun f t = match t with | A -> 1 | B -> 2
+
+def result = f C
+",
+            "Main.mw:5:11: non-exhaustive patterns: `C` is not matched",
+        ),
+        (
+            "nested",
+            "fun f m = match m with | Just (Just x) -> x | None -> 0
+
+def result = f None
+",
+            "non-exhaustive patterns: `Just None` is not matched",
+        ),
+        (
+            "tuple",
+            "fun f p = match p with | (True, _) -> 1 | (_, False) -> 2
+
+def result = f (True, True)
+",
+            "non-exhaustive patterns: `(False, True)` is not matched",
+        ),
+        (
+            "number",
+            "fun f n = match n with | 0 -> 1
+
+def result = f 0
+",
+            "non-exhaustive patterns: `_` is not matched",
+        ),
+        (
+            "guard",
+            "fun f m = match m with | Just x if x > 0 -> x | None -> 0
+
+def result = f None
+",
+            "non-exhaustive patterns: `Just _` is not matched",
+        ),
+    ];
+    for (name, source, why) in missed {
+        let said = said_of_with(&format!("strict-{name}"), source, &strict);
+        assert!(
+            said.contains(why) && said.contains("not compiled"),
+            "{name}: {said}"
+        );
+        let lenient = said_of(&format!("lenient-{name}"), source);
+        assert!(
+            !lenient.contains("not compiled"),
+            "{name}, not strict: {lenient}"
+        );
+    }
+    let covered = said_of_with(
+        "strict-covered",
+        "fun f m = match m with | Just (Just x) -> x | Just None -> 1 | None -> 0
+
+def result = f None
+",
+        &strict,
+    );
+    assert!(!covered.contains("not compiled"), "{covered}");
+}
+
+/// `meadowboot test` runs a package's `@test` functions -- the root module's
+/// and another's, private ones too -- compiled by MeadowBoot, and says each
+/// and what failed as `meadow test` says them; it fails when a test does, and
+/// a filter after the package runs only the tests whose names have it.
+#[test]
+fn a_package_s_tests_are_run_by_meadowboot_as_meadow_test_runs_them() {
+    let dir = std::env::temp_dir().join(format!("meadowboot-tests-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).expect("a package directory");
+    std::fs::write(
+        dir.join("Meadow.toml"),
+        "[package]\nname = \"Tp\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("a manifest");
+    std::fs::write(
+        dir.join("src").join("Main.mw"),
+        "mod Sums\n\nuse Std.Test (assert)\n\n@test fun addsUp () = assert (1 + 1 == 2) \"sums\"\n\n\
+         @test fun isWrong () = assert (1 > 2) \"one is not more than two\"\n\n\
+         fun main () = println \"hi\"\n",
+    )
+    .expect("the root module");
+    std::fs::write(
+        dir.join("src").join("Sums.mw"),
+        "use Std.Test (assert)\n\nfun double x = x * 2\n\n@test fun doubles () = assert (double 4 == 8) \"doubles\"\n",
+    )
+    .expect("a module");
+    let run = |more: &[&str]| {
+        let out = Command::new(meadowboot_exe())
+            .arg("test")
+            .arg(&dir)
+            .args(more)
+            .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+            .env("MEADOW", meadow())
+            .env_remove("MEADOWBOOT_EXPANSIONS")
+            .output()
+            .expect("MeadowBoot runs");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+    let (code, said) = run(&[]);
+    for line in [
+        "running 3 tests",
+        "test addsUp ... ok",
+        "test isWrong ... FAILED",
+        "test Sums.doubles ... ok",
+        "---- isWrong ----\n\"one is not more than two\"",
+        "test result: FAILED. 2 passed; 1 failed",
+    ] {
+        assert!(said.contains(line), "no `{line}` in:\n{said}");
+    }
+    assert_eq!(code, Some(1), "{said}");
+    let (code, said) = run(&["Sums"]);
+    assert!(
+        said.contains("running 1 test\n") && said.contains("test result: ok. 1 passed; 0 failed"),
+        "{said}"
+    );
+    assert_eq!(code, Some(0), "{said}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A function written `@export` is one C can call: a package of them is
+/// built by MeadowBoot as a library -- native, through Silo -- and each is a
+/// C function of the C types its Meadow types are. What calls them here is a
+/// Meadow program through `Std.Ffi`, as a C host would: an `int32_t`, a
+/// `double`, a `float` and two `int64_t`s go in, under the function's own
+/// name or the one `@export(name)` gives it, and the answers come back.
+#[test]
+fn a_function_meadowboot_exports_is_called_from_c() {
+    let root = std::env::temp_dir().join(format!("meadowboot-exports-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    // A dependency's exports are the library's too.
+    let dep = root.join("Dep");
+    std::fs::create_dir_all(dep.join("src")).expect("a package directory");
+    std::fs::write(
+        dep.join("Meadow.toml"),
+        "[package]\nname = \"Dep\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("a manifest");
+    std::fs::write(
+        dep.join("src").join("Lib.mw"),
+        "@export\nfun dep_three () : Int = 3\n",
+    )
+    .expect("the dependency's source");
+    let lib = root.join("Lib");
+    std::fs::create_dir_all(lib.join("src")).expect("a package directory");
+    std::fs::write(
+        lib.join("Meadow.toml"),
+        "[package]\nname = \"Lib\"\nversion = \"0.1.0\"\n\n[dependencies]\nDep = { path = \"../Dep\" }\n",
+    )
+    .expect("a manifest");
+    std::fs::write(
+        lib.join("src").join("Main.mw"),
+        "use Std.Ffi as Ffi\nuse Std.Ffi (Arg)\n\n\
+         @export\nfun twice (x : Int32) : Int32 = x * 2\n\n\
+         @export(lib_half)\nfun half (x : Float) : Float = x *. 0.5\n\n\
+         @export\nfun same32 (x : Float32) : Float32 = x\n\n\
+         @export\nfun add (a : Int) (b : Int) : Int = a + b\n\n\
+         @export\nfun broken (x : Int) : Int = x / (x - x)\n\n\
+         @export\nfun guarded (x : Int) : Int ! Process =\n  \
+         match Ffi.own () with\n  \
+         | Err _ -> 0\n  \
+         | Ok l ->\n      \
+         (match Ffi.function l \"broken\" with\n       \
+         | Err _ -> 0\n       \
+         | Ok f ->\n           \
+         (let r = Ffi.callInt f [Arg.Int x] in\n            \
+         match Ffi.failure () with | Just _ -> 1 | None -> 2))\n",
+    )
+    .expect("the library's source");
+    let built = Command::new(meadowboot_exe())
+        .arg("build")
+        .arg(&lib)
+        .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+        .env("MEADOW", meadow())
+        .env_remove("MEADOWBOOT_EXPANSIONS")
+        .output()
+        .expect("MeadowBoot runs");
+    // Named for its package, and where `meadow build` puts a native program.
+    let name = if cfg!(windows) {
+        "Lib.dll"
+    } else if cfg!(target_os = "macos") {
+        "libLib.dylib"
+    } else {
+        "libLib.so"
+    };
+    let library = lib.join("target/debug/native/silo").join(name);
+    assert!(
+        library.exists(),
+        "no library at {}:\n{}{}",
+        library.display(),
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let host = root.join("Host");
+    std::fs::create_dir_all(host.join("src")).expect("a package directory");
+    std::fs::write(
+        host.join("Meadow.toml"),
+        "[package]\nname = \"Host\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("a manifest");
+    std::fs::write(
+        host.join("src").join("Main.mw"),
+        format!(
+            "@!feature(ffi)\n\nuse Std.Ffi as Ffi\nuse Std.Ffi (Arg)\nuse Std.Result as R\n\n\
+             fun call name args = match Ffi.open {path:?} with\n  \
+             | Err why -> Err why\n  \
+             | Ok l -> (match Ffi.function l name with | Err why -> Err why | Ok f -> Ok f)\n\n\
+             fun main () =\n  let shown = (\n    \
+             R.andThen (\\f -> Ffi.callInt f [Arg.Int 21]) (call \"twice\" []),\n    \
+             R.andThen (\\f -> Ffi.callFloat f [Arg.Float 3.0]) (call \"lib_half\" []),\n    \
+             R.andThen (\\f -> Ffi.callFloat32 f [Arg.Float32 0.25]) (call \"same32\" []),\n    \
+             R.andThen (\\f -> Ffi.callInt f [Arg.Int 40, Arg.Int 2]) (call \"add\" [])\n  )\n  \
+             in\n  \
+             let failing = (\n    \
+             R.andThen (\\f -> Ffi.callInt f [Arg.Int 7]) (call \"broken\" []),\n    \
+             R.andThen (\\f -> Ffi.callInt f [Arg.Int 21]) (call \"twice\" []),\n    \
+             R.andThen (\\f -> Ffi.callInt f [Arg.Int 7]) (call \"guarded\" []),\n    \
+             R.andThen (\\f -> Ffi.callInt f []) (call \"dep_three\" [])\n  )\n  \
+             in\n  \
+             let u = println \"${{shown:?}}\" in\n  \
+             println \"${{failing:?}}\"\n",
+            path = library.to_string_lossy().replace('\\', "/")
+        ),
+    )
+    .expect("the host's source");
+    let out = Command::new(meadow())
+        .args(["run", "--offline"])
+        .arg(&host)
+        .output()
+        .expect("meadow runs");
+    let said = String::from_utf8_lossy(&out.stdout);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        said.contains("(Ok(42), Ok(1.5), Ok(0.25), Ok(42))"),
+        "{said}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // A call that fails answers zero, and C goes on: the library's next call
+    // is answered, and one of its functions calling another through C gets
+    // control back and is told why that one failed. And the dependency's
+    // function is called as the library's own are.
+    assert!(
+        said.contains("(Ok(0), Ok(42), Ok(1), Ok(3))"),
+        "{said}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// What a program prints when it is asked for help, on either stream.
+fn help_of(exe: &Path, args: &[&str]) -> String {
+    let out = Command::new(exe)
+        .args(args)
+        .output()
+        .expect("the program runs");
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// The flags a help text declares: each `--name`, and each `-x` beside one,
+/// where a line starts with it. A flag named in passing, in what another
+/// flag's help says, is not one.
+fn flags_in(help: &str) -> std::collections::BTreeSet<String> {
+    let mut flags = std::collections::BTreeSet::new();
+    for line in help.lines() {
+        let line = line.trim_start();
+        if !line.starts_with('-') {
+            continue;
+        }
+        for word in line.split([' ', ',']).take(3) {
+            let word = word.trim_end_matches(',');
+            let dashed = word.starts_with("--") && word.len() > 2;
+            let short = word.len() == 2 && word.starts_with('-') && word != "--";
+            if dashed || short {
+                flags.insert(word.to_string());
+            }
+        }
+        // `[alias: --all]`, `[aliases: --a, --b]`.
+        if let Some(at) = line.find("[alias") {
+            for word in line[at..].split([' ', ',', ']']) {
+                if word.starts_with("--") {
+                    flags.insert(word.to_string());
+                }
+            }
+        }
+    }
+    flags.remove("--help");
+    flags.remove("-h");
+    flags
+}
+
+/// MeadowBoot's command line is `meadow`'s: every command `meadow` has,
+/// MeadowBoot has, taking the same flags by the same names, letters and
+/// other names. Whoever runs one runs the other the same way, so nothing
+/// changes for them when a tool the Rust compiler is built on is one
+/// MeadowBoot is; and a flag added to one and not the other fails here.
+/// What MeadowBoot has besides -- each pass's output, for these tests, and
+/// `repl`, which `meadow` alone is -- is its own.
+#[test]
+fn a_command_takes_what_meadow_s_takes() {
+    let meadow_exe = meadow();
+    let boot = meadowboot_exe();
+    let top = help_of(&meadow_exe, &["--help"]);
+    let commands: Vec<String> = top
+        .lines()
+        .skip_while(|l| !l.starts_with("Commands:"))
+        .skip(1)
+        .take_while(|l| l.starts_with("  "))
+        .filter_map(|l| l.split_whitespace().next().map(str::to_string))
+        .filter(|c| c != "help")
+        .collect();
+    assert!(commands.len() >= 14, "{commands:?}");
+    assert_eq!(
+        flags_in(&top),
+        flags_in(&help_of(&boot, &["--help"])),
+        "what every command takes"
+    );
+    let mut wrong = Vec::new();
+    for command in &commands {
+        let theirs = flags_in(&help_of(&meadow_exe, &[command, "--help"]));
+        let ours = flags_in(&help_of(&boot, &[command, "--help"]));
+        if theirs != ours {
+            let missing: Vec<_> = theirs.difference(&ours).collect();
+            let extra: Vec<_> = ours.difference(&theirs).collect();
+            wrong.push(format!(
+                "`{command}`: MeadowBoot lacks {missing:?} and has {extra:?} besides"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    // And the version is said the same way.
+    let said = help_of(&boot, &["--version"]);
+    let theirs = help_of(&meadow_exe, &["--version"]);
+    assert_eq!(
+        said.trim().trim_start_matches("meadowboot"),
+        theirs.trim().trim_start_matches("meadow")
+    );
+}
+
+/// What MeadowBoot's `lower` says of the program `source`, on either stream:
+/// the package is made in a directory named for `name`.
+fn said_of(name: &str, source: &str) -> String {
+    said_of_with(name, source, &[])
+}
+
+/// The same, MeadowBoot told `args` besides.
+fn said_of_with(name: &str, source: &str, args: &[&str]) -> String {
+    let dir = std::env::temp_dir().join(format!("meadowboot-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("src")).expect("a package directory");
+    std::fs::write(
+        dir.join("Meadow.toml"),
+        "[package]\nname = \"Wrong\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("a manifest");
+    let main = dir.join("src").join("Main.mw");
+    std::fs::write(&main, source).expect("a source file");
+    let out = Command::new(meadowboot_exe())
+        .arg("lower")
+        .args(args)
+        .arg(&main)
+        .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+        .env_remove("MEADOWBOOT_EXPANSIONS")
+        .output()
+        .expect("MeadowBoot runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// A program that is wrong is not compiled, and MeadowBoot says what is wrong
+/// with it: a name, a type or a constructor nothing declares, where it is
+/// written, and types that do not agree, as the Rust compiler words them. It
+/// wrote a program of every one of these before, which failed when it ran or
+/// answered regardless.
+#[test]
+fn a_program_that_is_wrong_is_refused_by_meadowboot_with_what_is_wrong() {
+    let wrong = [
+        (
+            "name",
+            "def result = nope 1\n",
+            "Main.mw:1:14: undefined variable: nope",
+        ),
+        (
+            "constructor",
+            "def result = Nope 1\n",
+            "Main.mw:1:14: unknown constructor `Nope`",
+        ),
+        (
+            "type",
+            "fun f (x : Nope) = x\n\ndef result = 1\n",
+            "Main.mw:1:12: unknown type `Nope`",
+        ),
+        (
+            "number",
+            "def result = 1 + \"a\"\n",
+            "type mismatch: `String` is not an integer type",
+        ),
+        (
+            "signature",
+            "fun f (x : Int) : String = x\n\ndef result = 1\n",
+            "type mismatch: `String` vs `Int`",
+        ),
+        (
+            "itself",
+            "fun f x = x x\n\ndef result = 1\n",
+            "infinite type: `a` occurs in `a`",
+        ),
+        (
+            "tuple",
+            "def result = match (1, 2) with | (a, b, c) -> a\n",
+            "type mismatch: `(a, b, c)` vs `(a, b)`",
+        ),
+        (
+            "twice",
+            "fun f (x : Int) : Int = x\n\ndef f = 3\n\ndef result = 1\n",
+            "Main.mw:3:5: `f` is already defined in this module",
+        ),
+        (
+            "module",
+            "use Std.Nope as N\n\ndef result = 1\n",
+            "Main.mw:1:5: no module `Std.Nope`",
+        ),
+        (
+            "method",
+            "trait Named a { fun name : a -> String }\n\nimpl Named Int {}\n\ndef result = name 1\n",
+            "this `impl Named` is missing `name`",
+        ),
+        (
+            "effect",
+            "fun f x = let u = print \"a\" in x\n\ndef result = f 1\n",
+            "a top-level `def` cannot perform effects, and this one performs `Console`",
+        ),
+    ];
+    for (name, source, why) in wrong {
+        let said = said_of(&format!("wrong-{name}"), source);
+        assert!(
+            said.contains(why) && said.contains("not compiled"),
+            "{name}: {said}"
+        );
+    }
+    // And one that is right is compiled: a built-in type is not an unknown one.
+    let right = said_of(
+        "wrong-none",
+        "fun f (x : Int) (s : String) (u : ()) : [Int] = [x]\n\ndef result = f 1 \"a\" ()\n",
+    );
+    assert!(
+        right.contains("\ncut 0\n") && !right.contains("not compiled"),
+        "{right}"
     );
 }
 
@@ -2632,11 +3651,18 @@ fn axcut_answer(text: &str) -> String {
         Ok(l) => l,
         Err(e) => return format!("not lowered: {e}"),
     };
-    match Machine::run(&lowered, 500_000_000) {
-        Ok(Value::Str(s)) => s.to_string(),
-        Ok(v) => format!("answered {v}, not a string"),
-        Err(e) => format!("fails: {e:?}"),
-    }
+    // On a thread of its own, with room: the machine recurses as deep as
+    // the program does, past what a test's thread is given.
+    std::thread::Builder::new()
+        .stack_size(256 << 20)
+        .spawn(move || match Machine::run(&lowered, 500_000_000) {
+            Ok(Value::Str(s)) => s.to_string(),
+            Ok(v) => format!("answered {v}, not a string"),
+            Err(e) => format!("fails: {e:?}"),
+        })
+        .expect("a thread")
+        .join()
+        .unwrap_or_else(|_| "the machine panicked".to_string())
 }
 
 #[test]
@@ -2645,7 +3671,7 @@ fn glade_cases_lowered_to_cut_by_meadowboot_answer_as_the_rust_compiler_has_them
     let cases = run_cases(&dir);
     let wants: std::collections::HashMap<PathBuf, String> = cases.iter().cloned().collect();
     let files: Vec<PathBuf> = cases.iter().map(|(f, _)| f.clone()).collect();
-    let lowered = per_file("cut", &files);
+    let lowered = per_file("lower", &files);
     let answers: Vec<(PathBuf, String)> = lowered
         .iter()
         .map(|(p, text)| (p.clone(), format!("{}\n", cut_answer(text))))

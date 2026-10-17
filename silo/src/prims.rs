@@ -673,6 +673,9 @@ fn prim(p: Prim, a: &[Val], d: &[i64]) -> Word {
         GlobalReady => Word::from(globals(|g| matches!(g.get(index(arg(0))), Some(Some(_))))),
         GlobalGet => match globals(|g| g.get(index(arg(0))).copied().flatten()) {
             Some((w, wd)) => {
+                if counting() {
+                    read(index(arg(0)));
+                }
                 heap::share(w, wd);
                 w
             }
@@ -755,8 +758,11 @@ fn is_number(v: Val) -> bool {
 
 /// Structural equality, as `==` on values of any type means it.
 pub fn equal(a: Val, b: Val) -> bool {
-    let mut stack = vec![(a, b)];
-    while let Some((a, b)) = stack.pop() {
+    // Nothing is allocated to compare two numbers or two strings, which is
+    // what nearly every comparison is of: the stack is for what has parts.
+    let mut stack: Vec<(Val, Val)> = Vec::new();
+    let mut next = Some((a, b));
+    while let Some((a, b)) = next.take().or_else(|| stack.pop()) {
         match (a, b) {
             (Val::Int(x), Val::Int(y)) if x == y => {}
             (Val::Float(x), Val::Float(y)) if x == y => {}
@@ -770,6 +776,17 @@ pub fn equal(a: Val, b: Val) -> bool {
             (Val::Unit, Val::Unit) => {}
             (Val::Ref(x), Val::Ref(y)) => {
                 if x == y {
+                    continue;
+                }
+                // Two strings, where they are.
+                if heap::is_block(x)
+                    && heap::is_block(y)
+                    && heap::kind(x) == heap::STRING
+                    && heap::kind(y) == heap::STRING
+                {
+                    if heap::str_bytes(x) != heap::str_bytes(y) {
+                        return false;
+                    }
                     continue;
                 }
                 // A vector is equal to another of the same elements, whatever
@@ -801,7 +818,7 @@ pub fn equal(a: Val, b: Val) -> bool {
                 }
                 match kx {
                     heap::STRING => {
-                        if heap::bytes(x) != heap::bytes(y) {
+                        if heap::str_bytes(x) != heap::str_bytes(y) {
                             return false;
                         }
                     }
@@ -862,8 +879,10 @@ pub fn hash(v: Val) -> i64 {
         Label(String),
     }
     let mut h = Hasher::new();
-    let mut stack = vec![Work::Val(v)];
-    while let Some(w) = stack.pop() {
+    // A string, which is what is hashed most, is hashed where it is.
+    let mut stack: Vec<Work> = Vec::new();
+    let mut next = Some(Work::Val(v));
+    while let Some(w) = next.take().or_else(|| stack.pop()) {
         let v = match w {
             Work::Label(l) => {
                 h.str(&l);
@@ -880,6 +899,13 @@ pub fn hash(v: Val) -> i64 {
             Val::Sym(s) => h.str(show::names().syms.get(s).map_or("", |x| x.as_str())),
             Val::Unit => h.unit(),
             Val::Ref(x) => {
+                if x != 0 && x & 1 == 0 && heap::is_block(x) && heap::kind(x) == heap::STRING {
+                    h.str_packed(
+                        heap::str_bytes(x).len(),
+                        (0..heap::len(x)).map(|i| heap::field(x, i)),
+                    );
+                    continue;
+                }
                 if let Some(xs) = show::vector_elems(x) {
                     h.vector(xs.len());
                     stack.extend(xs.into_iter().rev().map(|(p, d)| Work::Val(val(p, d))));
@@ -897,8 +923,10 @@ pub fn hash(v: Val) -> i64 {
                 let field = |i: usize| val(heap::field(x, i), heap::field_desc(x, i));
                 match heap::kind(x) {
                     heap::STRING => {
-                        let bytes = heap::bytes(x);
-                        h.str_packed(bytes.len(), (0..heap::len(x)).map(|i| heap::field(x, i)));
+                        h.str_packed(
+                            heap::str_bytes(x).len(),
+                            (0..heap::len(x)).map(|i| heap::field(x, i)),
+                        );
                     }
                     heap::BIGINT => {
                         num::hash_into(&mut h, &number(v));
@@ -964,6 +992,27 @@ pub extern "C" fn meadow_hash(v: Word, d: i64) -> Word {
 #[unsafe(no_mangle)]
 pub extern "C" fn meadow_equal(a: Word, ad: i64, b: Word, bd: i64) -> Word {
     Word::from(equal(val(a, ad), val(b, bd)))
+}
+
+/// Whether top-level value `i` has been evaluated on this thread.
+#[unsafe(no_mangle)]
+pub extern "C" fn meadow_global_ready(i: Word) -> Word {
+    Word::from(globals(|g| matches!(g.get(i as usize), Some(Some(_)))))
+}
+
+/// Top-level value `i`, shared with whoever reads it.
+#[unsafe(no_mangle)]
+pub extern "C" fn meadow_global_get(i: Word) -> Word {
+    match globals(|g| g.get(i as usize).copied().flatten()) {
+        Some((w, wd)) => {
+            if counting() {
+                read(i as usize);
+            }
+            heap::share(w, wd);
+            w
+        }
+        None => fail("a definition read before it was evaluated"),
+    }
 }
 
 /// `stringIndexOf s sub from`: where `sub` next appears in `s`, or -1.
@@ -1281,7 +1330,7 @@ pub unsafe extern "C" fn meadow_array(n: i64, args: *const Word, descs: *const i
 // `MEADOW_SILO_PRIMS=1`: at exit, how many times each primitive was called
 // through `meadow_prim` rather than done inline -- what to inline next.
 
-fn counting() -> bool {
+pub(crate) fn counting() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("MEADOW_SILO_PRIMS").is_some())
 }
@@ -1297,10 +1346,36 @@ fn count(p: Prim) {
     c[i] += 1;
 }
 
+/// How many times each top-level value's place was read, by its place.
+static READS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+fn read(i: usize) {
+    let mut c = READS.lock().unwrap_or_else(|e| e.into_inner());
+    if c.len() <= i {
+        c.resize(i + 1, 0);
+    }
+    c[i] += 1;
+}
+
 /// The counts, most first, when counting.
 pub fn report() {
     if !counting() {
         return;
+    }
+    {
+        // The places read most: a value's place is where it is among the
+        // program's values, in the order it lists them.
+        let r = READS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut places: Vec<(u64, usize)> = r
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| **n > 0)
+            .map(|(i, n)| (*n, i))
+            .collect();
+        places.sort_by(|a, b| b.0.cmp(&a.0));
+        for (n, i) in places.iter().take(24) {
+            eprintln!("aot: {n:>12}  reads of value {i}");
+        }
     }
     let c = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
     let mut all: Vec<(u64, Prim)> = c
@@ -1312,5 +1387,39 @@ pub fn report() {
     all.sort_by(|a, b| b.0.cmp(&a.0));
     for (n, p) in all.iter().take(20) {
         eprintln!("aot: {n:>12}  {p:?}");
+    }
+    // What was made and let go of most, on every thread.
+    let erased = heap::erased();
+    let total: u64 = erased.iter().map(|(_, n)| n).sum();
+    eprintln!("aot: {total:>12}  blocks erased");
+    let named = |kind: u64, meta: u32| match kind {
+        heap::DATA => crate::show::ctor_name(meta as usize),
+        heap::CLOSURE => format!("closure, methods from {meta}"),
+        heap::STRING => "string".to_string(),
+        heap::ARRAY => "array".to_string(),
+        heap::RECORD => "record".to_string(),
+        heap::CELL => "ref".to_string(),
+        heap::MUT_ARRAY => "mutable array".to_string(),
+        heap::ONCE => "continuation, once".to_string(),
+        heap::STACK => "continuation, a stack".to_string(),
+        k => format!("kind {k}"),
+    };
+    for ((kind, meta), n) in erased.iter().take(40) {
+        eprintln!("aot: {n:>12}  erased: {}", named(*kind, *meta));
+    }
+    // And of those, the ones dropped whole: by which function of the
+    // program.
+    for ((kind, meta, who), n) in heap::dropped_by().iter().take(120) {
+        eprintln!("aot: {n:>12}  dropped: {} by {who}", named(*kind, *meta));
+    }
+    let (arrays, by) = heap::made_by();
+    eprintln!("aot: {arrays:>12}  arrays made");
+    for ((len, who), n) in by.iter().take(120) {
+        let len = if *len > 8 {
+            "more".to_string()
+        } else {
+            len.to_string()
+        };
+        eprintln!("aot: {n:>12}  made: array of {len} by {who}");
     }
 }

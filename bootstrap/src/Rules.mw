@@ -23,6 +23,7 @@ use MeadowBoot.Syntax (Surface, parseSurfaceTokens)
 use MeadowBoot.Fixity (Grouped)
 use Lingua.Red as R
 use Lingua.Red (Syntax)
+use Lingua.Green as G
 use Std.Collections.Vector as V
 use Std.Collections.HashMap as H
 use Std.Collections.HashMap (HashMap)
@@ -75,7 +76,7 @@ fun tok (tokenOf : Syntax Grouped -> Maybe Token) (t : Syntax Grouped) : Tok =
   }
 
 fun kids (s : Syntax Grouped) : [Syntax Grouped] =
-  V.filter (\x -> R.kindOf x != Grouped.Unknown) (R.children s)
+  R.childrenWhere (\g c -> G.kindAt g c != Grouped.Unknown) s
 
 @pub fun isGroup (s : Syntax Grouped) : Bool =
   let k = R.kindOf s in

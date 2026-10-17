@@ -42,6 +42,100 @@ fn meadow(dir: &Path, args: &[&str]) -> (bool, String, String) {
     )
 }
 
+/// Fifty threads, each keeping a compact in a table in a `Ref` that is written
+/// under a handler -- what a query's thread keeps its answers in -- and
+/// ending. Found by Lingua's session, reduced from a database whose answers
+/// were never let go.
+const KEPT_IN_A_REF: &str = r#"use Std.Collections.Vector as V
+use Std.Collections.HashMap as HashMap
+use Std.Collections.HashMap (HashMap)
+use Std.Compact as Compact
+use Std.Thread as Thread
+
+data Box = Box (Ref (HashMap Int (Compact [Int])))
+
+effect Ask { ask : Int -> Int }
+
+fun through (b : Box) (n : Int) : Int ! { Mut | e } =
+  handle (ask n + 1) with {
+    ask k resume ->
+      (match b with
+       | Box r ->
+           let c = Compact.make (V.range 0 k) in
+           let u = setRef r (HashMap.insert k c (getRef r)) in
+           resume (V.len (Compact.get c))),
+    return x -> x
+  }
+
+fun inBox (n : Int) = through (Box (newRef HashMap.empty)) n
+
+fun main () =
+  let tasks = V.map (\i -> Thread.spawn (\() -> inBox (1000 + i))) (V.range 0 50) in
+  println (show (V.foldl (\a b -> a + b) 0 (Thread.awaitAll tasks)))
+"#;
+
+/// A `Ref` that has been written is a candidate for Silo's cycle collector,
+/// and one that dies while it is a candidate is only marked, for the
+/// collector to free when it next runs. A thread that ended first never ran
+/// it: the `Ref`, the table in it and every region the table held stayed for
+/// the rest of the program.
+#[test]
+fn what_a_thread_kept_in_a_ref_goes_when_the_thread_does() {
+    let dir = scratch("kept-in-a-ref");
+    let root = package(&dir, "kept-in-a-ref", KEPT_IN_A_REF);
+    let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
+        .current_dir(&root)
+        .env("MEADOW_SILO_LEAKS", "1")
+        .args(["run", "--runtime", "silo", "."])
+        .output()
+        .expect("the meadow binary runs");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert_eq!(answer(&String::from_utf8_lossy(&out.stdout)), "51275");
+    assert!(err.contains("aot: 0 regions live at exit"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A hundred `TVar`s, made and read and let go of on five threads, each
+/// holding a vector.
+const VARS_LET_GO: &str = r#"use Std.Stm as T
+use Std.Collections.Vector as V
+use Std.Thread as Thread
+
+fun round (i : Int) =
+  let tv = T.newTVarIO (V.range 0 (100 + i)) in
+  let u = T.atomically (\() -> T.modifyTVar tv (\xs -> V.pushBack xs i)) in
+  V.len (T.readTVarIO tv)
+
+fun go (i : Int) (acc : Int) = if i == 0 then acc else go (i - 1) (acc + round i)
+
+fun main () =
+  let tasks = V.map (\k -> Thread.spawn (\() -> go 20 0)) (V.range 0 4) in
+  println (show (go 20 0 + V.foldl (\a b -> a + b) 0 (Thread.awaitAll tasks)))
+"#;
+
+/// A `TVar` keeps its value in a region of its own, and was kept for the
+/// whole run: nothing said when the last handle to one had gone. A program
+/// that made them as it went -- a database with one for each answer -- kept
+/// every value it had ever put in one. Handles are counted now, wherever
+/// they are, and a `TVar` nothing can reach lets its value go.
+#[test]
+fn a_tvar_nothing_can_reach_lets_its_value_go() {
+    let dir = scratch("vars-let-go");
+    let root = package(&dir, "vars-let-go", VARS_LET_GO);
+    let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
+        .current_dir(&root)
+        .env("MEADOW_SILO_LEAKS", "1")
+        .args(["run", "--runtime", "silo", "."])
+        .output()
+        .expect("the meadow binary runs");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert_eq!(answer(&String::from_utf8_lossy(&out.stdout)), "11150");
+    assert!(err.contains("aot: 0 regions live at exit"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The last line a run printed.
 fn answer(stdout: &str) -> &str {
     stdout.lines().last().unwrap_or("")
@@ -342,6 +436,77 @@ def t:Main/main (; k: ptr) =
         prim eq(r, 200002; μ̃ w: unit. <"wrong" | k>, μ̃ w: unit. <"200002" | k>))>))
 "#;
 
+/// The images kept of the programs of Cut in `dir`, by name.
+fn cut_images(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found: Vec<_> = std::fs::read_dir(dir.join("target").join("cut"))
+        .map(|d| d.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    found.retain(|p: &std::path::PathBuf| p.extension().is_some_and(|x| x == "image"));
+    found.sort();
+    found
+}
+
+/// A program of Cut that is run again -- the one a front end builds of a
+/// package's macros is run for every round of a build -- is not read and
+/// lowered again: its image is kept beside it, named for its text, and that
+/// is what runs. A program that changed has an image of its own, and one
+/// that cannot be read is made again.
+#[test]
+fn a_program_of_cut_run_again_runs_the_image_kept_of_it() {
+    let dir = scratch("cut-image");
+    let other = scratch("cut-image-other");
+    let said = "two hundred thousand and two";
+    std::fs::write(dir.join("count.cut"), CUT).unwrap();
+    std::fs::write(
+        other.join("count.cut"),
+        CUT.replace("\"200002\"", &format!("\"{said}\"")),
+    )
+    .unwrap();
+
+    let (ok, out, err) = meadow(&dir, &["cut", "count.cut"]);
+    assert!(ok, "{err}");
+    assert_eq!(out, "counting\n200002");
+    let kept = cut_images(&dir);
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    let (_, out, _) = meadow(&dir, &["cut", "count.cut"]);
+    assert_eq!(out, "counting\n200002");
+    assert_eq!(cut_images(&dir), kept, "the same text has the same image");
+
+    // It is the image that runs: with another program's in its place, the
+    // other program's answer is what comes back.
+    let (ok, out, err) = meadow(&other, &["cut", "count.cut"]);
+    assert!(ok, "{err}");
+    assert_eq!(out, format!("counting\n{said}"));
+    let theirs = cut_images(&other);
+    assert_eq!(theirs.len(), 1, "{theirs:?}");
+    assert_ne!(
+        theirs[0].file_name(),
+        kept[0].file_name(),
+        "named for its text"
+    );
+    std::fs::copy(&theirs[0], &kept[0]).unwrap();
+    let (_, out, _) = meadow(&dir, &["cut", "count.cut"]);
+    assert_eq!(out, format!("counting\n{said}"));
+
+    // One that does not read is made again, and the answer is the program's.
+    std::fs::write(&kept[0], b"not an image").unwrap();
+    let (ok, out, err) = meadow(&dir, &["cut", "count.cut"]);
+    assert!(ok, "{err}");
+    assert_eq!(out, "counting\n200002");
+
+    // A program that changed gets its own, and the one before it goes.
+    std::fs::write(
+        dir.join("count.cut"),
+        CUT.replace("\"200002\"", &format!("\"{said}\"")),
+    )
+    .unwrap();
+    let (_, out, _) = meadow(&dir, &["cut", "count.cut"]);
+    assert_eq!(out, format!("counting\n{said}"));
+    let now = cut_images(&dir);
+    assert_eq!(now.len(), 1, "{now:?}");
+    assert_ne!(now, kept);
+}
+
 #[test]
 fn a_program_of_cut_runs_on_glade_and_as_an_executable_of_silos() {
     let dir = scratch("cut");
@@ -382,6 +547,23 @@ fn a_program_of_cut_runs_on_glade_and_as_an_executable_of_silos() {
         let (ok, out, err) = meadow(&dir, &args);
         assert!(ok, "{runtime:?}: {err}");
         assert_eq!(out, "generic", "{runtime:?}");
+    }
+    // A program with no answer prints what it writes and nothing after:
+    // on Silo the `unit` it ended with was shown, as `<continuation>`.
+    std::fs::write(
+        dir.join("quiet.cut"),
+        "cut 0\nentry t:Main/main\nanswer none\n\n\
+         native {\n  t:Main/Console.say = Console.writeOutput\n}\n\n\
+         effect t:Main/Console { say(str) -> unit }\n\n\
+         def t:Main/main (; k: ptr) =\n  perform t:Main/Console.say(\"said\\n\"; μ̃ u: unit. <unit | k>)\n",
+    )
+    .unwrap();
+    for runtime in [&[][..], &["--runtime", "silo"]] {
+        let mut args = vec!["cut", "quiet.cut"];
+        args.extend_from_slice(runtime);
+        let (ok, out, err) = meadow(&dir, &args);
+        assert!(ok, "{runtime:?}: {err}");
+        assert_eq!(out, "said\n", "{runtime:?}");
     }
     std::fs::write(
         dir.join("refused.cut"),

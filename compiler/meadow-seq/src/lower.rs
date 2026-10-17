@@ -215,9 +215,11 @@ pub fn lower_program(program: &core::Program, opt: OptLevel) -> Lowered {
     // dictionaries it is at: a function that takes dictionaries is copied for
     // the ones it is known to be given -- see [`core::dictionaries`].
     let timing = Timing::from_env();
+    let skipped = std::env::var("MEADOW_SKIP_PASSES").unwrap_or_default();
+    let skip = |name: &str| skipped.split(',').any(|s| s == name);
     let program = &timing.pass("dictionaries", || core::dictionaries::program(program, opt));
     let specialized = timing.pass("specialize", || {
-        if opt.specializes() {
+        if opt.specializes() && !skip("release") {
             core::specialize::release(program)
         } else {
             core::specialize::program(program)
@@ -232,8 +234,11 @@ pub fn lower_program(program: &core::Program, opt: OptLevel) -> Lowered {
     let literals = timing.pass("literals", || {
         core::globals::inline_literals(&core::bools::program(&specialized))
     });
+    // `MEADOW_SKIP_PASSES=joins,simplify`: leave the named passes out, to
+    // measure what each is worth to a program -- of `inline`, `joins`,
+    // `simplify`, `lift` and `trmc`.
     let inlined = timing.pass("inline", || {
-        if opt.inlines() {
+        if opt.inlines() && !skip("inline") {
             core::inline::program(&literals)
         } else {
             literals.clone()
@@ -244,10 +249,34 @@ pub fn lower_program(program: &core::Program, opt: OptLevel) -> Lowered {
     // Local functions are lifted to the top level before it, so that a local
     // loop is a definition with a direct entry rather than a closure, and is a
     // candidate for TRMC like any other -- see [`core::lift`].
-    let joined = timing.pass("joins", || core::joins::program(&inlined));
-    let simplified = timing.pass("simplify", || core::simplify::program(&joined));
-    let lifted = timing.pass("lift", || core::lift::program(&simplified, opt));
-    let trmc = timing.pass("trmc", || core::trmc::program(&lifted, opt));
+    let joined = timing.pass("joins", || {
+        if skip("joins") {
+            inlined.clone()
+        } else {
+            core::joins::program(&inlined)
+        }
+    });
+    let simplified = timing.pass("simplify", || {
+        if skip("simplify") {
+            joined.clone()
+        } else {
+            core::simplify::program(&joined)
+        }
+    });
+    let lifted = timing.pass("lift", || {
+        if skip("lift") {
+            simplified.clone()
+        } else {
+            core::lift::program(&simplified, opt)
+        }
+    });
+    let trmc = timing.pass("trmc", || {
+        if skip("trmc") {
+            lifted.clone()
+        } else {
+            core::trmc::program(&lifted, opt)
+        }
+    });
     let program = &timing.pass("globals", || core::globals::program(&trmc));
     let lowering = std::time::Instant::now();
     if let Ok(want) = std::env::var("MEADOW_DUMP_CORE") {
@@ -518,6 +547,7 @@ pub fn lower_program(program: &core::Program, opt: OptLevel) -> Lowered {
     timing.since("lower", lowering);
     Lowered {
         program: Program {
+            exports: Vec::new(),
             defs,
             entry,
             tags: lower.tags,

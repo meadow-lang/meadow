@@ -1,0 +1,537 @@
+-- Macros: what crosses between the compiler and a procedural macro -- the
+-- call's tokens going in, and what it answered coming back -- as the Rust
+-- driver has it (`buildtools/meadow/src/proc.rs`).
+--
+-- A procedural macro is a function of a package this one depends on,
+-- `[TokenTree] -> [TokenTree] ! { Expand | e }`, and is run as a program of
+-- its own (`Std.Macro.Serve`): handed a `Wire` -- whether the round is
+-- settled, the compile-time bindings the call can see, its argument -- and
+-- answering one. A `Wire` is a tree of named nodes, text and numbers, and
+-- is written as text: `N` and the tag's length, `:`, the tag, and how many
+-- children, `;`, then the children; `T` and a length, `:`, and that many
+-- bytes; `W` an integer and `;`; `F` a float and `;` -- going in, an integer
+-- and a power of two, `F-3e-1;`, and coming out as `show` writes it.
+
+use MeadowBoot.Lex (lex, Lexed, Token)
+use MeadowBoot.Rules (Tok, Tree, Delim, flatten)
+use MeadowBoot.Rules.Tree.*
+use MeadowBoot.Rules.Delim.*
+use Std.Collections.Vector as V
+use Std.String as S
+use Std.Char as Ch
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+use Std.Result.Result.*
+
+-- A float is kept as it is written on the wire.
+@pub data Wire
+  = Node String [Wire]
+  | Text String
+  | Whole Int
+  | Frac String
+
+use Wire.*
+
+-- Child `i` of a node, if it has one.
+fun kid (w : Wire) (i : Int) : Maybe Wire = match w with | Node _ xs -> V.get xs i | _ -> None
+
+fun tagOf (w : Wire) : String = match w with | Node tag _ -> tag | _ -> ""
+
+fun arity (w : Wire) : Int = match w with | Node _ xs -> V.len xs | _ -> 0
+
+-- --- as text -----------------------------------------------------------------
+
+@pub fun writeWire (w : Wire) : String = S.join "" (pieces w [])
+
+fun pieces (w : Wire) (acc : [String]) : [String] =
+  match w with
+  | Text s -> V.pushBack acc "T${show (stringByteLength s)}:${s}"
+  | Whole n -> V.pushBack acc "W${show n};"
+  | Frac x -> V.pushBack acc "F${x};"
+  | Node tag xs ->
+      V.foldl
+        (\a x -> pieces x a)
+        (V.pushBack acc "N${show (stringByteLength tag)}:${tag}${show (V.len xs)};")
+        xs
+
+-- The `Wire` written at byte `i` of `s`, and where the next starts.
+@pub fun readWire (s : String) (i : Int) : Maybe (Wire, Int) =
+  let tag = stringSlice s i (i + 1) in
+  if tag == "T" then
+    M.andThen
+      (\colon ->
+        M.map
+          (\n -> (Text (stringSlice s (colon + 1) (colon + 1 + n)), colon + 1 + n))
+          (S.toInt (stringSlice s (i + 1) colon)))
+      (S.indexOfFrom ":" s (i + 1))
+  else if tag == "W" then
+    M.andThen
+      (\semi -> M.map (\n -> (Whole n, semi + 1)) (S.toInt (stringSlice s (i + 1) semi)))
+      (S.indexOfFrom ";" s (i + 1))
+  else if tag == "F" then
+    M.map (\semi -> (Frac (stringSlice s (i + 1) semi), semi + 1)) (S.indexOfFrom ";" s (i + 1))
+  else if tag == "N" then
+    M.andThen
+      (\colon ->
+        M.andThen
+          (\n ->
+            let name = stringSlice s (colon + 1) (colon + 1 + n) in
+            M.andThen
+              (\semi ->
+                M.andThen
+                  (\count ->
+                    M.map (\x -> (Node name (fst x), snd x)) (readMany s (semi + 1) count []))
+                  (S.toInt (stringSlice s (colon + 1 + n) semi)))
+              (S.indexOfFrom ";" s (colon + 1 + n)))
+          (S.toInt (stringSlice s (i + 1) colon)))
+      (S.indexOfFrom ":" s (i + 1))
+  else None
+
+fun readMany (s : String) (i : Int) (n : Int) (acc : [Wire]) : Maybe ([Wire], Int) =
+  if n <= 0 then Just (acc, i)
+  else
+    match readWire s i with
+    | Just (w, next) -> readMany s next (n - 1) (V.pushBack acc w)
+    | None -> None
+
+-- Every `Wire` written in `s`, one after another.
+@pub fun readWires (s : String) : [Wire] = wiresFrom s 0 []
+
+fun wiresFrom (s : String) (i : Int) (acc : [Wire]) : [Wire] =
+  match readWire s i with
+  | Just (w, next) -> wiresFrom s next (V.pushBack acc w)
+  | None -> acc
+
+-- --- a call ------------------------------------------------------------------
+
+-- What a macro is handed: whether nothing more can be defined, the bindings
+-- the call can see -- the latest first, since the first found is the one
+-- read -- each a name and its value as a `Datum` on the wire, and the
+-- argument's trees, standing where they were written.
+@pub fun callWire (settled : Bool) (scope : [(String, Wire)]) (trees : [Tree]) : Wire =
+  Node "" [
+    Whole (if settled then 1 else 0),
+    Node "" (V.map (\b -> Node (fst b) [snd b]) (V.reverse scope)),
+    treesWire True trees
+  ]
+
+@pub fun treesWire (spans : Bool) (trees : [Tree]) : Wire = Node "" (V.map (treeWire spans) trees)
+
+-- A token tree, as `Std.Macro.TokenTree` is: a name is a word and so is a
+-- keyword, and anything that is not a name, a literal or a group is
+-- punctuation by its text.
+fun treeWire (spans : Bool) (t : Tree) : Wire =
+  let at = \from to -> if spans then Node "At" [Whole from, Whole to] else Node "Nowhere" [] in
+  match t with
+  | Delimited d open close inner ->
+      Node "Group" [Text (opening d), treesWire spans inner, at open.from close.to]
+  | Leaf k ->
+      let here = at k.from k.to in
+      (match k.token with
+       | Token.LowerIdent s -> Node "Word" [Text s, here]
+       | Token.UpperIdent s -> Node "Word" [Text s, here]
+       | Token.Str s -> Node "Str" [Text s, here]
+       | Token.Char c -> Node "Chr" [Text (S.fromChars [Ch.fromCode c]), here]
+       | Token.Int n -> Node "Num" [Whole n, here]
+       | Token.Real r -> Node "Real" [Frac (exactly r), here]
+       | _ -> Node (if startsAlphabetic k.text then "Word" else "Punct") [Text k.text, here])
+
+fun opening (d : Delim) : String =
+  match d with
+  | Paren -> "("
+  | Brack -> "["
+  | Brace -> "{"
+
+fun startsAlphabetic (text : String) : Bool =
+  match S.charAt text 0 with
+  | Just c -> Ch.isAlpha c
+  | None -> False
+
+-- A float literal as an integer and a power of two, `m e k` for `m * 2^k`:
+-- what the wire takes a float as going in.
+fun exactly (literal : String) : String =
+  let digits = S.join "" (S.split "_" literal) in
+  let (mantissa, power) =
+    (match S.indexOf "e" (S.toLower digits) with
+     | Just k -> (S.take digits k, M.unwrapOr 0 (S.toInt (S.drop digits (k + 1))))
+     | None -> (digits, 0))
+  in
+  let (whole, fraction) =
+    (match S.indexOf "." mantissa with
+     | Just k -> (S.take mantissa k, S.drop mantissa (k + 1))
+     | None -> (mantissa, ""))
+  in
+  let n = toFloat (M.unwrapOr 0 (S.toInt (whole ++ fraction))) in
+  let x = scaleTen n (power - stringByteLength fraction) in
+  halving x 0
+
+fun scaleTen (x : Float) (e : Int) : Float =
+  if e > 0 then scaleTen (x *. 10.0) (e - 1) else if e < 0 then scaleTen (x /. 10.0) (e + 1) else x
+
+-- `x` doubled until it is a whole number, and how many times.
+fun halving (x : Float) (e : Int) : String =
+  let whole = floor x in
+  if toFloat whole == x or e <= 0 - 1074 then "${show whole}e${show e}"
+  else halving (x *. 2.0) (e - 1)
+
+-- --- an answer ---------------------------------------------------------------
+
+-- How a run ended: with the tokens that take the call's place and what it
+-- defined, each name with its value; set aside, waiting for a name nothing
+-- has defined yet; or with what is wrong, and where if it said.
+@pub data Answer
+  = Answered [Tree] [(String, Wire)]
+  | Waiting String
+  | Failed String (Maybe (Int, Int))
+
+-- What is wrong with an answer, and where the macro said it was.
+type Wrong = (String, Maybe (Int, Int))
+
+-- What `w` answers for a call standing at `at`: a token the macro made up
+-- stands there, and one it passed on where it was written.
+@pub fun answerOf (w : Wire) (at : (Int, Int)) : Answer =
+  match (tagOf w, kid w 0, kid w 1) with
+  | ("Answered", Just trees, Just defined) ->
+      (match decodeTrees trees at with
+       | Err (why, place) -> Answer.Failed why place
+       | Ok made ->
+           (match definedIn defined at with
+            | Err (why, place) -> Answer.Failed why place
+            | Ok ds -> Answer.Answered made ds))
+  | ("Waiting", Just (Text name), _) -> Answer.Waiting name
+  | _ -> Answer.Failed "it did not answer with tokens" None
+
+fun definedIn (w : Wire) (at : (Int, Int)) : Result Wrong [(String, Wire)] =
+  V.foldl
+    (\acc d ->
+      match (acc, d) with
+      | (Err e, _) -> Err e
+      | (Ok ds, _) ->
+          (match (arity d, kid d 0) with
+           | (1, Just value) ->
+               (match datum value at with
+                | Ok v -> Ok (V.pushBack ds (tagOf d, v))
+                | Err e -> Err e)
+           | _ -> Err ("a definition without a value", None)))
+    (Ok [])
+    (childrenOf w)
+
+fun childrenOf (w : Wire) : [Wire] = match w with | Node _ xs -> xs | _ -> []
+
+-- A binding's value as it is kept, and handed to whoever looks it up: the
+-- `Datum` as it came, but its code read into tokens and written back standing
+-- nowhere -- it was written in whatever file defined it, and where it is
+-- spliced is somewhere else.
+fun datum (w : Wire) (at : (Int, Int)) : Result Wrong Wire =
+  let tag = tagOf w in
+  let all = \xs -> each (\x -> datum x at) xs in
+  if tag == "Code" then
+    (match M.map (\trees -> decodeTrees trees at) (kid w 0) with
+     | Just (Ok ts) -> Ok (Node "Code" [treesWire False ts])
+     | Just (Err e) -> Err e
+     | None -> Err ("`Code` with nothing in it", None))
+  else if tag == "List" then
+    (match all (childrenOf w) with
+     | Ok ys -> Ok (Node "List" ys)
+     | Err e -> Err e)
+  else if tag == "Rec" then
+    (match each
+       (\f ->
+         match (arity f, kid f 0) with
+         | (1, Just v) ->
+             (match datum v at with
+              | Ok d -> Ok (Node (tagOf f) [d])
+              | Err e -> Err e)
+         | _ -> Err ("a field without a value", None))
+       (childrenOf w) with
+     | Ok ys -> Ok (Node "Rec" ys)
+     | Err e -> Err e)
+  else if tag == "Tag" then
+    (match (kid w 0, kid w 1) with
+     | (Just name, Just inner) ->
+         (match all (childrenOf inner) with
+          | Ok ys -> Ok (Node "Tag" [name, Node "" ys])
+          | Err e -> Err e)
+     | _ -> Err ("`Tag` with nothing in it", None))
+  else if tag == "Sym" or tag == "Str" or tag == "Int" or tag == "Float" or tag == "Bool" then Ok w
+  else Err ("`${tag}` is not a `Datum`", None)
+
+fun each (f : a -> Result e b) (xs : [a]) : Result e [b] =
+  V.foldl
+    (\acc x ->
+      match acc with
+      | Err e -> Err e
+      | Ok ys ->
+          (match f x with
+           | Ok y -> Ok (V.pushBack ys y)
+           | Err e -> Err e))
+    (Ok [])
+    xs
+
+-- Token trees, read back. `Code` is text, which is lexed here, so one tree
+-- can be several; and an interpolated string comes as several tokens --
+-- its text up to each hole, the hole's own, and on to its stop -- none of
+-- which is Meadow alone, so the whole literal is written out and lexed once.
+@pub fun decodeTrees (w : Wire) (at : (Int, Int)) : Result Wrong [Tree] =
+  decodeFrom (childrenOf w) 0 at []
+
+fun decodeFrom (items : [Wire]) (i : Int) (at : (Int, Int)) (acc : [Tree]) : Result Wrong [Tree] =
+  match V.get items i with
+  | None -> Ok acc
+  | Just item ->
+      if pieceOf item == 1 then
+        (match interpolated items i 0 [] with
+         | Err e -> Err e
+         | Ok (text, stop) ->
+             let first = M.unwrapOr at (locOf item) in
+             let last = M.unwrapOr first (M.andThen locOf (V.get items stop)) in
+             (match lexAt text (fst first, max (snd last) (fst first)) with
+              | Ok ts -> decodeFrom items (stop + 1) at (V.append acc ts)
+              | Err why -> Err (why, None)))
+      else
+        (match decode item at with
+         | Ok ts -> decodeFrom items (i + 1) at (V.append acc ts)
+         | Err e -> Err e)
+
+-- Which piece of an interpolated string a token is, as a macro is given
+-- them, each a `Punct` of the text the lexer writes it back with: 1 for
+-- `"…${`, 2 for `}…${`, 3 for `}…"`, and 0 for anything else.
+fun pieceOf (w : Wire) : Int =
+  match w with
+  | Node "Punct" parts ->
+      (match V.get parts 0 with
+       | Just (Text text) ->
+           if stringByteLength text < 2 then 0
+           else if S.startsWith "\"" text and S.endsWith hole text then 1
+           else if S.startsWith "}" text and S.endsWith hole text then 2
+           else if S.startsWith "}" text and S.endsWith "\"" text then 3
+           else 0
+       | _ -> 0)
+  | _ -> 0
+
+-- What opens a hole in a string: a dollar and a brace, spelt so that this
+-- is not one.
+def hole : String = S.fromChars [Ch.fromCode 36, Ch.fromCode 123]
+
+-- The interpolated string starting at `items[i]`, written out whole, and
+-- where its last piece is: the stop that closes it, past any string nested
+-- in one of its holes.
+fun interpolated (items : [Wire]) (i : Int) (depth : Int) (acc : [String])
+    : Result Wrong (String, Int) =
+  match V.get items i with
+  | None -> Err ("an interpolated string that does not stop", None)
+  | Just item ->
+      let k = pieceOf item in
+      let d = if k == 1 then depth + 1 else if k == 3 then depth - 1 else depth in
+      (match sourceText item with
+       | Err e -> Err e
+       | Ok text ->
+           if d == 0 then Ok (S.join " " (V.pushBack acc text), i)
+           else interpolated items (i + 1) d (V.pushBack acc text))
+
+-- A token tree of an answer, written back as Meadow.
+fun sourceText (w : Wire) : Result Wrong String =
+  match w with
+  | Node "Group" parts ->
+      (match (V.get parts 0, V.get parts 1) with
+       | (Just (Text open), Just inner) ->
+           (match (closing open, each sourceText (childrenOf inner)) with
+            | (Just close, Ok texts) -> Ok "${open}${S.join " " texts}${close}"
+            | (None, _) -> Err ("a group with no bracket", None)
+            | (_, Err e) -> Err e)
+       | _ -> Err ("a group with no bracket", None))
+  | Node tag parts ->
+      (match V.get parts 0 with
+       | None -> Err ("`${tag}` with nothing in it", None)
+       | Just first ->
+           if tag == "Word" or tag == "Punct" or tag == "Code" then textOf first
+           else if tag == "Str" then
+             (match textOf first with
+              | Ok s -> Ok (quoted s)
+              | Err e -> Err e)
+           else if tag == "Chr" then
+             (match textOf first with
+              | Ok s -> Ok "'${s}'"
+              | Err e -> Err e)
+           else if tag == "Num" then
+             (match first with
+              | Whole n -> Ok (show n)
+              | _ -> Err ("`Num` was given something that is not a number", None))
+           else if tag == "Real" then
+             (match first with
+              | Frac x -> Ok x
+              | _ -> Err ("`Real` was given something that is not a number", None))
+           else Err ("`${tag}` is not a token", None))
+  | _ -> Err ("it did not answer with tokens", None)
+
+fun textOf (w : Wire) : Result Wrong String =
+  match w with
+  | Text s -> Ok s
+  | _ -> Err ("text was expected", None)
+
+fun closing (open : String) : Maybe String =
+  if open == "(" then Just ")"
+  else if open == "[" then Just "]"
+  else if open == "{" then Just "}"
+  else None
+
+-- A string's contents as a literal: what the lexer reads back as them.
+fun quoted (s : String) : String =
+  let swap = \from to text -> S.join to (S.split from text) in
+  "\"${swap "\n" "\\n" (swap "\"" "\\\"" (swap "\\" "\\\\" s))}\""
+
+-- Where a token of an answer was written, if it says.
+fun locOf (w : Wire) : Maybe (Int, Int) =
+  match w with
+  | Node _ parts -> M.andThen written (V.last parts)
+  | _ -> None
+
+fun written (w : Wire) : Maybe (Int, Int) =
+  match (tagOf w, kid w 0, kid w 1) with
+  | ("At", Just (Whole a), Just (Whole b)) -> if a >= 0 and b >= a then Just (a, b) else None
+  | _ -> None
+
+fun decode (w : Wire) (at : (Int, Int)) : Result Wrong [Tree] =
+  match w with
+  | Node tag parts ->
+      -- Where the token stands: where it was written, or -- for one the
+      -- macro made up -- where the call is.
+      let placed = \i -> M.unwrapOr at (M.andThen written (V.get parts i)) in
+      let one =
+        \t text ->
+          (match placed 1 with
+           | (a, b) -> Ok [Leaf (Tok { token = t, text, from = a, to = b })])
+      in (match V.get parts 0 with
+          | None -> Err ("`${tag}` with nothing in it", None)
+          | Just first ->
+              -- A word is whatever the lexer makes of it: a keyword is a
+              -- keyword, and an identifier's case says which kind it is.
+              if tag == "Word" or tag == "Punct" then
+                (match first with
+                 | Text s ->
+                     (match lexAt s (placed 1) with
+                      | Ok ts -> Ok ts
+                      | Err why -> Err (why, None))
+                 | _ -> Err ("text was expected", None))
+              else if tag == "Code" then
+                (match first with
+                 | Text s ->
+                     (match lexAt s at with
+                      | Ok ts -> Ok ts
+                      | Err why -> Err (why, None))
+                 | _ -> Err ("text was expected", None))
+              else if tag == "Str" then
+                (match first with
+                 | Text s -> one (Token.Str s) (quoted s)
+                 | _ -> Err ("text was expected", None))
+              else if tag == "Chr" then
+                (match first with
+                 | Text s ->
+                     (match (S.charAt s 0, S.charLength s) with
+                      | (Just c, 1) -> one (Token.Char (Ch.code c)) "'${s}'"
+                      | _ -> Err ("a character has to be one character", None))
+                 | _ -> Err ("text was expected", None))
+              else if tag == "Num" then
+                (match first with
+                 | Whole n -> one (Token.Int n) (show n)
+                 | _ -> Err ("`Num` was given something that is not a number", None))
+              else if tag == "Real" then
+                (match first with
+                 | Frac x -> one (Token.Real x) x
+                 | _ -> Err ("`Real` was given something that is not a number", None))
+              -- Not tokens: what the macro has to say about what it was given,
+              -- and where -- the token that was wrong, when it said one.
+              else if tag == "Fail" then
+                (match first with
+                 | Text why -> Err (why, M.andThen written (V.get parts 1))
+                 | _ -> Err ("text was expected", None))
+              else if tag == "Group" then
+                (match (first, V.get parts 1) with
+                 | (Text open, Just inner) ->
+                     (match (delimOf open, decodeTrees inner at, placed 2) with
+                      | (Just (d, o, c), Ok ts, (a, b)) ->
+                          Ok
+                            [Delimited
+                               d
+                               (Tok { token = o, text = open, from = a, to = min (a + 1) b })
+                               (Tok {
+                                  token = c,
+                                  text = M.unwrapOr "" (closing open),
+                                  from = max (b - 1) a,
+                                  to = b
+                                })
+                               ts]
+                      | (None, _, _) -> Err ("a group with no bracket", None)
+                      | (_, Err e, _) -> Err e)
+                 | _ -> Err ("a group with no bracket", None))
+              else Err ("`${tag}` is not a token", None))
+  | _ -> Err ("it did not answer with tokens", None)
+
+fun delimOf (open : String) : Maybe (Delim, Token, Token) =
+  if open == "(" then Just (Paren, Token.LParen, Token.RParen)
+  else if open == "[" then Just (Brack, Token.LBrack, Token.RBrack)
+  else if open == "{" then Just (Brace, Token.LBrace, Token.RBrace)
+  else None
+
+-- `text` as token trees, lexed the way a file is, every token standing at
+-- `at`: it was not written anywhere else.
+@pub fun lexAt (text : String) (at : (Int, Int)) : Result String [Tree] =
+  let l = lex text in
+  match V.get l.problems 0 with
+  | Just p -> Err "`${text}` is not Meadow: ${p.message}"
+  | None ->
+      (match treesOf
+         (V.map
+            (\(x : Lexed) ->
+              Tok {
+                token = x.token,
+                text = stringSlice text x.from x.to,
+                from = fst at,
+                to = snd at
+              })
+            l.tokens) with
+       | Just ts -> Ok ts
+       | None -> Err "`${text}` does not balance")
+
+-- Tokens as trees, by their brackets -- or `None` if they do not balance.
+@pub fun treesOf (toks : [Tok]) : Maybe [Tree] =
+  match treesFrom toks 0 None [] with
+  | Just (ts, _) -> Just ts
+  | None -> None
+
+-- The trees from token `i` to the bracket that closes `inside`, and where
+-- the token after it is.
+fun treesFrom (toks : [Tok]) (i : Int) (inside : Maybe Delim) (acc : [Tree]) : Maybe ([Tree], Int) =
+  match V.get toks i with
+  | None -> if M.isNone inside then Just (acc, i) else None
+  | Just k ->
+      (match (opens k.token, closes k.token) with
+       | (Just d, _) ->
+           (match treesFrom toks (i + 1) (Just d) [] with
+            | Just (inner, stop) ->
+                (match V.get toks stop with
+                 | Just close ->
+                     treesFrom toks (stop + 1) inside (V.pushBack acc (Delimited d k close inner))
+                 | None -> None)
+            | None -> None)
+       | (_, Just d) ->
+           (match inside with
+            | Just want -> if sameDelim d want then Just (acc, i) else None
+            | None -> None)
+       | _ -> treesFrom toks (i + 1) inside (V.pushBack acc (Leaf k)))
+
+fun opens (t : Token) : Maybe Delim =
+  match t with
+  | Token.LParen -> Just Paren
+  | Token.LBrack -> Just Brack
+  | Token.LBrace -> Just Brace
+  | _ -> None
+
+fun closes (t : Token) : Maybe Delim =
+  match t with
+  | Token.RParen -> Just Paren
+  | Token.RBrack -> Just Brack
+  | Token.RBrace -> Just Brace
+  | _ -> None
+
+fun sameDelim (a : Delim) (b : Delim) : Bool = opening a == opening b

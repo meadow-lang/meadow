@@ -433,6 +433,9 @@ fn process(op: &str, arg: Val) -> Option<Build> {
             Ok(st) => Build::ok(Build::int(st.code().unwrap_or(-1) as i64)),
             Err(e) => Build::error(e.to_string()),
         },
+        // Nothing is noted of what a native program reaches: a fuzzer that
+        // asks is told nothing is new, and goes on as one with no guide.
+        "covered" => Build::int(0),
         "exit" => match arg {
             Val::Int(code) => {
                 use std::io::Write;
@@ -507,6 +510,7 @@ fn process(op: &str, arg: Val) -> Option<Build> {
                                 0 => ffi::Arg::Int(int(a[1])),
                                 1 => ffi::Arg::Float(float(a[2])),
                                 2 => ffi::Arg::Str(text(a[3], &what)),
+                                3 => ffi::Arg::Float32(float(a[2])),
                                 _ => fail(format!("{what}: no such kind of argument")),
                             }
                         })
@@ -558,6 +562,9 @@ fn process(op: &str, arg: Val) -> Option<Build> {
                     // Safety: as above.
                     Build::Str(unsafe { ffi::read_text(int(t[0]), int(t[1])) })
                 }
+                // What the last call C made into this library failed with,
+                // once; nothing when none did.
+                "ffiFailure" => Build::Str(crate::sched::take_failure().unwrap_or_default()),
                 _ => return None,
             }
         }

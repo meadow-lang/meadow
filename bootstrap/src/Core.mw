@@ -15,9 +15,14 @@
 
 use Scythe (lexer!)
 use Lingua (syntax!, lang!, pass!)
+use Std.Macro (toDatum)
 use MeadowBoot.Types
 use MeadowBoot.Types.Type.*
 use Std.Collections.Vector as V
+use Std.Collections.HashMap as H
+use Std.Collections.HashMap (HashMap)
+use Std.St (runSt)
+use Lingua.Lang (spanMeta)
 use Std.String as S
 use Std.Char as C
 use Std.Maybe as M
@@ -210,14 +215,18 @@ type Ty = Type
 -- A value generic in its type says so, `TyLam`, naming the variables its
 -- types are written with, and a mention of one says the types it is at,
 -- `TyApp`: how a value of a variable's type is represented is the type's to
--- say, at run time. A unit names its package, and what its definitions
+-- say, at run time. A value generic in a number's type says that beside
+-- them, `nums`, and a mention the number types it is at: nothing at run time
+-- depends on those but what a literal is, so they are gone -- the value
+-- copied for each number type it is used at, `Inline.numbered` -- before
+-- anything is lowered. A unit names its package, and what its definitions
 -- mention of another's -- `Extern`: the binder it has here, the symbol it
 -- is, how many types it is generic in, and how many arguments it is a
 -- function of where it is written as one.
 -- What `Elab` makes of a program, and what is lowered to Cut, which needs to
 -- know how each value is represented.
 @pub(pkg) lang! {
-  pub Core extends Erased
+  pub Core extends Erased with reflect
   DataCtor + DataCtor { name : String, fields : [Ty] }
   Data + Data { name : String, arity : Int, ctors : [DataCtor] }
   Op + Op { name : String, arg : Ty, result : Ty }
@@ -239,10 +248,21 @@ type Ty = Type
     + Clause { eff : String, op : String, param : Int, paramTy : Ty, resume : Int, body : Term }
   Term - Lam
   Term + Lam { param : Int, paramTy : Ty, body : Term }
-  Term + TyLam { vars : [Int], body : Term }
-  Term + TyApp { func : Term, tys : [Ty] }
+  Term + TyLam { vars : [Int], nums : [Int], body : Term }
+  Term + TyApp { func : Term, tys : [Ty], nums : [Ty] }
   Term * { ty : Ty }
   Pat * { ty : Ty }
+}
+
+-- A program is kept in a unit's interface, which is compared and printed:
+-- two are the same when what is written of them is, and one prints as
+-- nothing much.
+impl PartialEq CoreProgram {
+  fun (==) a b = toDatum a == toDatum b
+}
+
+impl Debug CoreProgram {
+  fun debug p = "<core>"
 }
 
 -- The types taken off: what the CEK machine runs.
@@ -282,6 +302,257 @@ pass! {
     | PCtor { name, args } -> PCtor { name, args }
     | PRecord { fields } -> PRecord { fields }
 }
+
+-- The types taken off, and every binder what `re` makes it: what `erase`
+-- does for one unit of several that are to be one program.
+pass! {
+  relink : Core -> Erased with re from Def, Named
+    | File { entry, defs, named } -> File { entry = re entry, defs, named }
+    | Def { id, body } -> Def { id = re id, body }
+    | Var { id } -> Var { id = re id }
+    | Lam { param, body } -> Lam { param = re param, body }
+    | TyLam { body } -> body
+    | TyApp { func } -> func
+    | App { func, arg } -> App { func, arg }
+    | Let { id, value, body } -> Let { id = re id, value, body }
+    | LetRec { binds, body } -> LetRec { binds, body }
+    | Bind { id, value } -> Bind { id = re id, value }
+    | If { cond, yes, no } -> If { cond, yes, no }
+    | Tuple { items } -> Tuple { items }
+    | Array { items } -> Array { items }
+    | Proj { tuple, index } -> Proj { tuple, index }
+    | Record { fields } -> Record { fields }
+    | Sel { target, label } -> Sel { target, label }
+    | Extend { target, label, value } -> Extend { target, label, value }
+    | Ctor { name, args } -> Ctor { name, args }
+    | Prim { op, args } -> Prim { op, args }
+    | Case { scrutinee, arms } -> Case { scrutinee, arms }
+    | Perform { eff, op, arg } -> Perform { eff, op, arg }
+    | Handle { body, clauses, retId, ret } -> Handle { body, clauses, retId = M.map re retId, ret }
+    | Clause { eff, op, param, resume, body } ->
+        Clause { eff, op, param = re param, resume = re resume, body }
+    | Join { id, params, rhs, body } -> Join { id = re id, params = V.map re params, rhs, body }
+    | Jump { id, args } -> Jump { id = re id, args }
+    | Ill {} -> Ill {}
+    | Const { lit } -> Const { lit }
+    | PWild {} -> PWild {}
+    | PVar { id } -> PVar { id = re id }
+    | PAs { id, pat } -> PAs { id = re id, pat }
+    | PLit { lit } -> PLit { lit }
+    | PTuple { items } -> PTuple { items }
+    | PArray { items } -> PArray { items }
+    | PCtor { name, args } -> PCtor { name, args }
+    | PRecord { fields } -> PRecord { fields }
+}
+
+-- A definition's symbol: its package, and its binder -- an `impl`'s
+-- dictionary's is below every other (`Elab.defSymbol`).
+fun symbolOf (pkg : String) (id : Int) : String =
+  if id < 0 then "meadow:${pkg}/impl${show (0 - id)}" else "meadow:${pkg}/d${show id}"
+
+-- Several units, each a program of core that names what it mentions of
+-- another by symbol, as one program the CEK machine runs: every binder made
+-- one no other unit has, and a mention of another unit's definition that
+-- definition. With it, where each definition is, by its symbol.
+@pub fun linkedUnits (units : [CoreProgram]) : (ErasedProgram, HashMap String Int) =
+  let many = V.len units + 1 in
+  let global = \u id -> if id >= 0 then id * many + u else id * many - u in
+  let parts =
+    \u ->
+      (match V.get units u with
+       | Just (CoreProgram a file) -> Just (a, file)
+       | None -> None)
+  in
+  let table =
+    V.foldl
+      (\h u ->
+        match parts u with
+        | Just (a, file) ->
+            (let pkg = coreFilePackage a file in
+             V.foldl
+               (\h2 d -> H.insert (symbolOf pkg (coreDefId a d)) (global u (coreDefId a d)) h2)
+               h
+               (coreFileDefs a file))
+        | None -> h)
+      H.empty
+      (V.range 0 (V.len units))
+  in runSt (\() ->
+       let out = newErasedBuilder () in
+       let made =
+         V.map
+           (\u ->
+             match parts u with
+             | Just (a, file) ->
+                 (let theirs =
+                    V.foldl
+                      (\h e ->
+                        match H.lookup (coreExternSymbol a e) table with
+                        | Just g -> H.insert (coreExternId a e) g h
+                        | None -> h)
+                      H.empty
+                      (coreFileExterns a file)
+                  in
+                  let re = \id -> M.unwrapOr (global u id) (H.lookup id theirs) in
+                  (
+                    V.map (\d -> relinkDef a out re d) (coreFileDefs a file),
+                    V.map (\n -> relinkNamed a out re n) (coreFileNamed a file)
+                  ))
+             | None -> ([], []))
+           (V.range 0 (V.len units))
+       in
+       let root =
+         newErasedFile out (spanMeta 0 0) (0 - 1) (V.concatMap fst made) (V.concatMap snd made)
+       in (ErasedProgram (freezeErased out) root, table))
+
+-- What one unit of several is written with where they are made one program
+-- of core: the binder each definition of another unit it mentions has there,
+-- the binder each of its own names has been given so far, and the next to
+-- give -- upwards for a name, downwards for an `impl`'s dictionary, which is
+-- below every other.
+record Joining s = {
+  theirs : HashMap Int Int,
+  names : StRef s (HashMap Int Int),
+  next : StRef s Int,
+  below : StRef s Int
+}
+
+-- The binder `id` has in the program the units are made.
+fun joined (j : Joining s) (id : Int) =
+  match H.lookup id j.theirs with
+  | Just there -> there
+  | None ->
+      (let names = stGetRef j.names in
+       match H.lookup id names with
+       | Just n -> n
+       | None ->
+           if id < 0 then
+             (let n = stGetRef j.below - 1 in
+              let u = stSetRef j.below n in
+              let w = stSetRef j.names (H.insert id n names) in
+              n)
+           else
+             (let n = stGetRef j.next in
+              let u = stSetRef j.next (n + 1) in
+              let w = stSetRef j.names (H.insert id n names) in
+              n))
+
+-- A unit written again with every binder what `joined` makes it, and its
+-- types as they were: `relink`, for a program that is to be made better and
+-- lowered rather than run.
+pass! {
+  rejoin : Core -> Core with j from Def, Named, Data, Effect, Extern
+    | Def { id, body } -> Def { id = joined j id, body }
+    | Var { id, ty } -> Var { id = joined j id, ty }
+    | Lam { param, paramTy, body, ty } -> Lam { param = joined j param, paramTy, body, ty }
+    | Let { id, value, body, ty } -> Let { id = joined j id, value, body, ty }
+    | Bind { id, value } -> Bind { id = joined j id, value }
+    | Clause { eff, op, param, paramTy, resume, body } ->
+        Clause { eff, op, param = joined j param, paramTy, resume = joined j resume, body }
+    | Handle { body, clauses, retId, ret, ty } ->
+        Handle { body, clauses, retId = M.map (\x -> joined j x) retId, ret, ty }
+    | Join { id, params, rhs, body, ty } ->
+        Join { id = joined j id, params = V.map (\x -> joined j x) params, rhs, body, ty }
+    | Jump { id, args, ty } -> Jump { id = joined j id, args, ty }
+    | PVar { id, ty } -> PVar { id = joined j id, ty }
+    | PAs { id, pat, ty } -> PAs { id = joined j id, pat, ty }
+    | Extern { id, symbol, types, arity } -> Extern { id = joined j id, symbol, types, arity }
+}
+
+-- Several units as one program of core, package `pkg`'s: `linkedUnits` with
+-- the types kept, for a program that is optimised as one. Every binder is
+-- one no other unit has, numbered from nothing so that none is where a later
+-- pass makes its own; a mention of another unit's definition is that
+-- definition; and a type, a constructor's fields or an effect that several
+-- units declare is declared once. What no unit defines is still named by
+-- its symbol. With it, the binder each definition has, by the symbol it had.
+@pub fun joinedUnits (pkg : String) (units : [CoreProgram]) : (CoreProgram, HashMap String Int) =
+  let parts =
+    \u ->
+      (match V.get units u with
+       | Just (CoreProgram a file) -> Just (a, file)
+       | None -> None)
+  in runSt (\() ->
+       let out = newCoreBuilder () in
+       let next = stNewRef 0 in
+       let below = stNewRef 0 in
+       -- Every unit's definitions numbered first: one unit mentions another's.
+       let numbered =
+         V.map
+           (\u ->
+             let names = stNewRef H.empty in
+             let own = Joining { theirs = H.empty, names, next, below } in
+             (
+               names,
+               match parts u with
+               | Just (a, file) ->
+                   V.map
+                     (\d ->
+                       (
+                         symbolOf (coreFilePackage a file) (coreDefId a d),
+                         joined own (coreDefId a d)
+                       ))
+                     (coreFileDefs a file)
+               | None -> []
+             ))
+           (V.range 0 (V.len units))
+       in
+       let table = H.fromVec (V.concatMap snd numbered) in
+       let made =
+         V.map
+           (\u ->
+             match (parts u, V.get numbered u) with
+             | (Just (a, file), Just (names, _)) ->
+                 (let externs = coreFileExterns a file in
+                  let theirs =
+                    V.foldl
+                      (\h e ->
+                        match H.lookup (coreExternSymbol a e) table with
+                        | Just there -> H.insert (coreExternId a e) there h
+                        | None -> h)
+                      H.empty
+                      externs
+                  in
+                  let j = Joining { theirs, names, next, below } in
+                  (
+                    V.map (\d -> rejoinDef a out j d) (coreFileDefs a file),
+                    V.map (\n -> (coreNamedName a n, rejoinNamed a out j n)) (coreFileNamed a file),
+                    V.map (\d -> (coreDataName a d, rejoinData a out j d)) (coreFileDatas a file),
+                    V.map
+                      (\e -> (coreEffectName a e, rejoinEffect a out j e))
+                      (coreFileEffects a file),
+                    V.concatMap
+                      (\e ->
+                        if M.isSome (H.lookup (coreExternSymbol a e) table) then []
+                        else [rejoinExtern a out j e])
+                      externs
+                  ))
+             | _ -> ([], [], [], [], []))
+           (V.range 0 (V.len units))
+       in
+       let root =
+         newCoreFile
+           out
+           (spanMeta 0 0)
+           pkg
+           (0 - 1)
+           (V.concatMap (\m -> match m with | (defs, _, _, _, _) -> defs) made)
+           (once (V.concatMap (\m -> match m with | (_, named, _, _, _) -> named) made))
+           (once (V.concatMap (\m -> match m with | (_, _, datas, _, _) -> datas) made))
+           (once (V.concatMap (\m -> match m with | (_, _, _, effects, _) -> effects) made))
+           (V.concatMap (\m -> match m with | (_, _, _, _, externs) -> externs) made)
+       in (CoreProgram (freezeCore out) root, table))
+
+-- Each of `named` whose name none before it has.
+fun once (named : [(String, a)]) : [a] =
+  snd
+    (V.foldl
+       (\acc x ->
+         match acc with
+         | (seen, kept) ->
+             if M.isSome (H.lookup (fst x) seen) then acc
+             else (H.insert (fst x) True seen, V.pushBack kept (snd x)))
+       (H.empty, [])
+       named)
 
 -- Each numeral a number, each quoted string its text, each float's bits the
 -- float; everything else is as it was.

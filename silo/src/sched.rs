@@ -54,6 +54,155 @@ struct Green {
 struct Task {
     outcome: Option<Result<Arc<Parcel>, String>>,
     waiters: Vec<Box<Green>>,
+    /// Nothing can `await` it any more -- every `Task` of it has gone -- so
+    /// what it answers is not kept: see [`held`].
+    nobody: bool,
+}
+
+// --- who can still await a thread ------------------------------------------
+//
+// What a thread answered is kept for `await`, and may be awaited more than
+// once, so it is kept while anything could ask: while there is a `Task` of
+// the thread in some heap, or in a parcel on its way to one. Kept for good,
+// as it was, a thread's answer -- and every compact region in it -- outlived
+// the program: a compiler that asked each file's tree of a thread held every
+// tree it had ever made.
+//
+// The count has a lock of its own, taken alone: a `Task` is erased, and a
+// parcel dropped, from places that hold the scheduler's. When it reaches
+// nothing the thread is put on a list, and the scheduler lets go of its
+// answer where it next takes its own lock afresh ([`forget`]).
+//
+// A `Task` in a heap that goes whole -- its thread ended still holding it --
+// is never counted off, and its thread's answer stays, as before.
+
+static HANDLES: Mutex<Option<HashMap<u32, usize>>> = Mutex::new(None);
+static FORGOTTEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+// The same for a `TVar`, by its cell's address: while there is a handle to
+// it -- in a heap, in a parcel, or inside a region, where a `TVar`'s value
+// may hold others -- its value is kept, and when the last has gone the value
+// is let go of, and its region with it. The cell itself stays: a transaction
+// under way may still have its address.
+static VARS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+static FORGOTTEN_VARS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// Whether that list has anything on it: read where a heap asks the system
+/// for more, so that a thread working on alone -- no other is scheduled, and
+/// the scheduler does not look -- still lets go of what it can before it
+/// takes more.
+static VARS_WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a `TVar` nothing can reach is waiting to let its value go.
+#[inline]
+pub fn vars_waiting() -> bool {
+    VARS_WAITING.load(Ordering::Relaxed)
+}
+
+/// One more handle to the `TVar` whose cell is at `at`.
+pub fn held_var(at: usize) {
+    let mut h = VARS.lock().unwrap_or_else(|p| p.into_inner());
+    *h.get_or_insert_with(HashMap::new).entry(at).or_default() += 1;
+}
+
+/// One fewer.
+pub fn let_go_var(at: usize) {
+    let last = {
+        let mut h = VARS.lock().unwrap_or_else(|p| p.into_inner());
+        let h = h.get_or_insert_with(HashMap::new);
+        match h.get_mut(&at) {
+            Some(n) if *n > 1 => {
+                *n -= 1;
+                false
+            }
+            Some(_) => {
+                h.remove(&at);
+                true
+            }
+            None => false,
+        }
+    };
+    if last {
+        FORGOTTEN_VARS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(at);
+        VARS_WAITING.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Let go of the values of the `TVar`s nothing can reach. Takes no lock but
+/// each cell's own, so it may be called from wherever no cell's is held.
+pub fn forget_vars() {
+    // A value let go of may hold the last handles to other `TVar`s, which
+    // puts them on the list in turn: until it is empty.
+    loop {
+        VARS_WAITING.store(false, Ordering::Relaxed);
+        let vars = std::mem::take(&mut *FORGOTTEN_VARS.lock().unwrap_or_else(|p| p.into_inner()));
+        if vars.is_empty() {
+            break;
+        }
+        for at in vars {
+            // Safety: a cell's address, and a cell lives for the whole run.
+            let cell = unsafe { &*(at as *const TVar) };
+            let was = {
+                let mut state = cell.state.lock().unwrap_or_else(|p| p.into_inner());
+                std::mem::replace(&mut state.0, Held::Imm(0, desc::INT))
+            };
+            drop(was);
+        }
+    }
+}
+
+/// One more `Task` of thread `tid`: made by `spawn`, copied into a parcel,
+/// or arrived out of one.
+pub fn held(tid: u32) {
+    let mut h = HANDLES.lock().unwrap_or_else(|p| p.into_inner());
+    *h.get_or_insert_with(HashMap::new).entry(tid).or_default() += 1;
+}
+
+/// One fewer: a `Task` erased, or a parcel holding one dropped.
+pub fn let_go(tid: u32) {
+    let last = {
+        let mut h = HANDLES.lock().unwrap_or_else(|p| p.into_inner());
+        let h = h.get_or_insert_with(HashMap::new);
+        match h.get_mut(&tid) {
+            Some(n) if *n > 1 => {
+                *n -= 1;
+                false
+            }
+            Some(_) => {
+                h.remove(&tid);
+                true
+            }
+            None => false,
+        }
+    };
+    if last {
+        FORGOTTEN
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(tid);
+    }
+}
+
+/// Let go of what the threads nobody can await answered. Called with the
+/// scheduler's lock not held: the answers are dropped once it is released.
+pub fn forget() {
+    forget_vars();
+    let gone = std::mem::take(&mut *FORGOTTEN.lock().unwrap_or_else(|p| p.into_inner()));
+    if gone.is_empty() {
+        return;
+    }
+    let answers: Vec<_> = {
+        let mut w = world();
+        gone.iter()
+            .filter_map(|t| {
+                let task = w.tasks.get_mut(*t as usize)?;
+                task.nobody = true;
+                task.outcome.take()
+            })
+            .collect()
+    };
+    drop(answers);
 }
 
 /// A channel: what has been sent and not yet taken, and the threads waiting
@@ -360,6 +509,7 @@ pub fn main(entry: impl FnOnce() -> Word + 'static) -> (Box<Ctx>, Word) {
 /// A worker: run ready threads until `main` has finished.
 fn work() {
     loop {
+        forget();
         let mut g = {
             let mut w = world();
             loop {
@@ -503,7 +653,9 @@ fn wake(w: &mut World, mut g: Box<Green>, with: Wake) {
 fn finish(w: &mut World, tid: usize, out: Result<Parcel, String>) {
     let out = out.map(Arc::new);
     let waiters = std::mem::take(&mut w.tasks[tid].waiters);
-    w.tasks[tid].outcome = Some(out.clone());
+    if !w.tasks[tid].nobody {
+        w.tasks[tid].outcome = Some(out.clone());
+    }
     for g in waiters {
         let with = match &out {
             Ok(p) => Wake::Value((**p).clone()),
@@ -609,10 +761,11 @@ fn park(request: Request) -> Wake {
 }
 
 /// A failure in a thread other than `main` fails that thread: `await` fails
-/// with the same message, and nothing else is affected. Answers whether it
-/// was one; for `main`, or outside every thread, the program stops.
+/// with the same message, and nothing else is affected; so does one in a call
+/// C made into a library, which ends that call ([`export_run`]). Answers
+/// whether it was one; for `main`, or outside every thread, the program stops.
 pub fn fail_thread(msg: &str) -> bool {
-    if !ctx::present() || cx().tid == 0 || segments::innermost().is_none() {
+    if !ctx::present() || (cx().tid == 0 && !cx().guarded) || segments::innermost().is_none() {
         return false;
     }
     loop {
@@ -675,6 +828,7 @@ pub fn prim(p: Prim, args: &[Val]) -> Word {
                 let v = unsafe { meadow_apply(f, 0, no_evidence()) };
                 let out = Parcel::of(v, answer);
                 heap::erase(v, answer);
+                heap::finish();
                 Box::into_raw(Box::new(out)) as Word
             });
             let mut w = world();
@@ -683,6 +837,7 @@ pub fn prim(p: Prim, args: &[Val]) -> Word {
                 co,
             });
             wake(&mut w, g, Wake::Nothing);
+            held(tid as u32);
             heap::build(heap::TASK, tid as u32, &[0], &[desc::INT])
         }
         ThreadAwait => {
@@ -745,6 +900,7 @@ pub fn prim(p: Prim, args: &[Val]) -> Word {
                 waiters: Mutex::new(Vec::new()),
             }));
             let id = NEXT_TVAR.fetch_add(1, Ordering::Relaxed) as u32;
+            held_var(at(cell));
             heap::build(heap::TVAR, id, &[at(cell) as Word], &[desc::INT])
         }
         StmRead => {
@@ -944,4 +1100,92 @@ fn drop_writes(levels: Vec<Vec<(usize, Word, i64)>>) {
     for (_, x, d) in levels.into_iter().flatten() {
         heap::erase(x, d);
     }
+}
+
+// --- calls C makes into a library ------------------------------------------
+
+thread_local! {
+    /// Stacks of calls into the library that have finished, to run the next
+    /// on.
+    static EXPORT_STACKS: std::cell::RefCell<Vec<DefaultStack>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// What the last call into the library that failed on this OS thread
+    /// failed with, until `Std.Ffi.failure` asks.
+    static FAILURE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `body` of `env` -- a call C made into a library, its arguments in
+/// `env` -- on a segment of its own, so that a failure in it ends the call
+/// rather than the process: as a thread's does, it parks the segment, which
+/// is let go without unwinding. Answers 0 when it returned, and 1 when it
+/// failed, its message said on stderr and kept for [`take_failure`]. What the
+/// call's frames held is given up; the context is as it was before the call.
+pub fn export_run(body: extern "C" fn(*mut std::ffi::c_void), env: *mut std::ffi::c_void) -> i32 {
+    let c = cx();
+    let depth = c.running.len();
+    let shadow = crate::shadow::head();
+    let in_txn = c.txn.is_some();
+    let guarded = std::mem::replace(&mut c.guarded, true);
+    let stack = EXPORT_STACKS
+        .with(|s| s.borrow_mut().pop())
+        .unwrap_or_else(|| {
+            DefaultStack::new(THREAD).unwrap_or_else(|e| {
+                crate::fail(&format!(
+                    "could not make a stack for a call into the library: {e}"
+                ))
+            })
+        });
+    let env = env as usize;
+    let mut co: segments::Segment =
+        Coroutine::with_stack(stack, move |y: &Yielder<Down, Up>, _: Down| {
+            segments::enter_thread(y);
+            body(env as *mut std::ffi::c_void);
+            segments::leave_thread();
+            0
+        });
+    let failed = match co.resume(Down::Start) {
+        CoroutineResult::Return(_) => None,
+        CoroutineResult::Yield(up) => {
+            let why = match (up, cx().request.take()) {
+                (Up::Park, Some(Request::Failed(m))) => m,
+                (Up::Park, _) => "a thread waited in a call C made into a library, where there                                   is no scheduler to run another"
+                    .to_string(),
+                (Up::Detach { .. }, _) => "an effect was performed after its handler had                                            finished, in a call C made into a library"
+                    .to_string(),
+            };
+            // Never resumed, and not unwound.
+            // Safety: nothing will resume it.
+            unsafe { co.force_reset() };
+            Some(why)
+        }
+    };
+    EXPORT_STACKS.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.len() < 2 {
+            s.push(co.into_stack());
+        }
+    });
+    let c = cx();
+    c.running.truncate(depth);
+    c.guarded = guarded;
+    if !in_txn {
+        c.txn = None;
+    }
+    crate::shadow::set(shadow);
+    match failed {
+        None => 0,
+        Some(why) => {
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            eprintln!("{why}");
+            FAILURE.with(|f| *f.borrow_mut() = Some(why));
+            1
+        }
+    }
+}
+
+/// What the last call into the library that failed on this OS thread failed
+/// with, once: see [`export_run`].
+pub fn take_failure() -> Option<String> {
+    FAILURE.with(|f| f.borrow_mut().take())
 }

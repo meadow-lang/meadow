@@ -13,6 +13,15 @@ beyond the last release is under _Unreleased_.
 
 ## Unreleased
 
+## 0.3.0 - 2026-10-16
+
+The release of MeadowBoot, the Meadow compiler written in Meadow with the
+Lingua toolkit: it compiles itself, agrees with the Rust compiler pass by
+pass, and is published beside `meadow` as an archive for each platform, with
+the `meadow` it hands the back end to and the standard library's sources.
+Meadow libraries can now be called from C, which is how mira runs Meadow
+scripts.
+
 ### Breaking
 
 - The lockfile is `Meadow.lock`, spelt as `Meadow.toml` is. One named
@@ -39,6 +48,97 @@ beyond the last release is under _Unreleased_.
 
 ### Added
 
+- `Std.Ffi` calls C on Windows (x86-64), where before it was Unix only: a
+  library is opened with `LoadLibrary`, and a call is made in one of sixteen
+  shapes, by which of its first four arguments are floats.
+- `Std.Ffi` passes and answers a C `float` (`Arg.Float32`, `callFloat32`),
+  calls a function whose address is in memory (`functionAt`, as a C library
+  hands its plugins a table of what they may call), lays out C structs
+  (`CType`, `sizeOf`, `alignOf`, `offsetOf`, `Aligned` for an over-aligned
+  one), reads and writes one value of a C type where it is (`readInt`,
+  `writeFloat`, `readPtr`, …), and lends text to C as a pointer and a length
+  (`withText`).
+- `Std.Ffi.own ()` opens the module the calling code is in -- the program
+  itself, or the library a plugin is -- so a function of it can be called by
+  address, as `open ""` does.
+- C calls Meadow: MeadowBoot builds a package whose functions say `@export`
+  -- or `@export(cName)`, under another name -- as a C library named for the
+  package (`Name.dll`, `libName.so`, `libName.dylib`), in
+  `target/<profile>/native/silo` as a native program is, each such function a C function of its numbers
+  (`int64_t`, `double`, `float`, the sized integers, `bool`) answering one
+  of them or `void`. Cut writes them as `export "name" = SYMBOL -> rep`, and
+  the Silo back end gives each a C entry that starts the runtime the first
+  time it is called on a thread. A function whose answer is not a number or
+  `()` is refused, saying so. A library exports its dependencies' `@export`
+  functions too, as a Rust `cdylib` does every crate's `#[no_mangle]` ones,
+  and two of one name are an error; a program exports only its own.
+- A call C makes into a Meadow library that fails -- an `error`, a division
+  by zero -- ends that call, which answers zero, and not the program C is:
+  each runs on a stack of its own, let go of when it fails. The message is on
+  stderr, and `Std.Ffi.failure ()` answers it once, so a plugin that calls
+  its own function through C, by address, can tell its host what went wrong.
+- `Std.Num.Float`: `sqrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`,
+  `exp`, `ln`, `pow`, `hypot`,
+  `ceil` and `round` (to an `Int`, as the built-in `floor` is), `abs`,
+  `isNaN`, `isFinite`, `pi` and `tau`, written in Meadow so every runtime
+  answers alike: good to a unit or two in the last place for arguments of
+  moderate size.
+- `intercalate` in the prelude joins strings with one between each two:
+  `intercalate ", " names` (`Std.String.join` by the name a list's has).
+  `Std.Collections.Vector` has `intersperse` and `intercalate` too, for any
+  vector: `V.intersperse 0 [1, 2]` is `[1, 0, 2]`.
+- A type is written through the module a `use … as` names, as its functions
+  are: `use Mira as M` and then `(s : M.System)`, without importing the type
+  by name. A type the module lacks is an unknown type, `M.Nope`.
+- A git dependency may be a directory of its repository rather than all of
+  it: `{ git = "…", rev = "…", subdir = "lib/Cut" }`. Its directory is part of
+  its source in `Meadow.lock`, so two packages of one repository are two.
+- `meadow cut --no-run` builds what would be run -- the bytecode image, or the
+  executable with `--aot` or `--runtime silo` -- and stops: what a front end's
+  `build` asks the back end for.
+- Property tests and fuzzing in the standard library. `Std.Test.Property`
+  checks a property on a hundred values a generator makes -- `forAll gen
+  prop`, or `check` where the property draws for itself -- and fails with the
+  smallest case it found. A generator is a function that draws numbers
+  (`between`, `bool`, `vector`, `element`, `oneOf`, `maybe`, `char`, `text`),
+  so one of your own is any function that calls them, and it shrinks as they
+  do: a failing case is run again on fewer and smaller draws. The same cases
+  are checked every run, and `replay draws prop` checks one again.
+  `Std.Test.Fuzz` runs a function on text close to examples it is given:
+  `fuzz corpus words prop` tries a thousand, each some example with pieces
+  taken out, doubled, moved from another, or words dropped in, and shrinks
+  what fails. `fuzzGuided` is the same steered by coverage: it asks the
+  machine after each input how much of the program has been reached, and an
+  input that got somewhere new is kept as an example for later ones -- so it
+  finds a text that starts `fuzz` in a few hundred tries, a character at a
+  time, where `fuzz` would need all four at once. It steers on the bytecode
+  machine, where tests run, and a thread that has asked is interpreted from
+  then on; a native program is told nothing is new. A program that stops the
+  process is not caught by either.
+- `Process.covered afresh` answers how many places in the program the thread
+  has reached since it first asked, or since it last asked with `True`: what
+  `fuzzGuided` steers by.
+- `Std.Test.failure act` runs `act` and says whether it failed an assertion
+  and with what message, where `didFail` says only whether.
+- A natively compiled program can profile itself: run with
+  `MEADOW_SILO_PROFILE=<file>` it samples where its time goes, and
+  `scripts/silo-profile.py` reads the file against the executable. For a
+  machine that allows no profiler from outside, as a container does not.
+  `MEADOW_SILO_PRIMS` also says which blocks a program erased, which
+  functions dropped them, and which made its arrays.
+- A program of Cut keeps the continuation a call answers through on the
+  stack, as a program the Rust compiler lowers does, and no longer on the
+  heap: a handled body runs on a stack segment of its own, which an
+  operation that captures its continuation cuts off and its resumption puts
+  back, once. A program with an operation marked `@many` is lowered as
+  before. `MEADOW_CUT_FRAMES=none` asks for the old lowering.
+- `main` is `() -> () ! Eff` wherever its type is shown, not the row its body
+  happened to perform; and a row of every effect the runtime answers is
+  written `Eff`.
+- `Std.Collections.Vector` folds and searches a vector where it stands; each
+  of `foldl`, `find`, `any`, `elem` and their kin copied it whole first.
+- `Std.Json` writes a value in time and room in its size, escapes control
+  characters as `\u00XX`, and reads `\uXXXX` back.
 - The Meadow colour theme for VS Code, **Meadow Dark** and **Meadow Light**, is
   an extension of its own in `editors/vscode-theme`: a colour for each kind of
   name the language server tells apart. Each release attaches it as
@@ -46,6 +146,15 @@ beyond the last release is under _Unreleased_.
   installs it beside the language extension.
 - `meadow cut FILE -- ARGS` gives the program what follows `--` as its
   arguments.
+- `meadow cut` on Glade compiles what runs often to machine code as it goes,
+  as `meadow run` does, where it only interpreted; `--aot` compiles the
+  whole program ahead of time into an executable.
+- `meadow cut FILE` on Glade keeps the program's bytecode image beside it,
+  under `target/cut`, named for the program's text and the `meadow` that
+  lowered it. A second run of the same text reads the image and lowers
+  nothing: a program a front end runs again and again -- the one that serves
+  a package's macros, once for every round of a build -- starts in a tenth
+  of the time.
 - A program of Cut may spawn threads: `prim threadSpawn(desc(rep), f; k)`
   says how what the thread answers is represented. And a top-level `val` is
   made the first time a thread reads it, not when the program starts, so a
@@ -112,6 +221,36 @@ St s }`), and `! Reading r` where a method's type says what it performs. A
 
 ### Fixed
 
+- A natively compiled program that makes `Ref`s by the million and no cycles
+  -- an interpreter, each of whose scopes shares cells with the one it was
+  made from -- no longer spends most of its time looking for cycles. The
+  collector waits for twice as many candidates each time a round of its runs
+  frees nothing, up to 262,144, and goes back to 1,024 when one does; most
+  candidates have died by then and are freed without a walk. One macro call
+  on MeadowBoot's CEK machine took 312 seconds, 72% of it in the collector,
+  and takes 54.
+- A natively compiled program lets go of what a finished thread answered,
+  and of a `TVar`'s value, once nothing can reach them. Both were kept for
+  the whole run -- "nothing says when the last handle is gone" -- and with
+  them every compact region they held. Handles are counted now, in heaps, in
+  values on their way between threads, and inside regions.
+- A natively compiled program frees what a thread kept in a `Ref` when the
+  thread ends. A `Ref` that had been written and then let go of was left for
+  the cycle collector, which a thread that ends does not run again: the
+  `Ref` and everything it held -- compact regions among it -- stayed for the
+  rest of the program.
+- A natively compiled program frees a compact's region once a thread that
+  held the compact has ended. What the thread had let go of but not yet
+  erased went with its heap, and the region was kept for good.
+- Threads that read values out of one compact region no longer slow each
+  other down on Silo. Each share and erase of such a value wrote the region's
+  one count; a thread now counts for itself and tells the region when it
+  moves on. Parsing the standard library's files on ten threads took as long
+  as on one, and takes a fifth of that now.
+- A natively compiled program no longer aborts when a thread waits, or is
+  made to give way, under two handlers that keep their continuations and then
+  performs the outer one's operation. The runtime lost count of which
+  suspended stack segments belonged to which handler.
 - A build keeps the release its lock names when a newer one has been tagged
   since. On a machine that had not fetched the dependency yet, a dependency
   taken by `version` was resolved to the newest release before the lock was

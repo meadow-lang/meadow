@@ -1,0 +1,1195 @@
+-- A unit's own optimisation of its core: `meadow_core::dictionaries` and
+-- `meadow_core::inline`, as far as they are here, in one walk of each
+-- definition.
+--
+-- **Dictionaries.** A trait is a dictionary and a method the function that
+-- reads itself out of one, so `x + 1` at `Int` is a call to a function that
+-- takes `impl Add Int`'s dictionary apart to find another function to call.
+-- Where a method is asked of a dictionary that is known -- an `impl`'s, in
+-- plain sight -- the asking is the method; and where that is a function
+-- whose whole body is a primitive of its parameters, a call of it is the
+-- primitive. And where a function that *takes* dictionaries is called with
+-- known ones, at types that are known, a copy of it is made for those
+-- dictionaries and types and called instead: in the copy each dictionary
+-- is a name in plain sight, so every method it asks for is found as above,
+-- and the functions it calls with them are copied in their turn. `range 0
+-- n` at `Int` is then a loop that compares and adds integers, where it was
+-- one that called three functions to do each.
+--
+-- **Inlining.** A call of a top-level function is a jump to its definition
+-- and a return from it, the right price for a function and a ruinous one
+-- for `fun isEmpty v = len v == 0`. Where a definition is a function,
+-- small, and reaches itself through no chain of such functions, a call of
+-- it with all its arguments is its body, with each parameter the name of
+-- its argument: a `let` each, so that an argument is still evaluated once
+-- and in its turn.
+--
+-- Core binds every name once and lowering relies on it, so a body is copied
+-- with every name it binds a new one; and a name's representation comes
+-- from its type all the way down, so a copy of a function generic in its
+-- types is written with every type in it at the types it is a copy for.
+--
+-- A unit is compiled by itself. So it keeps, for the units that import it,
+-- the functions they may want a copy of (`exports`), as GHC keeps
+-- unfoldings in an interface: the small ones, and the ones that take
+-- dictionaries.
+--
+-- Not here yet: an `impl` with a `where` of its own, which is a function
+-- from dictionaries to a dictionary and is known once it is copied; the
+-- function the program calls once, however large; and a loop copied for a
+-- function it is given.
+
+use Lingua (pass!)
+use Lingua.Lang (Meta, spanMeta)
+use MeadowBoot.Core
+use MeadowBoot.Core (Core!)
+use MeadowBoot.Dictionaries (Summary, Wrapper, summary)
+use MeadowBoot.Solve (Entry)
+use MeadowBoot.Types
+use MeadowBoot.Types.Type.*
+use Std.Collections.Vector as V
+use Std.Collections.HashMap as H
+use Std.Collections.HashMap (HashMap)
+use Std.String as S
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+
+-- The most nodes a function's body may have and still be copied to its
+-- calls: `meadow_core::inline::BUDGET`. The same at every level that copies
+-- at all: a body copied into its caller is copied again with it, so twice
+-- the size is not twice the program -- at 32, Lingua did not finish and had
+-- 21 GB when it was stopped.
+def budget : Int = 16
+
+-- The most nodes a function that takes dictionaries may have and still be
+-- kept for another unit to copy: twice as many for a generous build, which
+-- is what its highest level is -- larger functions copied for the
+-- dictionaries and the representations they are called at.
+fun keptAt (generous : Bool) : Int = if generous then 1200 else 600
+
+-- How long a chain of copies -- a copy asking for a copy -- may get: only a
+-- function that calls itself at an ever larger type makes one that does not
+-- end. `meadow_core::dictionaries::DEPTH`.
+def depth : Int = 24
+
+def nowhere : Meta = spanMeta 0 0
+
+-- Where the names this pass makes start, as `meadow_core`'s do.
+def base : Int = 2097152000
+
+-- And where its binders for what it names of other units start.
+def externs : Int = 2040000000
+
+-- The same two for `numbered`, which walks a unit before `program` does:
+-- the names one makes are names the other is handed, and must not be taken
+-- for its own. Above `Dictionaries`' and below the two above.
+def numberBase : Int = 1990000000
+
+def numberExterns : Int = 1970000000
+
+-- How many binders there are from where a walk's externs start: none of
+-- the ranges above is as near another as this.
+def span : Int = 16000000
+
+-- A function to copy: the type variables it is generic in; its parameters
+-- in order, each with its type; itself, a function; its body; the program
+-- that is in; for one
+-- from another unit, what each name of a definition in it is there; how
+-- many of its first parameters are dictionaries; and whether it is small
+-- enough to be written out at a call.
+record Body = {
+  vars : [Int],
+  -- The variables over number types it is generic in (`numbered`), and
+  -- what each variable over number types where it was written is when
+  -- nothing says: an `Int`, or a `Float`.
+  nums : [Int],
+  settle : HashMap Int Type,
+  params : [(Int, Type)],
+  whole : CoreTerm,
+  body : CoreTerm,
+  from : CoreArena,
+  tops : Maybe (HashMap Int Top),
+  dicts : Int,
+  small : Bool
+}
+
+-- What a body from another unit calls a definition, there: its symbol, how
+-- many types it is generic in, and how many parameters it is written with.
+record Top = {
+  symbol : String,
+  types : Int,
+  arity : Int
+}
+
+-- --- what a term holds ---------------------------------------------------------
+
+-- The terms directly under `t`.
+fun kids (a : CoreArena) (t : CoreTerm) : [CoreTerm] =
+  match viewCoreTerm a t with
+  | CoreTermView.Lam r -> [r.body]
+  | CoreTermView.TyLam r -> [r.body]
+  | CoreTermView.TyApp r -> [r.func]
+  | CoreTermView.App r -> [r.func, r.arg]
+  | CoreTermView.Let r -> [r.value, r.body]
+  | CoreTermView.LetRec r -> V.pushBack (V.map (\b -> coreBindValue a b) r.binds) r.body
+  | CoreTermView.If r -> [r.cond, r.yes, r.no]
+  | CoreTermView.Tuple r -> r.items
+  | CoreTermView.Array r -> r.items
+  | CoreTermView.Proj r -> [r.tuple]
+  | CoreTermView.Record r -> V.map (\f -> coreFieldValue a f) r.fields
+  | CoreTermView.Sel r -> [r.target]
+  | CoreTermView.Extend r -> [r.target, r.value]
+  | CoreTermView.Ctor r -> r.args
+  | CoreTermView.Prim r -> r.args
+  | CoreTermView.Perform r -> [r.arg]
+  | CoreTermView.Case r ->
+      V.pushFront
+        (V.concatMap
+           (\arm ->
+             match coreArmGuard a arm with
+             | Just g -> [g, coreArmBody a arm]
+             | None -> [coreArmBody a arm])
+           r.arms)
+        r.scrutinee
+  | CoreTermView.Handle r ->
+      V.concat [
+        [r.body],
+        V.map (\c -> coreClauseBody a c) r.clauses,
+        (match r.ret with | Just x -> [x] | None -> [])
+      ]
+  | CoreTermView.Join r -> [r.rhs, r.body]
+  | CoreTermView.Jump r -> r.args
+  | _ -> []
+
+-- How many nodes `t` is, counted no further than `cap`.
+fun size (a : CoreArena) (t : CoreTerm) (cap : Int) (n : Int) : Int =
+  if n > cap then n else V.foldl (\acc k -> size a k cap acc) (n + 1) (kids a t)
+
+-- The names `t` mentions, after `seen`.
+fun mentions (a : CoreArena) (t : CoreTerm) (seen : [Int]) : [Int] =
+  snd (mentionsIn a t (H.fromVec (V.map (\id -> (id, True)) seen), seen))
+
+-- The same, of a term after others: each name once, in the order first met,
+-- and which have been met so far -- a list alone is searched for every name,
+-- and a unit's functions mention thousands.
+fun mentionsIn (a : CoreArena) (t : CoreTerm) (seen : (HashMap Int Bool, [Int]))
+    : (HashMap Int Bool, [Int]) =
+  match viewCoreTerm a t with
+  | CoreTermView.Var r ->
+      (match seen with
+       | (met, order) ->
+           if M.isSome (H.lookup r.id met) then seen
+           else (H.insert r.id True met, V.pushBack order r.id))
+  | _ -> V.foldl (\acc k -> mentionsIn a k acc) seen (kids a t)
+
+-- A definition under the type variables it is generic in.
+fun peel (a : CoreArena) (t : CoreTerm) : ([Int], CoreTerm) =
+  match viewCoreTerm a t with
+  | CoreTermView.TyLam r -> (r.vars, r.body)
+  | _ -> ([], t)
+
+-- A function's parameters as it is written with them, each with its type,
+-- and its body.
+fun lams (a : CoreArena) (t : CoreTerm) (params : [(Int, Type)]) : ([(Int, Type)], CoreTerm) =
+  match viewCoreTerm a t with
+  | CoreTermView.Lam r -> lams a r.body (V.pushBack params (r.param, r.paramTy))
+  | _ -> (params, t)
+
+-- `t` under its first `n` parameters.
+fun under (a : CoreArena) (t : CoreTerm) (n : Int) : CoreTerm =
+  if n <= 0 then t
+  else
+    (match viewCoreTerm a t with
+     | CoreTermView.Lam r -> under a r.body (n - 1)
+     | _ -> t)
+
+-- Those of the small functions `left` that reach themselves through none:
+-- `safe` are the ones known not to, and a function every small function it
+-- mentions is safe is safe too, which is asked until a round finds none.
+-- What is left then is on a chain that comes back to itself, or calls one
+-- that is.
+fun settled
+    (a : CoreArena)
+    (small : HashMap Int Body)
+    (left : [(Int, Body)])
+    (safe : HashMap Int Body)
+    : HashMap Int Body =
+  let (more, rest) =
+    V.foldl
+      (\acc kv ->
+        match (acc, kv) with
+        | ((safeNow, waiting), (id, (b : Body))) ->
+            if V.all
+              (\m -> not (M.isSome (H.lookup m small)) or M.isSome (H.lookup m safe))
+              (mentions a b.body []) then (H.insert id b safeNow, waiting)
+            else (safeNow, V.pushBack waiting kv))
+      (safe, [])
+      left
+  in if V.len rest == V.len left then more else settled a small rest more
+
+-- How many of `params`, from the first, are dictionaries: of a type that is
+-- a trait's, `traits`.
+fun leading (traits : HashMap String Bool) (params : [(Int, Type)]) (i : Int) : Int =
+  match V.get params i with
+  | Just (_, Con name []) ->
+      if M.isSome (H.lookup name traits) then leading traits params (i + 1) else i
+  | _ -> i
+
+-- The functions of `p` there may be a copy of, by binder: the small ones
+-- that reach themselves through none, and the ones that take dictionaries.
+fun candidates (p : CoreProgram) (traits : HashMap String Bool) (reps : Bool) (generous : Bool)
+    : HashMap Int Body =
+  let a = coreArena p in
+  let kept = keptAt generous in
+  let all =
+    V.concatMap
+      (\d ->
+        (let (vars, inner) = peel a (coreDefBody a d) in
+         let (params, body) = lams a inner [] in
+         let n = size a body kept 0 in
+         let dicts = leading traits params 0 in
+         -- One generic in a type is kept too, where copies are made for the
+         -- representations a function is used at (`instantiated`).
+         let generic = reps and not (V.isEmpty vars) in
+         if V.isEmpty params or (n > budget and ((dicts == 0 and not generic) or n > kept)) then []
+         else
+           [(
+             coreDefId a d,
+             Body {
+               vars,
+               nums = [],
+               settle = H.empty,
+               params,
+               whole = inner,
+               body,
+               from = a,
+               tops = None,
+               dicts,
+               small = n <= budget
+             }
+           )]))
+      (coreFileDefs a (coreRoot p))
+  in
+  let small =
+    V.foldl
+      (\h kv ->
+        match snd kv with
+        | (b : Body) -> if b.small then H.insert (fst kv) b h else h)
+      H.empty
+      all
+  in
+  let safe = settled a small (H.toVec small) H.empty in
+  V.foldl
+    (\h kv ->
+      match kv with
+      | (id, (b : Body)) ->
+          if M.isSome (H.lookup id safe) then H.insert id b h
+          else if b.dicts > 0 or (reps and not (V.isEmpty b.vars)) then
+            H.insert id { b | small = False, dicts = b.dicts } h
+          else h)
+    H.empty
+    all
+
+-- --- the walk ----------------------------------------------------------------
+
+-- What every copy shares: what there may be a copy of, by the binder it has
+-- here; the names that stay as they are in a copy of one of the unit's
+-- own; the binder each symbol has, the symbol each binder is, and the
+-- binders made for symbols the unit never named; what is known of every
+-- definition in sight, by symbol (`Dictionaries.Summary`), and how many
+-- parameters each is written with; the next new name; the copies made for
+-- dictionaries, each by what it is a copy of and for; the definitions those
+-- are; and which of the two this does.
+record Shared s = {
+  pkg : String,
+  bodies : HashMap Int Body,
+  kept : HashMap Int Bool,
+  binders : HashMap String Int,
+  symbols : HashMap Int String,
+  made : StRef s [(Int, Top)],
+  selectors : HashMap String String,
+  dicts : HashMap String [Entry String],
+  wrappers : HashMap String Wrapper,
+  arities : HashMap String Int,
+  next : StRef s Int,
+  copies : StRef s (HashMap String Int),
+  extra : StRef s [CoreDef],
+  known : Bool,
+  inlines : Bool,
+  -- Where this walk's binders for what it names of other units start.
+  madeFrom : Int,
+  -- The definitions generic in a number's type, by symbol: this unit's and
+  -- the ones the units it imports keep for it (`numbered`).
+  numbers : HashMap String Body
+}
+
+-- What a walk carries: whether it is of one of the unit's definitions
+-- where it stands, which is written as it is; and for a copy, the type each
+-- type variable of the function is, what each name of a definition is
+-- where the function is from, the new name of each other name met so far,
+-- and how many copies deep it is.
+record Cx s = {
+  own : Bool,
+  types : HashMap Int Type,
+  tops : Maybe (HashMap Int Top),
+  names : StRef s (HashMap Int Int),
+  deep : Int,
+  sh : Shared s
+}
+
+fun symbolIn (pkg : String) (id : Int) : String =
+  if id < 0 then "meadow:${pkg}/impl${show (0 - id)}" else "meadow:${pkg}/d${show id}"
+
+-- The binder `top` has in the unit being written: a new one, where the unit
+-- never named it.
+fun binderOf (sh : Shared s) (top : Top) =
+  match H.lookup top.symbol sh.binders with
+  | Just id -> id
+  | None ->
+      (let made = stGetRef sh.made in
+       match V.find (\x -> match x with | (_, (t : Top)) -> t.symbol == top.symbol) made with
+       | Just (id, _) -> id
+       | None ->
+           (let id = sh.madeFrom + V.len made in
+            let u = stSetRef sh.made (V.pushBack made (id, top)) in
+            id))
+
+-- The symbol binder `id` is, if it is a definition's.
+fun symbolOf (sh : Shared s) (id : Int) =
+  if id >= sh.madeFrom and id < sh.madeFrom + span then
+    M.map
+      (\x -> match x with | (_, (t : Top)) -> t.symbol)
+      (V.get (stGetRef sh.made) (id - sh.madeFrom))
+  else H.lookup id sh.symbols
+
+-- The name `id` has where it is being written.
+fun renamed (cx : Cx s) (id : Int) =
+  if cx.own then id
+  else
+    (let foreign = M.andThen (\tops -> H.lookup id tops) cx.tops in
+     let names = stGetRef cx.names in
+     match H.lookup id names with
+     | Just n -> n
+     | None ->
+         if M.isSome foreign then
+           binderOf cx.sh (M.unwrapOr (Top { symbol = "", types = 0, arity = 0 }) foreign)
+         else if M.isNone cx.tops and M.isSome (H.lookup id cx.sh.kept) then id
+         else
+           (let n = stGetRef cx.sh.next in
+            let u = stSetRef cx.sh.next (n + 1) in
+            let w = stSetRef cx.names (H.insert id n names) in
+            n))
+
+-- A type of the function's, at the types the call is at.
+fun at (cx : Cx s) (t : Type) : Type =
+  if H.isEmpty cx.types then t
+  else
+    (match t with
+     | Var v -> M.unwrapOr t (H.lookup v cx.types)
+     | Con name args -> Con name (V.map (\x -> at cx x) args)
+     | Fun params result eff -> Fun (V.map (\x -> at cx x) params) (at cx result) (at cx eff)
+     | Tuple items -> Tuple (V.map (\x -> at cx x) items)
+     | Record row -> Record (at cx row)
+     | RowExtend label field rest -> RowExtend label (at cx field) (at cx rest)
+     | other -> other)
+
+-- A term under the types it is at.
+fun head out t =
+  match viewCoreTerm out t with
+  | CoreTermView.TyApp r -> r.func
+  | _ -> t
+
+-- The binder `t` names, if it is a name.
+fun named out t =
+  match viewCoreTerm out t with
+  | CoreTermView.Var r -> Just r.id
+  | _ -> None
+
+-- What `func` is applied to already, and the name at its head with the
+-- types it is at.
+fun spine out func args =
+  match viewCoreTerm out func with
+  | CoreTermView.App r -> spine out r.func (V.pushFront args r.arg)
+  | CoreTermView.Var r -> (Just (r.id, []), args)
+  | CoreTermView.TyApp r ->
+      (match viewCoreTerm out r.func with
+       | CoreTermView.Var v -> (Just (v.id, r.tys), args)
+       | _ -> (None, args))
+  | _ -> (None, args)
+
+-- The symbol of the known dictionary `t` names, if it names one.
+fun dictionary out (sh : Shared s) t =
+  match M.andThen (\id -> symbolOf sh id) (named out t) with
+  | Just symbol -> if M.isSome (H.lookup symbol sh.dicts) then Just symbol else None
+  | None -> None
+
+-- The symbol of what `func` given `arg` is, where `func` reads a field and
+-- `arg` is a dictionary whose fields are known.
+fun selected out (sh : Shared s) func arg =
+  match (M.andThen (\id -> symbolOf sh id) (named out (head out func)), dictionary out sh arg) with
+  | (Just fs, Just ds) ->
+      (match (H.lookup fs sh.selectors, H.lookup ds sh.dicts) with
+       | (Just label, Just fields) ->
+           M.map
+             (\(e : Entry String) -> e.value)
+             (V.find (\(e : Entry String) -> e.key == label) fields)
+       | _ -> None)
+  | _ -> None
+
+-- Whether a type is all there: no variable in it.
+fun closed (t : Type) : Bool =
+  match t with
+  | Var _ -> False
+  | Bound _ -> False
+  | Error -> False
+  | Con _ args -> V.all closed args
+  | Fun params result eff -> V.all closed params and closed result and closed eff
+  | Tuple items -> V.all closed items
+  | Record row -> closed row
+  | RowExtend _ field more -> closed field and closed more
+  | RowEmpty -> True
+
+-- A copy of `b`, binder `f` here, for the dictionaries `given` -- each a
+-- binder and its symbol -- and at `tys`: the binder of the definition that
+-- is, made if this is the first call to want it. It is named before its
+-- body is walked, so that a function calling itself calls its copy.
+fun copied out (cx : Cx s) (f : Int) (b : Body) (given : [(Int, String)]) (tys : [Type]) =
+  let sh = cx.sh in
+  let key =
+    "${M.unwrapOr (show f) (symbolOf sh f)}|${S.join "," (V.map snd given)}|${S.join "," (V.map (\t -> debug t) tys)}"
+  in match H.lookup key (stGetRef sh.copies) with
+     | Just id -> id
+     | None ->
+         (let id = stGetRef sh.next in
+          let u = stSetRef sh.next (id + 1) in
+          let w = stSetRef sh.copies (H.insert key id (stGetRef sh.copies)) in
+          let names =
+            V.foldl
+              (\h k ->
+                H.insert (fst (V.getOr (0, Error) b.params k)) (fst (V.getOr (0, "") given k)) h)
+              H.empty
+              (V.range 0 (V.len given))
+          in
+          let inner =
+            {
+              cx | own = False,
+              types = V.foldl (\h vt -> H.insert (fst vt) (snd vt) h) H.empty (V.zip b.vars tys),
+              tops = b.tops,
+              names = stNewRef names,
+              deep = cx.deep + 1
+            }
+          in
+          let whole = copyTerm b.from out inner (under b.from b.whole (V.len given)) in
+          let v =
+            stSetRef sh.extra (V.pushBack (stGetRef sh.extra) (newCoreDef out nowhere id whole))
+          in id)
+
+-- A generic function mentioned at `tys`: where the types are all there, and
+-- copies are being made, the copy of it for how values of those types are
+-- represented -- `meadow_core::specialize::release`. A function generic in a
+-- type does nothing with a value of it but move it, so one copy serves every
+-- type whose values are pointers, and one each the numbers and the rest that
+-- are not; and what the copy does with such a value it does knowing what the
+-- value is, where the function as written asks a descriptor at run time. A
+-- small function is left to be copied to where it is called, and one that
+-- takes dictionaries to be copied for them (`call`).
+fun instantiated out (cx : Cx s) (m : Meta) func tys (nums : [Type]) (t : Type) =
+  let sh = cx.sh in
+  -- The number types a mention is at are gone from what is written, known
+  -- or not: a mention at none of a variable's is the name itself.
+  let plain = \u -> if V.isEmpty tys then func else newCoreTermTyApp out m func tys [] t in
+  match (if wanted nums then numberBody out sh func else None) with
+  | Just (f, (b : Body)) ->
+      (let head = newCoreTermVar out m (numberCopy out cx f b nums) t in
+       if V.isEmpty tys then head else newCoreTermTyApp out m head tys [] t)
+  | None -> represent out cx m func tys t plain
+
+-- `instantiated`, where no copy is made for a number's type.
+fun represent out (cx : Cx s) (m : Meta) func tys (t : Type) plain =
+  let sh = cx.sh in
+  if V.isEmpty tys or not sh.inlines or cx.deep >= depth or not (V.all closed tys) then plain ()
+  else
+    (match named out func with
+     | Just f ->
+         (match H.lookup f sh.bodies with
+          | Just (b : Body) ->
+              if b.dicts == 0 and not b.small and V.len b.vars == V.len tys then
+                newCoreTermVar out m (copied out cx f b [] (V.map represented tys)) t
+              else plain ()
+          | None -> plain ())
+     | None -> plain ())
+
+-- Whether a mention at number types `nums` wants a copy of its own: they
+-- are all known, and not all what a literal is anyway -- an `Int`, a
+-- `Float` -- where the definition as it was written is that copy.
+fun wanted (nums : [Type]) : Bool =
+  not (V.isEmpty nums)
+    and V.all
+      (\t ->
+        match t with
+        | Con name [] -> V.elem name numeric
+        | _ -> False)
+      nums
+    and V.any
+      (\t ->
+        match t with
+        | Con name [] -> name != "Int" and name != "Float"
+        | _ -> False)
+      nums
+
+-- The types a number is of.
+def numeric : [String] =
+  [
+    "Int", "BigInt", "Float", "Float32", "Int8", "Int16", "Int32", "UInt8", "UInt16", "UInt32",
+    "UInt64"
+  ]
+
+-- The definition generic in a number's type that `func` names, if it names
+-- one: its binder here, and how it is written.
+fun numberBody out (sh : Shared s) func =
+  match named out func with
+  | None -> None
+  | Just f ->
+      (match M.andThen (\symbol -> H.lookup symbol sh.numbers) (symbolOf sh f) with
+       | Just b -> Just (f, b)
+       | None -> None)
+
+-- The copy of `b`, binder `f` here, for the number types `nums`: the binder
+-- of the definition that is, made if this is the first mention to want it
+-- -- `meadow_core::specialize`. In it each of the function's variables over
+-- a number type is the type, so a literal of one is made as that type and
+-- not as the `Int` it would otherwise be, and what it mentions at one of
+-- them is mentioned at the type, which asks for that one's copy in turn:
+-- the number types are few, so this ends. It is generic still in what the
+-- function is generic in besides.
+fun numberCopy out (cx : Cx s) (f : Int) (b : Body) (nums : [Type]) =
+  let sh = cx.sh in
+  let key = "${M.unwrapOr (show f) (symbolOf sh f)}|#|${S.join "," (V.map (\t -> debug t) nums)}" in
+  match H.lookup key (stGetRef sh.copies) with
+  | Just id -> id
+  | None ->
+      (let id = stGetRef sh.next in
+       let u = stSetRef sh.next (id + 1) in
+       let w = stSetRef sh.copies (H.insert key id (stGetRef sh.copies)) in
+       let inner =
+         {
+           cx | own = False,
+           -- Each of its variables over a number type the type the copy is
+           -- for, and every other such variable where it was written what
+           -- it is when nothing says.
+           types = V.foldl (\h vt -> H.insert (fst vt) (snd vt) h) b.settle (V.zip b.nums nums),
+           tops = b.tops,
+           names = stNewRef H.empty,
+           deep = cx.deep + 1
+         }
+       in
+       let body = copyTerm b.from out inner b.whole in
+       let whole =
+         if V.isEmpty b.vars then body
+         else newCoreTermTyLam out nowhere b.vars [] body (tyCoreTerm out body)
+       in
+       let v =
+         stSetRef sh.extra (V.pushBack (stGetRef sh.extra) (newCoreDef out nowhere id whole))
+       in id)
+
+-- A literal where a copy is made at number types: one of a variable's type
+-- is made again as the type the variable is there, as `Elab.literal` makes
+-- one of a type that is written.
+fun constant out (cx : Cx s) (m : Meta) lit (t : Type) =
+  if cx.own then newCoreTermConst out m lit t
+  else if kindCoreLit out lit == CoreLitKind.LInt then
+    (let n = coreLitLIntValue out lit in
+     match t with
+     | Con "BigInt" [] -> newCoreTermConst out m (newCoreLitLBig out m n) t
+     | Con name [] ->
+         (match sized name with
+          | Just width -> newCoreTermConst out m (newCoreLitLWord out m width n) t
+          | None -> newCoreTermConst out m lit t)
+     | _ -> newCoreTermConst out m lit t)
+  else if kindCoreLit out lit == CoreLitKind.LF64 then
+    (match t with
+     | Con "Float32" [] ->
+         newCoreTermConst out m (newCoreLitLF32 out m (coreLitLF64Value out lit)) t
+     | _ -> newCoreTermConst out m lit t)
+  else newCoreTermConst out m lit t
+
+-- The width a sized integer type's name says, as core writes it:
+-- `Elab.widthOf`.
+fun sized (name : String) : Maybe String =
+  match name with
+  | "Int8" -> Just "I8"
+  | "Int16" -> Just "I16"
+  | "Int32" -> Just "I32"
+  | "UInt8" -> Just "U8"
+  | "UInt16" -> Just "U16"
+  | "UInt32" -> Just "U32"
+  | "UInt64" -> Just "U64"
+  | _ -> None
+
+-- `body` generic in `vars`: itself, in none.
+fun generic out (m : Meta) (vars : [Int]) body (t : Type) =
+  if V.isEmpty vars then body else newCoreTermTyLam out m vars [] body t
+
+-- A type as a copy is made at it: itself where its values are not pointers,
+-- and otherwise one type that stands for every type whose values are. It
+-- names no declaration; nothing takes a value of it apart. An effect is
+-- itself: it is not a value's type.
+fun represented (t : Type) : Type =
+  match t with
+  | Con name args -> if V.isEmpty args and V.elem name unboxed then t else Con "#Ref" []
+  | RowEmpty -> t
+  | RowExtend _ _ _ -> t
+  | _ -> Con "#Ref" []
+
+-- The types whose values are not pointers: `Seq.scalars`.
+def unboxed : [String] =
+  [
+    "Int", "Float", "Float32", "Bool", "Char", "String", "Unit", "Int8", "Int16", "Int32", "UInt8",
+    "UInt16", "UInt32", "UInt64"
+  ]
+
+-- A call: `func` given `arg`, of type `t`.
+fun call out (cx : Cx s) (m : Meta) func arg (t : Type) =
+  let sh = cx.sh in
+  let plain = \u -> newCoreTermApp out m func arg t in
+  match (if sh.known then selected out sh func arg else None) with
+  | Just symbol ->
+      newCoreTermVar
+        out
+        m
+        (binderOf sh (Top { symbol, types = 0, arity = M.unwrapOr 0 (H.lookup symbol sh.arities) }))
+        t
+  | None ->
+      (match spine out func [arg] with
+       | (Just (f, tys), args) ->
+           -- A function whose whole body is a primitive of its parameters,
+           -- given them all.
+           (match (if sh.known then M.andThen (\s -> H.lookup s sh.wrappers) (symbolOf sh f)
+             else None) with
+            | Just (w : Wrapper) ->
+                if w.arity == V.len args then newCoreTermPrim out m w.op args t else plain ()
+            | None ->
+                (match H.lookup f sh.bodies with
+                 | None -> plain ()
+                 | Just (b : Body) ->
+                     if V.len b.vars != V.len tys then plain ()
+                     else if sh.known
+                       and b.dicts > 0
+                       and V.len args == b.dicts
+                       and cx.deep < depth
+                       and V.all closed tys then
+                       (let given =
+                          V.concatMap
+                            (\x ->
+                              match (named out x, dictionary out sh x) with
+                              | (Just id, Just symbol) -> [(id, symbol)]
+                              | _ -> [])
+                            args
+                        in if V.len given != b.dicts then plain ()
+                           else newCoreTermVar out m (copied out cx f b given tys) t)
+                     else if sh.inlines and b.small and V.len args == V.len b.params then
+                       (let inner =
+                          {
+                            cx | own = False,
+                            types =
+                              V.foldl
+                                (\h vt -> H.insert (fst vt) (snd vt) h)
+                                H.empty
+                                (V.zip b.vars tys),
+                            tops = b.tops,
+                            names = stNewRef H.empty,
+                            deep = cx.deep + 1
+                          }
+                        in if cx.deep >= depth then plain ()
+                           else
+                             (let body = copyTerm b.from out inner b.body in
+                              V.foldr
+                                (\k acc ->
+                                  newCoreTermLet
+                                    out
+                                    m
+                                    (renamed inner (fst (V.getOr (0, Error) b.params k)))
+                                    (V.getOr arg args k)
+                                    acc
+                                    t)
+                                body
+                                (V.range 0 (V.len args))))
+                     else plain ()))
+       | _ -> plain ())
+
+-- A term written again -- as it is, for one of the unit's definitions where
+-- it stands; for a copy, every name it binds a new one and every type in
+-- it at the types the copy is for -- with each call in it what `call`
+-- makes of it.
+pass! {
+  copy : Core -> Core with cx from Def, Term, Named, Data, Effect, Extern
+    | Var { id, ty } -> Var { id = renamed cx id, ty = at cx ty }
+    | Lam { param, paramTy, body, ty } ->
+        Lam { param = renamed cx param, paramTy = at cx paramTy, body, ty = at cx ty }
+    | TyLam { vars, nums, body, ty } -> generic out here vars body (at cx ty)
+    | TyApp { func, tys, nums, ty } ->
+        instantiated
+          out
+          cx
+          here
+          func
+          (V.map (\x -> at cx x) tys)
+          (V.map (\x -> at cx x) nums)
+          (at cx ty)
+    | App { func, arg, ty } -> call out cx here func arg (at cx ty)
+    | Let { id, value, body, ty } -> Let { id = renamed cx id, value, body, ty = at cx ty }
+    | LetRec { binds, body, ty } -> LetRec { binds, body, ty = at cx ty }
+    | Bind { id, value } -> Bind { id = renamed cx id, value }
+    | If { cond, yes, no, ty } -> If { cond, yes, no, ty = at cx ty }
+    | Tuple { items, ty } -> Tuple { items, ty = at cx ty }
+    | Array { items, ty } -> Array { items, ty = at cx ty }
+    | Proj { tuple, index, ty } -> Proj { tuple, index, ty = at cx ty }
+    | Record { fields, ty } -> Record { fields, ty = at cx ty }
+    | Sel { target, label, ty } -> Sel { target, label, ty = at cx ty }
+    | Extend { target, label, value, ty } -> Extend { target, label, value, ty = at cx ty }
+    | Ctor { name, args, ty } -> Ctor { name, args, ty = at cx ty }
+    | Prim { op, args, ty } -> Prim { op, args, ty = at cx ty }
+    | Case { scrutinee, arms, ty } -> Case { scrutinee, arms, ty = at cx ty }
+    | Perform { eff, op, arg, ty } -> Perform { eff, op, arg, ty = at cx ty }
+    | Ill { ty } -> Ill { ty = at cx ty }
+    | Const { lit, ty } -> constant out cx here lit (at cx ty)
+    | PWild { ty } -> PWild { ty = at cx ty }
+    | PVar { id, ty } -> PVar { id = renamed cx id, ty = at cx ty }
+    | PAs { id, pat, ty } -> PAs { id = renamed cx id, pat, ty = at cx ty }
+    | PLit { lit, ty } -> PLit { lit, ty = at cx ty }
+    | PTuple { items, ty } -> PTuple { items, ty = at cx ty }
+    | PArray { items, ty } -> PArray { items, ty = at cx ty }
+    | PCtor { name, args, ty } -> PCtor { name, args, ty = at cx ty }
+    | PRecord { fields, ty } -> PRecord { fields, ty = at cx ty }
+    | Join { id, params, rhs, body, ty } ->
+        Join {
+          id = renamed cx id,
+          params = V.map (\x -> renamed cx x) params,
+          rhs,
+          body,
+          ty = at cx ty
+        }
+    | Jump { id, args, ty } -> Jump { id = renamed cx id, args, ty = at cx ty }
+    | Clause { eff, op, param, paramTy, resume, body } ->
+        Clause {
+          eff,
+          op,
+          param = renamed cx param,
+          paramTy = at cx paramTy,
+          resume = renamed cx resume,
+          body
+        }
+    | Handle { body, clauses, retId, ret, ty } ->
+        Handle { body, clauses, retId = M.map (\x -> renamed cx x) retId, ret, ty = at cx ty }
+}
+
+pass! {
+  same : Core -> Core from Def
+    | Ill { ty } -> Ill { ty }
+}
+
+-- The traits among `names`, the named constructors in sight: the type of a
+-- trait's dictionary is the trait, and its constructor `Dict` of it.
+@pub fun traitsOf (names : [String]) : HashMap String Bool =
+  V.foldl
+    (\h n ->
+      if S.endsWith ".Dict" n then H.insert (S.take n (stringByteLength n - 5)) True h else h)
+    H.empty
+    names
+
+-- What `p` keeps of itself for the units that import it: each function of
+-- its own they may want a copy of, and -- as what it names of another unit
+-- is written -- each definition one of those mentions, its own included:
+-- its binder here, its symbol, and how it is written.
+@pub fun exports (p : CoreProgram) (traits : HashMap String Bool) (reps : Bool) (generous : Bool)
+    : CoreProgram =
+  exported p (candidates p traits reps generous)
+
+-- `exports`, of the definitions `bodies`.
+fun exported (p : CoreProgram) (bodies : HashMap Int Body) : CoreProgram =
+  let a = coreArena p in
+  let file = coreRoot p in
+  let pkg = coreFilePackage a file in
+  let own =
+    V.foldl
+      (\h d ->
+        (let (vars, inner) = peel a (coreDefBody a d) in
+         H.insert
+           (coreDefId a d)
+           (Top {
+              symbol = symbolIn pkg (coreDefId a d),
+              types = V.len vars,
+              arity = V.len (fst (lams a inner []))
+            })
+           h))
+      H.empty
+      (coreFileDefs a file)
+  in
+  let tops =
+    V.foldl
+      (\h x ->
+        H.insert
+          (coreExternId a x)
+          (Top {
+             symbol = coreExternSymbol a x,
+             types = coreExternTypes a x,
+             arity = coreExternArity a x
+           })
+          h)
+      own
+      (coreFileExterns a file)
+  in
+  let mentioned =
+    snd
+      (V.foldl
+         (\seen kv -> mentionsIn a (match snd kv with | (b : Body) -> b.body) seen)
+         (H.empty, [])
+         (H.toVec bodies))
+  in runSt (\() ->
+       let out = newCoreBuilder () in
+       let defs =
+         V.concatMap
+           (\d -> if M.isSome (H.lookup (coreDefId a d) bodies) then [sameDef a out d] else [])
+           (coreFileDefs a file)
+       in
+       let named =
+         V.concatMap
+           (\id ->
+             match H.lookup id tops with
+             | Just (t : Top) -> [newCoreExtern out nowhere id t.symbol t.types t.arity]
+             | None -> [])
+           mentioned
+       in
+       let root = newCoreFile out nowhere pkg 0 defs [] [] [] named in
+       CoreProgram (freezeCore out) root)
+
+-- What a unit that keeps nothing keeps.
+@pub fun nothing () : CoreProgram =
+  runSt (\() ->
+    let out = newCoreBuilder () in
+    let root = newCoreFile out nowhere "" 0 [] [] [] [] [] in
+    CoreProgram (freezeCore out) root)
+
+-- The functions `their` unit keeps for this one to copy, each by the binder
+-- its symbol has here: only one the unit names is ever called by it.
+fun imported
+    (binders : HashMap String Int)
+    (traits : HashMap String Bool)
+    (their : CoreProgram)
+    (h : HashMap Int Body)
+    : HashMap Int Body =
+  let a = coreArena their in
+  let file = coreRoot their in
+  let pkg = coreFilePackage a file in
+  let tops =
+    V.foldl
+      (\t x ->
+        H.insert
+          (coreExternId a x)
+          (Top {
+             symbol = coreExternSymbol a x,
+             types = coreExternTypes a x,
+             arity = coreExternArity a x
+           })
+          t)
+      H.empty
+      (coreFileExterns a file)
+  in V.foldl
+       (\acc d ->
+         match H.lookup (symbolIn pkg (coreDefId a d)) binders with
+         | None -> acc
+         | Just here ->
+             (let (vars, inner) = peel a (coreDefBody a d) in
+              let (params, body) = lams a inner [] in
+              H.insert
+                here
+                (Body {
+                   vars,
+                   nums = [],
+                   settle = H.empty,
+                   params,
+                   whole = inner,
+                   body,
+                   from = a,
+                   tops = Just tops,
+                   dicts = leading traits params 0,
+                   small = size a body budget 0 <= budget
+                 })
+                acc))
+       h
+       (coreFileDefs a file)
+
+-- `p` with what is known made use of: if `known`, a method asked of a known
+-- dictionary the method, a call of a primitive's wrapper the primitive, and
+-- a function called with known dictionaries a copy for them; if `inlines`,
+-- a call of a small function its body. `theirs` are the functions the
+-- units it imports keep for it, `summaries` what those say of their
+-- definitions, `arities` how many parameters each of their functions is
+-- written with, and `traits` every trait in sight.
+@pub fun program
+    (p : CoreProgram)
+    (theirs : [CoreProgram])
+    (summaries : [Summary])
+    (arities : [Entry Int])
+    (traits : HashMap String Bool)
+    (labels : [Entry [String]])
+    (known : Bool)
+    (inlines : Bool)
+    (generous : Bool)
+    : CoreProgram =
+  walked
+    p
+    theirs
+    summaries
+    arities
+    traits
+    labels
+    known
+    inlines
+    generous
+    H.empty
+    externs
+    base
+    H.empty
+
+-- `p` with each definition generic in a number's type copied for the number
+-- types it is used at, and nothing left that says which a mention is at:
+-- what is done to every unit before anything else is, at every level, since
+-- it is what a literal in such a definition is right by. `theirs` are the
+-- definitions of that kind the units it imports keep (`numbers`), each with
+-- its variables over number types and whether each is over fractions, as
+-- `own` are `p`'s: a type that is one of them and is not being copied for
+-- is an `Int`, or a `Float`, which is what the definition as it was written
+-- is the copy for.
+@pub fun numbered (p : CoreProgram) (theirs : [(CoreProgram, [(Int, Bool)])]) (own : [(Int, Bool)])
+    : CoreProgram =
+  walked
+    p
+    []
+    []
+    []
+    H.empty
+    []
+    False
+    False
+    False
+    (numberBodies p theirs (settling own))
+    numberExterns
+    numberBase
+    (settling own)
+
+-- What each variable over number types is when nothing says.
+fun settling (vars : [(Int, Bool)]) : HashMap Int Type =
+  V.foldl (\h v -> H.insert (fst v) (if snd v then Con "Float" [] else Con "Int" []) h) H.empty vars
+
+-- A unit's definitions that are generic in a number's type, as they were
+-- written, for the units that import it to copy: `exports`, of those.
+@pub fun numbers (p : CoreProgram) : CoreProgram =
+  let a = coreArena p in
+  exported
+    p
+    (V.foldl
+       (\h d ->
+         if V.isEmpty (numsOf a (coreDefBody a d)) then h
+         else H.insert (coreDefId a d) (bodyOf a None H.empty (coreDefBody a d)) h)
+       H.empty
+       (coreFileDefs a (coreRoot p)))
+
+-- Whether `p` keeps anything: a unit with nothing generic in a number's
+-- type keeps a program of none.
+@pub fun keepsAny (p : CoreProgram) : Bool =
+  not (V.isEmpty (coreFileDefs (coreArena p) (coreRoot p)))
+
+-- The package `p` is of.
+@pub fun packageOf (p : CoreProgram) : String = coreFilePackage (coreArena p) (coreRoot p)
+
+-- The variables over number types a definition written `t` is generic in.
+fun numsOf (a : CoreArena) (t : CoreTerm) : [Int] =
+  match viewCoreTerm a t with
+  | CoreTermView.TyLam r -> r.nums
+  | _ -> []
+
+-- A definition written `t`, as what a copy is made of.
+fun bodyOf
+    (a : CoreArena)
+    (tops : Maybe (HashMap Int Top))
+    (settle : HashMap Int Type)
+    (t : CoreTerm)
+    : Body =
+  let (vars, inner) = peel a t in
+  let (params, body) = lams a inner [] in
+  Body {
+    vars,
+    nums = numsOf a t,
+    settle,
+    params,
+    whole = inner,
+    body,
+    from = a,
+    tops,
+    dicts = 0,
+    small = False
+  }
+
+-- Every definition generic in a number's type in sight, by its symbol:
+-- `p`'s own, and those `theirs` keep, each with what it calls a definition
+-- of its own unit.
+fun numberBodies
+    (p : CoreProgram)
+    (theirs : [(CoreProgram, [(Int, Bool)])])
+    (settle : HashMap Int Type)
+    : HashMap String Body =
+  let a = coreArena p in
+  let pkg = coreFilePackage a (coreRoot p) in
+  let own =
+    V.foldl
+      (\h d ->
+        if V.isEmpty (numsOf a (coreDefBody a d)) then h
+        else H.insert (symbolIn pkg (coreDefId a d)) (bodyOf a None settle (coreDefBody a d)) h)
+      H.empty
+      (coreFileDefs a (coreRoot p))
+  in V.foldl (\h their -> theirNumbers (fst their) (settling (snd their)) h) own theirs
+
+fun theirNumbers (their : CoreProgram) (settle : HashMap Int Type) (h : HashMap String Body)
+    : HashMap String Body =
+  let b = coreArena their in
+  let file = coreRoot their in
+  let from = coreFilePackage b file in
+  let defined =
+    V.foldl
+      (\t d ->
+        (let (vars, inner) = peel b (coreDefBody b d) in
+         H.insert
+           (coreDefId b d)
+           (Top {
+              symbol = symbolIn from (coreDefId b d),
+              types = V.len vars,
+              arity = V.len (fst (lams b inner []))
+            })
+           t))
+      H.empty
+      (coreFileDefs b file)
+  in
+  let tops =
+    V.foldl
+      (\t x ->
+        H.insert
+          (coreExternId b x)
+          (Top {
+             symbol = coreExternSymbol b x,
+             types = coreExternTypes b x,
+             arity = coreExternArity b x
+           })
+          t)
+      defined
+      (coreFileExterns b file)
+  in V.foldl
+       (\g d ->
+         if V.isEmpty (numsOf b (coreDefBody b d)) then g
+         else
+           H.insert
+             (symbolIn from (coreDefId b d))
+             (bodyOf b (Just tops) settle (coreDefBody b d))
+             g)
+       h
+       (coreFileDefs b file)
+
+fun walked
+    (p : CoreProgram)
+    (theirs : [CoreProgram])
+    (summaries : [Summary])
+    (arities : [Entry Int])
+    (traits : HashMap String Bool)
+    (labels : [Entry [String]])
+    (known : Bool)
+    (inlines : Bool)
+    (generous : Bool)
+    (numberOnes : HashMap String Body)
+    (madeFrom : Int)
+    (nextFrom : Int)
+    (settle : HashMap Int Type)
+    : CoreProgram =
+  let a = coreArena p in
+  let file = coreRoot p in
+  let pkg = coreFilePackage a file in
+  let all = V.pushBack summaries (summary p labels) in
+  let symbols =
+    V.foldl
+      (\h x -> H.insert (coreExternId a x) (coreExternSymbol a x) h)
+      (V.foldl
+         (\h d -> H.insert (coreDefId a d) (symbolIn pkg (coreDefId a d)) h)
+         H.empty
+         (coreFileDefs a file))
+      (coreFileExterns a file)
+  in
+  let binders = V.foldl (\h kv -> H.insert (snd kv) (fst kv) h) H.empty (H.toVec symbols) in
+  let bodies =
+    V.foldl
+      (\h their -> imported binders traits their h)
+      (candidates p traits inlines generous)
+      theirs
+  in runSt (\() ->
+       let out = newCoreBuilder () in
+       let sh =
+         Shared {
+           pkg,
+           bodies,
+           kept = V.foldl (\h kv -> H.insert (fst kv) True h) H.empty (H.toVec symbols),
+           binders,
+           symbols,
+           made = stNewRef [],
+           selectors =
+             V.foldl
+               (\h (s : Summary) ->
+                 V.foldl (\g (e : Entry String) -> H.insert e.key e.value g) h s.selectors)
+               H.empty
+               all,
+           dicts =
+             V.foldl
+               (\h (s : Summary) ->
+                 V.foldl (\g (e : Entry [Entry String]) -> H.insert e.key e.value g) h s.dicts)
+               H.empty
+               all,
+           wrappers =
+             V.foldl
+               (\h (s : Summary) ->
+                 V.foldl (\g (e : Entry Wrapper) -> H.insert e.key e.value g) h s.wrappers)
+               H.empty
+               all,
+           arities = V.foldl (\h (e : Entry Int) -> H.insert e.key e.value h) H.empty arities,
+           next = stNewRef nextFrom,
+           copies = stNewRef H.empty,
+           extra = stNewRef [],
+           known,
+           inlines,
+           madeFrom,
+           numbers = numberOnes
+         }
+       in
+       let cx =
+         Cx { own = True, types = settle, tops = None, names = stNewRef H.empty, deep = 0, sh }
+       in
+       let defs = V.map (\d -> copyDef a out cx d) (coreFileDefs a file) in
+       let named = V.map (\n -> copyNamed a out cx n) (coreFileNamed a file) in
+       let datas = V.map (\d -> copyData a out cx d) (coreFileDatas a file) in
+       let effects = V.map (\e -> copyEffect a out cx e) (coreFileEffects a file) in
+       let externs = V.map (\x -> copyExtern a out cx x) (coreFileExterns a file) in
+       let more =
+         V.map
+           (\x ->
+             match x with
+             | (id, (t : Top)) -> newCoreExtern out nowhere id t.symbol t.types t.arity)
+           (stGetRef sh.made)
+       in
+       let root =
+         newCoreFile
+           out
+           nowhere
+           pkg
+           (coreFileEntry a file)
+           (V.append defs (stGetRef sh.extra))
+           named
+           datas
+           effects
+           (V.append externs more)
+       in CoreProgram (freezeCore out) root)

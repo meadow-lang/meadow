@@ -44,9 +44,21 @@
 //! is what makes a handler deep. An operation no entry answers is the
 //! runtime's, if the `native` table binds it, and an error if not.
 //!
-//! A resumption is not checked to be called once: Cut leaves that to the
-//! front end, and one called again goes on from the `perform` again, as an
-//! operation marked `@many` wants.
+//! In a program where an operation is marked `@many`, every continuation
+//! is an object on the heap and a resumption is not checked to be called
+//! once: one called again goes on from the `perform` again, which is what
+//! such an operation wants.
+//!
+//! In any other program -- every one of Meadow's -- the continuation a
+//! call is made with to answer through is a **frame** (`Program::frames`),
+//! which the back ends keep on a stack: the native one, on Silo. So a
+//! handled body runs on a segment of the stack of its own (`Enter`), an
+//! operation whose clause is given its continuation cuts the segments
+//! between it and its handler off (`Detach`), and the resumption, which is
+//! checked to be called once, puts them back (`Reattach`): `meadow_seq`'s
+//! lowering of the same, `docs/SILO.md`'s "Effects: stack segments".
+//! `MEADOW_CUT_FRAMES=none` keeps everything on the heap, for telling a
+//! fault in this from one anywhere else.
 //!
 //! # Representations: descriptors
 //!
@@ -171,6 +183,16 @@ impl Lowered {
 }
 
 fn lowered(p: &Program, prints: bool) -> R<Lowered> {
+    // A program to run is first copied for the representations its generic
+    // definitions are called at -- see [`crate::specialize`].
+    // `MEADOW_CUT_GENERIC=1` leaves them generic, to measure the copies by.
+    let copied;
+    let p = if prints && std::env::var_os("MEADOW_CUT_GENERIC").is_none() {
+        copied = crate::specialize::program(p);
+        &copied
+    } else {
+        p
+    };
     let lazy = lazily(p);
     let whole = p;
     let p = &lazy;
@@ -191,11 +213,37 @@ fn lowered(p: &Program, prints: bool) -> R<Lowered> {
         next_tag: 0,
         defs: HashMap::new(),
         vals: HashMap::new(),
+        literals: HashMap::new(),
+        frames: if p.effects.iter().any(|e| e.ops.iter().any(|o| o.many)) {
+            None
+        } else {
+            frame_kinds()
+        },
         methods: Vec::new(),
     };
     l.declare(p)?;
     for (i, v) in whole.vals.iter().enumerate() {
         l.vals.insert(v.symbol.clone(), (i as i64, l.rep(&v.rep)?));
+        if let Statement::Cut(x, Consumer::Halt) = &v.body
+            && matches!(
+                x,
+                Producer::Int(_)
+                    | Producer::Float(_)
+                    | Producer::Char(_)
+                    | Producer::Bool(_)
+                    | Producer::Unit
+                    | Producer::Str(_)
+            )
+        {
+            l.literals.insert(v.symbol.clone(), x.clone());
+        }
+    }
+    // `MEADOW_CUT_IMPURE=1` says of no definition that it is pure, to
+    // measure what saying so is worth.
+    if std::env::var_os("MEADOW_CUT_IMPURE").is_none() {
+        for i in crate::pure::defs(p) {
+            l.out.pure.insert(Label(i as u32));
+        }
     }
     for (i, d) in p.defs.iter().enumerate() {
         // What makes a value is the value's, to whoever asks what a block
@@ -244,6 +292,7 @@ fn lowered(p: &Program, prints: bool) -> R<Lowered> {
     l.current = None;
     l.rep_vars.clear();
     l.start(p)?;
+    l.exports(p)?;
     if l.handles {
         l.search_block();
     }
@@ -289,6 +338,15 @@ struct Lower {
     /// Each top-level value's place among the machine's globals, and how it
     /// is represented.
     vals: HashMap<Symbol, (i64, ax::Rep)>,
+    /// The values that are a literal written out: a mention of one is the
+    /// literal, which costs nothing to write again -- what
+    /// `meadow_core::globals::inline_literals` does to a program of core.
+    literals: HashMap<Symbol, Producer>,
+    /// The kinds of continuation that are frames -- none named is every
+    /// kind -- or `None` where none is: a program with an operation that may
+    /// be resumed more than once keeps every continuation on the heap, where
+    /// resuming twice is invoking an object twice (`docs/CUT.md`).
+    frames: Option<Vec<String>>,
     /// Every method any object of the program has, by name: a method's tag
     /// is its place here, so that a call need not know which object it has.
     methods: Vec<String>,
@@ -492,6 +550,80 @@ impl Lower {
     /// The block a program starts at: each top-level value computed, in the
     /// order written, and kept; then the entry, answering the continuation
     /// the block was given.
+    /// A block for each export, which C enters as a program's entry is
+    /// entered: its arguments and the continuation it answers through. It
+    /// starts with no handlers, as the program does, and is the exported
+    /// definition from there.
+    fn exports(&mut self, p: &Program) -> R<()> {
+        for e in &p.exports {
+            let Some(&(label, _)) = self.defs.get(&e.symbol) else {
+                return Err(format!(
+                    "`{}` exports `{}`, which is not a definition",
+                    e.name, e.symbol
+                ));
+            };
+            let Some(d) = p.defs.iter().find(|d| d.symbol == e.symbol) else {
+                return Err(format!(
+                    "`{}` exports `{}`, which is not here",
+                    e.name, e.symbol
+                ));
+            };
+            if !d.rep_vars.is_empty() || d.conts.len() != 1 {
+                return Err(format!(
+                    "`{}` exports `{}`, which is generic or takes other than one continuation",
+                    e.name, e.symbol
+                ));
+            }
+            let mut params = Vec::new();
+            let mut args = Vec::new();
+            for b in &d.params {
+                let rep = self.rep(&b.rep)?;
+                params.push(rep);
+                args.push(self.fresh(rep));
+            }
+            let result = self.rep(&e.result)?;
+            let k = self.fresh(ax::Rep::Ref);
+            self.out.returns.insert(k);
+            let ev = self.fresh(ax::Rep::Ref);
+            let mut given = args.clone();
+            given.push(k);
+            let mut passed = given.clone();
+            passed.push(ev);
+            let none = meadow_rt::roles::evidence::NONE;
+            let body = S::Let {
+                name: ev,
+                tag: self.tag_of(none),
+                ctor: InternedString::from(none),
+                fields: Vec::new(),
+                rest: Box::new(S::Substitute(
+                    passed.clone(),
+                    Box::new(Block {
+                        params: passed,
+                        body: S::Jump(label),
+                    }),
+                )),
+            };
+            let entry = Label(self.out.defs.len() as u32);
+            self.out.defs.push(ax::Def {
+                label: entry,
+                name: InternedString::from(format!("#export {}", e.name).as_str()),
+                module: InternedString::from(""),
+                block: Block {
+                    params: given,
+                    body,
+                },
+            });
+            self.out.results.insert(entry, result);
+            self.out.exports.push(ax::Export {
+                name: e.name.clone(),
+                label: entry,
+                params,
+                result,
+            });
+        }
+        Ok(())
+    }
+
     fn start(&mut self, p: &Program) -> R<()> {
         let Some(entry) = &p.entry else {
             return Ok(());
@@ -658,9 +790,12 @@ impl Lower {
             },
         });
         self.out.entry = Some(label);
+        // A program run for what it does answers nothing to show, whether
+        // its string was written out or it says it has no answer: taken for
+        // a reference, the `unit` it ends with was printed as one.
         self.out.results.insert(
             label,
-            if printed {
+            if self.prints {
                 ax::Rep::Bits(desc::UNIT)
             } else {
                 ax::Rep::Ref
@@ -675,7 +810,8 @@ impl Lower {
         let last = match s {
             // The value `body` gives to `k`: `k` is the consumer, by a name.
             Statement::Cut(Producer::Mu(k, body), c) => {
-                let kn = self.reify(c, &mut sc, &mut steps)?;
+                let frame = self.framing("join") && self.always_enters(body, k, &sc);
+                let kn = self.reify_as(c, &mut sc, &mut steps, frame)?;
                 sc.vars.insert(k.clone(), kn);
                 self.called(kn, k);
                 self.statement(body, &sc)?
@@ -711,7 +847,12 @@ impl Lower {
                 }
                 self.expected = None;
                 for c in conts {
-                    sel.push(self.reify(c, &mut sc, &mut steps)?);
+                    sel.push(self.reify_as(
+                        c,
+                        &mut sc,
+                        &mut steps,
+                        conts.len() == 1 && self.framing("call"),
+                    )?);
                 }
                 sel.push(sc.var(EV)?);
                 let params = self.distinct(&sel);
@@ -931,7 +1072,7 @@ impl Lower {
         for a in args {
             xs.push(self.atom(a, sc, steps)?);
         }
-        let kc = self.reify(c, sc, steps)?;
+        let kc = self.reify_as(c, sc, steps, self.framing("perform"))?;
         // A program that handles nothing has nothing to search.
         if !self.handles {
             let Some((effect, name)) = native else {
@@ -978,51 +1119,169 @@ impl Lower {
         // Called with a value and a continuation: that continuation is where
         // the handler's value goes from now on, and the code that performed
         // goes on with the value.
-        let apply = Block {
-            params: vec![kc, target, v, after, unused],
-            body: S::Extern {
-                op: Extern::Prim(Prim::SetRef),
-                args: vec![target, after],
-                blocks: vec![Block {
-                    params: vec![done, kc, target, v, after, unused],
-                    body: S::Substitute(
-                        vec![kc, v],
-                        Box::new(Block {
-                            params: vec![kc, v],
-                            body: S::Invoke(kc, 0),
-                        }),
-                    ),
-                }],
-            },
-        };
-        let methods = self.function(apply)?;
         let now = self.fresh(ax::Rep::Ref);
-        let mut with_resumption = in_entry.clone();
-        with_resumption.insert(0, resumption);
-        let mut with_now = with_resumption.clone();
-        with_now.insert(0, now);
         let mut enter = vec![clause];
         enter.extend(xs.iter().copied());
         enter.extend([resumption, now]);
         let enter_params = self.distinct(&enter);
-        let entered = S::New {
-            name: resumption,
-            captures: vec![kc, target],
-            methods,
-            rest: Box::new(S::Extern {
-                op: Extern::Prim(Prim::GetRef),
-                args: vec![target],
+        let entered = if self.segmented() {
+            // As `meadow_seq` has it: the operation's continuation is the
+            // frames between here and its handler, which `Detach` cuts off
+            // the stack and the resumption's `Reattach` puts back -- once,
+            // which the flag it is made with says.
+            let (flag, taken, seg) = (
+                self.fresh(ax::Rep::Bits(desc::UNIT)),
+                self.fresh(ax::Rep::Ref),
+                self.fresh(ax::Rep::Ref),
+            );
+            let (first, back) = (
+                self.fresh(ax::Rep::Bits(desc::BOOL)),
+                self.fresh(ax::Rep::Bits(desc::UNIT)),
+            );
+            let resume = vec![taken, kc, target, seg, v, after, unused];
+            let mut at_first = vec![first];
+            at_first.extend(resume.iter().copied());
+            let mut at_done = vec![done];
+            at_done.extend(at_first.iter().copied());
+            let mut at_back = vec![back];
+            at_back.extend(at_done.iter().copied());
+            let apply = Block {
+                params: resume,
+                body: S::Extern {
+                    op: Extern::Prim(Prim::TakeOnce),
+                    args: vec![taken],
+                    blocks: vec![Block {
+                        params: at_first.clone(),
+                        body: S::Extern {
+                            op: Extern::Branch,
+                            args: vec![first],
+                            blocks: vec![
+                                Block {
+                                    params: at_first.clone(),
+                                    body: S::Error("continuation resumed more than once"),
+                                },
+                                Block {
+                                    params: at_first,
+                                    body: S::Extern {
+                                        op: Extern::Prim(Prim::SetRef),
+                                        args: vec![target, after],
+                                        blocks: vec![Block {
+                                            params: at_done,
+                                            body: S::Extern {
+                                                op: Extern::Prim(Prim::Reattach),
+                                                args: vec![seg],
+                                                blocks: vec![Block {
+                                                    params: at_back,
+                                                    body: S::Substitute(
+                                                        vec![kc, v],
+                                                        Box::new(Block {
+                                                            params: vec![kc, v],
+                                                            body: S::Invoke(kc, 0),
+                                                        }),
+                                                    ),
+                                                }],
+                                            },
+                                        }],
+                                    },
+                                },
+                            ],
+                        },
+                    }],
+                },
+            };
+            let methods = self.function(apply)?;
+            let mut with_flag = in_entry.clone();
+            with_flag.insert(0, flag);
+            let mut with_taken = with_flag.clone();
+            with_taken.insert(0, taken);
+            let mut with_seg = with_taken.clone();
+            with_seg.insert(0, seg);
+            let mut with_resumption = with_seg.clone();
+            with_resumption.insert(0, resumption);
+            let mut with_now = with_resumption.clone();
+            with_now.insert(0, now);
+            S::Extern {
+                op: Extern::Lit(Lit::Unit),
+                args: Vec::new(),
                 blocks: vec![Block {
-                    params: with_now,
-                    body: S::Substitute(
-                        enter,
-                        Box::new(Block {
-                            params: enter_params,
-                            body: S::Invoke(clause, 0),
-                        }),
-                    ),
+                    params: with_flag,
+                    body: S::Extern {
+                        op: Extern::Prim(Prim::Once),
+                        args: vec![flag],
+                        blocks: vec![Block {
+                            params: with_taken,
+                            body: S::Extern {
+                                op: Extern::Prim(Prim::Detach),
+                                args: vec![target],
+                                blocks: vec![Block {
+                                    params: with_seg,
+                                    body: S::New {
+                                        name: resumption,
+                                        captures: vec![taken, kc, target, seg],
+                                        methods,
+                                        rest: Box::new(S::Extern {
+                                            op: Extern::Prim(Prim::GetRef),
+                                            args: vec![target],
+                                            blocks: vec![Block {
+                                                params: with_now,
+                                                body: S::Substitute(
+                                                    enter,
+                                                    Box::new(Block {
+                                                        params: enter_params,
+                                                        body: S::Invoke(clause, 0),
+                                                    }),
+                                                ),
+                                            }],
+                                        }),
+                                    },
+                                }],
+                            },
+                        }],
+                    },
                 }],
-            }),
+            }
+        } else {
+            let apply = Block {
+                params: vec![kc, target, v, after, unused],
+                body: S::Extern {
+                    op: Extern::Prim(Prim::SetRef),
+                    args: vec![target, after],
+                    blocks: vec![Block {
+                        params: vec![done, kc, target, v, after, unused],
+                        body: S::Substitute(
+                            vec![kc, v],
+                            Box::new(Block {
+                                params: vec![kc, v],
+                                body: S::Invoke(kc, 0),
+                            }),
+                        ),
+                    }],
+                },
+            };
+            let methods = self.function(apply)?;
+            let mut with_resumption = in_entry.clone();
+            with_resumption.insert(0, resumption);
+            let mut with_now = with_resumption.clone();
+            with_now.insert(0, now);
+            S::New {
+                name: resumption,
+                captures: vec![kc, target],
+                methods,
+                rest: Box::new(S::Extern {
+                    op: Extern::Prim(Prim::GetRef),
+                    args: vec![target],
+                    blocks: vec![Block {
+                        params: with_now,
+                        body: S::Substitute(
+                            enter,
+                            Box::new(Block {
+                                params: enter_params,
+                                body: S::Invoke(clause, 0),
+                            }),
+                        ),
+                    }],
+                }),
+            }
         };
         let mut found_params = held.clone();
         found_params.push(entry);
@@ -1167,7 +1426,7 @@ impl Lower {
     /// `handle { clauses; return } in μ b. body ; c`.
     fn handle(&mut self, h: &crate::Handle, sc: &mut Scope, steps: &mut Vec<Step>) -> R<S> {
         let outer = sc.var(EV)?;
-        let kc = self.reify(&h.cont, sc, steps)?;
+        let kc = self.reify_as(&h.cont, sc, steps, self.framing("handle"))?;
         // Where the handler's value goes, which a resumption changes.
         let target = self.fresh(ax::Rep::Ref);
         sc.push(target);
@@ -1176,6 +1435,19 @@ impl Lower {
             vec![kc],
             sc.env.clone(),
         ));
+        // The handled body on a segment of the stack of its own, which an
+        // operation that captures its continuation cuts off whole
+        // (`docs/SILO.md`, "Effects: stack segments"). With every
+        // continuation on the heap there is nothing on the stack to cut.
+        if self.segmented() {
+            let entered = self.fresh(ax::Rep::Bits(desc::UNIT));
+            sc.push(entered);
+            steps.push(Step::Extern(
+                Extern::Prim(Prim::Enter),
+                vec![target],
+                sc.env.clone(),
+            ));
+        }
         let entry = meadow_rt::roles::evidence::ENTRY;
         let entry_tag = self.tag_of(entry);
         let mut ev = outer;
@@ -1281,6 +1553,37 @@ impl Lower {
         body.vars.insert(h.body_cont.clone(), answers);
         body.vars.insert(EV.to_string(), ev);
         self.statement(&h.body, &body)
+    }
+
+    /// Whether continuations of `kind` are frames.
+    fn framing(&self, kind: &str) -> bool {
+        self.frames
+            .as_ref()
+            .is_some_and(|ks| ks.is_empty() || ks.iter().any(|k| k == kind))
+    }
+
+    /// Whether a handler's body runs on a stack segment of its own: wherever
+    /// any continuation is a frame, since a frame is the native stack's.
+    fn segmented(&self) -> bool {
+        self.frames.is_some()
+    }
+
+    /// Whether `body`, which a `μ` names `k` for, can only go on by `k`: it
+    /// mentions no continuation from around it, so nothing in it answers past
+    /// `k`. What `k` stands for is then entered exactly once, with whatever
+    /// was pushed after it dead -- a frame's due. A `μ` whose body may go
+    /// round it -- an arm that answers the function's caller -- is not: its
+    /// frame would be left behind each time.
+    fn always_enters(&self, body: &Statement, k: &str, sc: &Scope) -> bool {
+        let mut free = Free::default();
+        free.statement(body);
+        !free.halt
+            && free
+                .names
+                .iter()
+                .filter(|n| n.as_str() != k)
+                .filter_map(|n| sc.vars.get(n))
+                .all(|n| !self.out.continuations.contains(n) && !self.out.returns.contains(n))
     }
 
     /// `sel` as a block's parameters: each name once, a second mention under
@@ -1424,7 +1727,12 @@ impl Lower {
                     sel.push(self.atom(a, &mut sc, &mut steps)?);
                 }
                 for k in conts {
-                    sel.push(self.reify(k, &mut sc, &mut steps)?);
+                    sel.push(self.reify_as(
+                        k,
+                        &mut sc,
+                        &mut steps,
+                        conts.len() == 1 && self.framing("method"),
+                    )?);
                 }
                 sel.push(sc.var(EV)?);
                 let params = self.distinct(&sel);
@@ -1502,7 +1810,18 @@ impl Lower {
 
     /// `c` by a name: itself, or an object of one method made of it, which
     /// captures what it mentions.
-    fn reify(&mut self, c: &Consumer, sc: &mut Scope, steps: &mut Vec<Step>) -> R<Name> {
+    /// `c` as a continuation by a name. One made for a call to return
+    /// through -- `frame` -- is entered once, by that call, and everything
+    /// pushed after it is dead by then: the back end keeps it on the thread's
+    /// frame stack and not the heap (`Program::frames`). One a `μ` names is
+    /// not: a branch may never reach it.
+    fn reify_as(
+        &mut self,
+        c: &Consumer,
+        sc: &mut Scope,
+        steps: &mut Vec<Step>,
+        frame: bool,
+    ) -> R<Name> {
         if matches!(c, Consumer::Var(_) | Consumer::Halt) {
             return self.named(c, sc);
         }
@@ -1524,6 +1843,11 @@ impl Lower {
         let body = self.give(x, c, &inner)?;
         let k = self.fresh(ax::Rep::Ref);
         self.out.continuations.insert(k);
+        // Off unless `MEADOW_CUT_FRAMES` is set: a program this lowers with
+        // frames runs on Glade and spins on Silo, for a reason not yet found.
+        if frame {
+            self.out.frames.insert(k);
+        }
         steps.push(Step::New(
             k,
             captures,
@@ -1562,6 +1886,9 @@ impl Lower {
             // time this thread wants it (`lazily`): what follows is what it
             // is given to.
             Producer::Val(v) => {
+                if let Some(literal) = self.literals.get(v).cloned() {
+                    return self.atom(&literal, sc, steps);
+                }
                 let Some(&(_, rep)) = self.vals.get(v) else {
                     return Err(format!("`{v}` is not a value of this program"));
                 };
@@ -1662,6 +1989,11 @@ impl Lower {
                 let captures = sc.env.clone();
                 let object = self.fresh(ax::Rep::Ref);
                 self.out.continuations.insert(object);
+                // What a call is made with to answer through -- a value read
+                // of its definition is one -- is a frame, as any call's is.
+                if self.framing("join") && self.always_enters(body, k, sc) {
+                    self.out.frames.insert(object);
+                }
                 self.called(object, k);
                 let mut inside = sc.clone();
                 inside.push(object);
@@ -1949,6 +2281,18 @@ fn ctor_name(symbol: &str) -> String {
     }
 }
 
+/// Which continuations `MEADOW_CUT_FRAMES` asks to be frames: every kind
+/// unless it says otherwise -- `none`, or the kinds wanted, of `call`,
+/// `method`, `perform`, `handle` and `join`.
+fn frame_kinds() -> Option<Vec<String>> {
+    match std::env::var("MEADOW_CUT_FRAMES") {
+        Err(_) => Some(Vec::new()),
+        Ok(v) if v == "none" => None,
+        Ok(v) if v == "all" || v == "1" || v.is_empty() => Some(Vec::new()),
+        Ok(v) => Some(v.split(',').map(str::to_string).collect()),
+    }
+}
+
 /// The definition that answers a value: its symbol, by the value's.
 fn forcing(value: &Symbol) -> Symbol {
     value.child("#force")
@@ -1972,7 +2316,8 @@ fn forced(def: &Symbol) -> Symbol {
 /// no other. What `meadow_core::globals` does to a program of core. The
 /// definition asks whether the value's place is filled, answers what is
 /// there if it is, and otherwise runs the value's statement -- `halt` in it
-/// the continuation that fills the place and answers.
+/// the continuation that fills the place and answers. A value that is a
+/// function written out has no place: its definition answers the function.
 fn lazily(p: &Program) -> Program {
     let mut out = p.clone();
     out.vals.clear();
@@ -2010,6 +2355,21 @@ fn lazily(p: &Program) -> Program {
                 Box::new(Statement::Cut(Producer::Var("#had".to_string()), k())),
             )],
         );
+        // A function is made again where it is wanted, and has no place: it
+        // holds nothing, so making it is one object, where asking whether a
+        // place is filled and reading it are two calls into the runtime --
+        // and a program mentions its functions far more than its values.
+        if let Statement::Cut(Producer::Cocase(methods), Consumer::Halt) = &v.body {
+            out.defs.push(Def {
+                symbol: forcing(&v.symbol),
+                rep_vars: Vec::new(),
+                effect_vars: Vec::new(),
+                params: Vec::new(),
+                conts: vec!["#k".to_string()],
+                body: Statement::Cut(Producer::Cocase(methods.clone()), k()),
+            });
+            continue;
+        }
         let body = Statement::Prim(
             "globalReady".to_string(),
             vec![place()],

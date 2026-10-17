@@ -61,6 +61,10 @@ fun joinLoop sep acc i xs =
 @pub fun join (sep : String) (xs : [String]) : String =
   joinLoop sep V.empty 0 xs |> V.toArray |> concatStrings
 
+-- The same, by the name a vector's and a list's have: `intercalate ", "
+-- ["a", "b"]` is `"a, b"`. The prelude's.
+@pub fun intercalate (sep : String) (xs : [String]) : String = join sep xs
+
 fun repeatLoop acc s n = if n <= 0 then acc else repeatLoop (V.pushBack acc s) s (n - 1)
 
 -- `s` repeated `n` times.
@@ -268,6 +272,7 @@ use Std.Test (assertEq, assertTrue, assertFalse)
   let d = assertEq (join ", " ["a", "b"]) "a, b" "join" in
   let e = assertEq (join ", " ["only"]) "only" "one element gets no separator" in
   let f = assertEq (join ", " []) "" "nothing" in
+  let i = assertEq (intercalate ", " ["a", "b", "c"]) "a, b, c" "intercalate" in
   let g = assertEq (repeat "ab" 3) "ababab" "repeat" in
   assertEq (repeat "ab" 0) "" "repeat none"
 

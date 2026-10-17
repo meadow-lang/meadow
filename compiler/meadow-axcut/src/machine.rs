@@ -562,6 +562,11 @@ impl<'p> Machine<'p> {
             // prints cannot be compared.
             Extern::Native(effect, op) => match (&**effect, &**op, &vals[..]) {
                 ("Test", "fail", [v]) => return err(v.to_string()),
+                // How much of the program has been reached that had not been:
+                // nothing, as the CEK machine and native code answer -- this
+                // machine counts no coverage -- so a fuzzer steered by it runs
+                // as one that is not.
+                ("Process", "covered", [_]) => Value::Int(0),
                 ("Console", "writeOutput", [v]) => {
                     match v {
                         Value::Str(s) => print!("{s}"),
@@ -1757,6 +1762,7 @@ mod tests {
 
     fn program(body: Statement) -> Program {
         Program {
+            exports: Default::default(),
             returns: Default::default(),
             frames: Default::default(),
             continuations: Default::default(),

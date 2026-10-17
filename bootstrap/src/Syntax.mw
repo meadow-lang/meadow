@@ -318,9 +318,11 @@ use Std.Result.Result.*
       | brack:TBrack
       | recTy:RecTy
       | var:("lower" | "mac_lower")
-    TCon = name:("upper" | "mac_upper") args:TAtom*
+    TCon = name:("upper" | "mac_upper") quals:TQual* args:TAtom*
     TAtom = paren:TParen | array:TArray | brack:TBrack | recTy:RecTy | var:("lower" | "mac_lower")
-      | name:("upper" | "mac_upper")
+      | name:("upper" | "mac_upper") quals:TQual*
+    -- `M.Ty`: the type `Ty` of the module `M` qualifies.
+    TQual = "." name:"upper"
     HeadTy = paren:TParen
       | array:TArray
       | brack:TBrack

@@ -78,7 +78,7 @@ $ meadow run --types hello.mw
 
 ```
 === package Hello ===
-  main : forall e. () -> () ! { Console | e }
+  main : () -> () ! Eff
   (7 annotated nodes)
 entry: main
 Hello, Meadow!
@@ -86,8 +86,10 @@ Hello, Meadow!
 
 `main` takes `()` and returns `()`: it produces nothing useful. Printing is
 something it _does_ rather than something it returns, and a function's type
-records that too — the `! { Console | e }` says that calling `main` may write
-to the terminal. [Chapter 9](#9-effects) is about how.
+records that too — the `! Eff` says that calling `main` may do what a program
+does to the world outside it, writing to the terminal among them. `main` is
+always given that type, whatever less its body does.
+[Chapter 9](#9-effects) is about how.
 
 Every program's `main` has to fit one type, `() -> () ! Eff`. It must return
 `()`, and it may perform at most the effects the runtime itself knows how to
@@ -3074,7 +3076,7 @@ fun main () : () ! Eff =
 
 ```
   work : forall r. () -> Int ! { Log, Ask | r }
-  main : () -> () ! { Console, Fs, Process, Random, Time, Test, Mut, Thread }
+  main : () -> () ! Eff
 42
 ```
 

@@ -276,6 +276,15 @@ pub fn build_native_of(
     // hang.
     crate::status::status("Lowering", format!("`{name}` for Silo"));
     let lowered = lowered()?;
+    // A program that exports functions to C is a library of them, and is
+    // linked as one: no `main`, and named as the platform names a library.
+    let library = !lowered.exports.is_empty();
+    let exe = if library {
+        dir.join(target.format.library_name(name))
+    } else {
+        exe
+    };
+    let stamp = exe.with_extension("stamp");
     let units = meadow_llvm::compile_split(&lowered, meadow_llvm::UNIT, target.call_conv())
         .map_err(|e| e.msg)?;
     std::fs::create_dir_all(&dir)
@@ -335,7 +344,7 @@ pub fn build_native_of(
             format!("{reused} of {} objects of `{name}`", units.len()),
         );
     }
-    clang_link(&modules, &have, &runtime, &exe, opt, target)?;
+    clang_link(&modules, &have, &runtime, &exe, opt, target, library)?;
     let _ = std::fs::write(&stamp, &want);
     let listed: String = modules
         .iter()
@@ -463,6 +472,7 @@ pub fn clang_link(
     exe: &Path,
     opt: meadow_compiler::OptLevel,
     target: Target,
+    library: bool,
 ) -> Result<(), String> {
     let level = match opt {
         meadow_compiler::OptLevel::O0 => "-O0",
@@ -555,6 +565,9 @@ pub fn clang_link(
         .arg(&triple)
         .arg("-o")
         .arg(exe);
+    if library {
+        cmd.arg("-shared");
+    }
     // Several objects are named in a response file rather than on the command
     // line: a large program is hundreds of them, and a Windows command line
     // holds 32K characters.
