@@ -471,6 +471,7 @@ impl Lower {
     }
 
     fn method(&self, name: &str) -> R<Tag> {
+        let name = if name == "resume" { "apply" } else { name };
         self.methods
             .iter()
             .position(|m| m == name)
@@ -540,6 +541,10 @@ impl Lower {
         self.search = Label(p.defs.len() as u32 + u32::from(p.entry.is_some()));
         if self.handles {
             // A resumption is a function.
+            names.insert("apply".to_string());
+        }
+        // `resume` is `apply` by another name (`docs/CUT.md`, "Handlers").
+        if names.remove("resume") {
             names.insert("apply".to_string());
         }
         self.methods = names.into_iter().collect();
@@ -981,9 +986,11 @@ impl Lower {
     /// program's methods.
     fn function(&self, apply: Block) -> R<Vec<Block>> {
         let tag = self.method("apply")? as usize;
+        // Every method's parameters begin with the object's captures, the
+        // ones that can never be called as well: shaped as `apply` is.
         let mut blocks: Vec<Block> = (0..self.methods.len())
             .map(|_| Block {
-                params: Vec::new(),
+                params: apply.params.clone(),
                 body: S::Error("the object has no such method"),
             })
             .collect();
@@ -1942,9 +1949,11 @@ impl Lower {
                     free.method(m);
                 }
                 let captures = free.among(sc);
+                // A method's parameters begin with the object's captures,
+                // those it lacks as well.
                 let mut blocks: Vec<Block> = (0..self.methods.len())
                     .map(|_| Block {
-                        params: Vec::new(),
+                        params: captures.clone(),
                         body: S::Error("the object has no such method"),
                     })
                     .collect();
