@@ -8,7 +8,9 @@
 //! doing, and what goes wrong, but not the detail a developer turns on. It is
 //! read once.
 //!
-//!     2026-10-17T19:12:04.512Z INFO  listening on 127.0.0.1:8080
+//! ```text
+//! 2026-10-17T19:12:04.512Z INFO  listening on 127.0.0.1:8080
+//! ```
 //!
 //! Every runtime calls [`line`], so a program logs the same on each; the line
 //! is written in one call, so two threads' lines never interleave.
