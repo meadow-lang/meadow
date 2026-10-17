@@ -3340,6 +3340,13 @@ fn a_function_meadowboot_exports_is_called_from_c() {
         String::from_utf8_lossy(&built.stdout),
         String::from_utf8_lossy(&built.stderr)
     );
+    // What calls it is a Meadow program through `Std.Ffi`, which is unstable:
+    // a stable `meadow` -- a release's -- refuses it, so there the library
+    // being built is all there is to check.
+    if std::env::var("MEADOW_CHANNEL").as_deref() == Ok("stable") {
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
     let host = root.join("Host");
     std::fs::create_dir_all(host.join("src")).expect("a package directory");
     std::fs::write(
@@ -3479,13 +3486,16 @@ fn a_command_takes_what_meadow_s_takes() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-    // And the version is said the same way.
+    // And the version is said the same way. Its number, that is: which
+    // channel a `meadow` is -- `-dev` from a checkout, nothing for a release
+    // -- is decided where it is built, which MeadowBoot is not told.
+    let number = |s: &str, name: &str| {
+        let rest = s.trim().trim_start_matches(name).trim().to_string();
+        rest.split(['-', ' ']).next().unwrap_or("").to_string()
+    };
     let said = help_of(&boot, &["--version"]);
     let theirs = help_of(&meadow_exe, &["--version"]);
-    assert_eq!(
-        said.trim().trim_start_matches("meadowboot"),
-        theirs.trim().trim_start_matches("meadow")
-    );
+    assert_eq!(number(&said, "meadowboot"), number(&theirs, "meadow"));
 }
 
 /// What MeadowBoot's `lower` says of the program `source`, on either stream:

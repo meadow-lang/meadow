@@ -2,8 +2,10 @@
 //! at the top of a package's root module, as `#![feature(…)]` is at the top
 //! of a crate's. See `meadow::channel`.
 //!
-//! These run as a build from a checkout, which takes what a nightly takes;
-//! what a stable `meadow` says is `channel`'s own tests'.
+//! These run as the `meadow` they are built with: a build from a checkout
+//! takes what a nightly takes, and a release's stable one refuses what is
+//! asked for (`accepted`). What a stable `meadow` says is `channel`'s own
+//! tests'.
 
 use meadow::pipeline;
 use std::path::{Path, PathBuf};
@@ -37,6 +39,20 @@ fn said(dir: &Path) -> String {
         .join("\n")
 }
 
+/// What a package that asks for `ffi` rightly is told: nothing, by a build
+/// from a checkout or a nightly; and by a release's stable `meadow`, which
+/// takes no unstable feature, only that.
+fn accepted(said: &str) {
+    if meadow::channel::CHANNEL == "stable" {
+        assert!(
+            said.contains("the feature `ffi` is unstable, and this is a stable `meadow`"),
+            "{said}"
+        );
+    } else {
+        assert_eq!(said, "");
+    }
+}
+
 const CALLS: &str = "use Std.Ffi as Ffi\n\ndef result = 1\n";
 
 #[test]
@@ -50,7 +66,7 @@ fn a_package_that_calls_c_says_so_at_the_top_of_its_root_module() {
 
     let asked = format!("@!feature(ffi)\n\n{CALLS}");
     let with = package("with", MANIFEST, &[("Main.mw", &asked)]);
-    assert_eq!(said(&with), "");
+    accepted(&said(&with));
 }
 
 #[test]
@@ -63,7 +79,7 @@ fn the_root_module_asks_for_the_whole_package() {
             ("Other.mw", "use Std.Ffi as Ffi\n\n@pub def two = 2\n"),
         ],
     );
-    assert_eq!(said(&dir), "");
+    accepted(&said(&dir));
 }
 
 #[test]
@@ -120,5 +136,5 @@ fn a_lone_file_asks_as_a_package_does() {
     std::fs::write(&file, CALLS).unwrap();
     assert!(said(&file).contains("`@!feature(ffi)`"));
     std::fs::write(&file, format!("@!feature(ffi)\n\n{CALLS}")).unwrap();
-    assert_eq!(said(&file), "");
+    accepted(&said(&file));
 }
