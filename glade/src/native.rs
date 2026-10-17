@@ -296,6 +296,11 @@ impl Vm<'_> {
 
     /// Discharge `effect.op` against the real world, or say it cannot.
     /// `Std.Net`'s sockets and `Std.Tls`'s sessions: see `meadow_rt::net`.
+    ///
+    /// A call that may wait -- an accept, a read, a handshake -- is made into
+    /// a job of owned values: a machine a scheduler runs leaves it as a
+    /// request, so that the thread waits rather than its worker (see
+    /// [`crate::sched`]); one run on its own does it there and then.
     fn native_net(&mut self, op: &str, arg: Value) -> Result<Option<Build>, Error> {
         use meadow_rt::net;
         let what = format!("Net.{op}");
@@ -305,67 +310,90 @@ impl Vm<'_> {
                 other => err(format!("{what}: expected an Int, got {}", vm.show(other))),
             }
         };
-        let answered = |r: Result<Build, String>| match r {
-            Ok(b) => Build::ok(b),
-            Err(e) => Build::error(e),
-        };
-        Ok(Some(match op {
-            "tcpListen" | "tcpConnect" => {
+        fn answered(r: Result<Build, String>) -> Build {
+            match r {
+                Ok(b) => Build::ok(b),
+                Err(e) => Build::error(e),
+            }
+        }
+        let job: crate::vm::Work = match op {
+            "tcpListen" => {
                 let t = self.tuple_arg(&what, arg, 2)?;
                 let host = self.str_arg(&what, t[0])?;
                 let port = int(self, t[1])?;
-                let made = if op == "tcpListen" {
-                    net::listen(&host, port)
-                } else {
-                    net::connect(&host, port)
-                };
-                answered(made.map(Build::int))
+                return Ok(Some(answered(net::listen(&host, port).map(Build::int))));
             }
-            "tcpAccept" => answered(
-                net::accept(int(self, arg)?)
-                    .map(|(s, peer)| Build::Tuple(vec![Build::int(s), Build::Str(peer)])),
-            ),
+            "tcpClose" => {
+                net::close(int(self, arg)?);
+                return Ok(Some(Build::unit()));
+            }
+            "tcpTimeout" => {
+                let t = self.tuple_arg(&what, arg, 2)?;
+                let set = net::set_timeout(int(self, t[0])?, int(self, t[1])?);
+                return Ok(Some(answered(set.map(|()| Build::unit()))));
+            }
+            "tcpLocalPort" => {
+                return Ok(Some(answered(
+                    net::local_port(int(self, arg)?).map(Build::int),
+                )));
+            }
+            "tcpConnect" => {
+                let t = self.tuple_arg(&what, arg, 2)?;
+                let host = self.str_arg(&what, t[0])?;
+                let port = int(self, t[1])?;
+                Box::new(move || answered(net::connect(&host, port).map(Build::int)))
+            }
+            "tcpAccept" => {
+                let id = int(self, arg)?;
+                Box::new(move || {
+                    answered(
+                        net::accept(id)
+                            .map(|(s, peer)| Build::Tuple(vec![Build::int(s), Build::Str(peer)])),
+                    )
+                })
+            }
             "tcpRead" => {
                 let t = self.tuple_arg(&what, arg, 2)?;
-                answered(net::read(int(self, t[0])?, int(self, t[1])?).map(Build::Bytes))
+                let (id, max) = (int(self, t[0])?, int(self, t[1])?);
+                Box::new(move || answered(net::read(id, max).map(Build::Bytes)))
             }
             "tcpWrite" => {
                 let t = self.tuple_arg(&what, arg, 2)?;
                 let id = int(self, t[0])?;
                 let bytes = self.bytes(t[1], &what)?;
-                answered(net::write(id, &bytes).map(Build::int))
+                Box::new(move || answered(net::write(id, &bytes).map(Build::int)))
             }
-            "tcpClose" => {
-                net::close(int(self, arg)?);
-                Build::unit()
-            }
-            "tcpTimeout" => {
-                let t = self.tuple_arg(&what, arg, 2)?;
-                answered(
-                    net::set_timeout(int(self, t[0])?, int(self, t[1])?).map(|()| Build::unit()),
-                )
-            }
-            "tcpLocalPort" => answered(net::local_port(int(self, arg)?).map(Build::int)),
             "resolve" => {
                 let host = self.str_arg(&what, arg)?;
-                answered(
-                    net::resolve(&host)
-                        .map(|ips| Build::Vector(ips.into_iter().map(Build::Str).collect())),
-                )
+                Box::new(move || {
+                    answered(
+                        net::resolve(&host)
+                            .map(|ips| Build::Vector(ips.into_iter().map(Build::Str).collect())),
+                    )
+                })
             }
             "tlsConnect" | "tlsAccept" => {
                 let t = self.tuple_arg(&what, arg, 3)?;
                 let id = int(self, t[0])?;
                 let (a, b) = (self.str_arg(&what, t[1])?, self.str_arg(&what, t[2])?);
-                let made = if op == "tlsConnect" {
-                    net::tls_connect(id, &a, &b)
-                } else {
-                    net::tls_accept(id, &a, &b)
-                };
-                answered(made.map(Build::int))
+                let connecting = op == "tlsConnect";
+                Box::new(move || {
+                    let made = if connecting {
+                        net::tls_connect(id, &a, &b)
+                    } else {
+                        net::tls_accept(id, &a, &b)
+                    };
+                    answered(made.map(Build::int))
+                })
             }
             _ => return Ok(None),
-        }))
+        };
+        if self.scheduled {
+            self.blocking = Some(job);
+            Ok(Some(Build::unit()))
+        } else {
+            Ok(Some(job()))
+        }
     }
 
     /// `Std.Log`'s line, where no handler took it: see `meadow_rt::log`.

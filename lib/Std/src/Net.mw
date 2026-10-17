@@ -16,9 +16,11 @@
 -- `Std.Tls` makes a stream encrypted; the same `read` and `write` then carry
 -- it, so code over a `Stream` does not care which it has.
 --
--- Each operation waits as `Std.Fs`'s do, holding up the OS thread it runs on;
--- a server that answers many connections at once gives each a thread of its
--- own (`Std.Thread.spawn`), as `Std.Http`'s does.
+-- An operation that waits -- an accept, a read -- holds up the thread that
+-- makes it and nothing else: the runtime waits for it off the cores that run
+-- the program's threads, which go on running the others. So a server that
+-- answers many connections at once gives each a thread of its own
+-- (`Std.Thread.spawn`), as `Std.Http`'s does.
 
 use Std.Collections.Vector as V
 use Std.Collections.Vector (Vector, vecFromArray)

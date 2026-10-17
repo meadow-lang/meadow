@@ -415,6 +415,9 @@ struct World {
     next_wait: u64,
     /// Threads being run by a worker now.
     running: usize,
+    /// Threads waiting on a call into the world: not deadlocked, whatever
+    /// else is waiting.
+    calls: usize,
     /// Whether the workers have started.
     started: bool,
     /// Whether `main` has finished: the program is over, and the workers
@@ -520,7 +523,7 @@ fn work() {
                     w.running += 1;
                     break g;
                 }
-                if w.running == 0 {
+                if w.running == 0 && w.calls == 0 {
                     crate::fail(
                         "deadlock: every thread is waiting, on a channel nobody will send to \
                          or on another waiting thread",
@@ -590,6 +593,7 @@ fn start_workers(w: &mut World) {
         return;
     }
     w.started = true;
+    STARTED.store(true, Ordering::SeqCst);
     for i in 0..workers() {
         let _ = std::thread::Builder::new()
             .name(format!("meadow worker {i}"))
@@ -727,6 +731,21 @@ fn file(mut g: Box<Green>, request: Option<Request>) {
             drop(held);
             w.waiting.insert(key, g);
         }
+        Some(Request::Block(call)) => {
+            // Counted before the worker counts the thread out: see `work`.
+            world().calls += 1;
+            let mut io = io();
+            io.calls.push_back((g, call));
+            if io.calls.len() > io.idle {
+                // Every I/O thread is busy waiting on a call of its own.
+                drop(io);
+                let _ = std::thread::Builder::new()
+                    .name("meadow io".into())
+                    .spawn(io_thread);
+            } else {
+                IO_READY.notify_one();
+            }
+        }
         Some(Request::Failed(msg)) => {
             let tid = g.ctx.tid;
             // Never resumed, and not unwound.
@@ -738,6 +757,69 @@ fn file(mut g: Box<Green>, request: Option<Request>) {
             finish(&mut w, tid, Err(msg));
         }
     }
+}
+
+// --- calls into the world ----------------------------------------------------
+//
+// A socket's accept or read waits on the world, and a worker that made it
+// would wait with it: enough of them -- a server's connections, each reading
+// -- and no worker is left to run the thread that would answer. So a thread
+// on the scheduler hands such a call to an I/O thread and parks; the I/O
+// thread makes it and puts the thread back to run. One is started whenever a
+// call finds none waiting for one, so no call waits for another's.
+
+/// Whether the scheduler is running: without it, a call is made in place.
+static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[derive(Default)]
+struct IoQueue {
+    calls: VecDeque<(Box<Green>, Box<dyn FnOnce() + Send>)>,
+    /// I/O threads waiting for a call.
+    idle: usize,
+}
+
+static IO: LazyLock<Mutex<IoQueue>> = LazyLock::new(|| Mutex::new(IoQueue::default()));
+static IO_READY: Condvar = Condvar::new();
+
+fn io() -> MutexGuard<'static, IoQueue> {
+    IO.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+fn io_thread() {
+    loop {
+        let (g, call) = {
+            let mut io = io();
+            loop {
+                if let Some(c) = io.calls.pop_front() {
+                    break c;
+                }
+                io.idle += 1;
+                io = IO_READY.wait(io).unwrap_or_else(|p| p.into_inner());
+                io.idle -= 1;
+            }
+        };
+        call();
+        let mut w = world();
+        w.calls -= 1;
+        wake(&mut w, g, Wake::Nothing);
+    }
+}
+
+/// `work`'s answer: made by an I/O thread while this thread waits, where it
+/// is one of the scheduler's, or here and now.
+pub fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    if !STARTED.load(Ordering::SeqCst) || !ctx::present() || segments::innermost().is_none() {
+        return work();
+    }
+    let slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
+    let into = slot.clone();
+    let woken = park(Request::Block(Box::new(move || {
+        let answer = work();
+        *into.lock().unwrap_or_else(|p| p.into_inner()) = Some(answer);
+    })));
+    let _ = delivered(woken);
+    let answer = slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+    answer.unwrap_or_else(|| crate::fail("a call into the world came back without its answer"))
 }
 
 /// Put a thread back on the queue, with what it was woken with: the

@@ -9,19 +9,27 @@
 //! wrong rather than failing the program: a peer that went away is ordinary.
 //!
 //! Each call blocks the OS thread that makes it, as `Fs`'s do; a read waits
-//! for at least a byte, or for the timeout `set_timeout` gave the stream.
+//! for at least a byte, or for the timeout `set_timeout` gave the stream. A
+//! runtime with green threads makes the calls that may wait on OS threads of
+//! their own, so that a green thread waiting on a socket holds up no worker.
+//! Closing a socket wakes a call waiting on it, from whichever thread closes
+//! it, and a run that ends stops the calls its threads are still waiting in
+//! (`Waits`): a server's accepting thread must not keep a finished program
+//! from exiting.
 //!
 //! TLS is rustls, with ring's cryptography. A client checks the server's
 //! certificate against Mozilla's roots (`webpki-roots`), and against one more
 //! authority where it is given one -- a service's own, inside a company or a
 //! test. A server is given its certificate chain and key as PEM files.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::Duration;
+use std::thread::ThreadId;
+use std::time::{Duration, Instant};
 
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -29,13 +37,43 @@ use rustls::{
     ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
 };
 
-/// What a handle names.
+/// What a handle names, with what every call on it shares.
+struct Entry {
+    sock: Socket,
+    /// Set by `close`, for a call still waiting on the socket: an `accept`
+    /// woken by the connection closing makes, or a read woken by its slice.
+    closed: AtomicBool,
+    /// The stream's timeout, as `set_timeout` gave it.
+    timeout: Mutex<Option<Duration>>,
+}
+
 enum Socket {
     Listener(TcpListener),
     Tcp(TcpStream),
+    Tls(Tls),
+}
+
+struct Tls {
     /// Behind a lock of its own: a TLS session's state changes as it is read
     /// and written, where a plain stream's lives in the kernel.
-    Tls(Mutex<Session>),
+    session: Mutex<Session>,
+    /// The session's socket again, for what must not wait for the lock: a
+    /// read holds it for as long as it waits, and closing wakes that read.
+    raw: TcpStream,
+}
+
+impl Tls {
+    fn new(session: Session) -> Result<Tls, String> {
+        let raw = session.sock().try_clone().map_err(said)?;
+        Ok(Tls {
+            session: Mutex::new(session),
+            raw,
+        })
+    }
+
+    fn session(&self) -> MutexGuard<'_, Session> {
+        self.session.lock().unwrap_or_else(|p| p.into_inner())
+    }
 }
 
 enum Session {
@@ -52,37 +90,201 @@ impl Session {
     }
 }
 
-fn table() -> MutexGuard<'static, HashMap<i64, Arc<Socket>>> {
-    static TABLE: OnceLock<Mutex<HashMap<i64, Arc<Socket>>>> = OnceLock::new();
+impl Entry {
+    fn timeout(&self) -> Option<Duration> {
+        *self.timeout.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+/// How long a read waits at a time, where shutting a socket down does not
+/// wake a read waiting on it -- Windows. It then waits in slices, looking
+/// between them for a `close` and for its own timeout.
+const SLICE: Option<Duration> = if cfg!(windows) {
+    Some(Duration::from_millis(250))
+} else {
+    None
+};
+
+/// A stream's read timeout, as the system is to keep it: its own, or a
+/// slice where reads wait in slices.
+fn read_timeout(own: Option<Duration>) -> Option<Duration> {
+    match (SLICE, own) {
+        (Some(slice), Some(t)) => Some(slice.min(t)),
+        (Some(slice), None) => Some(slice),
+        (None, own) => own,
+    }
+}
+
+fn table() -> MutexGuard<'static, HashMap<i64, Arc<Entry>>> {
+    static TABLE: OnceLock<Mutex<HashMap<i64, Arc<Entry>>>> = OnceLock::new();
     TABLE
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|p| p.into_inner())
 }
 
-fn insert(s: Socket) -> i64 {
+fn insert(sock: Socket, timeout: Option<Duration>) -> i64 {
     static NEXT: AtomicI64 = AtomicI64::new(1);
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    table().insert(id, Arc::new(s));
+    let entry = Entry {
+        sock,
+        closed: AtomicBool::new(false),
+        timeout: Mutex::new(timeout),
+    };
+    table().insert(id, Arc::new(entry));
     id
+}
+
+/// A new stream's handle.
+fn stream(s: TcpStream) -> Result<i64, String> {
+    let _ = s.set_nodelay(true);
+    s.set_read_timeout(read_timeout(None)).map_err(said)?;
+    Ok(insert(Socket::Tcp(s), None))
 }
 
 /// The socket `id` names, shared: the table's lock is not held while it is
 /// used, so one thread's read does not hold up another's accept.
-fn get(id: i64) -> Result<Arc<Socket>, String> {
+fn get(id: i64) -> Result<Arc<Entry>, String> {
     table()
         .get(&id)
         .cloned()
         .ok_or_else(|| format!("socket {id} is closed, or was never opened"))
 }
 
+fn timed_out(e: &std::io::Error) -> bool {
+    matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+}
+
 /// What went wrong with an I/O call, said as a program would want it.
 fn said(e: std::io::Error) -> String {
-    match e.kind() {
-        ErrorKind::WouldBlock | ErrorKind::TimedOut => "timed out".to_string(),
-        _ => e.to_string(),
+    if timed_out(&e) {
+        "timed out".to_string()
+    } else {
+        e.to_string()
     }
 }
+
+/// `once` -- a read -- until it reads, or fails for some other reason than
+/// a slice's end; or until `closed` is set, or the stream's own timeout
+/// passes. Where reads do not wait in slices, it runs once.
+fn patiently(
+    closed: &AtomicBool,
+    timeout: Option<Duration>,
+    mut once: impl FnMut() -> std::io::Result<usize>,
+) -> Result<usize, String> {
+    let deadline = timeout.map(|t| Instant::now() + t);
+    loop {
+        match once() {
+            Ok(n) => return Ok(n),
+            Err(e) if SLICE.is_some() && timed_out(&e) => {
+                if closed.load(Ordering::SeqCst) {
+                    return Ok(0);
+                }
+                if deadline.is_some_and(|d| Instant::now() >= d) {
+                    return Err(said(e));
+                }
+            }
+            Err(e) => return Err(said(e)),
+        }
+    }
+}
+
+// --- waiting -----------------------------------------------------------------
+
+/// The calls one run's threads are waiting in, so that the run can stop them
+/// when it ends.
+///
+/// A runtime whose program ends with a thread still waiting -- a server's,
+/// in `accept` -- has a worker it cannot join. Each worker joins the run's
+/// `Waits` as it starts; a call it waits in is recorded with how to wake it,
+/// and `stop` wakes them all and refuses any later one. A process that
+/// simply exits at the end of `main` needs none of this.
+#[derive(Default)]
+pub struct Waits {
+    inner: Mutex<WaitsInner>,
+}
+
+#[derive(Default)]
+struct WaitsInner {
+    stopped: bool,
+    waiting: HashMap<ThreadId, Waker>,
+}
+
+/// How to wake a waiting call: close its handle; or, for a handshake, whose
+/// stream is out of the table, shut its socket and say why.
+enum Waker {
+    Handle(i64),
+    Shake(TcpStream, Arc<AtomicBool>),
+}
+
+thread_local! {
+    static RUN: RefCell<Option<Arc<Waits>>> = const { RefCell::new(None) };
+}
+
+impl Waits {
+    fn lock(&self) -> MutexGuard<'_, WaitsInner> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Wake every call the run's threads wait in, and refuse any they make
+    /// from now on.
+    pub fn stop(&self) {
+        let wakers: Vec<Waker> = {
+            let mut g = self.lock();
+            g.stopped = true;
+            g.waiting.drain().map(|(_, w)| w).collect()
+        };
+        for w in wakers {
+            match w {
+                Waker::Handle(id) => close(id),
+                Waker::Shake(s, stopped) => {
+                    stopped.store(true, Ordering::SeqCst);
+                    let _ = s.shutdown(Shutdown::Both);
+                }
+            }
+        }
+    }
+}
+
+/// This OS thread's calls are `run`'s, until `leave`.
+pub fn join(run: &Arc<Waits>) {
+    RUN.with(|r| *r.borrow_mut() = Some(run.clone()));
+}
+
+pub fn leave() {
+    RUN.with(|r| *r.borrow_mut() = None);
+}
+
+/// A call being waited in, on a thread that joined a run: recorded until
+/// it is dropped.
+struct Waiting(Option<Arc<Waits>>);
+
+impl Waiting {
+    fn on(waker: impl FnOnce() -> Option<Waker>) -> Result<Waiting, String> {
+        let Some(run) = RUN.with(|r| r.borrow().clone()) else {
+            return Ok(Waiting(None));
+        };
+        let mut g = run.lock();
+        if g.stopped {
+            return Err("the program has ended".to_string());
+        }
+        if let Some(w) = waker() {
+            g.waiting.insert(std::thread::current().id(), w);
+        }
+        drop(g);
+        Ok(Waiting(Some(run)))
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        if let Some(run) = &self.0 {
+            run.lock().waiting.remove(&std::thread::current().id());
+        }
+    }
+}
+
+// --- sockets -------------------------------------------------------------------
 
 fn port_of(port: i64) -> Result<u16, String> {
     u16::try_from(port).map_err(|_| format!("{port} is not a port: one is from 0 to 65535"))
@@ -92,50 +294,55 @@ fn port_of(port: i64) -> Result<u16, String> {
 /// for one the system picks (`local_port` says which).
 pub fn listen(host: &str, port: i64) -> Result<i64, String> {
     let l = TcpListener::bind((host, port_of(port)?)).map_err(said)?;
-    Ok(insert(Socket::Listener(l)))
+    Ok(insert(Socket::Listener(l), None))
 }
 
 /// The next connection to listener `id`, and where it came from.
 pub fn accept(id: i64) -> Result<(i64, String), String> {
-    match &*get(id)? {
-        Socket::Listener(l) => {
-            let (s, peer) = l.accept().map_err(said)?;
-            let _ = s.set_nodelay(true);
-            Ok((insert(Socket::Tcp(s)), peer.to_string()))
-        }
-        _ => Err(format!("socket {id} is a stream, not a listener")),
+    let e = get(id)?;
+    let Socket::Listener(l) = &e.sock else {
+        return Err(format!("socket {id} is a stream, not a listener"));
+    };
+    let _waiting = Waiting::on(|| Some(Waker::Handle(id)))?;
+    let (s, peer) = l.accept().map_err(said)?;
+    if e.closed.load(Ordering::SeqCst) {
+        return Err(format!("socket {id} is closed"));
     }
+    Ok((stream(s)?, peer.to_string()))
 }
 
 /// A stream to `host`'s `port`, trying each address the name has.
 pub fn connect(host: &str, port: i64) -> Result<i64, String> {
+    let _waiting = Waiting::on(|| None)?;
     let s = TcpStream::connect((host, port_of(port)?)).map_err(said)?;
-    let _ = s.set_nodelay(true);
-    Ok(insert(Socket::Tcp(s)))
+    stream(s)
 }
 
 /// Up to `max` bytes from stream `id`, waiting for at least one; none at
 /// all is the end of the stream.
 pub fn read(id: i64, max: i64) -> Result<Vec<u8>, String> {
     let mut buf = vec![0u8; max.clamp(1, 1 << 20) as usize];
-    let n = match &*get(id)? {
-        Socket::Tcp(s) => {
+    let e = get(id)?;
+    let _waiting = Waiting::on(|| Some(Waker::Handle(id)))?;
+    let n = match &e.sock {
+        Socket::Tcp(s) => patiently(&e.closed, e.timeout(), || {
             let mut r: &TcpStream = s;
-            r.read(&mut buf).map_err(said)?
-        }
-        Socket::Tls(m) => {
-            let mut g = m.lock().unwrap_or_else(|p| p.into_inner());
-            let got = match &mut *g {
-                Session::Client(s) => s.read(&mut buf),
-                Session::Server(s) => s.read(&mut buf),
-            };
-            match got {
-                Ok(n) => n,
-                // A peer that closes without saying so, as many servers do
-                // once a response is sent: the end of the stream all the same.
-                Err(e) if e.kind() == ErrorKind::UnexpectedEof => 0,
-                Err(e) => return Err(said(e)),
-            }
+            r.read(&mut buf)
+        })?,
+        Socket::Tls(t) => {
+            let mut g = t.session();
+            patiently(&e.closed, e.timeout(), || {
+                let got = match &mut *g {
+                    Session::Client(s) => s.read(&mut buf),
+                    Session::Server(s) => s.read(&mut buf),
+                };
+                match got {
+                    // A peer that closes without saying so, as many servers
+                    // do once a response is sent: the end all the same.
+                    Err(e) if e.kind() == ErrorKind::UnexpectedEof => Ok(0),
+                    got => got,
+                }
+            })?
         }
         Socket::Listener(_) => return Err(format!("socket {id} is a listener, not a stream")),
     };
@@ -145,13 +352,15 @@ pub fn read(id: i64, max: i64) -> Result<Vec<u8>, String> {
 
 /// All of `bytes` to stream `id`: how many there were.
 pub fn write(id: i64, bytes: &[u8]) -> Result<i64, String> {
-    match &*get(id)? {
+    let e = get(id)?;
+    let _waiting = Waiting::on(|| Some(Waker::Handle(id)))?;
+    match &e.sock {
         Socket::Tcp(s) => {
             let mut w: &TcpStream = s;
             w.write_all(bytes).map_err(said)?
         }
-        Socket::Tls(m) => {
-            let mut g = m.lock().unwrap_or_else(|p| p.into_inner());
+        Socket::Tls(t) => {
+            let mut g = t.session();
             match &mut *g {
                 Session::Client(s) => s.write_all(bytes).and_then(|_| s.flush()),
                 Session::Server(s) => s.write_all(bytes).and_then(|_| s.flush()),
@@ -164,30 +373,46 @@ pub fn write(id: i64, bytes: &[u8]) -> Result<i64, String> {
 }
 
 /// Close socket `id`: a TLS session says so to its peer first. Closing one
-/// already closed does nothing.
+/// already closed does nothing. A call another thread waits in on it ends:
+/// a read as the stream's end, an `accept` as closed.
 pub fn close(id: i64) {
-    let Some(s) = table().remove(&id) else {
+    let Some(e) = table().remove(&id) else {
         return;
     };
-    match &*s {
+    e.closed.store(true, Ordering::SeqCst);
+    match &e.sock {
         Socket::Tcp(t) => {
             let _ = t.shutdown(Shutdown::Both);
         }
-        Socket::Tls(m) => {
-            let mut g = m.lock().unwrap_or_else(|p| p.into_inner());
-            match &mut *g {
-                Session::Client(s) => {
-                    s.conn.send_close_notify();
-                    let _ = s.flush();
-                }
-                Session::Server(s) => {
-                    s.conn.send_close_notify();
-                    let _ = s.flush();
+        Socket::Tls(t) => {
+            // A session some thread is reading has nobody to say goodbye
+            // for: shutting the socket under it is what wakes that thread.
+            if let Ok(mut g) = t.session.try_lock() {
+                match &mut *g {
+                    Session::Client(s) => {
+                        s.conn.send_close_notify();
+                        let _ = s.flush();
+                    }
+                    Session::Server(s) => {
+                        s.conn.send_close_notify();
+                        let _ = s.flush();
+                    }
                 }
             }
-            let _ = g.sock().shutdown(Shutdown::Both);
+            let _ = t.raw.shutdown(Shutdown::Both);
         }
-        Socket::Listener(_) => {}
+        Socket::Listener(l) => {
+            // Nothing interrupts an `accept` but a connection: make one.
+            if let Ok(mut at) = l.local_addr() {
+                if at.ip().is_unspecified() {
+                    at.set_ip(match at.ip() {
+                        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+                        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+                    });
+                }
+                let _ = TcpStream::connect_timeout(&at, Duration::from_millis(500));
+            }
+        }
     }
 }
 
@@ -195,28 +420,25 @@ pub fn close(id: i64) {
 /// out, in milliseconds: 0 or less for as long as it takes.
 pub fn set_timeout(id: i64, millis: i64) -> Result<(), String> {
     let t = (millis > 0).then(|| Duration::from_millis(millis as u64));
-    let set = |s: &TcpStream| {
-        s.set_read_timeout(t)
-            .and_then(|_| s.set_write_timeout(t))
-            .map_err(said)
+    let e = get(id)?;
+    let s = match &e.sock {
+        Socket::Tcp(s) => s,
+        Socket::Tls(tls) => &tls.raw,
+        Socket::Listener(_) => return Err(format!("socket {id} is a listener, not a stream")),
     };
-    match &*get(id)? {
-        Socket::Tcp(s) => set(s),
-        Socket::Tls(m) => set(m.lock().unwrap_or_else(|p| p.into_inner()).sock()),
-        Socket::Listener(_) => Err(format!("socket {id} is a listener, not a stream")),
-    }
+    s.set_read_timeout(read_timeout(t))
+        .and_then(|_| s.set_write_timeout(t))
+        .map_err(said)?;
+    *e.timeout.lock().unwrap_or_else(|p| p.into_inner()) = t;
+    Ok(())
 }
 
 /// The port socket `id` is on, here: what port 0 was given.
 pub fn local_port(id: i64) -> Result<i64, String> {
-    let addr = match &*get(id)? {
+    let addr = match &get(id)?.sock {
         Socket::Listener(l) => l.local_addr(),
         Socket::Tcp(s) => s.local_addr(),
-        Socket::Tls(m) => m
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .sock()
-            .local_addr(),
+        Socket::Tls(t) => t.raw.local_addr(),
     };
     Ok(i64::from(addr.map_err(said)?.port()))
 }
@@ -239,14 +461,19 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-/// The plain stream `id` takes, to wrap: it must be no one else's, mid-call.
-fn take_plain(id: i64) -> Result<TcpStream, String> {
+/// The plain stream `id` takes, to wrap, with its timeout: it must be no one
+/// else's, mid-call.
+fn take_plain(id: i64) -> Result<(TcpStream, Option<Duration>), String> {
     let mut t = table();
-    let s = t
+    let e = t
         .remove(&id)
         .ok_or_else(|| format!("socket {id} is closed, or was never opened"))?;
-    match Arc::try_unwrap(s) {
-        Ok(Socket::Tcp(s)) => Ok(s),
+    match Arc::try_unwrap(e) {
+        Ok(Entry {
+            sock: Socket::Tcp(s),
+            timeout,
+            ..
+        }) => Ok((s, timeout.into_inner().unwrap_or_else(|p| p.into_inner()))),
         Ok(other) => {
             t.insert(id, Arc::new(other));
             Err(format!("socket {id} is not a plain stream"))
@@ -323,14 +550,11 @@ pub fn tls_connect(id: i64, server: &str, extra: &str) -> Result<i64, String> {
     let config = client_config(extra)?;
     let name = ServerName::try_from(server.to_string())
         .map_err(|_| format!("`{server}` is not a name a certificate can be for"))?;
-    let mut sock = take_plain(id)?;
+    let (mut sock, timeout) = take_plain(id)?;
     let mut conn = ClientConnection::new(config, name).map_err(|e| e.to_string())?;
-    while conn.is_handshaking() {
-        conn.complete_io(&mut sock).map_err(said)?;
-    }
-    Ok(insert(Socket::Tls(Mutex::new(Session::Client(
-        StreamOwned::new(conn, sock),
-    )))))
+    shake(&mut sock, &mut conn, timeout)?;
+    let tls = Tls::new(Session::Client(StreamOwned::new(conn, sock)))?;
+    Ok(insert(Socket::Tls(tls), timeout))
 }
 
 /// Stream `id` as the server of a TLS session, with the certificate chain
@@ -338,14 +562,35 @@ pub fn tls_connect(id: i64, server: &str, extra: &str) -> Result<i64, String> {
 /// first and takes `id`'s place.
 pub fn tls_accept(id: i64, cert: &str, key: &str) -> Result<i64, String> {
     let config = server_config(cert, key)?;
-    let mut sock = take_plain(id)?;
+    let (mut sock, timeout) = take_plain(id)?;
     let mut conn = ServerConnection::new(config).map_err(|e| e.to_string())?;
+    shake(&mut sock, &mut conn, timeout)?;
+    let tls = Tls::new(Session::Server(StreamOwned::new(conn, sock)))?;
+    Ok(insert(Socket::Tls(tls), timeout))
+}
+
+/// A handshake, to its end. The stream is out of the table while it goes
+/// on, so a run that ends wakes it by its socket.
+fn shake<D>(
+    sock: &mut TcpStream,
+    conn: &mut rustls::ConnectionCommon<D>,
+    timeout: Option<Duration>,
+) -> Result<(), String> {
+    let stopped = Arc::new(AtomicBool::new(false));
+    let _waiting = Waiting::on(|| {
+        sock.try_clone()
+            .ok()
+            .map(|s| Waker::Shake(s, stopped.clone()))
+    })?;
     while conn.is_handshaking() {
-        conn.complete_io(&mut sock).map_err(said)?;
+        patiently(&stopped, timeout, || {
+            conn.complete_io(&mut *sock).map(|(r, w)| r + w + 1)
+        })?;
+        if stopped.load(Ordering::SeqCst) {
+            return Err("the program has ended".to_string());
+        }
     }
-    Ok(insert(Socket::Tls(Mutex::new(Session::Server(
-        StreamOwned::new(conn, sock),
-    )))))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -384,7 +629,18 @@ mod tests {
         let c = connect("127.0.0.1", local_port(l).unwrap()).unwrap();
         let (s, _) = accept(l).unwrap();
         set_timeout(s, 50).unwrap();
+        let t0 = Instant::now();
         assert_eq!(read(s, 8).unwrap_err(), "timed out");
+        assert!(t0.elapsed() < Duration::from_secs(2));
+        // Longer than a slice, where reads wait in slices.
+        set_timeout(s, 600).unwrap();
+        let t0 = Instant::now();
+        assert_eq!(read(s, 8).unwrap_err(), "timed out");
+        assert!(
+            t0.elapsed() >= Duration::from_millis(550),
+            "{:?}",
+            t0.elapsed()
+        );
         for id in [c, s, l] {
             close(id);
         }
@@ -437,8 +693,75 @@ mod tests {
         write(t, b"pong").unwrap();
         assert_eq!(client.join().unwrap(), b"pong");
         assert!(read(t, 16).unwrap().is_empty());
+
+        // A session another thread is reading closes at once, all the same.
+        let trusted = cp.clone();
+        let client = std::thread::spawn(move || {
+            let c = connect("127.0.0.1", port).unwrap();
+            let t = tls_connect(c, "localhost", &trusted).unwrap();
+            let reading = std::thread::spawn(move || read(t, 16));
+            std::thread::sleep(Duration::from_millis(50));
+            let t0 = Instant::now();
+            close(t);
+            let got = reading.join().unwrap();
+            (got, t0.elapsed())
+        });
+        let (s, _) = accept(l).unwrap();
+        let t2 = tls_accept(s, &cp, &kp).unwrap();
+        let (got, took) = client.join().unwrap();
+        assert!(got.map_or(true, |b| b.is_empty()));
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        close(t2);
         close(t);
         close(l);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn closing_wakes_a_call_another_thread_waits_in() {
+        let l = listen("0.0.0.0", 0).unwrap();
+        let accepting = std::thread::spawn(move || accept(l));
+        std::thread::sleep(Duration::from_millis(50));
+        close(l);
+        assert!(accepting.join().unwrap().unwrap_err().contains("closed"));
+
+        let l = listen("127.0.0.1", 0).unwrap();
+        let c = connect("127.0.0.1", local_port(l).unwrap()).unwrap();
+        let (s, _) = accept(l).unwrap();
+        let reading = std::thread::spawn(move || read(s, 8));
+        std::thread::sleep(Duration::from_millis(50));
+        let t0 = Instant::now();
+        close(s);
+        assert!(reading.join().unwrap().map_or(true, |b| b.is_empty()));
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        close(c);
+        close(l);
+    }
+
+    #[test]
+    fn a_run_that_stops_wakes_its_threads_and_refuses_more() {
+        let run = Arc::new(Waits::default());
+        let l = listen("127.0.0.1", 0).unwrap();
+        let c = connect("127.0.0.1", local_port(l).unwrap()).unwrap();
+        let (s, _) = accept(l).unwrap();
+        let r = run.clone();
+        let waiting = std::thread::spawn(move || {
+            join(&r);
+            let got = read(s, 8);
+            let again = accept(l);
+            leave();
+            (got, again)
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let t0 = Instant::now();
+        run.stop();
+        let (got, again) = waiting.join().unwrap();
+        assert!(got.map_or(true, |b| b.is_empty()));
+        assert!(again.is_err());
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        // Not this thread's run: its calls go on as ever.
+        assert!(local_port(l).is_ok());
+        close(c);
+        close(l);
     }
 }

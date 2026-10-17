@@ -162,30 +162,37 @@ fn net(op: &str, arg: Val) -> Option<Build> {
         Ok(b) => Build::ok(b),
         Err(e) => Build::error(e),
     };
+    // What may wait is made by `sched::blocking`, with owned values: a thread
+    // waits for it, rather than its worker.
+    use crate::sched::blocking;
     Some(match op {
-        "tcpListen" | "tcpConnect" => {
+        "tcpListen" => {
             let t = tuple(arg, 2, &what);
             let (host, port) = (text(t[0], &what), int(t[1]));
-            let made = if op == "tcpListen" {
-                net::listen(&host, port)
-            } else {
-                net::connect(&host, port)
-            };
-            answered(made.map(Build::int))
+            answered(net::listen(&host, port).map(Build::int))
         }
-        "tcpAccept" => answered(
-            net::accept(int(arg))
-                .map(|(s, peer)| Build::Tuple(vec![Build::int(s), Build::Str(peer)])),
-        ),
+        "tcpConnect" => {
+            let t = tuple(arg, 2, &what);
+            let (host, port) = (text(t[0], &what), int(t[1]));
+            answered(blocking(move || net::connect(&host, port)).map(Build::int))
+        }
+        "tcpAccept" => {
+            let id = int(arg);
+            answered(
+                blocking(move || net::accept(id))
+                    .map(|(s, peer)| Build::Tuple(vec![Build::int(s), Build::Str(peer)])),
+            )
+        }
         "tcpRead" => {
             let t = tuple(arg, 2, &what);
-            answered(net::read(int(t[0]), int(t[1])).map(Build::Bytes))
+            let (id, max) = (int(t[0]), int(t[1]));
+            answered(blocking(move || net::read(id, max)).map(Build::Bytes))
         }
         "tcpWrite" => {
             let t = tuple(arg, 2, &what);
             let id = int(t[0]);
             let bytes = crate::prims::byte_array(t[1], &what);
-            answered(net::write(id, &bytes).map(Build::int))
+            answered(blocking(move || net::write(id, &bytes)).map(Build::int))
         }
         "tcpClose" => {
             net::close(int(arg));
@@ -196,18 +203,24 @@ fn net(op: &str, arg: Val) -> Option<Build> {
             answered(net::set_timeout(int(t[0]), int(t[1])).map(|()| Build::unit()))
         }
         "tcpLocalPort" => answered(net::local_port(int(arg)).map(Build::int)),
-        "resolve" => answered(
-            net::resolve(&text(arg, &what))
-                .map(|ips| Build::Vector(ips.into_iter().map(Build::Str).collect())),
-        ),
+        "resolve" => {
+            let host = text(arg, &what);
+            answered(
+                blocking(move || net::resolve(&host))
+                    .map(|ips| Build::Vector(ips.into_iter().map(Build::Str).collect())),
+            )
+        }
         "tlsConnect" | "tlsAccept" => {
             let t = tuple(arg, 3, &what);
             let (id, a, b) = (int(t[0]), text(t[1], &what), text(t[2], &what));
-            let made = if op == "tlsConnect" {
-                net::tls_connect(id, &a, &b)
-            } else {
-                net::tls_accept(id, &a, &b)
-            };
+            let connecting = op == "tlsConnect";
+            let made = blocking(move || {
+                if connecting {
+                    net::tls_connect(id, &a, &b)
+                } else {
+                    net::tls_accept(id, &a, &b)
+                }
+            });
             answered(made.map(Build::int))
         }
         _ => return None,
