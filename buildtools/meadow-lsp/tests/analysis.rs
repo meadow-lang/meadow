@@ -1958,3 +1958,73 @@ fn the_name_of_a_definition_called_is_found_by_its_symbol() {
     assert_eq!(focused.len(), 1, "{focused:?}\n{}", view.text);
     assert!(focused[0].ends_with("double"), "{focused:?}");
 }
+
+// --- modules and fields ---------------------------------------------------------
+
+/// Where `marker` in `src` jumps to: the text there, and the file's name.
+fn jumps(src: &str, marker: &str) -> (String, String) {
+    let (a, off) = at(src, marker);
+    let loc = STD
+        .with(|s| a.definition_at(off, s.definitions(), s.declared_names()))
+        .unwrap_or_else(|| panic!("a definition at {marker:?}"));
+    let text = loc.source.content[loc.span.start as usize..loc.span.end as usize].to_string();
+    (text, loc.source.name().to_string())
+}
+
+/// An alias, where it is declared and where it qualifies, is the module it
+/// names: the start of that module's file.
+#[test]
+fn a_module_alias_goes_to_the_module() {
+    let src = "use Std.Collections.Vector as V\ndef xs = @V.len [1; 2]\n";
+    let (text, file) = jumps(src, "@");
+    assert_eq!(text, "", "the start of the file");
+    assert!(file.ends_with("Collections/Vector.mw"), "got {file}");
+
+    let src = "use Std.Collections.Vector as @V\ndef xs = V.len [1; 2]\n";
+    assert!(jumps(src, "@").1.ends_with("Collections/Vector.mw"));
+}
+
+/// Each segment of a `use` path is the module it has reached.
+#[test]
+fn a_use_paths_segments_go_to_their_modules() {
+    let src = "use Std.@Collections.Vector as V\ndef xs = V.len [1]\n";
+    assert!(
+        jumps(src, "@").1.ends_with("Collections.mw"),
+        "Std.Collections"
+    );
+    let src = "use Std.Collections.@Vector as V\ndef xs = V.len [1]\n";
+    assert!(jumps(src, "@").1.ends_with("Collections/Vector.mw"));
+}
+
+/// A module is renamed by renaming its file, which is not this server's to do.
+#[test]
+fn a_module_is_not_renamed_as_a_name() {
+    let src = "use Std.Collections.Vector as V\ndef xs = @V.len [1]\n";
+    let (a, off) = at(src, "@");
+    let err = STD.with(|s| a.rename_at(off, "W", s)).unwrap_err();
+    assert!(err.contains("file"), "{err}");
+}
+
+/// A field is declared in its record, and is found from wherever it is read,
+/// built or matched -- by the record's type where that names it, and by the
+/// field's name where the record is inferred from its fields alone.
+#[test]
+fn a_field_goes_to_where_its_record_declares_it() {
+    let src = "record Point = { x : Int, y : Int }\n\ndef p : Point = { x = 1, y = 2 }\n\ndef sum = p.@y + p.x\n";
+    let (text, _) = jumps(src, "@");
+    assert_eq!(text, "y");
+    let (a, off) = at(src, "@");
+    let loc = STD
+        .with(|s| a.definition_at(off, s.definitions(), s.declared_names()))
+        .unwrap();
+    assert_eq!(
+        loc.span.start as usize,
+        src.find("y :").unwrap(),
+        "the declaration's `y`"
+    );
+
+    let src = "record Point = { x : Int, y : Int }\n\ndef p : Point = { @x = 1, y = 2 }\n";
+    assert_eq!(jumps(src, "@").0, "x");
+    let src = "record Box = { items : Int }\n\nfun count b = b.@items + 1\n";
+    assert_eq!(jumps(src, "@").0, "items");
+}

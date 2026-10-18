@@ -194,6 +194,9 @@ pub struct Resolver {
     /// The types each qualifier reaches, by how they are spelled: `M.Ty` in a
     /// type is the type `Ty` of the module `M` qualifies, with its arity.
     qualifier_types: HashMap<InternedString, HashMap<InternedString, (InternedString, usize)>>,
+    /// The module each qualifier names, by package and path -- what a mention
+    /// of the qualifier is recorded as (`NameRef::Module`).
+    qualifier_modules: HashMap<InternedString, InternedString>,
     /// How every operator binds that something declared: this unit's own
     /// `infixl 6 +` and its dependencies'. One table for the whole unit,
     /// because an operator's fixity goes by its spelling, not by which
@@ -512,6 +515,10 @@ pub enum NameRef {
     Type(InternedString),
     /// A data constructor, by its canonical `Type.Ctor` name.
     Ctor(InternedString),
+    /// A module, by its package and path: `Std.Collections.Vector`, or the
+    /// bare package name for its root. A `use` path's every segment, an `as`
+    /// alias, and the qualifier of `V.map`.
+    Module(InternedString),
 }
 
 /// Where a [`NameRef`] was written.
@@ -604,6 +611,7 @@ impl Resolver {
             qualifiers: HashMap::new(),
             qualifier_paths: HashMap::new(),
             qualifier_types: HashMap::new(),
+            qualifier_modules: HashMap::new(),
             fixities: HashMap::new(),
             prelude: HashMap::new(),
             errors: Vec::new(),
@@ -885,6 +893,7 @@ impl Resolver {
         self.current = path.to_vec();
         self.scope.truncate(self.base_scope);
         self.qualifiers.clear();
+        self.qualifier_modules.clear();
         self.qualifier_paths.clear();
         self.qualifier_types.clear();
         self.tycons = self.base_tycons.clone();
@@ -964,6 +973,23 @@ impl Resolver {
     /// Record a reference the HIR will not keep.
     pub fn note_ref(&mut self, span: Span, what: NameRef) {
         self.extra_refs.push(RefSite { span, what });
+    }
+
+    /// `qualifier` names the module `module` (its package and path), for
+    /// [`NameRef::Module`].
+    pub fn qualifier_names(&mut self, qualifier: InternedString, module: InternedString) {
+        self.qualifier_modules.insert(qualifier, module);
+    }
+
+    /// The qualifier at the start of `q` -- `V` of `V`, or of `M.Ty` -- is a
+    /// mention of the module it names.
+    fn note_qualifier(&mut self, q: InternedString, at: Span) {
+        let head = q.split('.').next().unwrap_or(&q);
+        let len = head.len() as u32;
+        if let Some(&module) = self.qualifier_modules.get(&InternedString::from(head)) {
+            let span = Span::new(at.start, at.start + len);
+            self.note_ref(span, NameRef::Module(module));
+        }
     }
 
     /// Take the references collected since the last call — the driver does
@@ -1303,6 +1329,17 @@ impl Resolver {
         self.activate_module(qualifier, values);
         self.activate_local_types(qualifier, path);
         self.qualifier_paths.insert(qualifier, path.to_vec());
+        if let Some(pkg) = self.package {
+            let mut full = vec![pkg];
+            full.extend_from_slice(path);
+            let full = full
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(".");
+            self.qualifier_modules
+                .insert(qualifier, InternedString::from(full.as_str()));
+        }
     }
 
     /// Make the types `types` -- a used module's, by their canonical names --
@@ -3208,6 +3245,7 @@ impl Resolver {
                 let found = match name.rsplit_once('.') {
                     Some((q, ty)) => {
                         let q = InternedString::from(q);
+                        self.note_qualifier(q, n.span);
                         match self.qualifier_types.get(&q) {
                             Some(types) => types
                                 .get(&InternedString::from(ty))
@@ -3708,6 +3746,7 @@ impl Resolver {
                 let ast::Expr::Qual(q, name) = func.value() else {
                     unreachable!()
                 };
+                self.note_qualifier(*q.value(), q.span);
                 if let Some(canonical) = self.qualified_type_ctor(q, *name.value()) {
                     // `Shape.Rect { w = 2, h = 3 }`: the braces are the
                     // constructor's named fields, exactly as they are unqualified.
@@ -3750,6 +3789,7 @@ impl Resolver {
             ast::Expr::Qual(q, name) => {
                 let qn = *q.value();
                 let nn = *name.value();
+                self.note_qualifier(qn, q.span);
                 if is_ctor_name(&nn) {
                     if let Some(canonical) = self.qualified_type_ctor(q, nn) {
                         let label = self.node(canonical, name.span);
@@ -4192,6 +4232,7 @@ impl Resolver {
             }
             ast::Pat::Cons(name, args) => self.resolve_ctor_pat(pat.span, name, args),
             ast::Pat::QualCons(q, name, args) => {
+                self.note_qualifier(*q.value(), q.span);
                 // `Core.Lam p b`, a pattern synonym of the module `Core`.
                 if self.qualified_type_ctor_known(q, *name.value()).is_none()
                     && let Some(matched) =
