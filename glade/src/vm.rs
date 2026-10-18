@@ -179,6 +179,9 @@ pub struct Vm<'p> {
     /// out -- see [`crate::sched`]. The primitive leaves it here and the
     /// machine stops, since what happens next may be another thread's turn.
     pub(crate) request: Option<Request>,
+    /// A native operation's call that may wait, left by it for `native_op`
+    /// to make a request of -- see [`Request::Block`].
+    pub(crate) blocking: Option<Work>,
     /// Is a scheduler running this machine? Without one there is nobody to
     /// carry out a request, and a thread operation is an error.
     pub(crate) scheduled: bool,
@@ -268,10 +271,28 @@ impl Vm<'_> {
 // which is borrowed for `'p`, and so outlives the machine.
 unsafe impl Send for Vm<'_> {}
 
+/// A call into the world that may wait, made of owned values: run by the
+/// scheduler away from the machine, its answer built into it afterwards.
+pub(crate) type Work = Box<dyn FnOnce() -> crate::native::Build + Send>;
+
+pub(crate) struct Job(pub(crate) Work);
+
+impl std::fmt::Debug for Job {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Job")
+    }
+}
+
 /// What a thread operation asks of the scheduler. `dst` is the register its
 /// answer goes in, once there is one.
 #[derive(Debug)]
 pub(crate) enum Request {
+    /// Wait for `job` -- an accept, a read -- off the worker, which runs
+    /// another thread meanwhile.
+    Block {
+        job: Job,
+        dst: Reg,
+    },
     Spawn {
         body: crate::heap::Parcel,
         /// The descriptor of what the thread answers.
@@ -356,6 +377,7 @@ impl<'p> Vm<'p> {
             io: Io::default(),
             host: None,
             request: None,
+            blocking: None,
             scheduled: false,
             globals: Vec::new(),
             literals: Vec::new(),
@@ -1047,6 +1069,12 @@ impl<'p> Vm<'p> {
         match self.native(&effect, &op, arg)? {
             Some(v) => {
                 self.set(i.a, v);
+                if let Some(work) = self.blocking.take() {
+                    self.request = Some(Request::Block {
+                        job: Job(work),
+                        dst: i.a,
+                    });
+                }
                 Ok(())
             }
             None => {

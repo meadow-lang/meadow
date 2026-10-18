@@ -295,6 +295,127 @@ impl Vm<'_> {
     // --- the natives ------------------------------------------------------
 
     /// Discharge `effect.op` against the real world, or say it cannot.
+    /// `Std.Net`'s sockets and `Std.Tls`'s sessions: see `meadow_rt::net`.
+    ///
+    /// A call that may wait -- an accept, a read, a handshake -- is made into
+    /// a job of owned values: a machine a scheduler runs leaves it as a
+    /// request, so that the thread waits rather than its worker (see
+    /// [`crate::sched`]); one run on its own does it there and then.
+    fn native_net(&mut self, op: &str, arg: Value) -> Result<Option<Build>, Error> {
+        use meadow_rt::net;
+        let what = format!("Net.{op}");
+        let int = |vm: &Vm, v: Value| -> Result<i64, Error> {
+            match v {
+                Value::Int(n) => Ok(n),
+                other => err(format!("{what}: expected an Int, got {}", vm.show(other))),
+            }
+        };
+        fn answered(r: Result<Build, String>) -> Build {
+            match r {
+                Ok(b) => Build::ok(b),
+                Err(e) => Build::error(e),
+            }
+        }
+        let job: crate::vm::Work = match op {
+            "tcpListen" => {
+                let t = self.tuple_arg(&what, arg, 2)?;
+                let host = self.str_arg(&what, t[0])?;
+                let port = int(self, t[1])?;
+                return Ok(Some(answered(net::listen(&host, port).map(Build::int))));
+            }
+            "tcpClose" => {
+                net::close(int(self, arg)?);
+                return Ok(Some(Build::unit()));
+            }
+            "tcpTimeout" => {
+                let t = self.tuple_arg(&what, arg, 2)?;
+                let set = net::set_timeout(int(self, t[0])?, int(self, t[1])?);
+                return Ok(Some(answered(set.map(|()| Build::unit()))));
+            }
+            "tcpLocalPort" => {
+                return Ok(Some(answered(
+                    net::local_port(int(self, arg)?).map(Build::int),
+                )));
+            }
+            "tcpConnect" => {
+                let t = self.tuple_arg(&what, arg, 2)?;
+                let host = self.str_arg(&what, t[0])?;
+                let port = int(self, t[1])?;
+                Box::new(move || answered(net::connect(&host, port).map(Build::int)))
+            }
+            "tcpAccept" => {
+                let id = int(self, arg)?;
+                Box::new(move || {
+                    answered(
+                        net::accept(id)
+                            .map(|(s, peer)| Build::Tuple(vec![Build::int(s), Build::Str(peer)])),
+                    )
+                })
+            }
+            "tcpRead" => {
+                let t = self.tuple_arg(&what, arg, 2)?;
+                let (id, max) = (int(self, t[0])?, int(self, t[1])?);
+                Box::new(move || answered(net::read(id, max).map(Build::Bytes)))
+            }
+            "tcpWrite" => {
+                let t = self.tuple_arg(&what, arg, 2)?;
+                let id = int(self, t[0])?;
+                let bytes = self.bytes(t[1], &what)?;
+                Box::new(move || answered(net::write(id, &bytes).map(Build::int)))
+            }
+            "resolve" => {
+                let host = self.str_arg(&what, arg)?;
+                Box::new(move || {
+                    answered(
+                        net::resolve(&host)
+                            .map(|ips| Build::Vector(ips.into_iter().map(Build::Str).collect())),
+                    )
+                })
+            }
+            "tlsConnect" | "tlsAccept" => {
+                let t = self.tuple_arg(&what, arg, 3)?;
+                let id = int(self, t[0])?;
+                let (a, b) = (self.str_arg(&what, t[1])?, self.str_arg(&what, t[2])?);
+                let connecting = op == "tlsConnect";
+                Box::new(move || {
+                    let made = if connecting {
+                        net::tls_connect(id, &a, &b)
+                    } else {
+                        net::tls_accept(id, &a, &b)
+                    };
+                    answered(made.map(Build::int))
+                })
+            }
+            _ => return Ok(None),
+        };
+        if self.scheduled {
+            self.blocking = Some(job);
+            Ok(Some(Build::unit()))
+        } else {
+            Ok(Some(job()))
+        }
+    }
+
+    /// `Std.Log`'s line, where no handler took it: see `meadow_rt::log`.
+    fn native_log(&mut self, op: &str, arg: Value) -> Result<Option<Build>, Error> {
+        match op {
+            "logAt" => {
+                let what = "Log.logAt";
+                let t = self.tuple_arg(what, arg, 2)?;
+                let level = match t[0] {
+                    Value::Int(n) => n,
+                    other => {
+                        return err(format!("{what}: expected an Int, got {}", self.show(other)));
+                    }
+                };
+                let message = self.str_arg(what, t[1])?;
+                meadow_rt::log::line(level, &message);
+                Ok(Some(Build::unit()))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub(crate) fn native(
         &mut self,
         effect: &str,
@@ -307,6 +428,10 @@ impl Vm<'_> {
             "Random" => self.native_random(op, arg)?,
             "Time" => self.native_time(op, arg)?,
             "Console" => self.native_console(op, arg)?,
+            // A Std effect not among the language's names comes here by its
+            // canonical one, and through Cut by its bare one.
+            "Log" | "Std.Log.Log" => self.native_log(op, arg)?,
+            "Net" | "Std.Net.Net" => self.native_net(op, arg)?,
             // Not the runtime's own: the host's, if this machine has one.
             _ => return self.ask_host(effect, op, arg),
         };

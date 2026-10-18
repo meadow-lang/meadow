@@ -54,7 +54,9 @@ pub mod specialize;
 pub mod trmc;
 pub use lower::Lowerer;
 pub mod desc;
-pub use meadow_rt::{args, compact, console, ffi, hash, num, stm, terminal, text, thread};
+pub use meadow_rt::{
+    args, compact, console, ffi, hash, log, net, num, stm, terminal, text, thread,
+};
 
 use meadow_hir as hir;
 /// How a canonical name is written, for the runtimes' messages.

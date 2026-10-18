@@ -20,6 +20,39 @@ beyond the last release is under _Unreleased_.
   a pattern or an expression, of the package's own modules and a
   dependency's alike. Where two of the module's types have a constructor of
   that name, `M.Type.Ctor` says which, and `M.Ctor` is an error saying so.
+- `Std.Log`, what a program says it is doing, as an effect: `Log.info`,
+  `Log.warn`, `Log.error`, `Log.debug`, or `log level message`. Where nothing
+  handles it the runtime writes each line to standard error with its time and
+  level, if the level is at or above the one `MEADOW_LOG` names (`debug`,
+  `info`, `warn`, `error` or `off`; `info` by default). `captured` collects a
+  block's lines, `silenced` drops them, and `atLeast` keeps those at a level
+  or above. `main` and a spawned thread may perform it, as `Eff` now says; a
+  program's own effect called `Log` is still its own.
+- `Std.Net`, TCP sockets: `listen`, `accept`, `connect`, `read`, `write` and
+  their text forms, `close`, `setTimeout`, `port` and `lookup`, on a
+  `Listener` and a `Stream`. Every operation answers `Err` with what went
+  wrong rather than stopping the program. `Net` is in `Eff`, so `main` and a
+  spawned thread may use it.
+- `Std.Tls` makes a `Std.Net` stream a TLS session: `connect` as a client,
+  checked against Mozilla's roots (and one more authority with
+  `connectTrusting`), or `accept` as a server, from a certificate chain and
+  key in PEM files. What it answers is a `Stream` like any other. The
+  runtime's TLS is rustls, so nothing has to be installed where a program
+  runs.
+- `Std.Http`, HTTP/1.1 in the standard library. A server: `serve host port
+  handler`, a `handler : Request -> Response ! Eff` answering each request on
+  a thread of the connection's own, with keep-alive, chunked bodies and
+  `serveTls` for HTTPS; `serveOn` and `serveOne` for a listener of the
+  program's own. A client: `get`, `post` and `request`, over `http://` or
+  `https://`. `text`, `html`, `json` and `withHeader` build a response;
+  `header` reads one in any case, and `bodyText` and `requestText` read a
+  body.
+- A thread waiting on a socket holds up only itself. Glade and Silo make a
+  call that may wait on an I/O thread while the worker runs the program's
+  other threads, and the CEK machine makes it on an OS thread of its own, so
+  a server's thousand reading connections need no more workers than cores. A
+  program ends when `main` does even with a thread still accepting, and
+  closing a socket wakes a call another thread waits in on it.
 
 ## 0.3.0 - 2026-10-16
 

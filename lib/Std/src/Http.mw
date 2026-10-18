@@ -1,0 +1,579 @@
+-- Std.Http: HTTP/1.1, a server and a client, over `Std.Net` and `Std.Tls`.
+--
+--   use Std.Http as Http
+--
+--   fun hello (r : Http.Request) : Http.Response ! Eff =
+--     if r.path == "/" then Http.text 200 "hello\n" else Http.text 404 "no such page\n"
+--
+--   fun main () = match Http.serve "127.0.0.1" 8080 hello with
+--     | Err why -> println "cannot serve: ${why}"
+--     | Ok _ -> ()
+--
+--   -- and from anywhere else:
+--   match Http.get "https://example.com/" with
+--   | Ok r -> println "${show r.status}: ${Http.bodyText r}"
+--   | Err why -> println why
+--
+-- `serve` answers each connection on a green thread of its own, so a handler
+-- is a function a thread may run -- `Request -> Response ! Eff` -- and a slow
+-- one holds up only its own connection. A connection is kept for the next
+-- request unless either side says `Connection: close`. `serveTls` is the same
+-- over TLS, from a certificate chain and key in PEM files.
+--
+-- The client sends `Connection: close` and reads the body by
+-- `Content-Length`, chunk by chunk (`Transfer-Encoding: chunked`), or to the
+-- end of the stream. It follows no redirect: a 301 is a response like any
+-- other, its `Location` header there to read.
+--
+-- Headers are name and value pairs in the order they came; `header` finds one
+-- whatever its case.
+
+use Std.Net as Net
+use Std.Net (Net, Stream, Listener)
+use Std.Tls as Tls
+use Std.Log as Log
+use Std.Eff (Eff)
+use Std.Thread as Thread
+use Std.String as S
+use Std.Collections.Vector as V
+use Std.Collections.Vector (vecFromArray)
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+use Std.Result.Result.*
+use Std.Bytes (bytesEmpty, bytesLength, bytesSlice, bytesConcat)
+use Std.Tuple (fst, snd)
+use Std.Num.Int (max)
+
+-- --- requests and responses --------------------------------------------------
+
+-- What a client asked: `GET /search?q=meadow` is method "GET", path
+-- "/search" and query "q=meadow" -- the query as it was written, its
+-- percent-escapes and all.
+@pub record Request = {
+  method : String,
+  path : String,
+  query : String,
+  headers : [(String, String)],
+  body : #[UInt8]
+}
+
+-- What a server answered.
+@pub record Response = {
+  status : Int,
+  headers : [(String, String)],
+  body : #[UInt8]
+}
+
+-- A response of `body`, said to be `contentType`.
+@pub fun response (status : Int) (contentType : String) (body : String) : Response =
+  Response { status, headers = [("Content-Type", contentType)], body = stringToBytes body }
+
+@pub fun text (status : Int) (body : String) : Response =
+  response status "text/plain; charset=utf-8" body
+
+@pub fun html (status : Int) (body : String) : Response =
+  response status "text/html; charset=utf-8" body
+
+-- A body of JSON, as `Std.Json` writes it.
+@pub fun json (status : Int) (body : String) : Response = response status "application/json" body
+
+-- `r` with one more header.
+@pub fun withHeader (name : String) (value : String) (r : Response) : Response =
+  { r | headers = V.pushBack r.headers (name, value) }
+
+-- The first header of that name, whatever its case.
+@pub fun header (name : String) (headers : [(String, String)]) : Maybe String =
+  let want = S.toLower name in
+  M.map snd (V.find (\h -> S.toLower (fst h) == want) headers)
+
+-- A request's body as text.
+@pub fun requestText (r : Request) : String = bytesToString r.body
+
+-- A response's body as text.
+@pub fun bodyText (r : Response) : String = bytesToString r.body
+
+-- The phrase a status is said with.
+@pub fun reason (status : Int) : String =
+  match status with
+  | 100 -> "Continue"
+  | 200 -> "OK"
+  | 201 -> "Created"
+  | 202 -> "Accepted"
+  | 204 -> "No Content"
+  | 301 -> "Moved Permanently"
+  | 302 -> "Found"
+  | 303 -> "See Other"
+  | 304 -> "Not Modified"
+  | 307 -> "Temporary Redirect"
+  | 308 -> "Permanent Redirect"
+  | 400 -> "Bad Request"
+  | 401 -> "Unauthorized"
+  | 403 -> "Forbidden"
+  | 404 -> "Not Found"
+  | 405 -> "Method Not Allowed"
+  | 408 -> "Request Timeout"
+  | 409 -> "Conflict"
+  | 413 -> "Content Too Large"
+  | 415 -> "Unsupported Media Type"
+  | 422 -> "Unprocessable Content"
+  | 429 -> "Too Many Requests"
+  | 500 -> "Internal Server Error"
+  | 501 -> "Not Implemented"
+  | 502 -> "Bad Gateway"
+  | 503 -> "Service Unavailable"
+  | 504 -> "Gateway Timeout"
+  | _ -> if status < 400 then "OK" else if status < 500 then "Client Error" else "Server Error"
+
+-- --- reading from a stream ---------------------------------------------------
+--
+-- What is read past what was asked for is handed on, as `rest`: the start of
+-- the next request on a kept connection.
+
+-- The most a head -- the request or status line and the headers -- may be.
+def maxHead : Int = 65536
+
+-- Where the first `\r\n\r\n` at or after `i` starts.
+fun blankAt (b : #[UInt8]) (i : Int) : Maybe Int =
+  if i + 3 >= bytesLength b then None
+  else if arrayGet b i == toUInt8 13
+    and arrayGet b (i + 1) == toUInt8 10
+    and arrayGet b (i + 2) == toUInt8 13
+    and arrayGet b (i + 3) == toUInt8 10 then Just i
+  else blankAt b (i + 1)
+
+-- Where the first `\r\n` at or after `i` starts.
+fun lineEndAt (b : #[UInt8]) (i : Int) : Maybe Int =
+  if i + 1 >= bytesLength b then None
+  else if arrayGet b i == toUInt8 13 and arrayGet b (i + 1) == toUInt8 10 then Just i
+  else lineEndAt b (i + 1)
+
+-- A head and what came after it. `Err "closed"` where the stream ended
+-- before any of it: a kept connection the other end let go.
+fun readHead (s : Stream) (have : #[UInt8]) (from : Int)
+    : Result String (#[UInt8], #[UInt8]) ! { Net | e } =
+  match blankAt have from with
+  | Just i -> Ok (bytesSlice have 0 i, bytesSlice have (i + 4) (bytesLength have))
+  | None ->
+      if bytesLength have > maxHead then Err "the head is too long"
+      else
+        (match Net.read s 16384 with
+         | Err why -> Err why
+         | Ok more ->
+             if bytesLength more == 0 then
+               (if bytesLength have == 0 then Err "closed"
+                else Err "the connection closed mid-head")
+             else readHead s (bytesConcat have more) (max 0 (bytesLength have - 3)))
+
+-- At least `n` bytes, starting with `have`.
+fun readAtLeast (s : Stream) (have : #[UInt8]) (n : Int) : Result String #[UInt8] ! { Net | e } =
+  if bytesLength have >= n then Ok have
+  else
+    (match Net.read s (max 16384 (n - bytesLength have)) with
+     | Err why -> Err why
+     | Ok more ->
+         if bytesLength more == 0 then Err "the connection closed mid-body"
+         else readAtLeast s (bytesConcat have more) n)
+
+-- Exactly `n` bytes, and what came after them.
+fun readExact (s : Stream) (have : #[UInt8]) (n : Int)
+    : Result String (#[UInt8], #[UInt8]) ! { Net | e } =
+  match readAtLeast s have n with
+  | Err why -> Err why
+  | Ok b -> Ok (bytesSlice b 0 n, bytesSlice b n (bytesLength b))
+
+-- Everything to the end of the stream.
+fun readToEnd (s : Stream) (have : #[UInt8]) : Result String #[UInt8] ! { Net | e } =
+  match Net.read s 65536 with
+  | Err why -> Err why
+  | Ok more -> if bytesLength more == 0 then Ok have else readToEnd s (bytesConcat have more)
+
+-- A line, without its `\r\n`, and what came after it.
+fun readLine (s : Stream) (have : #[UInt8]) : Result String (String, #[UInt8]) ! { Net | e } =
+  match lineEndAt have 0 with
+  | Just i -> Ok (bytesToString (bytesSlice have 0 i), bytesSlice have (i + 2) (bytesLength have))
+  | None ->
+      (match Net.read s 16384 with
+       | Err why -> Err why
+       | Ok more ->
+           if bytesLength more == 0 then Err "the connection closed mid-line"
+           else readLine s (bytesConcat have more))
+
+-- A body sent `Transfer-Encoding: chunked`, joined, and what came after it.
+fun readChunked (s : Stream) (have : #[UInt8]) (body : #[UInt8])
+    : Result String (#[UInt8], #[UInt8]) ! { Net | e } =
+  match readLine s have with
+  | Err why -> Err why
+  | Ok (line, rest) ->
+      (let size = M.unwrapOr (0 - 1) (hexOf (S.trim (V.getOr "" (S.split ";" line) 0))) in
+       if size < 0 then Err "a chunk's size is not a number"
+       else if size == 0 then
+         -- The trailer, if any, to the blank line that ends it.
+         (match skipTrailer s rest with
+          | Err why -> Err why
+          | Ok after -> Ok (body, after))
+       else
+         (match readExact s rest (size + 2) with
+          | Err why -> Err why
+          | Ok (chunk, after) -> readChunked s after (bytesConcat body (bytesSlice chunk 0 size))))
+
+fun skipTrailer (s : Stream) (have : #[UInt8]) : Result String #[UInt8] ! { Net | e } =
+  match readLine s have with
+  | Err why -> Err why
+  | Ok (line, rest) -> if line == "" then Ok rest else skipTrailer s rest
+
+-- A hexadecimal number.
+fun hexOf (t : String) : Maybe Int =
+  if t == "" then None
+  else
+    V.foldl
+      (\acc ch ->
+        M.andThen (\n -> (let d = hexDigit ch in if d < 0 then None else Just (n * 16 + d))) acc)
+      (Just 0)
+      (S.chars (S.toLower t))
+
+fun hexDigit (ch : Char) : Int =
+  let c = charCode ch in
+  if c >= 48 and c <= 57 then c - 48 else if c >= 97 and c <= 102 then c - 87 else 0 - 1
+
+-- The start line and the headers of a head.
+fun headParts (head : #[UInt8]) : (String, [(String, String)]) =
+  let lines = S.split "\r\n" (bytesToString head) in
+  (
+    V.getOr "" lines 0,
+    V.concatMap
+      (\l ->
+        match S.indexOf ":" l with
+        | Just i -> [(S.trim (S.take l i), S.trim (S.drop l (i + 1)))]
+        | None -> [])
+      (V.drop lines 1)
+  )
+
+-- A message's body, by what its headers say: chunked, of a length, or --
+-- where `toEnd` -- whatever is left of the stream. A request without either
+-- has none.
+fun readBody (s : Stream) (headers : [(String, String)]) (rest : #[UInt8]) (toEnd : Bool)
+    : Result String (#[UInt8], #[UInt8]) ! { Net | e } =
+  if M.unwrapOr "" (M.map S.toLower (header "Transfer-Encoding" headers)) == "chunked" then
+    readChunked s rest bytesEmpty
+  else
+    (match M.andThen (\v -> S.toInt (S.trim v)) (header "Content-Length" headers) with
+     | Just n -> readExact s rest n
+     | None ->
+         if toEnd then
+           (match readToEnd s rest with
+            | Err why -> Err why
+            | Ok b -> Ok (b, bytesEmpty))
+         else Ok (bytesEmpty, rest))
+
+-- A request from `s`, what came after it, and whether the connection is to
+-- be kept for another.
+@pub fun readRequest (s : Stream) (have : #[UInt8])
+    : Result String (Request, #[UInt8], Bool) ! { Net | e } =
+  match readHead s have 0 with
+  | Err why -> Err why
+  | Ok (head, rest) ->
+      (match headParts head with
+       | (start, headers) ->
+           (let words = S.split " " start in
+            match (V.get words 0, V.get words 1, V.get words 2) with
+            | (Just method, Just target, Just version) ->
+                (match readBody s headers rest False with
+                 | Err why -> Err why
+                 | Ok (body, after) ->
+                     (let (path, query) =
+                        (match S.indexOf "?" target with
+                         | Just i -> (S.take target i, S.drop target (i + 1))
+                         | None -> (target, ""))
+                      in
+                      let connection =
+                        M.unwrapOr "" (M.map S.toLower (header "Connection" headers))
+                      in
+                      let keep =
+                        if version == "HTTP/1.0" then connection == "keep-alive"
+                        else connection != "close"
+                      in Ok (Request { method, path, query, headers, body }, after, keep)))
+            | _ -> Err "not a request line: `${start}`"))
+
+-- A response from `s`, read to its end.
+@pub fun readResponse (s : Stream) : Result String Response ! { Net | e } =
+  match readHead s bytesEmpty 0 with
+  | Err why -> Err why
+  | Ok (head, rest) ->
+      (match headParts head with
+       | (start, headers) ->
+           (let words = S.split " " start in
+            match S.toInt (V.getOr "" words 1) with
+            | None -> Err "not a status line: `${start}`"
+            | Just status ->
+                (match readBody s headers rest True with
+                 | Err why -> Err why
+                 | Ok (body, _) -> Ok (Response { status, headers, body }))))
+
+-- --- writing -----------------------------------------------------------------
+
+fun headLines (headers : [(String, String)]) : String =
+  S.concatAll (V.map (\h -> match h with | (n, v) -> "${n}: ${v}\r\n") headers)
+
+-- `r` to `s`: its own headers, and `Content-Length` and `Connection` where it
+-- has not said them.
+@pub fun writeResponse (s : Stream) (r : Response) (keep : Bool) : Result String () ! { Net | e } =
+  let extra =
+    V.concat [
+      (if M.isSome (header "Content-Length" r.headers) then []
+       else [("Content-Length", show (bytesLength r.body))]),
+      (if M.isSome (header "Connection" r.headers) then []
+       else [("Connection", if keep then "keep-alive" else "close")])
+    ]
+  in
+  let head =
+    "HTTP/1.1 ${show r.status} ${reason r.status}\r\n${headLines (V.append r.headers extra)}\r\n"
+  in match Net.writeText s head with
+     | Err why -> Err why
+     | Ok _ -> if bytesLength r.body == 0 then Ok () else Net.write s r.body
+
+-- --- serving -----------------------------------------------------------------
+
+-- The requests of one connection, each answered, until it is closed.
+fun connection (s : Stream) (handler : Request -> Response ! Eff) (have : #[UInt8]) : () ! Eff =
+  match readRequest s have with
+  | Err why ->
+      (let u =
+         if why == "closed" then ()
+         else
+           (let w = writeResponse s (text 400 "${why}\n") False in
+            Log.debug "a bad request: ${why}")
+       in Net.close s)
+  | Ok (req, rest, keep) ->
+      (let resp = handler req in
+       match writeResponse s resp keep with
+       | Err why -> (let u = Log.debug "a response not sent: ${why}" in Net.close s)
+       | Ok _ -> if keep then connection s handler rest else Net.close s)
+
+-- Has `l` been closed? Then an `accept` that failed will not succeed again,
+-- where one that failed for want of a file handle, say, may.
+fun closed (l : Listener) : Bool ! { Net | e } =
+  match Net.port l with | Ok _ -> False | Err _ -> True
+
+-- Each connection `l` takes, answered on a thread of its own, until `l` is
+-- closed.
+@pub fun serveOn (l : Listener) (handler : Request -> Response ! Eff) : () ! Eff =
+  match Net.accept l with
+  | Err why -> if closed l then () else (let u = Log.warn "accept: ${why}" in serveOn l handler)
+  | Ok (s, _) ->
+      (let t = Thread.spawn (\() -> connection s handler bytesEmpty) in serveOn l handler)
+
+-- The next connection `l` takes, answered here, on this thread: what a test
+-- or a server of one client at a time wants.
+@pub fun serveOne (l : Listener) (handler : Request -> Response ! Eff) : () ! Eff =
+  match Net.accept l with
+  | Err why -> Log.warn "accept: ${why}"
+  | Ok (s, _) -> connection s handler bytesEmpty
+
+-- `handler` serving HTTP on `host`'s `port`, until the program ends.
+@pub fun serve (host : String) (port : Int) (handler : Request -> Response ! Eff)
+    : Result String () ! Eff =
+  match Net.listen host port with
+  | Err why -> Err why
+  | Ok l ->
+      (let u = Log.info "serving http on ${host}:${show port}" in
+       let v = serveOn l handler in
+       Ok ())
+
+-- The same, over TLS, as the certificate chain in the PEM file `certificate`
+-- and its key in `key` say this server is.
+@pub fun serveTls
+    (host : String)
+    (port : Int)
+    (certificate : String)
+    (key : String)
+    (handler : Request -> Response ! Eff)
+    : Result String () ! Eff =
+  match Net.listen host port with
+  | Err why -> Err why
+  | Ok l ->
+      (let u = Log.info "serving https on ${host}:${show port}" in
+       let v = tlsOn l certificate key handler in
+       Ok ())
+
+fun tlsOn (l : Listener) (certificate : String) (key : String) (handler : Request -> Response ! Eff)
+    : () ! Eff =
+  match Net.accept l with
+  | Err why ->
+      if closed l then ()
+      else (let u = Log.warn "accept: ${why}" in tlsOn l certificate key handler)
+  | Ok (plain, _) ->
+      (let t =
+         Thread.spawn (\() ->
+           match Tls.accept plain certificate key with
+           | Err why -> (let u = Log.debug "a TLS handshake failed: ${why}" in Net.close plain)
+           | Ok s -> connection s handler bytesEmpty)
+       in tlsOn l certificate key handler)
+
+-- --- the client --------------------------------------------------------------
+
+-- Where a URL points: `https://example.com:8443/a?b` is scheme "https", host
+-- "example.com", port 8443 and target "/a?b".
+@pub record Url = {
+  scheme : String,
+  host : String,
+  port : Int,
+  target : String
+}
+
+@pub fun parseUrl (url : String) : Result String Url =
+  match S.indexOf "://" url with
+  | None -> Err "`${url}` has no scheme: write `http://` or `https://`"
+  | Just i ->
+      (let scheme = S.toLower (S.take url i) in
+       let rest = S.drop url (i + 3) in
+       let (authority, target) =
+         (match S.indexOf "/" rest with
+          | Just j -> (S.take rest j, S.drop rest j)
+          | None -> (rest, "/"))
+       in
+       let defaultPort = if scheme == "https" then 443 else 80 in
+       if scheme != "http" and scheme != "https" then Err "`${scheme}` is not http or https"
+       else if authority == "" then Err "`${url}` has no host"
+       else
+         (match S.indexOf ":" authority with
+          | Just j ->
+              (match S.toInt (S.drop authority (j + 1)) with
+               | Just port -> Ok (Url { scheme, host = S.take authority j, port, target })
+               | None -> Err "`${authority}` has a port that is not a number")
+          | None -> Ok (Url { scheme, host = authority, port = defaultPort, target })))
+
+-- `method` of `url`, with `headers` and `body`.
+@pub fun request (method : String) (url : String) (headers : [(String, String)]) (body : #[UInt8])
+    : Result String Response ! { Net | e } =
+  match parseUrl url with
+  | Err why -> Err why
+  | Ok (u : Url) ->
+      (match Net.connect u.host u.port with
+       | Err why -> Err why
+       | Ok plain ->
+           (match (if u.scheme == "https" then Tls.connect plain u.host else Ok plain) with
+            | Err why -> (let c = Net.close plain in Err why)
+            | Ok s ->
+                (let host =
+                   if u.port == 80 or u.port == 443 then u.host else "${u.host}:${show u.port}"
+                 in
+                 let fixed = [("Host", host), ("User-Agent", "meadow"), ("Connection", "close")] in
+                 let sized =
+                   if bytesLength body > 0
+                     or method == "POST"
+                     or method == "PUT"
+                     or method == "PATCH" then [("Content-Length", show (bytesLength body))]
+                   else []
+                 in
+                 let head =
+                   "${method} ${u.target} HTTP/1.1\r\n${headLines (V.concat [fixed, sized, headers])}\r\n"
+                 in
+                 let sent =
+                   (match Net.writeText s head with
+                    | Err why -> Err why
+                    | Ok _ -> if bytesLength body == 0 then Ok () else Net.write s body)
+                 in
+                 let got =
+                   (match sent with
+                    | Err why -> Err why
+                    | Ok _ -> readResponse s)
+                 in
+                 let c = Net.close s in
+                 got)))
+
+@pub fun get (url : String) : Result String Response ! { Net | e } = request "GET" url [] bytesEmpty
+
+-- `body` to `url`, said to be `contentType`.
+@pub fun post (url : String) (contentType : String) (body : String)
+    : Result String Response ! { Net | e } =
+  request "POST" url [("Content-Type", contentType)] (stringToBytes body)
+
+-- --- tests -------------------------------------------------------------------
+--
+-- On one thread, as `Std.Net`'s are: what one end writes waits in the system
+-- for the other to read.
+
+use Std.Test (assertEq, assertTrue)
+
+@test fun aUrlIsTakenApart () =
+  let a =
+    assertEq
+      (M.map
+         (\(u : Url) -> (u.scheme, u.host, u.port, u.target))
+         (resultMaybe (parseUrl "https://example.com/a?b=1")))
+      (Just ("https", "example.com", 443, "/a?b=1"))
+      "https"
+  in
+  let b =
+    assertEq
+      (M.map
+         (\(u : Url) -> (u.host, u.port, u.target))
+         (resultMaybe (parseUrl "http://localhost:8080")))
+      (Just ("localhost", 8080, "/"))
+      "a port, no path"
+  in assertTrue (M.isNone (resultMaybe (parseUrl "ftp://x/"))) "not http"
+
+fun resultMaybe (r : Result String a) : Maybe a = match r with | Ok x -> Just x | Err _ -> None
+
+@test fun aRequestIsAnsweredOverAConnection () =
+  match Net.listen "127.0.0.1" 0 with
+  | Err why -> assertEq why "" "listen"
+  | Ok l ->
+      (match Net.port l with
+       | Err why -> assertEq why "" "port"
+       | Ok p ->
+           (match Net.connect "127.0.0.1" p with
+            | Err why -> assertEq why "" "connect"
+            | Ok c ->
+                (let w =
+                   Net.writeText
+                     c
+                     "POST /echo?x=1 HTTP/1.1\r\nHost: here\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+                 in
+                 let u =
+                   serveOne l (\(r : Request) ->
+                     text 201 "${r.method} ${r.path} ${r.query} ${requestText r}")
+                 in match readResponse c with
+                    | Err why -> assertEq why "" "response"
+                    | Ok (resp : Response) ->
+                        (let x = Net.close c in
+                         let y = Net.closeListener l in
+                         let a = assertEq resp.status 201 "the status" in
+                         let b =
+                           assertEq
+                             (header "content-type" resp.headers)
+                             (Just "text/plain; charset=utf-8")
+                             "a header, any case"
+                         in assertEq (bodyText resp) "POST /echo x=1 hello" "the body"))))
+
+@test fun aChunkedBodyIsJoined () =
+  match Net.listen "127.0.0.1" 0 with
+  | Err why -> assertEq why "" "listen"
+  | Ok l ->
+      (match Net.connect "127.0.0.1" (M.unwrapOr 0 (resultMaybe (Net.port l))) with
+       | Err why -> assertEq why "" "connect"
+       | Ok c ->
+           (match Net.accept l with
+            | Err why -> assertEq why "" "accept"
+            | Ok (s, _) ->
+                (let w =
+                   Net.writeText
+                     s
+                     "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n7\r\n, world\r\n0\r\n\r\n"
+                 in
+                 let v = Net.close s in
+                 let got = readResponse c in
+                 let x = Net.close c in
+                 let y = Net.closeListener l in
+                 assertEq (M.map bodyText (resultMaybe got)) (Just "hello, world") "joined")))
+
+@test fun aServerStopsWhenItsListenerCloses () =
+  match Net.listen "127.0.0.1" 0 with
+  | Err why -> assertEq why "" "listen"
+  | Ok l ->
+      (let p = M.unwrapOr 0 (resultMaybe (Net.port l)) in
+       let t = Thread.spawn (\() -> serveOn l (\(r : Request) -> text 200 "at ${r.path}")) in
+       let got = get "http://127.0.0.1:${show p}/here" in
+       let x = Net.closeListener l in
+       let y = Thread.await t in
+       assertEq (M.map bodyText (resultMaybe got)) (Just "at /here") "answered, then stopped")

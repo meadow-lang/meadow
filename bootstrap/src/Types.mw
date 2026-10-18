@@ -812,7 +812,10 @@ fun writeEach (nm : Namer) (ts : [Type]) (prec : Int) (hidden : [Int]) (sep : St
 -- braces, and a lone hidden variable is nothing.
 -- The effects the runtime answers itself, which `Std.Eff` names.
 @pub def runtimeRow : [String] =
-  ["Thread", "Console", "Fs", "Process", "Random", "Time", "Test", "Mut"]
+  [
+    "Thread", "Console", "Fs", "Process", "Random", "Time", "Test", "Mut", "Std.Log.Log",
+    "Std.Net.Net"
+  ]
 
 fun effectSuffix (nm : Namer) (eff : Type) (hidden : [Int]) : (String, Namer) =
   match rowLabels eff with

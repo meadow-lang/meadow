@@ -150,6 +150,100 @@ fn vector(items: Vec<Val>) -> Word {
     }
 }
 
+/// `Std.Net`'s sockets and `Std.Tls`'s sessions: see `meadow_rt::net`.
+fn net(op: &str, arg: Val) -> Option<Build> {
+    use meadow_rt::net;
+    let what = format!("Net.{op}");
+    let int = |v: Val| match v {
+        Val::Int(n) => n,
+        other => fail(format!("{what}: expected an Int, got {}", shown(other))),
+    };
+    let answered = |r: Result<Build, String>| match r {
+        Ok(b) => Build::ok(b),
+        Err(e) => Build::error(e),
+    };
+    // What may wait is made by `sched::blocking`, with owned values: a thread
+    // waits for it, rather than its worker.
+    use crate::sched::blocking;
+    Some(match op {
+        "tcpListen" => {
+            let t = tuple(arg, 2, &what);
+            let (host, port) = (text(t[0], &what), int(t[1]));
+            answered(net::listen(&host, port).map(Build::int))
+        }
+        "tcpConnect" => {
+            let t = tuple(arg, 2, &what);
+            let (host, port) = (text(t[0], &what), int(t[1]));
+            answered(blocking(move || net::connect(&host, port)).map(Build::int))
+        }
+        "tcpAccept" => {
+            let id = int(arg);
+            answered(
+                blocking(move || net::accept(id))
+                    .map(|(s, peer)| Build::Tuple(vec![Build::int(s), Build::Str(peer)])),
+            )
+        }
+        "tcpRead" => {
+            let t = tuple(arg, 2, &what);
+            let (id, max) = (int(t[0]), int(t[1]));
+            answered(blocking(move || net::read(id, max)).map(Build::Bytes))
+        }
+        "tcpWrite" => {
+            let t = tuple(arg, 2, &what);
+            let id = int(t[0]);
+            let bytes = crate::prims::byte_array(t[1], &what);
+            answered(blocking(move || net::write(id, &bytes)).map(Build::int))
+        }
+        "tcpClose" => {
+            net::close(int(arg));
+            Build::unit()
+        }
+        "tcpTimeout" => {
+            let t = tuple(arg, 2, &what);
+            answered(net::set_timeout(int(t[0]), int(t[1])).map(|()| Build::unit()))
+        }
+        "tcpLocalPort" => answered(net::local_port(int(arg)).map(Build::int)),
+        "resolve" => {
+            let host = text(arg, &what);
+            answered(
+                blocking(move || net::resolve(&host))
+                    .map(|ips| Build::Vector(ips.into_iter().map(Build::Str).collect())),
+            )
+        }
+        "tlsConnect" | "tlsAccept" => {
+            let t = tuple(arg, 3, &what);
+            let (id, a, b) = (int(t[0]), text(t[1], &what), text(t[2], &what));
+            let connecting = op == "tlsConnect";
+            let made = blocking(move || {
+                if connecting {
+                    net::tls_connect(id, &a, &b)
+                } else {
+                    net::tls_accept(id, &a, &b)
+                }
+            });
+            answered(made.map(Build::int))
+        }
+        _ => return None,
+    })
+}
+
+/// `Std.Log`'s line, where no handler took it: see `meadow_rt::log`.
+fn log(op: &str, arg: Val) -> Option<Build> {
+    match op {
+        "logAt" => {
+            let what = "Log.logAt";
+            let t = tuple(arg, 2, what);
+            let level = match t[0] {
+                Val::Int(n) => n,
+                other => fail(format!("{what}: expected an Int, got {}", shown(other))),
+            };
+            meadow_rt::log::line(level, &text(t[1], what));
+            Some(Build::unit())
+        }
+        _ => None,
+    }
+}
+
 fn text(v: Val, what: &str) -> String {
     match value::text(v) {
         Some(b) => String::from_utf8_lossy(&b).into_owned(),
@@ -235,6 +329,8 @@ pub unsafe extern "C" fn meadow_native(
         "Process" => process(&op, arg),
         "Random" => random(&op, arg),
         "Time" => time(&op, arg),
+        "Log" => log(&op, arg),
+        "Net" => net(&op, arg),
         _ => None,
     };
     match built {

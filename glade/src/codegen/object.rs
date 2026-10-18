@@ -102,6 +102,9 @@ impl Format {
                 "userenv.lib",
                 "ws2_32.lib",
                 "dbghelp.lib",
+                // The random numbers TLS's cryptography asks the system for.
+                "bcrypt.lib",
+                "advapi32.lib",
             ],
         }
     }

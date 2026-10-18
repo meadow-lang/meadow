@@ -1,0 +1,109 @@
+-- Std.Log: what a program says it is doing, at a level, as an effect.
+--
+--   use Std.Log as Log
+--
+--   fun serve port =
+--     let u = Log.info "listening on ${show port}" in
+--     ...
+--
+-- Where nothing handles it, the runtime writes each line to standard error
+-- with when it was said and its level, if the level is at or above the one
+-- `MEADOW_LOG` names -- `debug`, `info`, `warn`, `error` or `off`, and `info`
+-- where it is unset:
+--
+--   2026-10-17T19:12:04.512Z INFO  listening on 8080
+--
+-- Because it is an effect, a caller decides what becomes of it: `captured`
+-- collects a block's lines, as a test wants them; `silenced` drops them; and
+-- `atLeast` keeps only those at a level or above, the rest going nowhere.
+
+use Std.Collections.Vector as V
+use Std.Collections.Vector (vecFromArray)
+
+-- How much a line matters, least first.
+@derive(Debug, PartialEq)
+@pub data Level = Debug | Info | Warn | Error
+
+use Level.*
+
+@pub effect Log {
+  -- A line at a level's rank (`rank`). `log` and the functions named for
+  -- the levels are what to call.
+  logAt : (Int, String) -> (),
+}
+
+-- A level's place, from 0 for `Debug` to 3 for `Error`.
+@pub fun rank (level : Level) : Int =
+  match level with
+  | Debug -> 0
+  | Info -> 1
+  | Warn -> 2
+  | Error -> 3
+
+-- The level of a rank, the nearest where it is out of range.
+@pub fun levelOf (n : Int) : Level =
+  if n <= 0 then Debug else if n == 1 then Info else if n == 2 then Warn else Error
+
+-- `message` at `level`.
+@pub fun log (level : Level) (message : String) : () ! { Log | e } = logAt (rank level, message)
+
+@pub fun debug (message : String) : () ! { Log | e } = logAt (0, message)
+
+@pub fun info (message : String) : () ! { Log | e } = logAt (1, message)
+
+@pub fun warn (message : String) : () ! { Log | e } = logAt (2, message)
+
+@pub fun error (message : String) : () ! { Log | e } = logAt (3, message)
+
+-- --- handling ----------------------------------------------------------------
+
+-- What `act` answers, and each line it said, in order.
+@pub fun captured (act : () -> a ! { Log | e }) : (a, [(Level, String)]) ! e =
+  (handle act () with {
+     logAt line k ->
+       \said ->
+         match line with
+         | (n, message) -> (k ()) (V.pushBack said (levelOf n, message)),
+     return x -> \said -> (x, said)
+   })
+    []
+
+-- What `act` answers, saying nothing.
+@pub fun silenced (act : () -> a ! { Log | e }) : a ! e =
+  handle act () with { logAt line k -> k (), return x -> x }
+
+-- What `act` answers, its lines below `least` dropped and the rest said on.
+@pub fun atLeast (least : Level) (act : () -> a ! { Log | e }) : a ! { Log | e } =
+  handle act () with {
+    logAt line k ->
+      (match line with
+       | (n, message) -> (let u = if n >= rank least then logAt (n, message) else () in k ())),
+    return x -> x
+  }
+
+-- --- tests -------------------------------------------------------------------
+
+use Std.Test (assertEq)
+
+@test fun linesAreCapturedInOrderWithTheirLevels () =
+  let got =
+    captured (\() ->
+      let a = info "one" in
+      let b = warn "two" in
+      let c = log Error "three" in
+      7)
+  in assertEq got (7, [(Info, "one"), (Warn, "two"), (Error, "three")]) "captured"
+
+@test fun aLevelBelowTheLeastIsDropped () =
+  let got =
+    captured (\() ->
+      atLeast Warn (\() ->
+        let a = debug "d" in
+        let b = info "i" in
+        error "e"))
+  in assertEq got ((), [(Error, "e")]) "only error"
+
+@test fun silencedSaysNothing () = assertEq (silenced (\() -> let a = info "x" in 3)) 3 "silenced"
+
+@test fun ranksAndLevelsAgree () =
+  assertEq (V.map (\n -> rank (levelOf n)) [0, 1, 2, 3, 9]) [0, 1, 2, 3, 3] "round trip"

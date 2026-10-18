@@ -33,6 +33,10 @@ pub enum Request {
     Wait(Vec<(usize, u64)>),
     /// The thread failed with this message, and is done.
     Failed(String),
+    /// A call into the world that may wait -- an accept, a read -- for an
+    /// I/O thread to make, so that the worker runs another thread meanwhile:
+    /// see `crate::sched::blocking`.
+    Block(Box<dyn FnOnce() + Send>),
 }
 
 /// What a thread is woken with.

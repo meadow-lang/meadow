@@ -1,0 +1,49 @@
+-- Std.Tls: a `Std.Net` stream, encrypted.
+--
+--   use Std.Net as Net
+--   use Std.Tls as Tls
+--
+--   fun fetch () =
+--     match Net.connect "example.com" 443 with
+--     | Err why -> Err why
+--     | Ok plain ->
+--         match Tls.connect plain "example.com" with
+--         | Err why -> Err why
+--         | Ok s -> Net.writeText s "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+--
+-- What `connect` and `accept` answer is a `Stream` like any other, so
+-- `Net.read`, `Net.write` and `Net.close` carry it as they do a plain one;
+-- the plain stream it was made from is its, and is not to be used again.
+--
+-- A client checks the server's certificate against the roots browsers trust
+-- (Mozilla's), and against the name it was given. `connectTrusting` trusts one
+-- more authority as well -- a company's own, or a test's. A server is given
+-- its certificate chain and private key as PEM files. The handshake happens
+-- before either answers, so a certificate that does not check is an `Err`
+-- there, not at the first read.
+--
+-- The runtime's TLS is rustls: TLS 1.2 and 1.3, with nothing to install.
+
+use Std.Net (Net, Stream, streamId, tlsConnect, tlsAccept)
+use Std.Net.Stream.*
+use Std.Result.Result.*
+
+-- `plain` as a TLS session with `server`, checked against the usual roots.
+@pub fun connect (plain : Stream) (server : String) : Result String Stream ! { Net | e } =
+  connectTrusting plain server ""
+
+-- The same, trusting the authority in the PEM file `authority` too ("" for
+-- none).
+@pub fun connectTrusting (plain : Stream) (server : String) (authority : String)
+    : Result String Stream ! { Net | e } =
+  match tlsConnect (streamId plain, server, authority) with
+  | Ok n -> Ok (Stream n)
+  | Err why -> Err why
+
+-- `plain`, a connection a listener took, as a TLS session's server: its
+-- certificate chain in the PEM file `certificate`, and its key in `key`.
+@pub fun accept (plain : Stream) (certificate : String) (key : String)
+    : Result String Stream ! { Net | e } =
+  match tlsAccept (streamId plain, certificate, key) with
+  | Ok n -> Ok (Stream n)
+  | Err why -> Err why

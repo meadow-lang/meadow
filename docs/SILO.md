@@ -466,6 +466,15 @@ one queue, and a thread runs on whichever worker picks it up. The workers
 besides the one `main` starts on begin with the first `spawn`, so a program
 that never spawns never has a second OS thread.
 
+**A call into the world that waits** -- a socket's accept or read -- would
+hold up the worker that made it, and enough of them (a server's connections,
+each reading) would leave none to run the thread that answers. So a thread on
+the scheduler hands such a call to an I/O thread and parks
+(`sched::blocking`); the I/O thread makes it and puts the thread back to run.
+One is started whenever a call finds none of them free, and a thread waiting
+on a call is not deadlocked, whatever else waits. `meadow-glade` does the
+same, and the CEK machine makes each such call on an OS thread of its own.
+
 **A heap per thread** (`silo/src/ctx.rs`), so counting needs no atomics and no
 two workers ever touch the same block. What crosses between threads is copied
 (`silo/src/parcel.rs`): the function a thread is spawned with and everything it

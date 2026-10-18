@@ -291,6 +291,10 @@ fn run_all(
         ticker,
         profile: Mutex::new(None),
         sink,
+        waits: Arc::new(meadow_rt::net::Waits::default()),
+        io: Mutex::new(IoQueue::default()),
+        io_ready: Condvar::new(),
+        io_pending: AtomicUsize::new(0),
     };
     lock(&shared.locals[0]).push_back(main);
     // The calling thread is worker 0. The others start with the first `spawn`,
@@ -330,6 +334,8 @@ enum Wake {
     Deliver(Reg, Parcel),
     /// A new channel or thread handle, into a register.
     Handle(Reg, Kind, u32),
+    /// What a call into the world answered, into a register.
+    Built(Reg, crate::native::Build),
     /// An immediate -- a commit's `Bool`, a wait's `()` -- into a register.
     Set(Reg, crate::value::Value),
     /// What it was waiting for failed, with this message: the thread it
@@ -395,6 +401,22 @@ struct Shared<'p> {
     /// outlives every thread that samples on it, and stops when the run does.
     ticker: Option<crate::profile::Ticker>,
     profile: Mutex<Option<crate::profile::Profile>>,
+    /// The socket calls the run's threads are waiting in, stopped when it ends.
+    waits: Arc<meadow_rt::net::Waits>,
+    /// Threads waiting on a call into the world (`Request::Block`), each for
+    /// an I/O thread to make it.
+    io: Mutex<IoQueue<'p>>,
+    io_ready: Condvar,
+    /// Calls made or to be made: a thread waiting on one is not deadlocked,
+    /// whatever else is waiting.
+    io_pending: AtomicUsize,
+}
+
+#[derive(Default)]
+struct IoQueue<'p> {
+    calls: VecDeque<(Box<Fiber<'p>>, crate::vm::Work, Reg)>,
+    /// I/O threads waiting for a call.
+    idle: usize,
 }
 
 /// A lock, carrying on past a panic elsewhere: the data behind these locks is
@@ -428,6 +450,13 @@ impl<'p> Shared<'p> {
         }
         drop(finished);
         self.done.store(true, Ordering::SeqCst);
+        // A thread waiting on a socket -- a server's, accepting -- would keep
+        // its worker, and so the run, from ever ending.
+        self.waits.stop();
+        {
+            let _io = lock(&self.io);
+            self.io_ready.notify_all();
+        }
         let _guard = lock(&self.sleep);
         self.wake.notify_all();
     }
@@ -436,7 +465,12 @@ impl<'p> Shared<'p> {
     /// Called with whatever it waits on still locked, so nothing can wake it
     /// before it is counted out.
     fn release(&self) {
-        if self.active.fetch_sub(1, Ordering::SeqCst) == 1 {
+        // A call into the world counts until its thread is active again,
+        // and it is counted active before the call stops counting: so this
+        // never sees neither.
+        if self.active.fetch_sub(1, Ordering::SeqCst) == 1
+            && self.io_pending.load(Ordering::SeqCst) == 0
+        {
             // Nothing running and nothing queued: nobody is left who could
             // wake a waiting thread.
             self.finish(Err(Error {
@@ -478,6 +512,23 @@ impl Drop for StopOnPanic<'_, '_> {
     }
 }
 
+/// The worker's socket calls as the run's (`meadow_rt::net::Waits`), until
+/// it stops.
+struct JoinWaits;
+
+impl JoinWaits {
+    fn new(waits: &Arc<meadow_rt::net::Waits>) -> Self {
+        meadow_rt::net::join(waits);
+        JoinWaits
+    }
+}
+
+impl Drop for JoinWaits {
+    fn drop(&mut self) {
+        meadow_rt::net::leave();
+    }
+}
+
 /// One OS thread's view of the scheduler.
 struct Worker<'s, 'p> {
     index: usize,
@@ -515,6 +566,7 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
     fn run(mut self, scope: &'s std::thread::Scope<'s, '_>) {
         let sh = self.shared;
         let _stop_everyone = StopOnPanic(sh);
+        let _waits = JoinWaits::new(&sh.waits);
         loop {
             if sh.done.load(Ordering::SeqCst) {
                 return;
@@ -724,6 +776,24 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
                 None
             }
             Stop::Requested(request) => match request {
+                Request::Block { job, dst } => {
+                    // Counted as pending before the thread is counted out --
+                    // see `Shared::release`.
+                    sh.io_pending.fetch_add(1, Ordering::SeqCst);
+                    let more = {
+                        let mut io = lock(&sh.io);
+                        io.calls.push_back((fiber, job.0, dst));
+                        io.calls.len() > io.idle
+                    };
+                    if more {
+                        // Every I/O thread is busy waiting on a call of its own.
+                        scope.spawn(move || io_thread(sh));
+                    } else {
+                        sh.io_ready.notify_one();
+                    }
+                    sh.release();
+                    None
+                }
                 Request::Spawn { body, answer, dst } => {
                     let mut child = Box::new(Fiber {
                         vm: Vm::with_heap(sh.program, Heap::with_capacity(THREAD_INITIAL)),
@@ -897,6 +967,35 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
     }
 }
 
+/// Make the calls into the world that threads wait on, one at a time, each
+/// thread's answer handed back to the workers to run it again; until the run
+/// ends. One is started whenever a call finds none of them waiting for one,
+/// so a thread never waits for another's call.
+fn io_thread(sh: &Shared) {
+    let _waits = JoinWaits::new(&sh.waits);
+    loop {
+        let (mut fiber, work, dst) = {
+            let mut io = lock(&sh.io);
+            loop {
+                if sh.done.load(Ordering::SeqCst) {
+                    return;
+                }
+                if let Some(call) = io.calls.pop_front() {
+                    break call;
+                }
+                io.idle += 1;
+                io = sh.io_ready.wait(io).unwrap_or_else(|p| p.into_inner());
+                io.idle -= 1;
+            }
+        };
+        fiber.wake = Wake::Built(dst, work());
+        sh.active.fetch_add(1, Ordering::SeqCst);
+        lock(&sh.global).push_back(fiber);
+        sh.io_pending.fetch_sub(1, Ordering::SeqCst);
+        sh.nudge();
+    }
+}
+
 /// Deliver what the thread was woken with, then run it for a slice.
 fn run_slice(sh: &Shared, fiber: &mut Fiber) -> Stop {
     let vm = &mut fiber.vm;
@@ -911,6 +1010,10 @@ fn run_slice(sh: &Shared, fiber: &mut Fiber) -> Stop {
         Wake::Deliver(dst, parcel) => vm.deliver_parcel(dst, &parcel),
         Wake::Handle(dst, kind, id) => vm.deliver_handle(dst, kind, id),
         Wake::Set(dst, v) => vm.set(dst, v),
+        Wake::Built(dst, b) => {
+            let v = vm.build(b);
+            vm.set(dst, v);
+        }
         Wake::Fail(msg) => return Stop::Failed(Error { msg }),
     }
     for n in 0..SLICE {

@@ -1,0 +1,149 @@
+-- Std.Net: TCP sockets, as an effect the runtime answers.
+--
+--   use Std.Net as Net
+--
+--   fun serve () =
+--     match Net.listen "127.0.0.1" 8080 with
+--     | Err why -> println "cannot listen: ${why}"
+--     | Ok l ->
+--         match Net.accept l with
+--         | Ok (s, peer) -> Net.writeText s "hello, ${peer}\n"
+--         | Err why -> println why
+--
+-- A `Listener` takes connections and a `Stream` carries bytes both ways. Every
+-- operation answers `Err` with what went wrong -- a peer that went away, a
+-- port in use, a read that timed out -- rather than stopping the program.
+-- `Std.Tls` makes a stream encrypted; the same `read` and `write` then carry
+-- it, so code over a `Stream` does not care which it has.
+--
+-- An operation that waits -- an accept, a read -- holds up the thread that
+-- makes it and nothing else: the runtime waits for it off the cores that run
+-- the program's threads, which go on running the others. So a server that
+-- answers many connections at once gives each a thread of its own
+-- (`Std.Thread.spawn`), as `Std.Http`'s does.
+
+use Std.Collections.Vector as V
+use Std.Collections.Vector (Vector, vecFromArray)
+use Std.Result.Result.*
+
+@pub effect Net {
+  tcpListen : (String, Int) -> Result String Int,
+  tcpAccept : Int -> Result String (Int, String),
+  tcpConnect : (String, Int) -> Result String Int,
+  tcpRead : (Int, Int) -> Result String #[UInt8],
+  tcpWrite : (Int, #[UInt8]) -> Result String Int,
+  tcpClose : Int -> (),
+  tcpTimeout : (Int, Int) -> Result String (),
+  tcpLocalPort : Int -> Result String Int,
+  resolve : String -> Result String (Vector String),
+  -- A stream as a TLS session's client, with the server's name and one more
+  -- authority's PEM file to trust ("" for none); or as its server, with the
+  -- certificate chain's and the key's. See `Std.Tls`.
+  tlsConnect : (Int, String, String) -> Result String Int,
+  tlsAccept : (Int, String, String) -> Result String Int,
+}
+
+-- A socket that takes connections.
+@derive(Debug, PartialEq)
+@pub data Listener = Listener Int
+
+-- A connection: what one end writes, the other reads.
+@derive(Debug, PartialEq)
+@pub data Stream = Stream Int
+
+-- The handle the runtime knows a stream by, for `Std.Tls`.
+@pub fun streamId (s : Stream) : Int = match s with | Stream n -> n
+
+-- A listener on `host`'s `port`: `"0.0.0.0"` for every address, `"127.0.0.1"`
+-- for this machine alone, and port 0 for any free one (`port` says which).
+@pub fun listen (host : String) (port : Int) : Result String Listener ! { Net | e } =
+  match tcpListen (host, port) with
+  | Ok n -> Ok (Listener n)
+  | Err why -> Err why
+
+-- The next connection, waiting for one, and the address it came from.
+@pub fun accept (l : Listener) : Result String (Stream, String) ! { Net | e } =
+  match l with
+  | Listener n ->
+      (match tcpAccept n with
+       | Ok (s, peer) -> Ok (Stream s, peer)
+       | Err why -> Err why)
+
+-- A connection to `host`'s `port`.
+@pub fun connect (host : String) (port : Int) : Result String Stream ! { Net | e } =
+  match tcpConnect (host, port) with
+  | Ok n -> Ok (Stream n)
+  | Err why -> Err why
+
+-- Up to `max` bytes, waiting for at least one: none at all is the end of the
+-- stream, the other end having closed it.
+@pub fun read (s : Stream) (max : Int) : Result String #[UInt8] ! { Net | e } =
+  tcpRead (streamId s, max)
+
+-- The same, as text (UTF-8, a malformed byte read as U+FFFD).
+@pub fun readText (s : Stream) (max : Int) : Result String String ! { Net | e } =
+  match read s max with
+  | Ok b -> Ok (bytesToString b)
+  | Err why -> Err why
+
+-- All of `bytes`.
+@pub fun write (s : Stream) (bytes : #[UInt8]) : Result String () ! { Net | e } =
+  match tcpWrite (streamId s, bytes) with
+  | Ok _ -> Ok ()
+  | Err why -> Err why
+
+@pub fun writeText (s : Stream) (text : String) : Result String () ! { Net | e } =
+  write s (stringToBytes text)
+
+-- Close the stream; closing one twice does nothing.
+@pub fun close (s : Stream) : () ! { Net | e } = tcpClose (streamId s)
+
+@pub fun closeListener (l : Listener) : () ! { Net | e } = match l with | Listener n -> tcpClose n
+
+-- How long a read or a write waits before it is `Err "timed out"`, in
+-- milliseconds; 0 for as long as it takes, which is how a stream starts.
+@pub fun setTimeout (s : Stream) (millis : Int) : Result String () ! { Net | e } =
+  tcpTimeout (streamId s, millis)
+
+-- The port a listener is on: the one port 0 was given.
+@pub fun port (l : Listener) : Result String Int ! { Net | e } =
+  match l with | Listener n -> tcpLocalPort n
+
+-- The addresses a name has.
+@pub fun lookup (host : String) : Result String [String] ! { Net | e } = resolve host
+
+-- --- tests -------------------------------------------------------------------
+--
+-- On one thread: a connection is made before it is accepted, and what is
+-- written waits in the system until it is read.
+
+use Std.Test (assertEq, assertTrue)
+
+fun unwrap (r : Result String a) (otherwise : a) : a = match r with | Ok x -> x | Err _ -> otherwise
+
+@test fun aStreamCarriesWhatIsWrittenToIt () =
+  match listen "127.0.0.1" 0 with
+  | Err why -> assertEq why "" "listen"
+  | Ok l ->
+      let p = unwrap (port l) 0 in
+      (match connect "127.0.0.1" p with
+       | Err why -> assertEq why "" "connect"
+       | Ok c ->
+           (match accept l with
+            | Err why -> assertEq why "" "accept"
+            | Ok (s, peer) ->
+                let a = writeText c "hello" in
+                let b = close c in
+                let got = unwrap (readText s 64) "" in
+                let rest = unwrap (read s 64) (stringToBytes "?") in
+                let u = close s in
+                let v = closeListener l in
+                let w = assertTrue (arrayLen rest == 0) "then the end" in
+                assertEq got "hello" "what was written"))
+
+@test fun aClosedStreamIsAnErrorNotACrash () =
+  match connect "127.0.0.1" 1 with
+  | Ok s -> close s
+  | Err why -> assertTrue (why != "") "said why"
+
+@test fun aNameHasAnAddress () = assertTrue (V.len (unwrap (lookup "localhost") []) > 0) "localhost"

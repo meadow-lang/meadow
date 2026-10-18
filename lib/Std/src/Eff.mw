@@ -6,12 +6,14 @@
 -- effect of a program's own is handled inside `main`, where a handler can see
 -- it:
 --
---   effect Log { log : String -> () }
+--   effect Note { note : String -> () }
 --
 --   fun main () : () ! Eff =
---     handle greet () with { log line k -> let u = println line in k () }
+--     handle greet () with { note line k -> let u = println line in k () }
 --
 -- `Console`, `Fs`, `Process`, `Random` and `Time` are the outside world;
+-- `Log` is what a program says it is doing, written to standard error;
+-- `Net` is its sockets, plain and TLS;
 -- `Test` is a failed assertion; `Mut` is a `Ref`'s, and `Thread` a green
 -- thread's.
 
@@ -21,6 +23,8 @@ use Std.Process (Process)
 use Std.Random (Random)
 use Std.Time (Time)
 use Std.Test (Test)
+use Std.Log (Log)
+use Std.Net (Net)
 
 @pub effect Eff = {
   Console,
@@ -29,6 +33,8 @@ use Std.Test (Test)
   Random,
   Time,
   Test,
+  Log,
+  Net,
   Mut,
   Thread
 }

@@ -13,7 +13,17 @@ num-traits.workspace = true
 meadow-intern.workspace = true
 meadow-span.workspace = true
 serde.workspace = true
+# Sockets' TLS, for `Std.Tls`: `net.rs`. rustls with ring's cryptography, so
+# that nothing has to be installed where a program runs, and Mozilla's roots
+# to check a server against.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+webpki-roots = "1"
 
 # What a terminal is set with and asked through: `terminal.rs`.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# A certificate to test TLS with.
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }

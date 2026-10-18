@@ -327,6 +327,16 @@ a `str` error.
 | `Time.monotonic`                                   | `unit`                       | `i64`, nanoseconds                                          |
 | `Time.sleep`                                       | `i64`, milliseconds          | `unit`                                                      |
 | `Test.fail`                                        | `str`                        | does not return: stops with the message, status 1           |
+| `Log.logAt`                                        | `(i64, str)`, a level's rank | `unit`: a line to standard error, by `MEADOW_LOG`'s level   |
+| `Net.tcpListen`, `Net.tcpConnect`                  | `(str, i64)`, host and port  | fallible `i64`, a socket's handle                           |
+| `Net.tcpAccept`                                    | `i64`, a listener            | fallible `(i64, str)`: a stream and its peer's address      |
+| `Net.tcpRead`                                      | `(i64, i64)`, at most so many| fallible array of `u8`; empty at the end of the stream      |
+| `Net.tcpWrite`                                     | `(i64, ptr)`, an array       | fallible `i64`, the bytes written                           |
+| `Net.tcpClose`                                     | `i64`                        | `unit`                                                      |
+| `Net.tcpTimeout`                                   | `(i64, i64)`, milliseconds   | fallible `unit`                                             |
+| `Net.tcpLocalPort`                                 | `i64`                        | fallible `i64`                                              |
+| `Net.resolve`                                      | `str`, a host's name         | fallible sequence of `str`, its addresses                   |
+| `Net.tlsConnect`, `Net.tlsAccept`                  | `(i64, str, str)`: see `Std.Tls` | fallible `i64`, the session that takes the stream's place |
 
 A sequence a runtime makes -- `Process.argv`'s, and any other an operation
 answers as a sequence -- is a vector if the program declares the vector roles,

@@ -428,6 +428,8 @@ enum Request {
     Receive(u32),
     StmCommit,
     StmWait,
+    /// A call into the world that may wait: see [`NetCall`].
+    Block(Box<dyn FnOnce() -> NetAnswer + Send>),
 }
 
 impl<'a> Machine<'a> {
@@ -1374,6 +1376,22 @@ impl<'a> Machine<'a> {
             }
             if &*effect == "Console" {
                 let result = native_console(&op, arg)?;
+                self.ctrl = Control::Ret(result);
+                return Ok(());
+            }
+            if &*effect == "Net" || &*effect == "Std.Net.Net" {
+                match native_net(&op, arg)? {
+                    NetCall::Now(v) => self.ctrl = Control::Ret(v),
+                    NetCall::Later(call) => {
+                        // Answered by the scheduler once the call is made.
+                        self.ctrl = Control::Ret(Value::Unit);
+                        self.request = Some(Request::Block(call));
+                    }
+                }
+                return Ok(());
+            }
+            if &*effect == "Log" || &*effect == "Std.Log.Log" {
+                let result = native_log(&op, arg)?;
                 self.ctrl = Control::Ret(result);
                 return Ok(());
             }
@@ -2993,6 +3011,160 @@ pub fn read_exact_bounded<R: std::io::Read>(
 }
 
 /// The runtime's default handler for the `Std.Time` effect: the real clock.
+/// What a `Net` operation comes to: an answer now, or a call that may wait
+/// -- an accept, a read -- for [`schedule`] to make on an OS thread of its
+/// own while the other threads run.
+enum NetCall {
+    Now(Value),
+    Later(Box<dyn FnOnce() -> NetAnswer + Send>),
+}
+
+/// What a call answered, before it is a value: made on another OS thread,
+/// where a value -- reference-counted -- cannot go.
+enum NetAnswer {
+    Int(Result<i64, String>),
+    Accepted(Result<(i64, String), String>),
+    Bytes(Result<Vec<u8>, String>),
+    Names(Result<Vec<String>, String>),
+}
+
+fn net_value(a: NetAnswer) -> Value {
+    let sv = |s: String| Value::Str(InternedString::from(s));
+    let answered = |r: Result<Value, String>| match r {
+        Ok(v) => Value::ctor(InternedString::from("Result.Ok"), vec![v]),
+        Err(m) => Value::ctor(InternedString::from("Result.Err"), vec![sv(m)]),
+    };
+    match a {
+        NetAnswer::Int(r) => answered(r.map(Value::Int)),
+        NetAnswer::Accepted(r) => {
+            answered(r.map(|(s, peer)| Value::Tuple(vec![Value::Int(s), sv(peer)])))
+        }
+        NetAnswer::Bytes(r) => answered(r.map(|b| {
+            Value::Array(Rc::new(
+                b.into_iter()
+                    .map(|x| Value::Word(num::Width::U8, u64::from(x)))
+                    .collect(),
+            ))
+        })),
+        NetAnswer::Names(r) => {
+            answered(r.map(|ips| vector_value(ips.into_iter().map(sv).collect())))
+        }
+    }
+}
+
+/// `Std.Net`'s sockets and `Std.Tls`'s sessions: see `meadow_rt::net`.
+fn native_net(op: &str, arg: Value) -> Result<NetCall, RuntimeError> {
+    use meadow_core::net;
+    let sv = |s: String| Value::Str(InternedString::from(s));
+    let answered = |r: Result<Value, String>| match r {
+        Ok(v) => Value::ctor(InternedString::from("Result.Ok"), vec![v]),
+        Err(m) => Value::ctor(InternedString::from("Result.Err"), vec![sv(m)]),
+    };
+    let wrong = |arg: &Value| err(format!("Net.{op}: unexpected argument {arg}"));
+    let int = |v: &Value| match v {
+        Value::Int(n) => Some(*n),
+        _ => None,
+    };
+    let text = |v: &Value| match v {
+        Value::Str(s) => Some(s.to_string()),
+        _ => None,
+    };
+    let parts = |v: &Value| match v {
+        Value::Tuple(t) => t.to_vec(),
+        _ => Vec::new(),
+    };
+    let t = parts(&arg);
+    let later = |f: Box<dyn FnOnce() -> NetAnswer + Send>| Ok(NetCall::Later(f));
+    Ok(NetCall::Now(match op {
+        "tcpListen" => match (t.first().and_then(text), t.get(1).and_then(int)) {
+            (Some(host), Some(port)) => answered(net::listen(&host, port).map(Value::Int)),
+            _ => return wrong(&arg),
+        },
+        "tcpConnect" => match (t.first().and_then(text), t.get(1).and_then(int)) {
+            (Some(host), Some(port)) => {
+                return later(Box::new(move || NetAnswer::Int(net::connect(&host, port))));
+            }
+            _ => return wrong(&arg),
+        },
+        "tcpAccept" => match int(&arg) {
+            Some(id) => return later(Box::new(move || NetAnswer::Accepted(net::accept(id)))),
+            None => return wrong(&arg),
+        },
+        "tcpRead" => match (t.first().and_then(int), t.get(1).and_then(int)) {
+            (Some(id), Some(max)) => {
+                return later(Box::new(move || NetAnswer::Bytes(net::read(id, max))));
+            }
+            _ => return wrong(&arg),
+        },
+        "tcpWrite" => match (t.first().and_then(int), t.get(1)) {
+            (Some(id), Some(Value::Array(xs))) => {
+                let bytes: Vec<u8> = xs
+                    .iter()
+                    .map(|x| match x {
+                        Value::Word(_, w) => *w as u8,
+                        Value::Int(n) => *n as u8,
+                        _ => 0,
+                    })
+                    .collect();
+                return later(Box::new(move || NetAnswer::Int(net::write(id, &bytes))));
+            }
+            _ => return wrong(&arg),
+        },
+        "tcpClose" => match int(&arg) {
+            Some(id) => {
+                net::close(id);
+                Value::Unit
+            }
+            None => return wrong(&arg),
+        },
+        "tcpTimeout" => match (t.first().and_then(int), t.get(1).and_then(int)) {
+            (Some(id), Some(ms)) => answered(net::set_timeout(id, ms).map(|()| Value::Unit)),
+            _ => return wrong(&arg),
+        },
+        "tcpLocalPort" => match int(&arg) {
+            Some(id) => answered(net::local_port(id).map(Value::Int)),
+            None => return wrong(&arg),
+        },
+        "resolve" => match text(&arg) {
+            Some(host) => return later(Box::new(move || NetAnswer::Names(net::resolve(&host)))),
+            None => return wrong(&arg),
+        },
+        "tlsConnect" | "tlsAccept" => match (
+            t.first().and_then(int),
+            t.get(1).and_then(text),
+            t.get(2).and_then(text),
+        ) {
+            (Some(id), Some(a), Some(b)) => {
+                let connecting = op == "tlsConnect";
+                return later(Box::new(move || {
+                    NetAnswer::Int(if connecting {
+                        net::tls_connect(id, &a, &b)
+                    } else {
+                        net::tls_accept(id, &a, &b)
+                    })
+                }));
+            }
+            _ => return wrong(&arg),
+        },
+        _ => return err(format!("unhandled effect Net.{op}")),
+    }))
+}
+
+/// `Std.Log`'s line, where no handler took it: see `meadow_rt::log`.
+fn native_log(op: &str, arg: Value) -> Result<Value, RuntimeError> {
+    match (op, &arg) {
+        ("logAt", Value::Tuple(t)) if t.len() == 2 => match (&t[0], &t[1]) {
+            (Value::Int(n), Value::Str(s)) => {
+                meadow_core::log::line(*n, s);
+                Ok(Value::Unit)
+            }
+            _ => err(format!("Log.logAt: expected (Int, String), got {arg}")),
+        },
+        ("logAt", other) => err(format!("Log.logAt: expected (Int, String), got {other}")),
+        _ => err(format!("unhandled effect Log.{op}")),
+    }
+}
+
 fn native_time(op: &str, arg: Value) -> Result<Value, RuntimeError> {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     // A process-wide origin, so `monotonic` is a small number that fits an `Int`
@@ -3325,8 +3497,42 @@ fn schedule(main: Machine<'_>) -> Result<Value, RuntimeError> {
     // Threads parked by `retry`, and which `TVar`s -- by address -- each waits on.
     let mut parked: Vec<Option<(Machine, u32)>> = Vec::new();
     let mut stm_waiters: HashMap<usize, Vec<usize>> = HashMap::new();
+    // Threads waiting on a call into the world, each made on an OS thread of
+    // its own, whose answers come back here; and the calls, for the run to
+    // stop when it ends (see `meadow_rt::net::Waits`).
+    let mut calling: Vec<Option<(Machine, u32)>> = Vec::new();
+    let mut pending = 0usize;
+    let (answers, answered) = std::sync::mpsc::channel::<(usize, NetAnswer)>();
+    let waits = Arc::new(core::net::Waits::default());
+    struct StopCalls(Arc<core::net::Waits>);
+    impl Drop for StopCalls {
+        fn drop(&mut self) {
+            self.0.stop();
+        }
+    }
+    let _stop = StopCalls(waits.clone());
 
-    while let Some((mut m, task)) = ready.pop_front() {
+    loop {
+        // Every answer in, waiting for one only when nothing else can run.
+        let mut came = Vec::new();
+        while let Ok(a) = answered.try_recv() {
+            came.push(a);
+        }
+        if came.is_empty() && ready.is_empty() && pending > 0 {
+            if let Ok(a) = answered.recv() {
+                came.push(a);
+            }
+        }
+        for (slot, a) in came {
+            if let Some((mut w, wt)) = calling[slot].take() {
+                pending -= 1;
+                w.ctrl = Control::Ret(net_value(a));
+                ready.push_back((w, wt));
+            }
+        }
+        let Some((mut m, task)) = ready.pop_front() else {
+            break;
+        };
         loop {
             match m.run_slice() {
                 Stop::Preempted => {
@@ -3376,6 +3582,17 @@ fn schedule(main: Machine<'_>) -> Result<Value, RuntimeError> {
                     Request::Yield => {
                         m.ctrl = Control::Ret(Value::Unit);
                         ready.push_back((m, task));
+                        break;
+                    }
+                    Request::Block(call) => {
+                        let slot = calling.len();
+                        calling.push(Some((m, task)));
+                        pending += 1;
+                        let (answers, waits) = (answers.clone(), waits.clone());
+                        std::thread::spawn(move || {
+                            core::net::join(&waits);
+                            let _ = answers.send((slot, call()));
+                        });
                         break;
                     }
                     Request::NewChannel => {
