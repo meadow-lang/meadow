@@ -72,6 +72,17 @@ pub type DefIndex = std::collections::HashMap<VarId, Loc>;
 pub struct NameIndex {
     pub types: std::collections::HashMap<InternedString, Loc>,
     pub ctors: std::collections::HashMap<InternedString, Loc>,
+    /// Each module, by package and path (`Std.Collections.Vector`; the bare
+    /// package name for its root), at the start of its file.
+    pub modules: std::collections::HashMap<InternedString, Loc>,
+    /// Each record's fields, by [`field_key`]: the record's canonical name
+    /// and the field's.
+    pub fields: std::collections::HashMap<InternedString, Loc>,
+}
+
+/// How a field is known: `Point.x`, by the record's canonical name.
+fn field_key(record: InternedString, field: InternedString) -> InternedString {
+    InternedString::from(format!("{record}.{field}").as_str())
 }
 
 impl NameIndex {
@@ -79,6 +90,22 @@ impl NameIndex {
         match ns {
             Namespace::Type => self.types.get(&name),
             Namespace::Ctor => self.ctors.get(&name),
+            Namespace::Module => self.modules.get(&name),
+            // `*.x`: a field of a record the type does not name -- one
+            // written `{ x = 1 }`, or read off a value inferred as any
+            // record with an `x`. The record here that has one, the first
+            // by name where several do.
+            Namespace::Field if name.starts_with("*.") => {
+                let suffix = &name[1..];
+                let mut found: Vec<(&InternedString, &Loc)> = self
+                    .fields
+                    .iter()
+                    .filter(|(k, _)| k.ends_with(suffix))
+                    .collect();
+                found.sort_by_key(|(k, _)| k.to_string());
+                found.first().map(|(_, l)| *l)
+            }
+            Namespace::Field => self.fields.get(&name),
         }
         .copied()
     }
@@ -86,6 +113,26 @@ impl NameIndex {
     fn absorb(&mut self, other: NameIndex) {
         self.types.extend(other.types);
         self.ctors.extend(other.ctors);
+        self.modules.extend(other.modules);
+        self.fields.extend(other.fields);
+    }
+
+    /// Where the modules of `pkg` are: at the start of each one's file.
+    fn modules_of(&mut self, pkg: &CompiledPackage) {
+        for m in &pkg.modules {
+            let mut key = pkg.name.to_string();
+            for seg in &m.path {
+                key.push('.');
+                key.push_str(seg);
+            }
+            self.modules.insert(
+                InternedString::from(key.as_str()),
+                Loc {
+                    source: m.source,
+                    span: Span::new(0, 0),
+                },
+            );
+        }
     }
 }
 
@@ -162,6 +209,12 @@ pub enum Namespace {
     Type,
     /// In an expression or a pattern: `Just x`.
     Ctor,
+    /// A module: a `use` path's segments, an `as` alias, and the qualifier
+    /// of `V.map`. Matched by package and path.
+    Module,
+    /// A record's field, where it is declared and where it is read, built or
+    /// updated: matched by [`field_key`], the record found from the type.
+    Field,
 }
 
 /// What a rename is renaming, and where it was declared.
@@ -775,6 +828,7 @@ impl Std {
         for (var, scheme) in &pkg.generalized {
             a.schemes.entry(*var).or_insert_with(|| scheme.to_string());
         }
+        a.names.modules_of(&pkg);
         for m in &pkg.modules {
             if m.source.id == here.id {
                 let mut w = Walk {
@@ -910,6 +964,7 @@ impl Std {
         for (var, scheme) in &pkg.generalized {
             a.schemes.entry(*var).or_insert_with(|| scheme.to_string());
         }
+        a.names.modules_of(&pkg);
         for m in &pkg.modules {
             let mut w = Walk {
                 types: Some(&pkg.types),
@@ -968,6 +1023,7 @@ pub fn of_unit(pkg: &CompiledPackage, text: &str, source: Source) -> Analysis {
         declarations: Vec::new(),
         ir: Default::default(),
     };
+    a.names.modules_of(pkg);
     for m in &pkg.modules {
         if m.source.id != source.id {
             continue;
@@ -1327,6 +1383,9 @@ fn absorb_refs(a: &mut Analysis, m: &meadow_compiler::TypedModule) {
             meadow_compiler::rename::NameRef::Ctor(n) => {
                 a.name_refs.push((r.span, n, Namespace::Ctor))
             }
+            meadow_compiler::rename::NameRef::Module(n) => {
+                a.name_refs.push((r.span, n, Namespace::Module))
+            }
         }
     }
     // What a derive wrote stands at an empty span: it is nobody's text, and
@@ -1379,17 +1438,39 @@ pub fn mentions(pkg: &CompiledPackage, others: &[&CompiledPackage]) -> Vec<(Sour
                 what: Mentioned::Value(v),
                 declared: defs.get(&v).copied(),
             });
-            let named = a.name_refs.iter().map(|&(span, n, ns)| Mention {
-                span,
-                what: match ns {
-                    Namespace::Type => Mentioned::Type(n),
-                    Namespace::Ctor => Mentioned::Ctor(n),
-                },
-                declared: names.get(n, ns),
+            // Modules aside: MeadowBoot's resolver, which these are checked
+            // against, does not say where a module is mentioned.
+            let named = a.name_refs.iter().filter_map(|&(span, n, ns)| {
+                Some(Mention {
+                    span,
+                    what: match ns {
+                        Namespace::Type => Mentioned::Type(n),
+                        Namespace::Ctor => Mentioned::Ctor(n),
+                        Namespace::Module | Namespace::Field => return None,
+                    },
+                    declared: names.get(n, ns),
+                })
             });
             (m.source, values.chain(named).collect())
         })
         .collect()
+}
+
+/// Where `word` is next written in `text` at or after `from`, as a whole word.
+fn word_at(text: &str, word: &str, from: usize) -> Option<usize> {
+    let ident = |c: char| c.is_alphanumeric() || c == '_' || c == '\'';
+    let mut at = from.min(text.len());
+    while let Some(i) = text.get(at..)?.find(word) {
+        let start = at + i;
+        let end = start + word.len();
+        let before = text[..start].chars().next_back().is_some_and(ident);
+        let after = text[end..].chars().next().is_some_and(ident);
+        if !before && !after {
+            return Some(start);
+        }
+        at = end;
+    }
+    None
 }
 
 /// Walk every module of `pkg` for its definitions alone.
@@ -1398,6 +1479,7 @@ pub fn mentions(pkg: &CompiledPackage, others: &[&CompiledPackage]) -> Vec<(Sour
 /// what costs, and a package nobody has open needs none of them — so `types` is
 /// `None` and `record` does nothing.
 fn index_package(pkg: &CompiledPackage, into: &mut DefIndex, names: &mut NameIndex) {
+    names.modules_of(pkg);
     for m in &pkg.modules {
         let mut scratch = Analysis::empty();
         let mut w = Walk {
@@ -1526,6 +1608,18 @@ impl Walk<'_> {
             }
             hir::Decl::Record(rd) => {
                 self.declare(Namespace::Type, rd.name, rd.name_span);
+                // The HIR keeps a field's name and not where it was written:
+                // each is the next mention of its name after the last.
+                let source = self.source;
+                let text = &source.content;
+                let mut from = rd.name_span.end as usize;
+                for (field, _) in &rd.fields {
+                    if let Some(at) = word_at(text, field, from) {
+                        let span = Span::new(at as u32, (at + field.len()) as u32);
+                        self.declare(Namespace::Field, field_key(rd.name, *field), span);
+                        from = at + field.len();
+                    }
+                }
                 rd.fields.iter().for_each(|(_, t)| self.ty(t));
             }
             hir::Decl::Effect(ed) => {
@@ -1594,6 +1688,20 @@ impl Walk<'_> {
         }
     }
 
+    /// `label`, a field of the record whose value is the node `of`: a
+    /// reference to the field, where the record's type is known.
+    fn field(&mut self, of: hir::NodeId, label: &hir::Label) {
+        let Some(types) = self.types else {
+            return;
+        };
+        let record = match types.get(of) {
+            Some(meadow_compiler::infer::Type::Con(record, _)) => *record,
+            _ => InternedString::from("*"),
+        };
+        let key = field_key(record, *label.value());
+        self.a.name_refs.push((label.span, key, Namespace::Field));
+    }
+
     /// `Show a` in a `where`: a reference to the trait, and to what its type
     /// mentions.
     fn bound(&mut self, b: &hir::Bound) {
@@ -1612,6 +1720,8 @@ impl Walk<'_> {
         match ns {
             Namespace::Type => self.a.names.types.insert(name, loc),
             Namespace::Ctor => self.a.names.ctors.insert(name, loc),
+            Namespace::Module => self.a.names.modules.insert(name, loc),
+            Namespace::Field => self.a.names.fields.insert(name, loc),
         };
         // Standing on the declaration itself counts as referring to it, the way
         // it does for a value binding.
@@ -1751,7 +1861,12 @@ impl Walk<'_> {
                     .push((name.span, *name.value(), Namespace::Ctor));
                 ps.iter().for_each(|q| self.pat(q, hint));
             }
-            hir::Pat::Record(fs, _) => fs.iter().for_each(|(_, q)| self.pat(q, hint)),
+            hir::Pat::Record(fs, _) => {
+                for (label, q) in fs {
+                    self.field(p.id, label);
+                    self.pat(q, hint);
+                }
+            }
             hir::Pat::View(f, q) => {
                 self.expr(f);
                 self.pat(q, hint);
@@ -1804,15 +1919,24 @@ impl Walk<'_> {
                 xs.iter().for_each(|x| self.expr(x));
             }
             hir::Expr::Record(fs, base) => {
-                fs.iter().for_each(|(_, x)| self.expr(x));
+                for (label, x) in fs {
+                    self.field(e.id, label);
+                    self.expr(x);
+                }
                 if let Some(b) = base {
                     self.expr(b);
                 }
             }
-            hir::Expr::Field(x, _) => self.expr(x),
+            hir::Expr::Field(x, label) => {
+                self.field(x.id, label);
+                self.expr(x)
+            }
             hir::Expr::Update(base, fs) => {
                 self.expr(base);
-                fs.iter().for_each(|(_, x)| self.expr(x));
+                for (label, x) in fs {
+                    self.field(base.id, label);
+                    self.expr(x);
+                }
             }
             hir::Expr::Handle(body, arms, ret) => {
                 self.expr(body);
@@ -1895,17 +2019,22 @@ impl Analysis {
                 return Some(*loc);
             }
         }
-        // Then a type or a data constructor. Innermost wins, so `Int` inside
-        // `Maybe Int` beats the `Maybe` whose span encloses it.
-        let (_, name, ns) = self
+        // Then a type, a data constructor or a module. Innermost wins, so
+        // `Int` inside `Maybe Int` beats the `Maybe` whose span encloses it;
+        // and the first that is found anywhere, since what a derive writes
+        // -- a `use`, say -- can stand at the span of the type it is for.
+        let mut here: Vec<&(Span, InternedString, Namespace)> = self
             .name_refs
             .iter()
             .filter(|(s, _, _)| covers(*s, offset))
-            .min_by_key(|(s, _, _)| s.end - s.start)?;
-        self.names
-            .get(*name, *ns)
-            .or_else(|| self.wider_names.get(*name, *ns))
-            .or_else(|| declared.get(*name, *ns))
+            .collect();
+        here.sort_by_key(|(s, _, _)| s.end - s.start);
+        here.into_iter().find_map(|(_, name, ns)| {
+            self.names
+                .get(*name, *ns)
+                .or_else(|| self.wider_names.get(*name, *ns))
+                .or_else(|| declared.get(*name, *ns))
+        })
     }
 
     // --- rename --------------------------------------------------------------
@@ -2007,6 +2136,12 @@ impl Analysis {
             .min_by_key(|(s, _, _)| s.end - s.start)
             .copied()
             .ok_or_else(|| "nothing to rename here".to_string())?;
+        if ns == Namespace::Module {
+            return Err("a module is named by its file: rename the file".to_string());
+        }
+        if ns == Namespace::Field {
+            return Err("renaming a field is not supported yet".to_string());
+        }
         if let Some(loc) = self.names.get(name, ns) {
             return Ok((span, Target::Name(name, ns, (None, loc.span))));
         }

@@ -1206,6 +1206,31 @@ fn use_in(
     if segs.is_empty() {
         return Vec::new();
     }
+    // Every module the path passes through is a mention of it, for an editor
+    // to follow: `Std`, `Std.Collections` and `Std.Collections.Vector`. By
+    // package and path, a sibling's under this package's name. A segment that
+    // is a type rather than a module names nothing an editor will find.
+    let module_of = |prefix: &[InternedString]| -> InternedString {
+        let local = if prefix[0] == pkg {
+            &prefix[1..]
+        } else {
+            prefix
+        };
+        if prefix[0] == pkg || resolver.has_module(local) {
+            let mut full = vec![pkg];
+            full.extend_from_slice(local);
+            InternedString::from(dotted(&full).as_str())
+        } else {
+            InternedString::from(dotted(prefix).as_str())
+        }
+    };
+    let mentioned: Vec<(meadow_span::Span, InternedString)> = (1..=segs.len())
+        .map(|i| (u.path[i - 1].span, module_of(&segs[..i])))
+        .collect();
+    let whole = module_of(&segs);
+    for (span, m) in mentioned {
+        resolver.note_ref(span, NameRef::Module(m));
+    }
     // `use M (vec!)` selects a macro and nothing else. Expansion has already
     // taken it, and what is left must not be read as a bare `use M`, which
     // would bring in every name the module has.
@@ -1273,6 +1298,8 @@ fn use_in(
                 let values = resolver.module_values(&local);
                 resolver.activate_module(*a.value(), values);
                 resolver.activate_local_types(*a.value(), &local);
+                resolver.qualifier_names(*a.value(), whole);
+                resolver.note_ref(a.span, NameRef::Module(whole));
             }
             None => types_brought.extend(resolver.use_module(&local, &u.names)),
         }
@@ -1421,6 +1448,8 @@ fn use_in(
         Some(a) => {
             resolver.activate_module(*a.value(), map.clone());
             resolver.activate_module_types(*a.value(), &module_types(pkg, &segs, deps));
+            resolver.qualifier_names(*a.value(), whole);
+            resolver.note_ref(a.span, NameRef::Module(whole));
         }
         // `use M` — bring every exported name into scope unqualified. Qualifying
         // is what `as` is for, so a bare `use` does not introduce one.

@@ -188,6 +188,8 @@ pub fn classified(text: &str, scope: &Scope<'_>) -> Vec<(usize, usize, u32)> {
                     match ns {
                         Namespace::Ctor => "enumMember",
                         Namespace::Type => "type",
+                        Namespace::Module => "namespace",
+                        Namespace::Field => "variable",
                     }
                 } else if in_use_path {
                     // `Ty` in `use M.Ty (C)` resolved above; the rest of a
