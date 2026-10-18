@@ -459,6 +459,21 @@ pattern is a comparison: `prim eq(n, 0; c_other, c_zero)`. A test's
 continuations receive `unit`, so a branch is written `μ̃ u: unit. s`: no
 consumer is value-less.
 
+**A primitive's answer given straight to a continuation's name has no
+representation written**, since a continuation is a `ptr`. Where the
+primitive says what it answers -- a comparison a `bool`, `arrayLen` an `i64`,
+arithmetic its operands' -- the back end takes that. Where the answer is
+whatever was stored -- `arrayGet`, `getRef`, `select` -- it is taken to be a
+`ptr`, which it is only if what was stored is. Anything else must be bound
+at its representation first:
+
+```text
+prim arrayGet(xs, i; μ̃ x: 'a. <x | k>)    an element of rep 'a, to k
+```
+
+Glade's values carry their own tags, so a wrong guess there goes unnoticed;
+Silo's do not, and a word taken for a pointer is followed.
+
 The `i64` arithmetic is what `meadow_rt::num` does, and what every runtime and
 both front ends' interpreters agree on:
 
