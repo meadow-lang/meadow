@@ -3267,6 +3267,55 @@ fn a_package_s_tests_are_run_by_meadowboot_as_meadow_test_runs_them() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A constructor written through the module a `use … as` names, as MeadowBoot
+/// builds it: `A.App` where one of the module's types has that constructor,
+/// and `A.Term.Var` where two do -- in a pattern and in an expression -- with
+/// the answer the Rust compiler gives.
+#[test]
+fn a_constructor_is_written_through_the_module_an_alias_names() {
+    let root = std::env::temp_dir().join(format!("meadowboot-ctor-alias-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).expect("a package directory");
+    std::fs::write(
+        root.join("Meadow.toml"),
+        "[package]\nname = \"Alias\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("a manifest");
+    std::fs::write(
+        root.join("src").join("Ast.mw"),
+        "@pub data Term = Var Int | App Term Term\n\n@pub data Ty = Var Int\n",
+    )
+    .expect("the module");
+    std::fs::write(
+        root.join("src").join("Main.mw"),
+        "mod Ast\n\nuse Alias.Ast as A\n\n\
+         fun size (t : A.Term) : Int = match t with | A.Term.Var _ -> 1 | A.App f x -> size f + size x\n\n\
+         fun ty (t : A.Ty) : Int = match t with | A.Ty.Var n -> n\n\n\
+         fun main () = println (show (size (A.App (A.Term.Var 1) (A.Term.Var 2)) + ty (A.Ty.Var 40)))\n",
+    )
+    .expect("the root module");
+    let run = |exe: &Path| {
+        let out = Command::new(exe)
+            .args(["run", "--offline"])
+            .arg(&root)
+            .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+            .env("MEADOW", meadow())
+            .env_remove("MEADOWBOOT_EXPANSIONS")
+            .output()
+            .expect("it runs");
+        (
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+    let (theirs, why) = run(&meadow());
+    assert!(theirs.contains("42"), "{theirs}{why}");
+    let _ = std::fs::remove_dir_all(root.join("target"));
+    let (ours, why) = run(&meadowboot_exe());
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(ours.contains("42"), "{ours}{why}");
+}
+
 /// A function written `@export` is one C can call: a package of them is
 /// built by MeadowBoot as a library -- native, through Silo -- and each is a
 /// C function of the C types its Meadow types are. What calls them here is a

@@ -15,6 +15,11 @@ beyond the last release is under _Unreleased_.
 
 ### Added
 
+- A constructor is written through the module a `use … as` names, as its
+  functions and types are: `use Mira as M` and then `M.VoxelHit b f d k`, in
+  a pattern or an expression, of the package's own modules and a
+  dependency's alike. Where two of the module's types have a constructor of
+  that name, `M.Type.Ctor` says which, and `M.Ctor` is an error saying so.
 - `Std.Log`, what a program says it is doing, as an effect: `Log.info`,
   `Log.warn`, `Log.error`, `Log.debug`, or `log level message`. Where nothing
   handles it the runtime writes each line to standard error with its time and

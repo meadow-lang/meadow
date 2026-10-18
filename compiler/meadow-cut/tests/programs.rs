@@ -187,6 +187,34 @@ def idyll:Main/main (; k: ptr) =
 }
 
 #[test]
+fn resume_is_apply_by_another_name_beside_an_object_of_other_methods() {
+    // A resumption called by `resume`, in a program whose objects have a
+    // method besides `apply`: the lowering once gave `resume` a slot of its
+    // own, and the slots a resumption does not use no captures, which the
+    // pass adding descriptors to environments ran off the end of.
+    let out = runs(
+        "cut 0
+entry idyll:Main/main
+answer str
+
+effect idyll:Main/Ask { ask(unit) -> i64 }
+
+def idyll:Main/main (; k: ptr) =
+  let two: i64 = 2 in
+  <cocase { twice(x: i64; k0: ptr) => prim mul(x, two; k0) } | twice(5; μ̃ ten: i64.
+    handle {
+      idyll:Main/Ask.ask(u: unit; r: ptr, k2: ptr) => <r | resume(ten; k2)>;
+      return(x: i64; k3: ptr) => <x | k3>
+    } in μ b.
+      perform idyll:Main/Ask.ask(unit; μ̃ a: i64.
+        perform idyll:Main/Ask.ask(unit; μ̃ c: i64. prim add(a, c; b)))
+    ; μ̃ total: i64. prim eq(total, 20; μ̃ u: unit. <\"no\" | k>, μ̃ u: unit. <\"yes\" | k>))>
+",
+    );
+    assert_eq!(out.output, "yes");
+}
+
+#[test]
 fn an_object_is_called_through_its_method() {
     let out = runs(
         "cut 0

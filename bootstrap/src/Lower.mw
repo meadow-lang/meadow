@@ -292,6 +292,22 @@ fun typeName (s : GTree) : Nm =
        (V.foldl (\acc (n : Nm) -> "${acc}.${n.text}") first.text names)
        (spanMeta (metaStart first.at) (metaEnd last.at)))
 
+-- A qualified name's parts, as `meadow-parser`'s `qualifier` takes them
+-- apart: what qualifies it -- `A`, or `A.Term` -- and its last part, the name.
+fun qualParts (s : GTree) : (Nm, Nm) =
+  let words = \x -> V.filter (\t -> R.kindOf t != TokenPeriod) (tokenKids x) in
+  let ns = V.map nameOf (V.append (words s) (V.concatMap words (childrenOf NodeQualTail s))) in
+  let last = V.getOr (named "" (spanOf s)) ns (V.len ns - 1) in
+  let quals = V.take ns (V.len ns - 1) in
+  let first = V.getOr last quals 0 in
+  let stop = V.getOr last quals (V.len quals - 1) in
+  (
+    named
+      (S.join "." (V.map (\(n : Nm) -> n.text) quals))
+      (spanMeta (metaStart first.at) (metaEnd stop.at)),
+    last
+  )
+
 fun firstName (s : GTree) : Nm =
   match s with
   | Syntax g i ->
@@ -1101,9 +1117,9 @@ pass! {
     | ConsTail { atom } -> atom
     | PAtom { con, arg } -> M.unwrapOr (M.unwrapOr (0 - 1) arg) con
     -- `A x y`, `A.B x y`, or either with nothing after it.
-    | ConPat { raw qual, later args } ->
-        conOf out node qual (V.map (\a -> a (px cx.c)) args) (M.unwrapOr (spanOf node) cx.over)
-    | NullCon { raw qual } -> conOf out node qual [] (M.unwrapOr (spanOf node) cx.over)
+    | ConPat { later args } ->
+        conOf out node (V.map (\a -> a (px cx.c)) args) (M.unwrapOr (spanOf node) cx.over)
+    | NullCon {} -> conOf out node [] (M.unwrapOr (spanOf node) cx.over)
     | Parg { later con, later arg } ->
         (match (con, arg) with
          | (Just f, _) -> f (px cx.c)
@@ -1195,16 +1211,11 @@ fun headed cx (s : GTree) (k : Grouped) first conses =
        (spanOf (must k s)))
 
 -- A constructor's pattern, qualified by its type or not.
-fun conOf b (s : GTree) (qual : Maybe GTree) written (m : Meta) =
-  match qual with
-  | Just q ->
-      newAstPatQualCons
-        b
-        m
-        (nm b (nameOf (must TokenUpperIdent s)))
-        (nm b (nameOf (must TokenUpperIdent q)))
-        written
-  | None -> newAstPatCons b m (nm b (nameOf (must TokenUpperIdent s))) written
+fun conOf b (s : GTree) written (m : Meta) =
+  if has NodeQualTail s then
+    (match qualParts s with
+     | (q, x) -> newAstPatQualCons b m (nm b q) (nm b x) written)
+  else newAstPatCons b m (nm b (nameOf (must TokenUpperIdent s))) written
 
 -- A pattern's parts, each written at a span it may be told to take, and the
 -- span it has of its own: joined by `::`, then by `as`.
@@ -1271,7 +1282,8 @@ fun basePat (c : Lc) b (s : GTree) (over : Maybe Meta) =
       let k = R.kindOf h in
       if k == NodeMacCall then patCall c b m h
       else if k == NodeQualHead then
-        newAstPatQualCons b m (nm b (firstName h)) (nm b (lastName h)) (V.map (atomPat c b) args)
+        (match qualParts h with
+         | (q, x) -> newAstPatQualCons b m (nm b q) (nm b x) (V.map (atomPat c b) args))
       else lowPat c b h over
   | None -> newAstPatCons b m (nm b (firstName head)) (V.map (atomPat c b) args)
 
@@ -1282,7 +1294,8 @@ fun atomPat (c : Lc) b (s : GTree) =
       let k = R.kindOf n in
       if k == NodeMacAtom then patCall c b m n
       else if k == NodeQualAtom then
-        newAstPatQualCons b m (nm b (firstName n)) (nm b (lastName n)) []
+        (match qualParts n with
+         | (q, x) -> newAstPatQualCons b m (nm b q) (nm b x) [])
       else lowPat c b n None
   | None -> newAstPatCons b m (nm b (firstName s)) []
 
@@ -1749,7 +1762,8 @@ pass! {
                    applied (\o -> exprCall cx.c out (M.unwrapOr (macSpan h) o) h)
                  else if k == NodeQualHead then
                    applied (\o ->
-                     newAstExprQual out (spanOf node) (nm out (firstName h)) (nm out (lastName h)))
+                     match qualParts h with
+                     | (q, x) -> newAstExprQual out (spanOf node) (nm out q) (nm out x))
                  else applied (\o -> lowerExprLowAtom () out { cx | over = o } h))
             | None -> newAstExprCons out m (nm out (firstName head)) (written ()))
     | Atom {} ->
@@ -1759,17 +1773,9 @@ pass! {
              (let k = R.kindOf n in
               if k == NodeMacAtom then fieldsOf out n (exprCall cx.c out (macSpan n) n)
               else if k == NodeQualAtom then
-                (let toks = V.filter (\t -> R.kindOf t != TokenPeriod) (tokenKids n) in
-                 let q =
-                   (match V.get toks 0 with
-                    | Just t -> nameOf t
-                    | None -> named "" m)
-                 in
-                 let x =
-                   (match V.get toks 1 with
-                    | Just t -> nameOf t
-                    | None -> named "" m)
-                 in fieldsOf out n (newAstExprQual out (from q.at x.at) (nm out q) (nm out x)))
+                (match qualParts n with
+                 | (q, x) ->
+                     fieldsOf out n (newAstExprQual out (from q.at x.at) (nm out q) (nm out x)))
               else lowerExprLowAtom () out { cx | over = None } n)
          | None -> newAstExprCons out m (nm out (firstName node)) [])
     | LowAtom { closed, open } ->
