@@ -193,7 +193,9 @@ gives its value to the continuation `halt`, and what it gives is the value.
 Vals are computed in the order the program lists them. A front end lists them
 so that every val comes after the vals it reads, across packages as OCaml
 initialises modules. A val may perform effects, and they happen then, once. A
-use of a val reads the value. It does not compute it again.
+use of a val reads the value. It does not compute it again. A val that cannot
+perform may be computed instead when it is first read, which a program cannot
+tell apart, and a val nothing reads may not be computed at all.
 
 A `def` is a statement with parameters and runs each time it is called. A
 top-level value is a `val`, never a `def` without parameters.
