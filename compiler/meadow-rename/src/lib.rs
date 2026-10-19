@@ -197,6 +197,10 @@ pub struct Resolver {
     /// The module each qualifier names, by package and path -- what a mention
     /// of the qualifier is recorded as (`NameRef::Module`).
     qualifier_modules: HashMap<InternedString, InternedString>,
+    /// What each `use … as` of the module being resolved has named so far:
+    /// the module, and where the alias was written. A second `use` of one
+    /// alias would quietly take the first's place.
+    use_aliases: HashMap<InternedString, (InternedString, Span)>,
     /// How every operator binds that something declared: this unit's own
     /// `infixl 6 +` and its dependencies'. One table for the whole unit,
     /// because an operator's fixity goes by its spelling, not by which
@@ -612,6 +616,7 @@ impl Resolver {
             qualifier_paths: HashMap::new(),
             qualifier_types: HashMap::new(),
             qualifier_modules: HashMap::new(),
+            use_aliases: HashMap::new(),
             fixities: HashMap::new(),
             prelude: HashMap::new(),
             errors: Vec::new(),
@@ -894,6 +899,7 @@ impl Resolver {
         self.scope.truncate(self.base_scope);
         self.qualifiers.clear();
         self.qualifier_modules.clear();
+        self.use_aliases.clear();
         self.qualifier_paths.clear();
         self.qualifier_types.clear();
         self.tycons = self.base_tycons.clone();
@@ -973,6 +979,26 @@ impl Resolver {
     /// Record a reference the HIR will not keep.
     pub fn note_ref(&mut self, span: Span, what: NameRef) {
         self.extra_refs.push(RefSite { span, what });
+    }
+
+    /// A `use … as alias` of `module`, written at `at`: the module and place
+    /// of an earlier one of this module giving the same alias to a different
+    /// module, if there is one, which this one would otherwise silently
+    /// replace. The same `use` twice says nothing new, and is let be.
+    pub fn use_alias(
+        &mut self,
+        alias: InternedString,
+        module: InternedString,
+        at: Span,
+    ) -> Option<(InternedString, Span)> {
+        match self.use_aliases.get(&alias) {
+            Some(before) if before.0 != module => Some(*before),
+            Some(_) => None,
+            None => {
+                self.use_aliases.insert(alias, (module, at));
+                None
+            }
+        }
     }
 
     /// `qualifier` names the module `module` (its package and path), for

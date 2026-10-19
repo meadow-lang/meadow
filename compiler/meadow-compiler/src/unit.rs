@@ -1295,6 +1295,18 @@ fn use_in(
     if names_module && resolver.has_module(&local) {
         match &u.alias {
             Some(a) => {
+                if let Some((before, at)) = resolver.use_alias(*a.value(), whole, a.span) {
+                    diags.push(Diagnostic {
+                        msg: format!(
+                            "`{}` already names `{before}` here, so it cannot name `{whole}` too",
+                            a.value()
+                        ),
+                        filename: filename.to_string(),
+                        label: ("a second module of that name".to_string(), a.span),
+                        extra_labels: vec![("the first".to_string(), at)],
+                    });
+                    return Vec::new();
+                }
                 let values = resolver.module_values(&local);
                 resolver.activate_module(*a.value(), values);
                 resolver.activate_local_types(*a.value(), &local);
@@ -1446,6 +1458,18 @@ fn use_in(
         // `use M as C` — a qualifier and nothing else. `C.name` reaches the
         // module's exports; none of them are in scope unqualified.
         Some(a) => {
+            if let Some((before, at)) = resolver.use_alias(*a.value(), whole, a.span) {
+                diags.push(Diagnostic {
+                    msg: format!(
+                        "`{}` already names `{before}` here, so it cannot name `{whole}` too",
+                        a.value()
+                    ),
+                    filename: filename.to_string(),
+                    label: ("a second module of that name".to_string(), a.span),
+                    extra_labels: vec![("the first".to_string(), at)],
+                });
+                return Vec::new();
+            }
             resolver.activate_module(*a.value(), map.clone());
             resolver.activate_module_types(*a.value(), &module_types(pkg, &segs, deps));
             resolver.qualifier_names(*a.value(), whole);
