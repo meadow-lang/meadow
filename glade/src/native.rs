@@ -215,16 +215,22 @@ impl Vm<'_> {
         }
     }
 
+    /// A sequence the program gives: a vector, or a plain array, which is a
+    /// language's that has no vector.
     fn vector_arg(&self, what: &str, v: Value) -> Result<Vec<Value>, Error> {
-        match self.vector_elems(v) {
+        match self.vector_elems(v).or_else(|| self.array_elems(v)) {
             Some(xs) => Ok(xs),
             None => err(format!("{what}: expected a Vector, got {}", self.show(v))),
         }
     }
 
-    /// Lay `items` out as `Vector.fromArray` would. Room must already have
-    /// been made -- see [`Build::slots`].
+    /// Lay `items` out as `Vector.fromArray` would, or as a plain array where
+    /// the program declares no vector (`docs/CUT.md`). Room must already have
+    /// been made -- see [`Build::slots`], which counts a vector's, the more.
     fn vector_here(&mut self, items: Vec<Value>) -> Value {
+        if self.role(Role::VectorSingle).is_none() {
+            return Value::Obj(self.heap.alloc(Kind::Array, 0, &items));
+        }
         let data = |vm: &mut Vm, role: Role, fields: &[Value]| {
             let tag = vm.role_tag(role);
             Value::Obj(vm.heap.alloc(Kind::Data, tag, fields))

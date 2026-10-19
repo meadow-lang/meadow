@@ -507,6 +507,32 @@ fn a_program_of_cut_run_again_runs_the_image_kept_of_it() {
     assert_ne!(now, kept);
 }
 
+/// A program that declares no vector -- a language without Meadow's -- gets
+/// `Process.argv` as a plain array, which the array primitives take apart:
+/// `docs/CUT.md`. Found by Idyll's session.
+#[test]
+fn a_program_with_no_vector_gets_its_arguments_as_an_array() {
+    let dir = scratch("cut-argv");
+    std::fs::write(
+        dir.join("argv.cut"),
+        "cut 0\nentry t:Main/main\nanswer str\n\n\
+         native {\n  t:Main/P.argv = Process.argv\n}\n\n\
+         effect t:Main/P { argv(unit) -> ptr }\n\n\
+         def t:Main/main (; k: ptr) =\n  perform t:Main/P.argv(unit; μ̃ v: ptr.\n    \
+         prim arrayLen(v; μ̃ n: i64.\n      prim eq(n, 2; μ̃ u: unit. <\"not two\" | k>, μ̃ u: unit.\n        \
+         prim arrayGet(v, 1; μ̃ s: str. <s | k>))))\n",
+    )
+    .unwrap();
+    for runtime in [&[][..], &["--runtime", "silo"]] {
+        let mut args = vec!["cut", "argv.cut"];
+        args.extend_from_slice(runtime);
+        args.extend_from_slice(&["--", "first", "second"]);
+        let (ok, out, err) = meadow(&dir, &args);
+        assert!(ok, "{runtime:?}: {err}");
+        assert_eq!(out, "second", "{runtime:?}");
+    }
+}
+
 #[test]
 fn a_program_of_cut_runs_on_glade_and_as_an_executable_of_silos() {
     let dir = scratch("cut");
