@@ -193,7 +193,8 @@ fn lowered(p: &Program, prints: bool) -> R<Lowered> {
     } else {
         p
     };
-    let lazy = lazily(p);
+    let mut lazy = lazily(p);
+    started(p, &mut lazy);
     let whole = p;
     let p = &lazy;
     let mut l = Lower {
@@ -2409,6 +2410,59 @@ fn lazily(p: &Program) -> Program {
         });
     }
     out
+}
+
+/// `lazy`, with an entry that first makes each value that might perform, in
+/// the order `whole` writes them, and then runs the entry: a value's effects
+/// happen when the program starts, once (`docs/CUT.md`). The rest are made
+/// when they are first read, which a program cannot tell from their being
+/// made at the start -- and so one that is never read is never made.
+fn started(whole: &Program, lazy: &mut Program) {
+    let Some(entry) = lazy.entry.clone() else {
+        return;
+    };
+    let pure = crate::pure::defs(lazy);
+    let performing: Vec<(Symbol, Rep)> = whole
+        .vals
+        .iter()
+        .filter(|v| {
+            let made = forcing(&v.symbol);
+            lazy.defs
+                .iter()
+                .position(|d| d.symbol == made)
+                .is_some_and(|i| !pure.contains(&i))
+        })
+        .map(|v| (v.symbol.clone(), v.rep.clone()))
+        .collect();
+    if performing.is_empty() {
+        return;
+    }
+    let mut body = Statement::Call(
+        entry.clone(),
+        Vec::new(),
+        vec![Consumer::Var("#k".to_string())],
+    );
+    for (symbol, rep) in performing.into_iter().rev() {
+        let made = Binder {
+            name: "#made".to_string(),
+            rep,
+        };
+        body = Statement::Call(
+            forcing(&symbol),
+            Vec::new(),
+            vec![Consumer::MuTilde(made, Box::new(body))],
+        );
+    }
+    let symbol = entry.child("#values");
+    lazy.defs.push(Def {
+        symbol: symbol.clone(),
+        rep_vars: Vec::new(),
+        effect_vars: Vec::new(),
+        params: Vec::new(),
+        conts: vec!["#k".to_string()],
+        body,
+    });
+    lazy.entry = Some(symbol);
 }
 
 /// `s` with `halt` the continuation `#halt`.
