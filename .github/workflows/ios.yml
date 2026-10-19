@@ -1,0 +1,101 @@
+name: ios
+
+# Meadow for iOS, built on a Mac and run in the simulator: a program built
+# with `meadow build --runtime silo --target aarch64-apple-ios-sim`, and a
+# static library of `@export`s built with MeadowBoot's `build --target`,
+# linked into a C program as an app would link it. A phone's build,
+# `aarch64-apple-ios`, is made too, and linked, though nothing here can run
+# it: it differs from the simulator's only in the SDK.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "buildtools/meadow/src/aot.rs"
+      - "buildtools/meadow/src/cut.rs"
+      - "bootstrap/src/Main.mw"
+      - "silo/**"
+      - "compiler/meadow-llvm/**"
+      - "compiler/meadow-rt/**"
+      - "scripts/silo-runtime.sh"
+      - ".github/workflows/ios.yml"
+
+jobs:
+  simulator:
+    runs-on: macos-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup update stable
+
+      - name: Build meadow
+        working-directory: buildtools
+        run: cargo build --release -p meadow
+
+      - name: Build Silo's runtime for iOS
+        run: |
+          scripts/silo-runtime.sh aarch64-apple-ios-sim
+          scripts/silo-runtime.sh aarch64-apple-ios
+
+      - name: Build MeadowBoot
+        run: buildtools/target/release/meadow build --release bootstrap
+
+      - name: Build a program, a library and its host for iOS
+        run: |
+          meadow="$PWD/buildtools/target/release/meadow"
+          boot="$PWD/bootstrap/target/release/native/silo/MeadowBoot"
+          mkdir -p "$RUNNER_TEMP/Hello/src" "$RUNNER_TEMP/Lib/src" out/sim out/device
+          printf '[package]\nname = "Hello"\nversion = "0.1.0"\n' > "$RUNNER_TEMP/Hello/Meadow.toml"
+          cat > "$RUNNER_TEMP/Hello/src/Main.mw" <<'EOF'
+          use Std.Collections.Vector as V
+          fun main () = println "hello from Meadow on iOS, ${show (V.len (V.range 0 3))} things"
+          EOF
+          printf '[package]\nname = "Lib"\nversion = "0.1.0"\n' > "$RUNNER_TEMP/Lib/Meadow.toml"
+          cat > "$RUNNER_TEMP/Lib/src/Main.mw" <<'EOF'
+          @export
+          fun twice (x : Int32) : Int32 = x * 2
+
+          @export
+          fun add (a : Int) (b : Int) : Int = a + b
+          EOF
+          cat > "$RUNNER_TEMP/host.c" <<'EOF'
+          #include <stdint.h>
+          #include <stdio.h>
+          int32_t twice(int32_t);
+          int64_t add(int64_t, int64_t);
+          int main(void) {
+            printf("twice 21 = %d, add 40 2 = %lld\n", twice(21), (long long)add(40, 2));
+            return twice(21) == 42 && add(40, 2) == 42 ? 0 : 1;
+          }
+          EOF
+          for t in aarch64-apple-ios-sim aarch64-apple-ios; do
+            if [ $t = aarch64-apple-ios-sim ]; then
+              d=sim sdk=iphonesimulator clang=arm64-apple-ios15.0-simulator
+            else
+              d=device sdk=iphoneos clang=arm64-apple-ios15.0
+            fi
+            "$meadow" build --release --runtime silo --target $t "$RUNNER_TEMP/Hello"
+            cp "$RUNNER_TEMP/Hello/target/release/native/$t/silo/Hello" out/$d/
+            MEADOWBOOT_STD="$PWD/lib/Std" MEADOW="$meadow" \
+              "$boot" build --release --target $t "$RUNNER_TEMP/Lib"
+            cp "$RUNNER_TEMP/Lib/target/release/native/$t/silo/libLib.a" out/$d/
+            xcrun --sdk $sdk clang --target=$clang -isysroot "$(xcrun --sdk $sdk --show-sdk-path)" \
+              "$RUNNER_TEMP/host.c" out/$d/libLib.a -o out/$d/host \
+              -liconv -framework Security -framework CoreFoundation
+          done
+          file out/*/*
+          nm -gU out/sim/libLib.a | grep -wE '_twice|_add'
+
+      - name: Run them in the simulator
+        run: |
+          udid=$(xcrun simctl list devices available -j \
+            | jq -r '[.devices | to_entries[] | select(.key | contains("iOS")) | .value[] | select(.name | startswith("iPhone"))][0].udid')
+          echo "simulator $udid"
+          xcrun simctl boot "$udid"
+          xcrun simctl bootstatus "$udid" -b
+          xcrun simctl spawn "$udid" "$PWD/out/sim/Hello" | tee hello.txt
+          xcrun simctl spawn "$udid" "$PWD/out/sim/host" | tee host.txt
+          grep -q "hello from Meadow on iOS, 3 things" hello.txt
+          grep -q "twice 21 = 42, add 40 2 = 42" host.txt

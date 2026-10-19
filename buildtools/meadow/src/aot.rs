@@ -93,6 +93,10 @@ pub enum Os {
     Android,
     MacOs,
     Windows,
+    /// An iPhone or iPad.
+    Ios,
+    /// The iOS simulator, on a Mac: iOS's libraries, the Mac's processor.
+    IosSim,
 }
 
 impl Os {
@@ -112,9 +116,15 @@ impl Os {
     pub fn format(self) -> Format {
         match self {
             Os::Linux | Os::Android => Format::Elf,
-            Os::MacOs => Format::MachO,
+            Os::MacOs | Os::Ios | Os::IosSim => Format::MachO,
             Os::Windows => Format::Coff,
         }
+    }
+
+    /// iOS, on a device or the simulator: no code loaded from outside the
+    /// app, so a library is a static one, linked in when the app is.
+    pub fn is_ios(self) -> bool {
+        matches!(self, Os::Ios | Os::IosSim)
     }
 
     /// As `@cfg(os = "…")` names it.
@@ -124,6 +134,7 @@ impl Os {
             Os::Android => "android",
             Os::MacOs => "macos",
             Os::Windows => "windows",
+            Os::Ios | Os::IosSim => "ios",
         }
     }
 }
@@ -172,6 +183,8 @@ impl Target {
             Some("unknown-linux-gnu") => Os::Linux,
             Some("apple-darwin") => Os::MacOs,
             Some("pc-windows-msvc") => Os::Windows,
+            Some("apple-ios") => Os::Ios,
+            Some("apple-ios-sim") => Os::IosSim,
             _ => None.ok_or_else(|| unknown_target(name))?,
         };
         let arch = name
@@ -217,6 +230,21 @@ impl Target {
             (Arch::X86_64, Os::Linux) => "x86_64-unknown-linux-gnu",
             (Arch::Aarch64, Os::Windows) => "aarch64-pc-windows-msvc",
             (Arch::X86_64, Os::Windows) => "x86_64-pc-windows-msvc",
+            (Arch::Aarch64, Os::Ios) => "aarch64-apple-ios",
+            (Arch::Aarch64, Os::IosSim) => "aarch64-apple-ios-sim",
+            // Rust's name for the simulator on an Intel Mac, which is the
+            // only iOS there is on x86-64.
+            (Arch::X86_64, Os::Ios | Os::IosSim) => "x86_64-apple-ios",
+        }
+    }
+
+    /// What a library of `name`'s exports is called here: a static one on
+    /// iOS, and the platform's shared one elsewhere.
+    pub fn library_name(self, name: &str) -> String {
+        if self.os.is_ios() {
+            format!("lib{name}.a")
+        } else {
+            self.format.library_name(name)
         }
     }
 }
@@ -226,7 +254,8 @@ fn unknown_target(name: &str) -> String {
         "no native target `{name}` -- there is `aarch64` and `x86_64` for this system, and \
          the triples `aarch64-linux-android`, `x86_64-linux-android`, \
          `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, \
-         `x86_64-apple-darwin`, `aarch64-pc-windows-msvc` and `x86_64-pc-windows-msvc`"
+         `x86_64-apple-darwin`, `aarch64-pc-windows-msvc`, `x86_64-pc-windows-msvc`, \
+         `aarch64-apple-ios`, `aarch64-apple-ios-sim` and `x86_64-apple-ios`"
     )
 }
 
@@ -278,10 +307,41 @@ fn ndk_clang() -> Result<String, String> {
     Ok(clang.to_string_lossy().into_owned())
 }
 
-/// The clang a native build for `target` runs, and the `--target` it gives
-/// it: `MEADOW_CLANG` or the `clang` on `PATH`, except that a build for
-/// Android takes the NDK's, and names the API level in the triple.
-fn clang_for(target: Target) -> Result<(String, String), String> {
+/// The oldest iOS a build for iOS runs on: `MEADOW_IOS_MIN`, or 15.0.
+fn ios_min() -> String {
+    std::env::var("MEADOW_IOS_MIN")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "15.0".to_string())
+}
+
+/// The iOS SDK Xcode has, for a device or the simulator: what `xcrun`
+/// says, which is where the headers and libraries a build links against are.
+fn ios_sdk(os: Os) -> Result<String, String> {
+    let sdk = if os == Os::IosSim {
+        "iphonesimulator"
+    } else {
+        "iphoneos"
+    };
+    let out = Command::new("xcrun")
+        .args(["--sdk", sdk, "--show-sdk-path"])
+        .output()
+        .map_err(|e| format!("a build for iOS needs Xcode, on a Mac: could not run xcrun: {e}"))?;
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || path.is_empty() {
+        return Err(format!(
+            "Xcode has no {sdk} SDK: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(path)
+}
+
+/// The clang a native build for `target` runs, and what it is told of the
+/// target: `MEADOW_CLANG` or the `clang` on `PATH`, given `--target`. A build
+/// for Android takes the NDK's, and names the API level in the triple; one
+/// for iOS names the oldest iOS it runs on, and the SDK it links against.
+fn clang_for(target: Target) -> Result<(String, Vec<String>), String> {
     let set = std::env::var("MEADOW_CLANG").ok().filter(|c| !c.is_empty());
     if target.os == Os::Android {
         let clang = match set {
@@ -290,12 +350,33 @@ fn clang_for(target: Target) -> Result<(String, String), String> {
         };
         return Ok((
             clang,
-            format!("--target={}{}", target.triple(), android_api()),
+            vec![format!("--target={}{}", target.triple(), android_api())],
+        ));
+    }
+    if target.os.is_ios() {
+        // clang's names, not Rust's: `arm64-apple-ios15.0-simulator`.
+        let arch = match target.arch {
+            Arch::Aarch64 => "arm64",
+            Arch::X86_64 => "x86_64",
+        };
+        let sim = if target.os == Os::IosSim || target.arch == Arch::X86_64 {
+            "-simulator"
+        } else {
+            ""
+        };
+        let os = if sim.is_empty() { Os::Ios } else { Os::IosSim };
+        return Ok((
+            set.unwrap_or_else(|| "clang".into()),
+            vec![
+                format!("--target={arch}-apple-ios{}{sim}", ios_min()),
+                "-isysroot".to_string(),
+                ios_sdk(os)?,
+            ],
         ));
     }
     Ok((
         set.unwrap_or_else(|| "clang".into()),
-        format!("--target={}", target.triple()),
+        vec![format!("--target={}", target.triple())],
     ))
 }
 
@@ -420,7 +501,7 @@ pub fn build_native_of(
     // linked as one: no `main`, and named as the platform names a library.
     let library = !lowered.exports.is_empty();
     let exe = if library {
-        dir.join(target.format.library_name(name))
+        dir.join(target.library_name(name))
     } else {
         exe
     };
@@ -635,9 +716,13 @@ pub fn clang_link(
         }
         Ok(())
     };
+    // A library for iOS is static: the objects and the runtime in one
+    // archive, for the app to link.
+    let archive = library && target.os.is_ios();
     // One module compiles and links in one step; several are compiled apart
-    // first, as many at once as there are cores.
-    let inputs: Vec<PathBuf> = if modules.len() == 1 {
+    // first, as many at once as there are cores -- and so is one that goes
+    // into an archive, which holds objects.
+    let inputs: Vec<PathBuf> = if modules.len() == 1 && !archive {
         modules.to_vec()
     } else {
         let objects: Vec<PathBuf> = modules.iter().map(|m| m.with_extension("o")).collect();
@@ -669,7 +754,7 @@ pub fn clang_link(
                         cmd.arg(level)
                             .arg("-c")
                             .arg("-Wno-override-module")
-                            .arg(&triple)
+                            .args(&triple)
                             .arg("-o")
                             .arg(&objects[i])
                             .arg(&modules[i]);
@@ -698,10 +783,33 @@ pub fn clang_link(
         exe.file_name()
             .map_or(String::new(), |n| n.to_string_lossy().into_owned()),
     );
+    if archive {
+        // Apple's `libtool` merges the runtime's archive in whole, where `ar`
+        // would put the archive itself in this one.
+        let libtool = std::env::var("MEADOW_LIBTOOL").unwrap_or_else(|_| "libtool".into());
+        let _ = std::fs::remove_file(exe);
+        let out = Command::new(&libtool)
+            .arg("-static")
+            .arg("-o")
+            .arg(exe)
+            .args(&inputs)
+            .arg(runtime)
+            .output()
+            .map_err(|e| format!("could not run {libtool}: {e} -- an iOS library needs Xcode's"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "{libtool} could not make {}:\n{}{}",
+                exe.display(),
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        return Ok(());
+    }
     let mut cmd = Command::new(&clang);
     cmd.arg(level)
         .arg("-Wno-override-module")
-        .arg(&triple)
+        .args(&triple)
         .arg("-o")
         .arg(exe);
     if library {
@@ -743,6 +851,17 @@ fn native_system_libs(target: Target) -> &'static [&'static str] {
     // unwinder the NDK carries -- what Glade's runtime links on Android too.
     if target.os == Os::Android {
         return &["-ldl", "-llog", "-lunwind", "-lm"];
+    }
+    // The randomness TLS's cryptography asks the system for is the Security
+    // framework's on iOS.
+    if target.os.is_ios() {
+        return &[
+            "-liconv",
+            "-framework",
+            "Security",
+            "-framework",
+            "CoreFoundation",
+        ];
     }
     match target.format {
         Format::Coff => &[
@@ -1071,9 +1190,9 @@ pub fn runtimes(target: Target) -> Result<Vec<PathBuf>, String> {
     if !found.is_empty() {
         return Ok(found);
     }
-    // Android's needs the NDK's C compiler for the C its crates build, which
-    // the script sets up.
-    let how = if target.os == Os::Android {
+    // Android's needs the NDK's C compiler for the C its crates build, and
+    // iOS's the oldest iOS it runs on, which the script sets up.
+    let how = if target.os == Os::Android || target.os.is_ios() {
         format!(
             "`scripts/silo-runtime.sh {}` in a checkout",
             target.triple()

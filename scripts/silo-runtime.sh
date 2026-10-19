@@ -4,6 +4,8 @@
 #
 #   scripts/silo-runtime.sh aarch64-linux-android
 #   scripts/silo-runtime.sh x86_64-linux-android
+#   scripts/silo-runtime.sh aarch64-apple-ios
+#   scripts/silo-runtime.sh aarch64-apple-ios-sim
 #
 # A program built for that system with `--runtime silo --target <triple>`
 # links against it. It must be built from the same checkout as the `meadow`
@@ -12,6 +14,9 @@
 # Android needs its NDK, at ANDROID_NDK_HOME (or ANDROID_NDK_ROOT,
 # ANDROID_NDK_LATEST_HOME, ANDROID_NDK), and the Rust target, which this adds.
 # The API level is MEADOW_ANDROID_API, 24 by default: what `meadow` links for.
+#
+# iOS needs Xcode, on a Mac. The oldest iOS is MEADOW_IOS_MIN, 15.0 by
+# default, as it is for `meadow`.
 set -euo pipefail
 
 triple=${1:?usage: scripts/silo-runtime.sh <target triple>}
@@ -36,6 +41,9 @@ case "$triple" in
     cc="$bin/$triple$api-clang"
     [ -e "$cc" ] || cc="$cc.cmd"
     export "CC_$lower=$cc" "AR_$lower=$bin/llvm-ar" "CARGO_TARGET_${under}_LINKER=$cc"
+    ;;
+  *-apple-ios*)
+    export IPHONEOS_DEPLOYMENT_TARGET=${MEADOW_IOS_MIN:-15.0}
     ;;
 esac
 

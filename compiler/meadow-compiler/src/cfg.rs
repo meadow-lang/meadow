@@ -128,7 +128,7 @@ pub fn holds(condition: &ast::Meta, opts: &Options) -> Result<bool, (String, Spa
             let (actual, allowed): (String, &[&str]) = match &**key.value() {
                 "os" => (
                     cfg.os.to_string(),
-                    &["windows", "linux", "macos", "android"],
+                    &["windows", "linux", "macos", "android", "ios"],
                 ),
                 "arch" => (cfg.arch.to_string(), &["x86_64", "aarch64"]),
                 "family" => (cfg.family().to_string(), &["unix", "windows"]),

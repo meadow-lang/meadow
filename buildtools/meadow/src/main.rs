@@ -1073,7 +1073,7 @@ fn command() {
                         // A library is built, and there is nothing to run.
                         if matches!(
                             exe.extension().and_then(|e| e.to_str()),
-                            Some("dll" | "so" | "dylib")
+                            Some("dll" | "so" | "dylib" | "a")
                         ) {
                             meadow::status::status("Built", exe.display().to_string());
                             return Ok(0);
