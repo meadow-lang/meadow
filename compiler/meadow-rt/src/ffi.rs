@@ -12,10 +12,14 @@
 //! reads only the registers of the parameters it has. So every function is
 //! called as one of eight integers and eight floats -- the arguments in the
 //! first of each, zeros in the rest -- and what it does not take it does not
-//! look at. That holds for up to eight integers (six on x86-64) and eight
-//! floats; past that an argument goes on the stack, in an order this cannot
-//! arrange, and the call is refused. A struct by value and a variadic
-//! function are refused by not being expressible.
+//! look at. That holds for up to eight integers and eight floats. On x86-64
+//! six integers travel in registers and the seventh and eighth in the first
+//! two stack slots, in order -- which is where a function of seven or eight
+//! reads them, whatever floats are among its parameters, since no float
+//! reaches the stack before a ninth. Past eight of either an argument goes on
+//! the stack in an order this cannot arrange, and the call is refused. A
+//! struct by value and a variadic function are refused by not being
+//! expressible.
 //!
 //! **Windows on x86-64** passes the first four arguments by place, not by
 //! kind -- the second in `rdx` or `xmm1`, whichever its type says -- and the
@@ -125,8 +129,9 @@ mod sys {
     use super::{Answer, Arg, Ret};
     use std::ffi::{CStr, CString, c_void};
 
-    /// How many integer arguments travel in registers.
-    const INTS: usize = if cfg!(target_arch = "x86_64") { 6 } else { 8 };
+    /// How many integer arguments a call may have: in registers, and on
+    /// x86-64 the last two on the stack -- see the module docs.
+    const INTS: usize = 8;
     const FLOATS: usize = 8;
 
     fn last_error() -> String {
@@ -770,8 +775,60 @@ mod tests {
         free(at);
     }
 
+    extern "C" fn seven(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64) -> i64 {
+        a + 10 * b + 100 * c + 1_000 * d + 10_000 * e + 100_000 * f + 1_000_000 * g
+    }
+
+    extern "C" fn eight(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64) -> i64 {
+        seven(a, b, c, d, e, f, g) + 10_000_000 * h
+    }
+
+    /// Floats among the integers, and the seventh integer last: still where
+    /// the function reads it.
+    extern "C" fn mixed(
+        a: i64,
+        x: f64,
+        b: i64,
+        c: i64,
+        d: i64,
+        y: f32,
+        e: i64,
+        f: i64,
+        g: i64,
+    ) -> f64 {
+        (seven(a, b, c, d, e, f, g) as f64) + x + f64::from(y)
+    }
+
+    #[test]
+    fn seven_and_eight_integers_cross() {
+        // Mira's `action_bind_axis` takes seven: one past the six x86-64 has
+        // registers for, which were all a call could have.
+        let digits: Vec<Arg> = (1..=8).map(Arg::Int).collect();
+        let at = seven as extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 as usize as i64;
+        assert_eq!(call(at, Ret::Int, &digits[..7]).unwrap().0, 7_654_321);
+        let at =
+            eight as extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 as usize as i64;
+        assert_eq!(call(at, Ret::Int, &digits).unwrap().0, 87_654_321);
+        let at = mixed as extern "C" fn(i64, f64, i64, i64, i64, f32, i64, i64, i64) -> f64 as usize
+            as i64;
+        let args = [
+            Arg::Int(1),
+            Arg::Float(0.5),
+            Arg::Int(2),
+            Arg::Int(3),
+            Arg::Int(4),
+            Arg::Float32(0.25),
+            Arg::Int(5),
+            Arg::Int(6),
+            Arg::Int(7),
+        ];
+        assert_eq!(call(at, Ret::Float, &args).unwrap().1, 7_654_321.75);
+    }
+
     #[test]
     fn what_cannot_be_called_is_refused() {
+        let ints: Vec<Arg> = (0..9).map(Arg::Int).collect();
+        assert!(call(libc_fn("strlen"), Ret::Int, &ints).is_err());
         assert!(open("/no/such/library.dylib").is_err());
         assert!(call(0, Ret::Int, &[]).is_err());
         let floats: Vec<Arg> = (0..9).map(|_| Arg::Float(0.0)).collect();

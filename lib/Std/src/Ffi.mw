@@ -34,8 +34,7 @@
 -- check it against, so what is passed and which `call…` is used are taken at
 -- their word, and a call that says it wrongly does whatever the C does --
 -- usually crash. A call takes at most eight integers, pointers and strings
--- (six on x86-64) and eight floats, and on Windows sixteen arguments of any
--- kind; a struct passed by value, a variadic function such as `printf`, and
+-- and eight floats, and on Windows sixteen arguments of any kind; a struct passed by value, a variadic function such as `printf`, and
 -- a C function calling back into Meadow are not expressible.
 --
 -- A function need not be found by name: one whose address is in memory --
