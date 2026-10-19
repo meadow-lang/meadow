@@ -16,9 +16,22 @@ use std::{
 
 static INTERNER: Lazy<ThreadedRodeo> = Lazy::new(|| ThreadedRodeo::default());
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InternedString {
     pub key: Spur,
+}
+
+/// The empty string. Not the handle's own default: that is the first handle,
+/// whichever string the process happened to intern first -- in a build, the
+/// package name a directory's name suggests -- and every definition made with
+/// `module: Default::default()` was put in a module of that name.
+impl Default for InternedString {
+    fn default() -> Self {
+        static EMPTY: Lazy<InternedString> = Lazy::new(|| InternedString {
+            key: INTERNER.get_or_intern_static(""),
+        });
+        *EMPTY
+    }
 }
 
 /// In the order of the text, not of the handles. A handle is a string's
@@ -128,5 +141,20 @@ impl Deref for InternedString {
 
     fn deref(&self) -> &Self::Target {
         INTERNER.resolve(&self.key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_is_the_empty_string_whatever_was_interned_first() {
+        // A build interns a package name before anything asks for a default;
+        // the default handle used to be that name.
+        let _ = InternedString::from("Silorepro");
+        assert_eq!(&*InternedString::default(), "");
+        assert!(InternedString::default().is_empty());
+        assert_eq!(InternedString::default(), InternedString::from(""));
     }
 }
