@@ -977,6 +977,9 @@ impl Server {
                 HintPart::Name(name) => {
                     let loc = {
                         let doc = self.docs.get(here)?;
+                        // The hint spells a type as its source does; the index
+                        // knows it by its canonical name.
+                        let name = doc.analysis.hint_names.get(name).unwrap_or(name);
                         doc.analysis
                             .names
                             .types

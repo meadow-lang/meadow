@@ -423,6 +423,36 @@ fn a_type_name_in_a_hint_is_a_link() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A type a module declares is indexed by its canonical name,
+/// `Std.String.Parse.Parser`, and a hint spells it `Parser`: the link is
+/// found all the same.
+#[test]
+fn a_modules_type_in_a_hint_is_a_link() {
+    let root = std_sources("hint-link-module");
+    let mut c = Client::start_with(Some(root.clone()));
+    c.set("use Std.String.Parse as P\n\nfun twice p = P.thenSkip p p\n");
+    let hints = c.request(
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": {"uri": URI},
+            "range": {"start": {"line": 0, "character": 0},
+                      "end": {"line": 9, "character": 0}}
+        }),
+    );
+    let linked: Vec<String> = hints
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|h| h["label"].as_array().unwrap().clone())
+        .filter(|p| p.get("location").is_some())
+        .map(|p| p["value"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(linked.contains(&"Parser".to_string()), "linked: {linked:?}");
+
+    drop(c);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn semantic_tokens_come_back_as_deltas() {
     let mut c = Client::start();

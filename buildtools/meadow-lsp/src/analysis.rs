@@ -408,6 +408,11 @@ pub struct Analysis {
     /// source. Written to read as what you could have typed -- `(x : Int)` --
     /// because the annotation syntax is real and someone may want to keep it.
     pub binders: Vec<Hint>,
+    /// What each type name a hint shows stands for: its spelling, `Parser`,
+    /// to its canonical name, `Std.String.Parse.Parser`, which is what the
+    /// name index knows it by. Read off the hint's own type, so that a
+    /// spelling two packages share links to the one this hint means.
+    pub hint_names: std::collections::HashMap<InternedString, InternedString>,
     /// Names of top-level bindings, for hover headers.
     pub binding_names: std::collections::HashMap<VarId, String>,
     /// Rendered scheme of each top-level binding.
@@ -782,6 +787,7 @@ impl Std {
             defs: Default::default(),
             refs: Vec::new(),
             binders: Vec::new(),
+            hint_names: Default::default(),
             binding_names: Default::default(),
             schemes: Default::default(),
             name_refs: Vec::new(),
@@ -928,6 +934,7 @@ impl Std {
             defs: Default::default(),
             refs: Vec::new(),
             binders: Vec::new(),
+            hint_names: Default::default(),
             binding_names: Default::default(),
             schemes: Default::default(),
             name_refs: Vec::new(),
@@ -1007,6 +1014,7 @@ pub fn of_unit(pkg: &CompiledPackage, text: &str, source: Source) -> Analysis {
         defs: Default::default(),
         refs: Vec::new(),
         binders: Vec::new(),
+        hint_names: Default::default(),
         binding_names: Default::default(),
         schemes: Default::default(),
         name_refs: Vec::new(),
@@ -1519,7 +1527,38 @@ impl Walk<'_> {
     /// The type at `id`, named consistently with the rest of this declaration.
     fn hint_type(&mut self, id: hir::NodeId) -> Option<String> {
         let ty = self.types.and_then(|t| t.get(id))?.clone();
+        self.name_types(&ty);
         Some(self.namer.render(&ty))
+    }
+
+    /// Remember what each type and effect name in `ty` stands for, as a hint
+    /// of it will spell it: see [`Analysis::hint_names`].
+    fn name_types(&mut self, ty: &meadow_compiler::infer::Type) {
+        use meadow_compiler::infer::Type::*;
+        match ty {
+            Con(name, args) => {
+                let spelled = InternedString::from(meadow_compiler::hir::spelling(name));
+                self.a.hint_names.insert(spelled, *name);
+                args.iter().for_each(|t| self.name_types(t));
+            }
+            Tuple(ts) => ts.iter().for_each(|t| self.name_types(t)),
+            Fun(ps, r, e) => {
+                ps.iter().for_each(|t| self.name_types(t));
+                self.name_types(r);
+                self.name_types(e);
+            }
+            Record(row) => self.name_types(row),
+            RowExtend(label, field, rest) => {
+                // An effect's name; a record's field is written small.
+                if label.starts_with(|c: char| c.is_uppercase()) || label.contains('.') {
+                    let spelled = InternedString::from(meadow_compiler::hir::spelling(label));
+                    self.a.hint_names.insert(spelled, *label);
+                }
+                self.name_types(field);
+                self.name_types(rest);
+            }
+            Var(_) | Bound(_) | RowEmpty | Error => {}
+        }
     }
 
     /// The declared result of a function of `arity` parameters: what follows
@@ -1531,6 +1570,7 @@ impl Walk<'_> {
     /// body would claim the function is pure.
     fn result_hint(&mut self, fn_id: hir::NodeId, arity: usize) -> Option<String> {
         let whole = self.types.and_then(|t| t.get(fn_id))?.clone();
+        self.name_types(&whole);
         let mut ty = whole.clone();
         let mut effect = meadow_compiler::infer::Type::RowEmpty;
         for _ in 0..arity {
@@ -2289,6 +2329,7 @@ impl Analysis {
             name_refs: Vec::new(),
             names: Default::default(),
             binders: Vec::new(),
+            hint_names: Default::default(),
             binding_names: Default::default(),
             schemes: Default::default(),
             types_in_scope: Default::default(),
