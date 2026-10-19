@@ -506,7 +506,7 @@ Reading a field a record does not have is a run-time error.
 
 Text and arrays have their own primitives, among them `concatStrings` (an
 array of strings, joined), `stringByteLength`, `stringByteAt` (the byte at an
-index, as an `i64`; out of bounds is an error), `stringSlice`, `stringCompare`,
+index, as a `u8`; out of bounds is an error), `stringSlice`, `stringCompare`,
 `arrayLen`, `arrayGet`, `arraySlice` and `arrayConcat`.
 
 **The runtimes turn no value into text but a string.** There is no generic

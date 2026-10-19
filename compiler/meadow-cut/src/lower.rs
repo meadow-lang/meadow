@@ -1663,6 +1663,7 @@ impl Lower {
             ArrayLen | StringByteLength | StringCompare | CharCode | Hash | PopCount | BitWidth
             | ToInt | StArrayLen | CompactSize => ax::Rep::Int,
             ToWord(w) => ax::Rep::Bits(desc::word(w)),
+            StringByteAt => ax::Rep::Bits(desc::word(meadow_rt::num::Width::U8)),
             ToFloat32 => ax::Rep::Bits(desc::FLOAT32),
             CharFromCode => ax::Rep::Bits(desc::CHAR),
             ToFloat | Floor => ax::Rep::Float,
