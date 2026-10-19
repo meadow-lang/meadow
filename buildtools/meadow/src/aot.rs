@@ -357,7 +357,11 @@ pub fn build_native_of(
     let _ = std::fs::write(&kept, listed);
     // The IR was only ever clang's input -- several times the size of the
     // objects it made -- and nothing reads it again: the next build writes it
-    // afresh. Kept when the link fails, which is when someone wants to read it.
+    // afresh. Kept when the link fails, which is when someone wants to read it,
+    // and with `MEADOW_KEEP_IR`, for someone who wants to read it anyway.
+    if std::env::var_os("MEADOW_KEEP_IR").is_some() {
+        return Ok(exe);
+    }
     for m in &modules {
         let _ = std::fs::remove_file(m);
     }
