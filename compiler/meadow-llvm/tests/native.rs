@@ -936,6 +936,25 @@ fn an_arm_can_test_a_value_and_keep_it_whole() {
 }
 
 #[test]
+fn a_literal_in_a_tuple_from_an_inlined_copy_is_tested_at_its_own_representation() {
+    // `mapOpt` is generic, so a release build copies it at `#Ref`: the
+    // `match` sees an `Opt #Ref`, which says nothing of the tuple inside, and
+    // the `True` field went without a representation. The test on it then
+    // reached the runtime as a value described as anything. The literal says
+    // what it is, as a constructor's field already did.
+    let got = run(
+        "literal-in-inlined-tuple",
+        "use Opt.*
+         data Opt a = None | Some a
+         fun mapOpt (f : a -> b) (o : Opt a) : Opt b = match o with | Some x -> Some (f x) | None -> None
+         fun shape (n : Int) : (Int, Bool) = (n, n > 1)
+         fun kind (n : Int) : Int = match mapOpt shape (Some n) with | Some (k, True) -> k * 10 | Some (k, False) -> k | None -> 0
+         def result = kind 3 + kind 1",
+    );
+    assert_eq!(got, "31");
+}
+
+#[test]
 fn a_nested_pattern_on_an_inlined_copy_counts_what_it_takes_apart() {
     // `first` is generic, so a release build copies it at `#Ref` and inlines
     // the copy: the `match` sees a `Opt #Ref`, which says nothing of what the

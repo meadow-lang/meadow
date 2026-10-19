@@ -4238,7 +4238,11 @@ impl Lower {
                                     Some(core::Ty::Tuple(items)) => items.get(i).cloned(),
                                     _ => None,
                                 };
-                                names[i] = Some(self.fresh_typed(field_type(ty, sub)));
+                                // What the pattern says, where the tuple's
+                                // type does not: a literal's own, as for a
+                                // constructor's fields.
+                                let ty = field_type(ty, sub).or_else(|| self.pattern_type(sub));
+                                names[i] = Some(self.fresh_typed(ty));
                             }
                         }
                     }
