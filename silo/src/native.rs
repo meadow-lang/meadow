@@ -104,6 +104,10 @@ fn vector(items: Vec<Val>) -> Word {
         let words: Vec<Word> = xs.iter().map(|v| v.word()).collect();
         Val::Ref(crate::prims::new_array(heap::ARRAY, &words, d))
     };
+    // A program that declares no vector gets a plain array (`docs/CUT.md`).
+    if show::role(Role::VectorSingle).is_empty() {
+        return arr(&items).word();
+    }
     if items.is_empty() {
         return value::data(show::role(Role::VectorEmpty), &[]);
     }
@@ -276,9 +280,11 @@ fn tuple(v: Val, n: usize, what: &str) -> Vec<Val> {
     }
 }
 
+/// A sequence the program gives: a vector, or a plain array, which is a
+/// language's that has no vector.
 fn vector_arg(v: Val, what: &str) -> Vec<Val> {
     match v {
-        Val::Ref(w) => match show::vector_elems(w) {
+        Val::Ref(w) => match show::vector_elems(w).or_else(|| show::array_elems(w)) {
             Some(xs) => xs.into_iter().map(|(x, d)| val(x, d)).collect(),
             None => fail(format!("{what}: expected a Vector, got {}", shown(v))),
         },

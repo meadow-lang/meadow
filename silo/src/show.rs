@@ -240,7 +240,7 @@ fn vector_node(v: Word, out: &mut Vec<(Word, i64)>) -> Option<()> {
     }
 }
 
-fn array_elems(v: Word) -> Option<Vec<(Word, i64)>> {
+pub fn array_elems(v: Word) -> Option<Vec<(Word, i64)>> {
     (heap::is_block(v) && heap::kind(v) == heap::ARRAY).then(|| fields_of(v))
 }
 
