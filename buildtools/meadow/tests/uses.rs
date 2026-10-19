@@ -114,6 +114,32 @@ fn two_aliases_for_one_module_coexist() {
     );
 }
 
+#[test]
+fn one_alias_for_two_modules_is_an_error() {
+    // The second used to take the first's place without a word, and a name
+    // only the first exports was then "not exported by module `C`".
+    assert_eq!(
+        errors(
+            "use Std.Collections.List as C\n\
+             use Std.String as C\n\
+             def result = 1\n"
+        ),
+        "`C` already names `Std.Collections.List` here, so it cannot name `Std.String` too"
+    );
+}
+
+#[test]
+fn the_same_use_twice_is_let_be() {
+    assert_eq!(
+        eval_main_std(
+            "use Std.Collections.List as L\n\
+             use Std.Collections.List as L\n\
+             def result = L.length [1; 2]\n"
+        ),
+        "2"
+    );
+}
+
 // --- selected names ----------------------------------------------------------
 
 #[test]
