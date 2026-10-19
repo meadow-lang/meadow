@@ -54,20 +54,35 @@ jobs:
           EOF
           printf '[package]\nname = "Lib"\nversion = "0.1.0"\n' > "$RUNNER_TEMP/Lib/Meadow.toml"
           cat > "$RUNNER_TEMP/Lib/src/Main.mw" <<'EOF'
+          use Std.Ffi as Ffi
+          use Std.Ffi (Arg)
+
           @export
           fun twice (x : Int32) : Int32 = x * 2
 
           @export
           fun add (a : Int) (b : Int) : Int = a + b
+
+          -- `add`, found by name in the library this is, as a plugin finds
+          -- its own functions to hand its host: in an app whose names a
+          -- release build stripped.
+          @export
+          fun viaOwn (x : Int) : Int ! Process =
+            match Ffi.own () with
+            | Err _ -> 0 - 1
+            | Ok l ->
+                (match Ffi.function l "add" with
+                 | Err _ -> 0 - 2
+                 | Ok f -> (match Ffi.callInt f [Arg.Int x, Arg.Int 1] with | Ok n -> n | Err _ -> 0 - 3))
           EOF
           cat > "$RUNNER_TEMP/host.c" <<'EOF'
           #include <stdint.h>
           #include <stdio.h>
           int32_t twice(int32_t);
-          int64_t add(int64_t, int64_t);
+          int64_t viaOwn(int64_t);
           int main(void) {
-            printf("twice 21 = %d, add 40 2 = %lld\n", twice(21), (long long)add(40, 2));
-            return twice(21) == 42 && add(40, 2) == 42 ? 0 : 1;
+            printf("twice 21 = %d, viaOwn 41 = %lld\n", twice(21), (long long)viaOwn(41));
+            return twice(21) == 42 && viaOwn(41) == 42 ? 0 : 1;
           }
           EOF
           for t in aarch64-apple-ios-sim aarch64-apple-ios; do
@@ -82,8 +97,12 @@ jobs:
               "$boot" build --release --target $t "$RUNNER_TEMP/Lib"
             cp "$RUNNER_TEMP/Lib/target/release/native/$t/silo/libLib.a" out/$d/
             xcrun --sdk $sdk clang --target=$clang -isysroot "$(xcrun --sdk $sdk --show-sdk-path)" \
-              "$RUNNER_TEMP/host.c" out/$d/libLib.a -o out/$d/host \
+              "$RUNNER_TEMP/host.c" out/$d/libLib.a -o out/$d/host -Wl,-dead_strip \
               -liconv -framework Security -framework CoreFoundation
+            # As a release build of an app is: its names stripped, and signed
+            # again.
+            strip out/$d/host
+            codesign -s - -f out/$d/host
           done
           file out/*/*
           nm -gU out/sim/libLib.a | grep -wE '_twice|_add'
@@ -98,4 +117,4 @@ jobs:
           xcrun simctl spawn "$udid" "$PWD/out/sim/Hello" | tee hello.txt
           xcrun simctl spawn "$udid" "$PWD/out/sim/host" | tee host.txt
           grep -q "hello from Meadow on iOS, 3 things" hello.txt
-          grep -q "twice 21 = 42, add 40 2 = 42" host.txt
+          grep -q "twice 21 = 42, viaOwn 41 = 42" host.txt

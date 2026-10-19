@@ -559,12 +559,43 @@ mod sys {
 /// loader looks -- answering a handle to it, or why not. The empty path is
 /// the library this code is in: the program itself, or the plugin it is.
 pub fn open(path: &str) -> Result<i64, String> {
+    if path.is_empty() && EXPORTS.get().is_some() {
+        return Ok(OWN);
+    }
     sys::open(path)
 }
 
 /// The address of `name` in `library`, or why there is none.
 pub fn symbol(library: i64, name: &str) -> Result<i64, String> {
+    if library == OWN {
+        if let Some(&(_, at)) = EXPORTS
+            .get()
+            .and_then(|t| t.iter().find(|(n, _)| n == name))
+        {
+            return Ok(at);
+        }
+        // Not one of the library's exports: what else the loader knows of
+        // the module this is.
+        return sys::symbol(sys::open("")?, name);
+    }
     sys::symbol(library, name)
+}
+
+/// The C functions of the library of Meadow's this runtime is linked into,
+/// by name: what `open("")` answers is looked in first. A library linked
+/// into the program that uses it -- iOS's, which is static -- is part of an
+/// executable whose names the loader may not know, a release build having
+/// stripped the names nothing calls by. The runtime is given them as the
+/// library is first entered.
+static EXPORTS: std::sync::OnceLock<Vec<(String, i64)>> = std::sync::OnceLock::new();
+
+/// What `open("")` answers in a library that has its table: odd, so no
+/// handle a loader gives.
+const OWN: i64 = 1;
+
+/// Keep `table`, the library's C functions by name, for `open("")`.
+pub fn set_exports(table: Vec<(String, i64)>) {
+    let _ = EXPORTS.set(table);
 }
 
 /// Call the C function at `function` with `args`, answering as `ret` says.
