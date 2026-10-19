@@ -126,7 +126,10 @@ pub fn holds(condition: &ast::Meta, opts: &Options) -> Result<bool, (String, Spa
         }),
         ast::Meta::Value(key, value) => {
             let (actual, allowed): (String, &[&str]) = match &**key.value() {
-                "os" => (cfg.os.to_string(), &["windows", "linux", "macos"]),
+                "os" => (
+                    cfg.os.to_string(),
+                    &["windows", "linux", "macos", "android"],
+                ),
                 "arch" => (cfg.arch.to_string(), &["x86_64", "aarch64"]),
                 "family" => (cfg.family().to_string(), &["unix", "windows"]),
                 "profile" => (cfg.profile.to_string(), &["debug", "release"]),
