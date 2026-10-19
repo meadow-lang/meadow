@@ -337,9 +337,28 @@ pub fn collect_oversized(heap: &mut heap::Heap) {
     }
 }
 
+thread_local! {
+    /// Whether this thread's collector is running: what `MEADOW_SILO_POISON`
+    /// asks of a block being freed.
+    static RUNNING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Is this thread's collector in a run?
+pub fn running() -> bool {
+    RUNNING.with(|r| r.get())
+}
+
 /// One run of the three passes, over at most `batch` candidates and walking
 /// at most `budget` blocks. See the module docs.
 fn run(heap: &mut heap::Heap, batch: usize, budget: usize) {
+    RUNNING.with(|r| r.set(true));
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            RUNNING.with(|r| r.set(false));
+        }
+    }
+    let _running = Done;
     let roots = heap.take_candidates(batch);
     if roots.is_empty() {
         return;
@@ -417,6 +436,9 @@ fn run(heap: &mut heap::Heap, batch: usize, budget: usize) {
     }
     for &s in &marked {
         collect_white(s, heap, &mut work, &mut kids);
+    }
+    if heap::tracking() {
+        heap.check_none_white();
     }
     heap.paced(walked, heap.freed() - was);
     heap.reschedule();
@@ -529,13 +551,24 @@ fn scan_black(s: Word, kids: &mut Vec<Word>) {
 }
 
 /// The white blocks are reachable only from each other. Free them.
+///
+/// All of them, through a block still waiting in the candidate buffer as
+/// through any other. A run takes a batch of the candidates, not all of
+/// them -- the published algorithm collects every buffered root at once --
+/// so a white block can be waiting beyond it, and left white for its own
+/// turn it was left pointing at the blocks this walk freed. By its turn that
+/// memory had been handed out again, and walking it freed what had been
+/// built there: a live block, or one freed twice. So a waiting block is
+/// collected with the rest, and only its memory is held back, as for one
+/// that died while waiting, until its turn takes it ([`heap::Heap::
+/// hold_collected`]).
 fn collect_white(s: Word, heap: &mut heap::Heap, work: &mut Vec<Word>, kids: &mut Vec<Word>) {
     work.clear();
     work.push(s);
     // Freed after the walk, not during it: the walk reads their fields.
     let mut doomed = Vec::new();
     while let Some(v) = work.pop() {
-        if heap::colour(v) != heap::WHITE || heap::buffered(v) {
+        if heap::colour(v) != heap::WHITE {
             continue;
         }
         heap::set_colour(v, heap::BLACK);
@@ -549,6 +582,10 @@ fn collect_white(s: Word, heap: &mut heap::Heap, work: &mut Vec<Word>, kids: &mu
         release_leaves(v, heap);
     }
     for v in doomed {
-        heap.free_cycle(v);
+        if heap::buffered(v) {
+            heap.hold_collected(v);
+        } else {
+            heap.free_cycle(v);
+        }
     }
 }

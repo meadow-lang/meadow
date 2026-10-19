@@ -714,6 +714,37 @@ fn a_cycle_still_in_use_is_kept() {
     );
 }
 
+#[test]
+fn a_cycle_of_more_candidates_than_a_run_takes_is_collected_whole() {
+    // A ring of 300 cells, each a candidate when the knot is let go: a run
+    // takes 64 of them, and its walk reaches the rest, waiting beyond its
+    // batch. Those were left white, pointing at the blocks the run freed --
+    // memory a later run walked once it had been handed out again, which
+    // crashed a compiler written in Meadow one run in six. The runtime checks
+    // under the leak check that no run leaves one so.
+    assert_eq!(
+        run_checked(
+            "cycle_ring",
+            "data L = Nil | Node Int (Ref L)
+             use L.*
+             fun link (first : Ref L) (prev : Ref L) (n : Int) : () ! Mut =
+               if n == 0 then setRef prev (Node 0 first)
+               else
+                 let r = newRef Nil in
+                 let _ = setRef prev (Node n r) in
+                 link first r (n - 1)
+             fun ring (n : Int) : () ! Mut =
+               let first = newRef Nil in
+               link first first n
+             fun many (k : Int) (acc : Int) : Int ! Mut =
+               if k == 0 then acc else let _ = ring 300 in many (k - 1) (acc + 1)
+             def result = many 60 0",
+            false
+        ),
+        "60"
+    );
+}
+
 // --- reuse ---------------------------------------------------------------------
 
 const LIST: &str = "use L.*

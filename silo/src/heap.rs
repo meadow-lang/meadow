@@ -753,6 +753,140 @@ impl Heap {
     }
 }
 
+// --- MEADOW_SILO_POISON -------------------------------------------------------
+//
+// For a block used after it was freed. Every freed block is filled with
+// junk and never handed out again, and at exit each one written to since is
+// said; `collector` in the variable keeps only what the cycle collector
+// frees, to tell its mistakes from counting's, and `ptr` makes the junk an
+// address nothing is mapped at, so that a reference read out of a freed
+// block faults where it is followed -- and on Windows the fault is said, with
+// its address in the executable, for `llvm-symbolizer` (a build with `-g`,
+// through `MEADOW_CLANG`). It found the collector freeing what a later run
+// would still walk: `cycles::collect_white`.
+
+fn poisoning() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MEADOW_SILO_POISON").is_some())
+}
+
+fn poison_says(what: &str) -> bool {
+    std::env::var("MEADOW_SILO_POISON").is_ok_and(|v| v.split(',').any(|p| p == what))
+}
+
+fn poison_collector_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| poison_says("collector"))
+}
+
+/// What a freed block is filled with: odd, so no block and no small number;
+/// or, with `ptr`, even, and an address nothing is mapped at.
+fn poison() -> Word {
+    static P: std::sync::OnceLock<Word> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        if poison_says("ptr") {
+            0x0000_7ead_beef_0000
+        } else {
+            0xdead_beef_dead_beef
+        }
+    })
+}
+
+/// Every block freed under poisoning: where, and how many words.
+static QUARANTINE: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+fn quarantine(p: *mut Word, words: usize) {
+    for i in 0..words {
+        // Safety: the block's own words, which nothing should read any more.
+        unsafe { *p.add(i) = poison() };
+    }
+    QUARANTINE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((p as usize, words));
+}
+
+/// Under poisoning, at exit: each freed block written to since, and each
+/// freed twice.
+pub fn quarantined() {
+    if !poisoning() {
+        return;
+    }
+    let q = QUARANTINE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut written = 0;
+    let mut seen = std::collections::HashSet::new();
+    let mut twice = 0;
+    for &(p, words) in q.iter() {
+        twice += usize::from(!seen.insert(p));
+        let p = p as *const Word;
+        // Safety: never handed out again under poisoning.
+        let changed: Vec<(usize, Word)> = (0..words)
+            .map(|i| (i, unsafe { *p.add(i) }))
+            .filter(|(_, w)| *w != poison())
+            .collect();
+        if !changed.is_empty() {
+            written += 1;
+            if written <= 20 {
+                eprintln!("aot: freed block {p:p} of {words} words written since: {changed:x?}");
+            }
+        }
+    }
+    eprintln!(
+        "aot: {} blocks freed; {written} written to after, {twice} freed twice",
+        q.len()
+    );
+}
+
+/// Under poisoning, on Windows: an access violation said before the process
+/// goes -- where, the offset into the executable, and the address touched.
+pub fn catch_faults() {
+    if !poisoning() {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct Record {
+            code: u32,
+            flags: u32,
+            next: *mut Record,
+            address: *mut std::ffi::c_void,
+            count: u32,
+            info: [usize; 15],
+        }
+        #[repr(C)]
+        struct Pointers {
+            record: *mut Record,
+            context: *mut std::ffi::c_void,
+        }
+        unsafe extern "system" {
+            fn AddVectoredExceptionHandler(
+                first: u32,
+                handler: extern "system" fn(*mut Pointers) -> i32,
+            ) -> *mut std::ffi::c_void;
+            fn GetModuleHandleW(name: *const u16) -> *mut std::ffi::c_void;
+        }
+        extern "system" fn said(p: *mut Pointers) -> i32 {
+            // Safety: what Windows hands a vectored handler.
+            let r = unsafe { &*(*p).record };
+            if r.code == 0xc000_0005 {
+                let base = unsafe { GetModuleHandleW(std::ptr::null()) } as usize;
+                eprintln!(
+                    "aot: access violation at {:p} (offset {:#x} in the executable), {} {:#x}",
+                    r.address,
+                    (r.address as usize).wrapping_sub(base),
+                    if r.info[0] == 1 { "writing" } else { "reading" },
+                    r.info[1]
+                );
+                std::process::exit(99);
+            }
+            0
+        }
+        // Safety: a handler that lives as long as the process.
+        unsafe { AddVectoredExceptionHandler(1, said) };
+    }
+}
+
 /// The block at `v` is done with: its fields were moved out, or erased.
 pub fn clean(v: Word) {
     clean_in(crate::ctx::get(), v);
@@ -930,6 +1064,26 @@ impl Heap {
     /// A block the collector found in a garbage cycle. Its edges are
     /// accounted for already -- the mark pass took them away and the scan
     /// pass did not put them back -- so only the memory comes back here.
+    /// A block of a garbage cycle that is waiting in the candidate buffer:
+    /// collected, its edges gone with the rest of the cycle's, and its memory
+    /// held back until its turn frees it -- dead, with nothing left in it to
+    /// erase. See `cycles::collect_white`.
+    pub(crate) fn hold_collected(&mut self, v: Word) {
+        self.freed += 1;
+        set_word(v, 1, (word(v, 1) | DEAD | MOVED) & !(3 << COLOUR_SHIFT));
+    }
+
+    /// Under `MEADOW_SILO_LEAKS`, after a run of the collector: no candidate
+    /// still waiting is white. One that is was left, proved garbage, for a
+    /// later run to collect, still pointing at what this one freed.
+    pub(crate) fn check_none_white(&self) {
+        for &v in self.candidates.iter().chain(&self.oversized) {
+            if !dead(v) && colour(v) == WHITE {
+                crate::fail("the cycle collector left a garbage block waiting for a later run");
+            }
+        }
+    }
+
     pub(crate) fn free_cycle(&mut self, v: Word) {
         self.freed += 1;
         let words = size(v);
@@ -938,6 +1092,10 @@ impl Heap {
 
     fn clean_block(&mut self, p: *mut Word, words: usize) {
         self.live -= 1;
+        if poisoning() && (!poison_collector_only() || crate::cycles::running()) {
+            quarantine(p, words);
+            return;
+        }
         if crate::memory::on() {
             self.held = self.held.saturating_sub(words);
             crate::memory::LIVE.fetch_sub(words, std::sync::atomic::Ordering::Relaxed);
