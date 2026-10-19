@@ -300,12 +300,14 @@ pub unsafe extern "C" fn meadow_run(
         // What `main` answers is in its heap, which stays current here.
         allocator();
         memory::start();
+        heap::catch_faults();
         profile::start();
         let (mut main_ctx, v) = run_main(entry);
         profile::finish();
         let text = show::show(v, d);
         prims::report();
         cycles::report();
+        heap::quarantined();
         heap::erase(v, d);
         if std::env::var_os("MEADOW_SILO_LEAKS").is_some() {
             // Every cycle collected and everything pending erased, so that
