@@ -507,6 +507,26 @@ fn a_program_of_cut_run_again_runs_the_image_kept_of_it() {
     assert_ne!(now, kept);
 }
 
+/// `meadow cut --emit` prints what a program is made into -- its AxCut, or
+/// the LLVM IR a Silo build compiles -- and runs nothing: what a front end's
+/// tools show of the back end's lowering.
+#[test]
+fn a_program_of_cut_is_printed_as_axcut_and_as_llvm() {
+    let dir = scratch("cut-emit");
+    std::fs::write(dir.join("count.cut"), CUT).unwrap();
+    let (ok, out, err) = meadow(&dir, &["cut", "count.cut", "--emit", "axcut"]);
+    assert!(ok, "{err}");
+    assert!(out.contains("-- t:Main/count"), "{out}");
+    assert!(!out.contains("counting\n200002"), "nothing ran: {out}");
+    let (ok, out, err) = meadow(&dir, &["cut", "count.cut", "--emit", "llvm"]);
+    assert!(ok, "{err}");
+    assert!(out.contains("define "), "{out}");
+    assert!(!out.contains("counting\n200002"), "nothing ran: {out}");
+    let (ok, _, err) = meadow(&dir, &["cut", "count.cut", "--emit", "bytes"]);
+    assert!(!ok);
+    assert!(err.contains("`axcut` or `llvm`"), "{err}");
+}
+
 #[test]
 fn a_program_of_cut_runs_on_glade_and_as_an_executable_of_silos() {
     let dir = scratch("cut");

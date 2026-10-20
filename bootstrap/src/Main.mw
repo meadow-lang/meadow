@@ -294,6 +294,12 @@ cli! {
         optLevel : Option Int =
           2 "How hard an executable is optimised: 0, 1 or 2" short "O" value "LEVEL"
         noRun : Flag "Build what would be run -- the bytecode image, or the executable -- and stop"
+        emit
+          : Option
+            String
+            "Print what the program is made into, and run nothing: `axcut`, the AxCut it is lowered to, or `llvm`, the LLVM IR a Silo build compiles"
+            value
+            "WHAT"
       }
     | clean
       "Remove what a build wrote: the package's `target` directory, with the images, executables and incremental cache in it"
