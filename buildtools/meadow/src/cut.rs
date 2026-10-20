@@ -25,6 +25,41 @@ pub fn lowered(path: &Path) -> Result<meadow_seq::Program, String> {
     Ok(lowered)
 }
 
+/// What `meadow cut --emit` prints of the program at `path`: `axcut`, each
+/// definition it is lowered to, under a line naming it; or `llvm`, the LLVM
+/// IR a Silo build of it for this machine compiles -- each unit, after the
+/// first, under a line naming it. A view of the back end's, for a front
+/// end's tools to show: its form is not a contract (`docs/CUT.md`).
+pub fn emitted(path: &Path, what: &str) -> Result<String, String> {
+    use std::fmt::Write;
+    let program = lowered(path)?;
+    let mut out = String::new();
+    match what {
+        "axcut" => {
+            for d in &program.defs {
+                let _ = writeln!(out, "-- {} (L{})\n{}", d.name, d.label.0, d.block);
+            }
+        }
+        "llvm" => {
+            let conv = aot::Target::host()?.call_conv();
+            let units = meadow_llvm::compile_split(&program, meadow_llvm::UNIT, conv)
+                .map_err(|e| format!("{}: {}", path.display(), e.msg))?;
+            for (i, u) in units.iter().enumerate() {
+                if i > 0 {
+                    let _ = writeln!(out, "\n; ---- unit {} ----\n", u.name);
+                }
+                out.push_str(&u.text);
+            }
+        }
+        other => {
+            return Err(format!(
+                "`{other}` is not what `meadow cut --emit` prints: `axcut` or `llvm`"
+            ));
+        }
+    }
+    Ok(out)
+}
+
 /// The program's bytecode image, kept beside the file, under `target`, for
 /// the next run of the same text by the same `meadow`.
 ///
