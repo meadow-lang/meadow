@@ -2332,7 +2332,7 @@ fun conditionHolds (c : Lc) (m : GTree) : Result (String, Meta) Bool =
                     ],
                     spanOf v
                   )
-            in if key == "os" then among cfg.os ["windows", "linux", "macos"]
+            in if key == "os" then among cfg.os ["windows", "linux", "macos", "android"]
                else if key == "arch" then among cfg.arch ["x86_64", "aarch64"]
                else if key == "family" then among (familyOf cfg) ["unix", "windows"]
                else if key == "profile" then among cfg.profile ["debug", "release"]
