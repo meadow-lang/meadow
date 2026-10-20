@@ -74,7 +74,7 @@ fn a_small_definition_is_inlined_and_what_it_leaves_known_is_taken() {
         "t:Main/pair(",
         "t:Main/first(",
         "t:Main/twice(",
-        "case",
+        "| case",
         "prim if",
     ] {
         assert!(!shown.contains(gone), "`{gone}` is left:\n{shown}");
