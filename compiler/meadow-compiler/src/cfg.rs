@@ -18,7 +18,7 @@
 //!
 //! | condition | holds when |
 //! |---|---|
-//! | `os = "windows"` / `"linux"` / `"macos"` / `"android"` | the program is built for that system |
+//! | `os = "windows"` / `"linux"` / `"macos"` / `"android"` / `"ios"` | the program is built for that system |
 //! | `arch = "x86_64"` / `"aarch64"` | … that processor |
 //! | `family = "unix"` / `"windows"`, or bare `unix` / `windows` | … that family of systems |
 //! | `profile = "debug"` / `"release"`, or bare `debug` / `release` | the build profile |
