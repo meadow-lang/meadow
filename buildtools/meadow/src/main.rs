@@ -311,9 +311,10 @@ enum Cmd {
         /// build for another system is built and not run.
         #[arg(long, value_name = "TARGET")]
         target: Option<String>,
-        /// Print what the program is made into, and run nothing: `axcut`, the
-        /// AxCut it is lowered to, or `llvm`, the LLVM IR a Silo build
-        /// compiles.
+        /// Print what the program is made into, and run nothing: `inlined`,
+        /// the Cut it is lowered from once its small definitions are inlined;
+        /// `axcut`, the AxCut it is lowered to; or `llvm`, the LLVM IR a Silo
+        /// build compiles.
         #[arg(long, value_name = "WHAT")]
         emit: Option<String>,
         /// What the program is given, after `--`: what its `argv` answers.

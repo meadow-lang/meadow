@@ -182,13 +182,28 @@ impl Lowered {
     }
 }
 
+/// What a program to run is lowered from: `p` copied for the
+/// representations its generic definitions are called at -- see
+/// [`crate::specialize`] -- and its small definitions inlined -- see
+/// [`crate::inline`]. `MEADOW_CUT_GENERIC=1` leaves them generic, and
+/// `MEADOW_CUT_INLINE=0` leaves the calls, to measure each by.
+pub fn optimized(p: &Program) -> Program {
+    let copied = if std::env::var_os("MEADOW_CUT_GENERIC").is_none() {
+        crate::specialize::program(p)
+    } else {
+        p.clone()
+    };
+    if std::env::var("MEADOW_CUT_INLINE").as_deref() == Ok("0") {
+        copied
+    } else {
+        crate::inline::program(&copied)
+    }
+}
+
 fn lowered(p: &Program, prints: bool) -> R<Lowered> {
-    // A program to run is first copied for the representations its generic
-    // definitions are called at -- see [`crate::specialize`].
-    // `MEADOW_CUT_GENERIC=1` leaves them generic, to measure the copies by.
     let copied;
-    let p = if prints && std::env::var_os("MEADOW_CUT_GENERIC").is_none() {
-        copied = crate::specialize::program(p);
+    let p = if prints {
+        copied = optimized(p);
         &copied
     } else {
         p
