@@ -306,9 +306,10 @@ enum Cmd {
         /// -- and stop: what a front end's `build` asks for.
         #[arg(long)]
         no_run: bool,
-        /// Print what the program is made into, and run nothing: `axcut`, the
-        /// AxCut it is lowered to, or `llvm`, the LLVM IR a Silo build
-        /// compiles.
+        /// Print what the program is made into, and run nothing: `inlined`,
+        /// the Cut it is lowered from once its small definitions are inlined;
+        /// `axcut`, the AxCut it is lowered to; or `llvm`, the LLVM IR a Silo
+        /// build compiles.
         #[arg(long, value_name = "WHAT")]
         emit: Option<String>,
         /// What the program is given, after `--`: what its `argv` answers.

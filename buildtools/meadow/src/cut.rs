@@ -25,22 +25,31 @@ pub fn lowered(path: &Path) -> Result<meadow_seq::Program, String> {
     Ok(lowered)
 }
 
-/// What `meadow cut --emit` prints of the program at `path`: `axcut`, each
-/// definition it is lowered to, under a line naming it; or `llvm`, the LLVM
-/// IR a Silo build of it for this machine compiles -- each unit, after the
-/// first, under a line naming it. A view of the back end's, for a front
-/// end's tools to show: its form is not a contract (`docs/CUT.md`).
+/// What `meadow cut --emit` prints of the program at `path`: `inlined`, the
+/// Cut it is lowered from once its small definitions are inlined
+/// (`meadow_cut::inline`); `axcut`, each definition it is lowered to, under
+/// a line naming it; or `llvm`, the LLVM IR a Silo build of it for this
+/// machine compiles -- each unit, after the first, under a line naming it. A
+/// view of the back end's, for a front end's tools to show: its form is not
+/// a contract (`docs/CUT.md`).
 pub fn emitted(path: &Path, what: &str) -> Result<String, String> {
     use std::fmt::Write;
-    let program = lowered(path)?;
     let mut out = String::new();
     match what {
+        "inlined" => {
+            let text =
+                std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let program =
+                meadow_cut::parse(&text).map_err(|e| format!("{}:{e}", path.display()))?;
+            out = meadow_cut::print::program(&meadow_cut::lower::optimized(&program));
+        }
         "axcut" => {
-            for d in &program.defs {
+            for d in &lowered(path)?.defs {
                 let _ = writeln!(out, "-- {} (L{})\n{}", d.name, d.label.0, d.block);
             }
         }
         "llvm" => {
+            let program = lowered(path)?;
             let conv = aot::Target::host()?.call_conv();
             let units = meadow_llvm::compile_split(&program, meadow_llvm::UNIT, conv)
                 .map_err(|e| format!("{}: {}", path.display(), e.msg))?;
@@ -53,7 +62,7 @@ pub fn emitted(path: &Path, what: &str) -> Result<String, String> {
         }
         other => {
             return Err(format!(
-                "`{other}` is not what `meadow cut --emit` prints: `axcut` or `llvm`"
+                "`{other}` is not what `meadow cut --emit` prints: `inlined`, `axcut` or `llvm`"
             ));
         }
     }
@@ -122,6 +131,11 @@ fn image_key(path: &Path) -> Option<(PathBuf, String, u64)> {
     text.hash(&mut h);
     exe.len().hash(&mut h);
     exe.modified().ok()?.hash(&mut h);
+    // What changes how a program of Cut is lowered: an image made one way is
+    // not what a run asking for the other wants.
+    for knob in ["MEADOW_CUT_INLINE", "MEADOW_CUT_GENERIC"] {
+        std::env::var(knob).ok().hash(&mut h);
+    }
     let root = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
