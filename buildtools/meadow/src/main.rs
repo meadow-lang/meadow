@@ -306,6 +306,11 @@ enum Cmd {
         /// -- and stop: what a front end's `build` asks for.
         #[arg(long)]
         no_run: bool,
+        /// Print what the program is made into, and run nothing: `axcut`, the
+        /// AxCut it is lowered to, or `llvm`, the LLVM IR a Silo build
+        /// compiles.
+        #[arg(long, value_name = "WHAT")]
+        emit: Option<String>,
         /// What the program is given, after `--`: what its `argv` answers.
         #[arg(last = true, value_name = "ARGS")]
         args: Vec<String>,
@@ -1013,6 +1018,7 @@ fn command() {
             aot: ahead,
             opt,
             no_run,
+            emit,
             args,
         }) => {
             let opt = match opt {
@@ -1021,6 +1027,12 @@ fn command() {
                 _ => meadow_compiler::OptLevel::O2,
             };
             let ran = match aot::Runtime::named(&runtime) {
+                _ if emit.is_some() => {
+                    meadow::cut::emitted(&file, emit.as_deref().unwrap_or_default()).map(|text| {
+                        print!("{text}");
+                        0
+                    })
+                }
                 Some(aot::Runtime::Glade) if no_run && ahead => {
                     meadow::cut::build_for_glade(&file, opt).map(|_| 0)
                 }
