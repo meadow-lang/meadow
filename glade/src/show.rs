@@ -153,7 +153,7 @@ impl Vm<'_> {
         }
     }
 
-    fn array_elems(&self, v: Value) -> Option<Vec<Value>> {
+    pub(crate) fn array_elems(&self, v: Value) -> Option<Vec<Value>> {
         let a = v.addr()?;
         if !self.heap.kind(a).is_array() {
             return None;
