@@ -259,6 +259,17 @@ pub fn build_native_of(
             .chain(opt.name().bytes())
             .chain(target.triple().bytes())
             .chain(linked_with.iter().copied())
+            // How a program of Cut is lowered, where it is one.
+            .chain(
+                std::env::var("MEADOW_CUT_INLINE")
+                    .unwrap_or_default()
+                    .into_bytes(),
+            )
+            .chain(
+                std::env::var("MEADOW_CUT_GENERIC")
+                    .unwrap_or_default()
+                    .into_bytes(),
+            )
         {
             h ^= u64::from(b);
             h = h.wrapping_mul(0x0100_0000_01b3);
@@ -297,6 +308,17 @@ pub fn build_native_of(
             .flat_map(|u| u.text.bytes())
             .chain(opt.name().bytes())
             .chain(linked_with.iter().copied())
+            // How a program of Cut is lowered, where it is one.
+            .chain(
+                std::env::var("MEADOW_CUT_INLINE")
+                    .unwrap_or_default()
+                    .into_bytes(),
+            )
+            .chain(
+                std::env::var("MEADOW_CUT_GENERIC")
+                    .unwrap_or_default()
+                    .into_bytes(),
+            )
         {
             h ^= u64::from(b);
             h = h.wrapping_mul(0x0100_0000_01b3);
