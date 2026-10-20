@@ -294,6 +294,12 @@ cli! {
         optLevel : Option Int =
           2 "How hard an executable is optimised: 0, 1 or 2" short "O" value "LEVEL"
         noRun : Flag "Build what would be run -- the bytecode image, or the executable -- and stop"
+        target
+          : Option
+            String
+            "What a Silo build compiles for: `aarch64` or `x86_64`, or a target triple such as `aarch64-linux-android`"
+            value
+            "TARGET"
       }
     | clean
       "Remove what a build wrote: the package's `target` directory, with the images, executables and incremental cache in it"
