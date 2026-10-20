@@ -542,6 +542,12 @@ fn process(op: &str, arg: Val) -> Option<Build> {
             Val::Int(code) => {
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
+                // What a run that ends here was asked to report, as one that
+                // returns from `main` reports it: its profile, and what
+                // `MEADOW_SILO_PRIMS` and `MEADOW_SILO_CYCLES` count.
+                crate::profile::finish();
+                crate::prims::report();
+                crate::cycles::report();
                 std::process::exit(code as i32)
             }
             other => fail(format!(
