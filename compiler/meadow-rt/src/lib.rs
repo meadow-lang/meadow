@@ -25,6 +25,7 @@ pub mod stm;
 pub mod terminal;
 pub mod text;
 pub mod thread;
+pub mod world;
 
 use meadow_intern::InternedString;
 
