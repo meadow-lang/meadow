@@ -98,6 +98,11 @@ pub struct Ctx {
     /// Segments suspended for a handler further out than their own, while
     /// that suspension lasts, innermost first: see `crate::segments::drive`.
     pub(crate) parked: Vec<Parked>,
+    /// Under tracing, the shadow chains of the segments running further out
+    /// than the running one, which each `drive` frame holds while the segment
+    /// it drives runs: roots the collector would not find otherwise. See
+    /// `crate::trace`.
+    pub outer_chains: Vec<Word>,
     pub next_handler: u32,
     /// String literals, made once per thread, by their bytes' address.
     pub literals: ByAddress<Word>,
@@ -137,6 +142,7 @@ impl Ctx {
             running: Vec::new(),
             suspended: Vec::new(),
             parked: Vec::new(),
+            outer_chains: Vec::new(),
             next_handler: 1,
             literals: ByAddress::default(),
             globals: Vec::new(),

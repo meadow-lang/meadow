@@ -84,6 +84,26 @@ impl Runtime {
     }
 }
 
+/// How a native program's memory is managed: Silo counts references unless
+/// told to trace (`docs/RUNTIME-MERGE.md`). `--gc` sets it for a command, and
+/// `MEADOW_GC=tracing` for everything that runs.
+static GC: std::sync::OnceLock<meadow_llvm::Collect> = std::sync::OnceLock::new();
+
+/// Say how memory is managed, before anything is built: `--gc`.
+pub fn set_gc(collect: meadow_llvm::Collect) {
+    let _ = GC.set(collect);
+}
+
+/// How memory is managed: what `--gc` said, or `MEADOW_GC`, or counting.
+pub fn gc() -> meadow_llvm::Collect {
+    *GC.get_or_init(|| {
+        std::env::var("MEADOW_GC")
+            .ok()
+            .and_then(|g| meadow_llvm::Collect::named(&g))
+            .unwrap_or_default()
+    })
+}
+
 /// What to compile for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Target {
@@ -259,6 +279,8 @@ pub fn build_native_of(
             .chain(opt.name().bytes())
             .chain(target.triple().bytes())
             .chain(linked_with.iter().copied())
+            // Traced and counted, the same program is two executables.
+            .chain(std::iter::once(gc() as u8))
         {
             h ^= u64::from(b);
             h = h.wrapping_mul(0x0100_0000_01b3);
@@ -285,8 +307,9 @@ pub fn build_native_of(
         exe
     };
     let stamp = exe.with_extension("stamp");
-    let units = meadow_llvm::compile_split(&lowered, meadow_llvm::UNIT, target.call_conv())
-        .map_err(|e| e.msg)?;
+    let units =
+        meadow_llvm::compile_split_with(&lowered, meadow_llvm::UNIT, target.call_conv(), gc())
+            .map_err(|e| e.msg)?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
     // Unchanged module and runtime: the executable there is this one.

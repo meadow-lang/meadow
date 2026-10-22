@@ -247,10 +247,20 @@ pub struct Module<'p> {
     /// The most words any call passes through the spill area, or any function
     /// reads from it: how big the area has to be. See [`spill`].
     spill_words: usize,
+    /// Whether memory is traced rather than counted: see [`Collect`]. Then
+    /// nothing is shared or erased, no block is reused, and the program is
+    /// collected at safe points, where everything it holds is in a record.
+    tracing: bool,
 }
 
 impl<'p> Module<'p> {
     pub fn new(program: &'p Program, conv: CallConv) -> Module<'p> {
+        Module::with(program, conv, Collect::Count)
+    }
+
+    /// [`Module::new`], with memory managed as `collect` says.
+    pub fn with(program: &'p Program, conv: CallConv, collect: Collect) -> Module<'p> {
+        let tracing = collect == Collect::Trace;
         Module {
             program,
             cc: conv.keyword(),
@@ -276,10 +286,15 @@ impl<'p> Module<'p> {
             frame_tables: HashMap::new(),
             pending_frames: Vec::new(),
             threaded: spawns(program),
-            cycles: ties_knots(program),
-            regions: makes_regions(program),
-            shadow: uses(program, &[Prim::Detach]),
+            // Tracing finds cycles as it finds everything else, and keeps a
+            // region alive by finding a pointer into it: neither is counted.
+            cycles: !tracing && ties_knots(program),
+            regions: !tracing && makes_regions(program),
+            // A frame's record is where the collector finds what the frame
+            // holds while it waits on a call.
+            shadow: tracing || uses(program, &[Prim::Detach]),
             spill_words: 0,
+            tracing,
         }
     }
 
@@ -390,6 +405,64 @@ impl<'p> Module<'p> {
         f.label(&on);
     }
 
+    /// Under tracing, where a function begins: if a collection is due, the
+    /// collector is run here, with `held` -- the function's parameters, each
+    /// with its descriptor -- in a record on the chain, so that everything the
+    /// program holds is in one: the callers' frames are, from the calls they
+    /// are waiting on, and the heap is reached from them. Nothing moves, so
+    /// nothing is read back. A loop is a tail call, so every loop passes one.
+    fn collect_point(&self, f: &mut Fun, held: &[(String, D)]) {
+        if !self.tracing {
+            return;
+        }
+        let (run, on) = (f.b(), f.b());
+        let flag = f.t();
+        f.i(format!("{flag} = load volatile i8, ptr @meadow_gc_due"));
+        let c = f.t();
+        f.i(format!("{c} = icmp ne i8 {flag}, 0"));
+        f.i(format!("br i1 {c}, label %{run}, label %{on}, !prof !1"));
+        f.label(&run);
+        let refs: Vec<(String, String)> = held
+            .iter()
+            .filter_map(|(v, d)| match d {
+                D::Known(k) if *k == desc::REF => Some((v.clone(), k.to_string())),
+                D::Known(_) => None,
+                D::Dyn(d) => Some((v.clone(), d.clone())),
+            })
+            .collect();
+        let words = 2 + 2 * refs.len();
+        let rec = f.t();
+        f.alloca(format!("{rec} = alloca [{words} x i64]"));
+        let slot = if self.threaded {
+            let c = f.ptr(CTX);
+            let s = f.t();
+            f.i(format!("{s} = getelementptr i64, ptr {c}, i64 1"));
+            s
+        } else {
+            "@meadow_shadow_single".to_string()
+        };
+        let prev = f.t();
+        f.i(format!("{prev} = load i64, ptr {slot}"));
+        let store = |f: &mut Fun, i: usize, v: &str| {
+            let q = f.t();
+            f.i(format!("{q} = getelementptr i64, ptr {rec}, i64 {i}"));
+            f.i(format!("store i64 {v}, ptr {q}"));
+        };
+        store(f, 0, &prev);
+        store(f, 1, &refs.len().to_string());
+        for (i, (v, d)) in refs.iter().enumerate() {
+            store(f, 2 + 2 * i, v);
+            store(f, 3 + 2 * i, d);
+        }
+        let at = f.t();
+        f.i(format!("{at} = ptrtoint ptr {rec} to i64"));
+        f.i(format!("store i64 {at}, ptr {slot}"));
+        f.i(format!("call void @meadow_gc_poll(i64 {})", self.cx()));
+        f.i(format!("store i64 {prev}, ptr {slot}"));
+        f.i(format!("br label %{on}"));
+        f.label(&on);
+    }
+
     /// A definition: its function.
     /// Say which module the definitions written from here on are of: what
     /// [`Module::units`] divides the program by. A definition's methods and
@@ -463,6 +536,13 @@ impl<'p> Module<'p> {
         for (n, p) in b.params.iter().zip(&params) {
             env.insert(*n, V::Val(p.clone()));
         }
+        let held: Vec<(String, D)> = b
+            .params
+            .iter()
+            .zip(&params)
+            .map(|(n, p)| (p.clone(), self.desc(*n, &env)))
+            .collect();
+        self.collect_point(&mut f, &held);
         self.stmt(&b.body, &mut env, &mut f)?;
         self.finish(f);
         self.drain()
@@ -626,6 +706,12 @@ impl<'p> Module<'p> {
         for (i, n) in m.params[ncap..].iter().enumerate() {
             env.insert(*n, V::Val(format!("%a{i}")));
         }
+        // The object holds the captures, so it is what is kept of them.
+        let mut held = vec![("%obj".to_string(), D::Known(desc::REF))];
+        for (i, n) in m.params[ncap..].iter().enumerate() {
+            held.push((format!("%a{i}"), self.desc(*n, &env)));
+        }
+        self.collect_point(&mut f, &held);
         self.stmt(&m.body, &mut env, &mut f)?;
         self.finish(f);
         Ok(())
@@ -677,6 +763,9 @@ impl<'p> Module<'p> {
     /// worth it -- the inline sequence at every one of the many places a
     /// linear program shares made the module several times the size.
     fn share(&self, f: &mut Fun, v: &str, d: &D, times: usize) {
+        if self.tracing {
+            return;
+        }
         match d {
             D::Known(k) if *k == desc::REF => {
                 f.i(format!("call void @mw.share(i64 {v}, i32 {times})"));
@@ -690,6 +779,9 @@ impl<'p> Module<'p> {
 
     /// Erase `v`, described by `d`: see [`Module::share`].
     fn erase(&self, f: &mut Fun, v: &str, d: &D) {
+        if self.tracing {
+            return;
+        }
         match d {
             D::Known(k) if *k == desc::REF => {
                 f.i(format!("call void @mw.erase(i64 {}, i64 {v})", self.cx()))
@@ -743,6 +835,10 @@ impl<'p> Module<'p> {
         loaded: &[String],
         env: &HashMap<Name, V>,
     ) -> Result<(), Error> {
+        // Traced: the fields are loaded, and nothing is counted.
+        if self.tracing {
+            return Ok(());
+        }
         if names.is_empty() {
             // Nothing loaded: a nullary constructor, or a closure with no
             // captures -- which has no block, or one that is simply erased.
@@ -811,6 +907,11 @@ impl<'p> Module<'p> {
         loaded: &[String],
         env: &HashMap<Name, V>,
     ) -> Result<String, Error> {
+        // Traced: nobody knows whether anyone else holds the block, so
+        // nothing is built in it.
+        if self.tracing {
+            return Ok("0".to_string());
+        }
         let p = f.ptr(v);
         let rc = f.t();
         f.i(format!("{rc} = load i32, ptr {p}"));
@@ -859,6 +960,9 @@ impl<'p> Module<'p> {
         names: &[Name],
         env: &HashMap<Name, V>,
     ) -> Result<String, Error> {
+        if self.tracing {
+            return Ok("0".to_string());
+        }
         let p = f.ptr(v);
         let rc = f.t();
         f.i(format!("{rc} = load i32, ptr {p}"));
@@ -892,6 +996,9 @@ impl<'p> Module<'p> {
 
     /// Give reuse token `token` back unused: its block, if it holds one.
     fn clean_token(&self, f: &mut Fun, token: &str) {
+        if self.tracing {
+            return;
+        }
         let (give, on) = (f.b(), f.b());
         let has = f.t();
         f.i(format!("{has} = icmp ne i64 {token}, 0"));
@@ -2504,9 +2611,11 @@ impl<'p> Module<'p> {
         };
         let first_only = format!(
             "@meadow_threaded = constant i8 {}\n@meadow_cycles = constant i8 {}\n\
+             @meadow_gc = constant i8 {}\n\
              @meadow_spill_words = constant i64 {}\n\n",
             u8::from(self.threaded),
             u8::from(self.cycles),
+            u8::from(self.tracing),
             self.spill_area()
         );
         let string_sizes: HashMap<&str, usize> = self
@@ -2577,6 +2686,15 @@ impl<'p> Module<'p> {
     /// the unit that defines what the others share.
     fn threads_part(&self, first: bool) -> String {
         let mut out = String::new();
+        if self.tracing {
+            // Set by the runtime when a heap wants collecting: see
+            // [`Module::collect_point`]. The branch to it is cold.
+            out.push_str("@meadow_gc_due = external global i8\n");
+            out.push_str("!1 = !{!\"branch_weights\", i32 1, i32 65536}\n");
+            if !self.threaded && !self.shadow {
+                out.push_str("@meadow_shadow_single = external global i64\n");
+            }
+        }
         if self.threaded {
             // The context comes in as every function's first argument, and
             // the spill area and the shadow chain's head are in it; only the
@@ -2845,6 +2963,7 @@ declare i64 @meadow_field(i64, i64)
 declare i64 @meadow_text(ptr, i64)
 declare i64 @meadow_bigint(i64)
 declare void @meadow_preempted()
+declare void @meadow_gc_poll(i64)
 declare void @meadow_candidate(i64)
 declare void @meadow_region_shared(i64)
 declare void @meadow_region_erased(i64)
@@ -3006,6 +3125,32 @@ const CTX: &str = "%ctx";
 /// Either way **nothing is passed on the stack**: a function takes as many
 /// words as the convention has registers for ([`CallConv::regs`]), and the
 /// rest go through the spill area ([`spill`]).
+/// How the program's memory is managed (`docs/RUNTIME-MERGE.md`).
+///
+/// - **`Count`**: the AxCut paper's reference counting, with reuse and
+///   borrowing, as `docs/SILO.md` has it. Silo's own, and the default.
+/// - **`Trace`**: the same blocks, found rather than counted. Nothing is
+///   shared, erased or reused; the runtime marks what the program's records
+///   and its context reach and sweeps the rest, at safe points where a
+///   function begins ([`Module::collect_point`]). Nothing moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Collect {
+    #[default]
+    Count,
+    Trace,
+}
+
+impl Collect {
+    /// By the name a command line gives it: `rc` or `tracing`.
+    pub fn named(name: &str) -> Option<Collect> {
+        match name {
+            "rc" | "count" | "counting" => Some(Collect::Count),
+            "tracing" | "trace" => Some(Collect::Trace),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallConv {
     Ghc,

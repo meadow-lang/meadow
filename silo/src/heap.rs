@@ -276,6 +276,9 @@ pub struct Heap {
     /// Under `MEADOW_SILO_PRIMS`: how many blocks of each kind this heap has
     /// erased, by what makes them -- a constructor, a closure's code.
     erased: Option<std::collections::HashMap<(u64, u32), u64>>,
+    /// Where a traced program's blocks come from: see [`crate::trace`]. Made
+    /// at its first allocation; never, for a program that counts.
+    space: Option<Box<crate::trace::Space>>,
 }
 
 impl Heap {
@@ -300,7 +303,17 @@ impl Heap {
             large: crate::ctx::ByAddress::default(),
             held: 0,
             erased: crate::prims::counting().then(std::collections::HashMap::new),
+            space: None,
         }
+    }
+
+    /// The traced program's memory, if it has allocated any.
+    pub fn space(&self) -> Option<&crate::trace::Space> {
+        self.space.as_deref()
+    }
+
+    pub fn space_mut(&mut self) -> Option<&mut crate::trace::Space> {
+        self.space.as_deref_mut()
     }
 }
 
@@ -515,7 +528,7 @@ pub fn meta(v: Word) -> u32 {
     (word(v, 1) >> 32) as u32
 }
 
-fn uniform(v: Word) -> bool {
+pub(crate) fn uniform(v: Word) -> bool {
     word(v, 1) & UNIFORM != 0
 }
 
@@ -583,7 +596,7 @@ pub fn set_field(v: Word, i: usize, x: Word, d: i64) {
 /// `n` references more to `v`, described by `d`: one count written, unless
 /// the block is in a region, which counts each.
 pub fn share_n(v: Word, d: i64, n: usize) {
-    if n == 0 || d != meadow_rt::desc::REF || !is_block(v) {
+    if n == 0 || d != meadow_rt::desc::REF || !is_block(v) || crate::trace::on() {
         return;
     }
     if in_region(v) {
@@ -600,7 +613,8 @@ pub fn share_n(v: Word, d: i64, n: usize) {
 /// One reference more to `v`, described by `d`.
 #[inline]
 pub fn share(v: Word, d: i64) {
-    if d == meadow_rt::desc::REF && is_block(v) {
+    // Traced, nothing is counted: see `crate::trace`.
+    if d == meadow_rt::desc::REF && is_block(v) && !crate::trace::on() {
         // Safety: a live block's count.
         let rc = unsafe { &mut *(v as *mut u32) };
         *rc += 1;
@@ -616,7 +630,7 @@ pub fn share(v: Word, d: i64) {
 /// One reference fewer.
 #[inline]
 pub fn erase(v: Word, d: i64) {
-    if d == meadow_rt::desc::REF && is_block(v) {
+    if d == meadow_rt::desc::REF && is_block(v) && !crate::trace::on() {
         // Safety: a live block's count.
         let rc = unsafe { &mut *(v as *mut u32) };
         if *rc == 0 {
@@ -646,6 +660,9 @@ fn died(v: Word) {
 /// [`died`], in context `c`'s heap.
 #[inline]
 pub fn died_in(c: *mut crate::ctx::Ctx, v: Word) {
+    if crate::trace::on() {
+        return;
+    }
     if crate::prims::counting() {
         dropped(v);
     }
@@ -666,6 +683,13 @@ pub fn acquire(words: usize) -> Word {
 
 /// [`acquire`], from context `c`'s heap.
 pub fn acquire_in(c: *mut crate::ctx::Ctx, words: usize) -> Word {
+    if crate::trace::on() {
+        return with_in(c, |h| {
+            h.space
+                .get_or_insert_with(|| Box::new(crate::trace::Space::new()))
+                .take(words)
+        });
+    }
     with_in(c, |h| {
         // Work off what is pending: one step always, more while nothing clean
         // of this size is to be had.
@@ -894,6 +918,10 @@ pub fn clean(v: Word) {
 
 /// [`clean`], into context `c`'s heap.
 pub fn clean_in(c: *mut crate::ctx::Ctx, v: Word) {
+    // Traced, a block is freed by the sweep and nothing else.
+    if crate::trace::on() {
+        return;
+    }
     if crate::cycles::possible() && buffered(v) {
         // Waiting in the candidate buffer: hold the memory back, and
         // remember that there is nothing left inside to erase.

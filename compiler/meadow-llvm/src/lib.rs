@@ -50,7 +50,7 @@ pub fn fingerprint() -> &'static str {
     env!("MEADOW_SILO_FINGERPRINT")
 }
 
-pub use emit::CallConv;
+pub use emit::{CallConv, Collect};
 
 /// `program` as an LLVM module, as text, its functions in `conv`.
 pub fn compile(program: &Program, conv: CallConv) -> Result<String, Error> {
@@ -87,13 +87,23 @@ impl Unit {
 /// `emit::Module::units`. Their functions are in `conv`, which is the
 /// target's: see [`CallConv`].
 pub fn compile_split(program: &Program, unit: usize, conv: CallConv) -> Result<Vec<Unit>, Error> {
+    compile_split_with(program, unit, conv, Collect::Count)
+}
+
+/// [`compile_split`], with memory managed as `collect` says.
+pub fn compile_split_with(
+    program: &Program,
+    unit: usize,
+    conv: CallConv,
+    collect: Collect,
+) -> Result<Vec<Unit>, Error> {
     if !program.exports.is_empty() {
-        return compile_library(program, unit, conv);
+        return compile_library_with(program, unit, conv, collect);
     }
     let entry = program.entry.ok_or_else(|| Error {
         msg: "the program has no entry point".into(),
     })?;
-    let mut module = emit::Module::new(program, conv);
+    let mut module = emit::Module::with(program, conv, collect);
     let blocks = linear::program(program, &[entry])?;
     module.name_labels(blocks.iter().map(|(i, label, _)| {
         let d = &program.defs[*i];
@@ -154,8 +164,18 @@ fn report_sizes(module: &emit::Module) {
 /// exports, which is all of it that is kept, and no `main`. In modules of
 /// about `unit` bytes, as [`compile_split`] makes them.
 pub fn compile_library(program: &Program, unit: usize, conv: CallConv) -> Result<Vec<Unit>, Error> {
+    compile_library_with(program, unit, conv, Collect::Count)
+}
+
+/// [`compile_library`], with memory managed as `collect` says.
+pub fn compile_library_with(
+    program: &Program,
+    unit: usize,
+    conv: CallConv,
+    collect: Collect,
+) -> Result<Vec<Unit>, Error> {
     let roots: Vec<meadow_axcut::Label> = program.exports.iter().map(|e| e.label).collect();
-    let mut module = emit::Module::new(program, conv);
+    let mut module = emit::Module::with(program, conv, collect);
     let blocks = linear::program(program, &roots)?;
     module.name_labels(blocks.iter().map(|(i, label, _)| {
         let d = &program.defs[*i];
@@ -188,7 +208,18 @@ pub fn compile_tests(
     unit: usize,
     conv: CallConv,
 ) -> Result<Vec<Unit>, Error> {
-    let mut module = emit::Module::new(program, conv);
+    compile_tests_with(program, tests, unit, conv, Collect::Count)
+}
+
+/// [`compile_tests`], with memory managed as `collect` says.
+pub fn compile_tests_with(
+    program: &Program,
+    tests: &[meadow_axcut::Label],
+    unit: usize,
+    conv: CallConv,
+    collect: Collect,
+) -> Result<Vec<Unit>, Error> {
+    let mut module = emit::Module::with(program, conv, collect);
     let blocks = linear::program(program, tests)?;
     module.name_labels(blocks.iter().map(|(i, label, _)| {
         let d = &program.defs[*i];

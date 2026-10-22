@@ -620,11 +620,12 @@ pub fn run_tests_native(
     let labels: Vec<meadow_seq::Label> = (0..tests.len())
         .map(|i| meadow_seq::Label((base + i) as u32))
         .collect();
-    let units = meadow_llvm::compile_tests(
+    let units = meadow_llvm::compile_tests_with(
         &lowered.program,
         &labels,
         meadow_llvm::UNIT,
         meadow_llvm::CallConv::host(),
+        crate::aot::gc(),
     )
     .map_err(|e| e.msg)?;
     let target = crate::aot::Target::host()?.with_runtime(crate::aot::Runtime::Silo);

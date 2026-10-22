@@ -1067,7 +1067,8 @@ pub extern "C" fn meadow_st_set(a: Word, i: Word, x: Word, d: i64) -> Word {
 /// Whether the array at `a` can be written in place: nobody else holds it, and
 /// it is not in a region, whose blocks are never counted.
 fn unshared(a: Word) -> bool {
-    heap::word(a, 0) & 0xFFFF_FFFF == 0
+    // Traced, nobody counts: a block may always be held elsewhere.
+    !crate::trace::on() && heap::word(a, 0) & 0xFFFF_FFFF == 0
 }
 
 /// Set the length of the array at `a` to `n`, keeping its count, and its

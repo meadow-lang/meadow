@@ -182,7 +182,7 @@ fn new_region() -> *const Region {
 ///
 /// `v` must be a block inside a region, which its count says (see
 /// [`heap::REGION_FLOOR`]).
-unsafe fn owner(v: Word) -> *const Region {
+pub(crate) unsafe fn owner(v: Word) -> *const Region {
     // Safety: the caller's.
     unsafe { *(v as *const Word).sub(1) as *const Region }
 }

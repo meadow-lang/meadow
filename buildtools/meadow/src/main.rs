@@ -423,6 +423,11 @@ struct TargetArgs {
     /// the same, and `threads = N` in a profile; both runtimes read it.
     #[arg(long, short = 'j', value_name = "N")]
     threads: Option<usize>,
+    /// How a native program's memory is managed: `rc`, counting references
+    /// with reuse (Silo's, the default), or `tracing`, marking what the
+    /// program reaches and sweeping the rest. `MEADOW_GC` says the same.
+    #[arg(long, value_name = "STRATEGY", value_parser = gc_strategy)]
+    gc: Option<meadow_llvm::Collect>,
     /// How large Glade's collector lets a thread's nursery grow: `8M`, `512K`,
     /// `1G`, or bytes, from 256K to 1G. 2M by default. A larger one collects
     /// less often and promotes less, which a program that allocates a great
@@ -450,6 +455,12 @@ struct TargetArgs {
     all_features: bool,
 }
 
+/// `--gc`'s strategy, by name.
+fn gc_strategy(s: &str) -> Result<meadow_llvm::Collect, String> {
+    meadow_llvm::Collect::named(s)
+        .ok_or_else(|| format!("`{s}` is not a strategy: `rc` or `tracing`"))
+}
+
 impl TargetArgs {
     /// These, with what the resolved profile says for whatever the command
     /// line left out -- the runtime above all, which only the profile knows.
@@ -468,6 +479,7 @@ impl TargetArgs {
                 .or_else(|| profile.target.map(|t| t.to_string())),
             runtime: profile.runtime,
             threads: self.threads.or(profile.threads),
+            gc: self.gc,
             nursery: self.nursery.or(profile.nursery),
             leaks: self.leaks || profile.leaks,
             features: self.features.clone(),
@@ -480,6 +492,9 @@ impl TargetArgs {
     /// runtimes are told, and a program Silo runs is a process
     /// of its own, which inherits it.
     fn configure(&self) {
+        if let Some(g) = self.gc {
+            meadow::aot::set_gc(g);
+        }
         if let Some(n) = self.threads.filter(|n| *n > 0) {
             // Safety: before the program, its threads or any child of it.
             unsafe { std::env::set_var("MEADOW_THREADS", n.to_string()) };

@@ -254,7 +254,16 @@ fn drive(
     cx().parked.append(&mut nested);
     loop {
         crate::shadow::set(shadow);
+        // Under tracing, this segment's frames hold what `here` says while the
+        // one it drives runs: see `crate::trace`.
+        let traced = crate::trace::on();
+        if traced {
+            cx().outer_chains.push(here);
+        }
         let result = segment.resume(down);
+        if traced {
+            cx().outer_chains.pop();
+        }
         shadow = crate::shadow::head();
         crate::shadow::set(here);
         match result {

@@ -31,6 +31,7 @@ pub mod sched;
 pub mod segments;
 pub mod shadow;
 pub mod show;
+pub mod trace;
 pub mod value;
 
 use ctx::Ctx;
