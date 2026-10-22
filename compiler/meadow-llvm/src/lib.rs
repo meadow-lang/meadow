@@ -14,7 +14,9 @@
 //! - [`emit`] writes LLVM IR as text, for clang to compile and link.
 
 pub mod emit;
-pub mod linear;
+/// `meadow_axcut::linear`, where it lives now that more than one engine reads
+/// it.
+pub use meadow_axcut::linear;
 
 use meadow_axcut::Program;
 

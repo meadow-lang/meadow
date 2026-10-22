@@ -193,6 +193,18 @@ for Glade today with slot numbers.
 So primitives, printing, the natives and FFI read every block the same way,
 and only the heap differs.
 
+**Under reference counting nothing changes.** LLVM with RC is Silo exactly as
+it is: the same header, odd words, size classes, lazy freeing, cycle
+collection. It is the baseline the rest is measured against.
+
+**One layout for now, kept open** (Chris, 2026-10-22). The shared code reads
+values through traits (`meadow_rt::world::World`, `meadow_rt::look::Look`,
+and those that follow). It never reads a header directly. So a strategy that
+needs a layout of its own can have one. What would then be per layout is the
+LIR lowering's description of a block (header size, where the length and
+kind are, how a field is addressed), and converting values that cross
+between two layouts in a compact region or a parcel.
+
 ### Debugging native code
 
 The interpreter remains the debugger's engine: debug builds use it, and it

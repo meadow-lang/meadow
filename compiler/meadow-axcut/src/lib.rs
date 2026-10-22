@@ -458,6 +458,10 @@ impl Program {
 
 pub mod describe;
 
+/// AxCut with every share, erase and reuse written down: what an engine that
+/// counts references runs (`docs/RUNTIME-MERGE.md`, the memory pass).
+pub mod linear;
+
 pub mod machine;
 
 mod print;

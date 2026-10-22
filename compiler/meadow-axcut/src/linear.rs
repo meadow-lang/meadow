@@ -85,7 +85,7 @@
 //! and erased with the descriptor it is described by, and the emitted code
 //! asks the descriptor.
 
-use meadow_axcut::{Block, Extern, Label, Name, Program, Rep, Statement, Tag};
+use crate::{Block, Extern, Label, Name, Program, Rep, Statement, Tag};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -1209,7 +1209,7 @@ impl<'p> Pass<'p> {
                 // caller's to erase. See `emit::consumes`.
                 let mut owned = owned;
                 let mut share_first = None;
-                if let Some(i) = crate::emit::consumes(op)
+                if let Some(i) = consumes(op)
                     && let Some(&a) = args.get(i)
                     && self.counted(a)
                     && !owned.contains(&a)
@@ -1217,7 +1217,7 @@ impl<'p> Pass<'p> {
                     // Borrowed: the primitive is handed a reference of its own.
                     self.consumed_borrowed(a);
                     share_first = Some(a);
-                } else if let Some(i) = crate::emit::consumes(op)
+                } else if let Some(i) = consumes(op)
                     && let Some(&a) = args.get(i)
                     && self.counted(a)
                 {
@@ -1663,7 +1663,7 @@ impl Pass<'_> {
     /// A new reuse token's name.
     fn token(&mut self) -> Name {
         self.tokens += 1;
-        meadow_axcut::VarId(u32::MAX - self.tokens)
+        crate::VarId(u32::MAX - self.tokens)
     }
 
     /// `l`, with the first `let` of `n` fields on each path building in token
@@ -1795,5 +1795,21 @@ impl Pass<'_> {
             },
             other => L::Clean(t, Box::new(other)),
         }
+    }
+}
+
+/// The argument a primitive **consumes** rather than borrows, if it does.
+///
+/// Every other primitive borrows its arguments. One that consumes is handed a
+/// reference of its own: the linearization shares the argument first where it
+/// is used again, and otherwise gives up the caller's. So a count of zero inside
+/// the primitive means nobody else can see the value, and it may be changed in
+/// place -- which is how `arrayPush` grows an array without copying it, and
+/// how a record whose type says where the label is gets its field replaced.
+pub fn consumes(op: &Extern) -> Option<usize> {
+    match op {
+        Extern::Prim(meadow_rt::Prim::ArrayPush | meadow_rt::Prim::ArrayConcat)
+        | Extern::Extend(_, Some(_)) => Some(0),
+        _ => None,
     }
 }

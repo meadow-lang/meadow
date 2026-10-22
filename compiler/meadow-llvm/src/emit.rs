@@ -3622,21 +3622,9 @@ fn direct(p: Prim) -> Option<(&'static str, Descs)> {
     })
 }
 
-/// The argument a primitive **consumes** rather than borrows, if it does.
-///
-/// Every other primitive borrows its arguments. One that consumes is handed a
-/// reference of its own: the linearization shares the argument first where it
-/// is used again, and otherwise gives up the caller's. So a count of zero inside
-/// the primitive means nobody else can see the value, and it may be changed in
-/// place -- which is how `arrayPush` grows an array without copying it, and
-/// how a record whose type says where the label is gets its field replaced.
-pub fn consumes(op: &meadow_axcut::Extern) -> Option<usize> {
-    match op {
-        meadow_axcut::Extern::Prim(Prim::ArrayPush | Prim::ArrayConcat)
-        | meadow_axcut::Extern::Extend(_, Some(_)) => Some(0),
-        _ => None,
-    }
-}
+/// The argument a primitive consumes rather than borrows: the memory pass's
+/// rule, `meadow_axcut::linear::consumes`.
+pub use crate::linear::consumes;
 
 /// Which arguments of a [`direct`] primitive carry a descriptor.
 #[derive(Clone, Copy, PartialEq)]
