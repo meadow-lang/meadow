@@ -371,6 +371,40 @@ impl Reflect [a] where Reflect a {
     | other -> Err (expected "a list" other)
 }
 
+-- A tuple is a `List` of its parts, in order.
+impl Reflect (a, b) where Reflect a, Reflect b {
+  fun toDatum p = match p with | (x, y) -> Datum.List [toDatum x, toDatum y]
+  fun fromDatum d =
+    match d with
+    | Datum.List ds if V.len ds == 2 ->
+        (match (V.get ds 0, V.get ds 1) with
+         | (Just dx, Just dy) ->
+             (match (fromDatum dx, fromDatum dy) with
+              | (Ok x, Ok y) -> Ok (x, y)
+              | (Err e, _) -> Err e
+              | (_, Err e) -> Err e)
+         | _ -> Err (expected "a pair" d))
+    | other -> Err (expected "a pair" other)
+}
+
+impl Reflect (a, b, c) where Reflect a, Reflect b, Reflect c {
+  fun toDatum t =
+    match t with
+    | (x, y, z) -> Datum.List [toDatum x, toDatum y, toDatum z]
+  fun fromDatum d =
+    match d with
+    | Datum.List ds if V.len ds == 3 ->
+        (match (V.get ds 0, V.get ds 1, V.get ds 2) with
+         | (Just dx, Just dy, Just dz) ->
+             (match (fromDatum dx, fromDatum dy, fromDatum dz) with
+              | (Ok x, Ok y, Ok z) -> Ok (x, y, z)
+              | (Err e, _, _) -> Err e
+              | (_, Err e, _) -> Err e
+              | (_, _, Err e) -> Err e)
+         | _ -> Err (expected "a triple" d))
+    | other -> Err (expected "a triple" other)
+}
+
 impl Reflect (Maybe a) where Reflect a {
   fun toDatum m =
     match m with
@@ -556,6 +590,14 @@ use Std.Test (assertEq, assertTrue, assertFalse)
   let g = assertFalse (isOk big) "256 is not a UInt8" in
   let (surrogate : Result String Char) = fromDatum (Datum.Int 55296) in
   assertFalse (isOk surrogate) "a surrogate is not a Char"
+
+@test fun tuplesGoThroughADatumAndBack () =
+  let (p : Result String [(Int, String)]) = fromDatum (toDatum [(1, "one"), (2, "two")]) in
+  let a = assertEq p (Ok [(1, "one"), (2, "two")]) "a list of pairs" in
+  let (t : Result String (Bool, Char, Float)) = fromDatum (toDatum (True, 'x', 1.5)) in
+  let b = assertEq t (Ok (True, 'x', 1.5)) "a triple" in
+  let (short : Result String (Int, Int)) = fromDatum (Datum.List [Datum.Int 1]) in
+  assertFalse (isOk short) "one thing is not a pair"
 
 fun isOk (r : Result String a) : Bool = match r with | Ok _ -> True | Err _ -> False
 
