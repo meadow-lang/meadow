@@ -91,7 +91,9 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// A linear statement. See the module docs for what each consumes.
-#[derive(Debug, Clone)]
+// Written to an image for Silo's interpreter, which runs the program this
+// pass made of it rather than making it again: see `image`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum L {
     /// One reference more to `name`, which stays owned.
     Share(Name, Box<L>),
@@ -157,11 +159,12 @@ pub enum L {
         args: Vec<Name>,
         blocks: Vec<(Vec<Name>, L)>,
     },
-    Error(&'static str),
+    Error(#[serde(deserialize_with = "crate::leaked")] &'static str),
 }
 
 /// An arm of a [`L::Switch`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct SwitchArm {
     pub tag: Tag,
     pub fields: Vec<Name>,
@@ -175,7 +178,8 @@ pub struct SwitchArm {
 
 /// A method: what it binds, and its body, which owns all of it but the
 /// parameters `borrowed` says it borrows.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct LBlock {
     pub params: Vec<Name>,
     pub borrowed: Vec<bool>,

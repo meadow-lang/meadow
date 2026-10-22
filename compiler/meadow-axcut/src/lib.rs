@@ -119,7 +119,7 @@ pub type Tag = u32;
 /// known when the program is compiled: a value whose type is a type variable,
 /// whose representation is whatever the variable is instantiated to -- which
 /// the variable's *descriptor* says, at run time (`meadow_core::desc`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Rep {
     /// A heap object: data, a closure or continuation, an array, a record, a
     /// `BigInt`, a `Ref` -- anything the collector follows.
@@ -162,20 +162,23 @@ impl Rep {
 }
 
 /// A top-level block, reachable by [`Statement::Jump`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct Label(pub u32);
 
 /// A block: parameter names, and a body that runs with those names bound.
 ///
 /// The parameters are the shape the environment must have on entry. A caller
 /// arranges it with [`Statement::Substitute`] and then jumps.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct Block {
     pub params: Vec<Name>,
     pub body: Statement,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Statement {
     /// `substitute [x, y, …] in block` — rebuild the environment from the named
     /// values, in that order, and run the block.
@@ -278,7 +281,7 @@ pub enum Statement {
 
     /// Not in the paper. Reaching one is a runtime error, and it exists so that
     /// an untranslatable term is loud rather than silently missing.
-    Error(&'static str),
+    Error(#[serde(deserialize_with = "leaked")] &'static str),
 
     /// Not in the paper either: `s`, which a person wrote at `loc`. It does
     /// nothing. Code generation reads it to say which source position the
@@ -296,13 +299,13 @@ pub enum Statement {
 /// the labels in the order a record keeps them -- the interned names' -- and
 /// how many labels there are. A back end that lays a record out in that order
 /// reads the field there, rather than searching the labels at run time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Place {
     pub at: u32,
     pub of: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Extern {
     /// Produce a constant. One continuation, which binds it.
     Lit(meadow_rt::Lit),
@@ -359,7 +362,8 @@ pub enum Extern {
 }
 
 /// A labelled block in the program table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct Def {
     pub label: Label,
     pub name: InternedString,
@@ -373,7 +377,7 @@ pub struct Def {
 /// A block C may call, by the name it calls it: what a library built of the
 /// program exports. The block takes `params` and then the continuation it
 /// answers through, and answers `result`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Export {
     pub name: String,
     pub label: Label,
@@ -381,7 +385,8 @@ pub struct Export {
     pub result: Rep,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct Program {
     /// What C may call, where the program is built as a library.
     pub exports: Vec<Export>,
@@ -463,6 +468,10 @@ pub mod describe;
 pub mod linear;
 
 pub mod machine;
+
+/// A program as a file, for an engine that runs in a process of its own:
+/// Silo's interpreter (`silo/vm`).
+pub mod image;
 
 mod print;
 pub use print::Listing;
@@ -754,4 +763,12 @@ mod still_used_tests {
         assert!(!at_jump.contains(&n(2)));
         assert_eq!(at_jump.len(), 3, "only what the jump carries");
     }
+}
+
+/// A `&'static str` read back from a program's file: leaked, since the
+/// message lives as long as the program does: a `Statement::Error`'s, and a
+/// `linear::L::Error`'s.
+pub(crate) fn leaked<'de, D: serde::Deserializer<'de>>(d: D) -> Result<&'static str, D::Error> {
+    let s: String = serde::Deserialize::deserialize(d)?;
+    Ok(Box::leak(s.into_boxed_str()))
 }

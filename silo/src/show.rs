@@ -28,8 +28,20 @@ unsafe extern "C" {
     static meadow_sym_count: i64;
 }
 
-/// The emitted module's tables, read once.
+/// Tables given by whatever runs the program when there is no emitted module
+/// to read them from: an interpreter (`silo/vm`), before the program starts.
+static INSTALLED: std::sync::OnceLock<Names> = std::sync::OnceLock::new();
+
+/// Give the program's tables to the runtime, before anything asks for them.
+pub fn install(names: Names) {
+    let _ = INSTALLED.set(names);
+}
+
+/// The program's tables: those installed, or the emitted module's, read once.
 pub fn names() -> &'static Names {
+    if let Some(n) = INSTALLED.get() {
+        return n;
+    }
     static NAMES: std::sync::OnceLock<Names> = std::sync::OnceLock::new();
     NAMES.get_or_init(|| {
         let read = |p: *const std::ffi::c_char| {

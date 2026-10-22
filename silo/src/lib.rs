@@ -237,7 +237,13 @@ pub unsafe extern "C" fn meadow_run_test(
         return 2;
     };
     // Safety: the caller's.
-    let entry = unsafe { *tests.add(i) };
+    run_one_test(unsafe { *tests.add(i) })
+}
+
+/// Run `entry` as a test: on a stack of its own, status 0 if it returns and 1
+/// if it fails. What a test executable does with the test it was asked for,
+/// and what Silo's interpreter does with one of an image's tests.
+pub fn run_one_test(entry: extern "C" fn() -> Word) -> i32 {
     let ran = std::thread::Builder::new()
         .name("main".into())
         .stack_size(1 << 30)

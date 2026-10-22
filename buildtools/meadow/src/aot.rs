@@ -99,9 +99,93 @@ pub fn gc() -> meadow_llvm::Collect {
     *GC.get_or_init(|| {
         std::env::var("MEADOW_GC")
             .ok()
-            .and_then(|g| meadow_llvm::Collect::named(&g))
-            .unwrap_or_default()
+            .map_or_else(Default::default, |g| strategy(&g))
     })
+}
+
+/// Whether a program for Silo is interpreted rather than compiled: `--interpret`
+/// or `MEADOW_INTERPRET`. See [`write_image`].
+static INTERPRET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Interpret, rather than compile, what is built for Silo: `--interpret`.
+pub fn set_interpret() {
+    let _ = INTERPRET.set(true);
+}
+
+pub fn interpret() -> bool {
+    *INTERPRET.get_or_init(|| std::env::var_os("MEADOW_INTERPRET").is_some())
+}
+
+/// Write `program` as an image for Silo's interpreter (`silo/vm`) to `path`:
+/// what a build that interprets makes in place of an executable. Its tests, if
+/// it is a program of them, are where each begins.
+pub fn write_image(
+    path: &Path,
+    program: meadow_seq::Program,
+    tests: Vec<meadow_seq::Label>,
+) -> Result<(), String> {
+    // The memory pass, done here once rather than by every run: where it
+    // starts is the entry, or each test.
+    let roots = match (tests.is_empty(), program.entry) {
+        (true, Some(e)) => vec![e],
+        (true, None) => return Err("the program has no entry point".into()),
+        (false, _) => tests.clone(),
+    };
+    let linear = meadow_llvm::linear::program(&program, &roots).map_err(|e| e.msg)?;
+    // What the definitions were before the pass is not read again.
+    let mut program = program;
+    for d in &mut program.defs {
+        d.block.body = meadow_seq::Statement::Error("made linear");
+    }
+    let image = meadow_seq::image::Image {
+        program,
+        tracing: gc() == meadow_llvm::Collect::Trace,
+        tests,
+        linear,
+    };
+    write(path, &meadow_seq::image::encode(&image)?)
+}
+
+/// Is `path` an image, which [`interpreter`] runs, rather than an executable?
+pub fn is_image(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "image")
+}
+
+/// Silo's interpreter: `MEADOW_SILO_VM`, or beside this executable, or where
+/// a checkout builds it.
+pub fn interpreter() -> Result<PathBuf, String> {
+    let exe = format!("meadow-silo-vm{}", std::env::consts::EXE_SUFFIX);
+    if let Some(path) = std::env::var_os("MEADOW_SILO_VM") {
+        return Ok(PathBuf::from(path));
+    }
+    let mut candidates = Vec::new();
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(Path::to_path_buf))
+    {
+        candidates.push(dir.join(&exe));
+    }
+    let built = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../silo/target");
+    for profile in ["release", "debug"] {
+        candidates.push(built.join(profile).join(&exe));
+    }
+    candidates
+        .into_iter()
+        .find(|p| p.is_file())
+        .ok_or_else(|| {
+            "Silo's interpreter is not built: `cargo build --release --manifest-path              silo/Cargo.toml -p meadow-silo-vm`, or say where it is with MEADOW_SILO_VM"
+                .to_string()
+        })
+}
+
+/// Silo's strategy for a name `--gc` takes: counting for `rc`, and its one
+/// tracing collector for any name of one -- Glade's `generational` and
+/// `copying` among them, so that a strategy means the same on either runtime.
+pub fn strategy(name: &str) -> meadow_llvm::Collect {
+    match name {
+        "generational" | "copying" => meadow_llvm::Collect::Trace,
+        g => meadow_llvm::Collect::named(g).unwrap_or_default(),
+    }
 }
 
 /// What to compile for.
@@ -287,6 +371,18 @@ pub fn build_native_of(
         }
         format!("inputs {h:016x}")
     });
+    if interpret() {
+        crate::status::status("Lowering", format!("`{name}` for Silo's interpreter"));
+        let lowered = lowered()?;
+        if !lowered.exports.is_empty() {
+            return Err("a library is compiled, not interpreted".into());
+        }
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+        let image = dir.join(format!("{name}.image"));
+        write_image(&image, lowered, Vec::new())?;
+        return Ok(image);
+    }
     if let Some(want) = &keyed
         && exe.exists()
         && std::fs::read_to_string(&stamp).is_ok_and(|had| had == *want)

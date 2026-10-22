@@ -1,4 +1,6 @@
 [workspace]
+# Silo's interpreter: the runtime, running a program it is handed as a file.
+members = ["vm"]
 
 [package]
 name = "meadow-silo"

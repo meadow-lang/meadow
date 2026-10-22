@@ -95,11 +95,6 @@ enum Cmd {
         /// program to guard its calls on: profile-guided optimization.
         #[arg(long)]
         train: bool,
-        /// Which collector the VM uses: `generational` (the default: a nursery,
-        /// and an old generation marked concurrently, for short pauses) or
-        /// `copying` (one space, copied whole). `MEADOW_GC` sets the same.
-        #[arg(long, value_parser = ["generational", "copying"])]
-        gc: Option<String>,
         #[command(flatten)]
         target: TargetArgs,
         /// Arguments for the program, after `--`: what `Process.argv` gives
@@ -423,11 +418,21 @@ struct TargetArgs {
     /// the same, and `threads = N` in a profile; both runtimes read it.
     #[arg(long, short = 'j', value_name = "N")]
     threads: Option<usize>,
-    /// How a native program's memory is managed: `rc`, counting references
-    /// with reuse (Silo's, the default), or `tracing`, marking what the
-    /// program reaches and sweeping the rest. `MEADOW_GC` says the same.
-    #[arg(long, value_name = "STRATEGY", value_parser = gc_strategy)]
-    gc: Option<meadow_llvm::Collect>,
+    /// How memory is managed, on either runtime: `rc`, counting references
+    /// with reuse (Silo's default), or a tracing collector -- `tracing`, or
+    /// by Glade's names for its two, `generational` (Glade's default: a
+    /// nursery, and an old generation marked concurrently) and `copying` (one
+    /// space, copied whole). Silo has one tracing collector, which any of the
+    /// three names; Glade has no counting. `MEADOW_GC` says the same.
+    #[arg(long, value_name = "STRATEGY", value_parser = ["rc", "tracing", "generational", "copying"])]
+    gc: Option<String>,
+    /// Interpret what is built for Silo rather than compiling it: the program
+    /// is lowered to AxCut and run by Silo's interpreter on Silo's runtime --
+    /// the same heap, strategies and primitives -- with nothing for LLVM to
+    /// do, so it starts as soon as it is lowered. `MEADOW_INTERPRET` says the
+    /// same.
+    #[arg(long)]
+    interpret: bool,
     /// How large Glade's collector lets a thread's nursery grow: `8M`, `512K`,
     /// `1G`, or bytes, from 256K to 1G. 2M by default. A larger one collects
     /// less often and promotes less, which a program that allocates a great
@@ -455,12 +460,6 @@ struct TargetArgs {
     all_features: bool,
 }
 
-/// `--gc`'s strategy, by name.
-fn gc_strategy(s: &str) -> Result<meadow_llvm::Collect, String> {
-    meadow_llvm::Collect::named(s)
-        .ok_or_else(|| format!("`{s}` is not a strategy: `rc` or `tracing`"))
-}
-
 impl TargetArgs {
     /// These, with what the resolved profile says for whatever the command
     /// line left out -- the runtime above all, which only the profile knows.
@@ -479,7 +478,8 @@ impl TargetArgs {
                 .or_else(|| profile.target.map(|t| t.to_string())),
             runtime: profile.runtime,
             threads: self.threads.or(profile.threads),
-            gc: self.gc,
+            gc: self.gc.clone(),
+            interpret: self.interpret,
             nursery: self.nursery.or(profile.nursery),
             leaks: self.leaks || profile.leaks,
             features: self.features.clone(),
@@ -492,8 +492,16 @@ impl TargetArgs {
     /// runtimes are told, and a program Silo runs is a process
     /// of its own, which inherits it.
     fn configure(&self) {
-        if let Some(g) = self.gc {
-            meadow::aot::set_gc(g);
+        if self.interpret {
+            meadow::aot::set_interpret();
+        }
+        if let Some(g) = &self.gc {
+            meadow::aot::set_gc(meadow::aot::strategy(g));
+            if g == "rc" && self.runtime == aot::Runtime::Glade {
+                status::warning("Glade has no reference counting: its collector traces");
+            }
+            // Glade's collector is chosen by it. Safety: as below.
+            unsafe { std::env::set_var("MEADOW_GC", g) };
         }
         if let Some(n) = self.threads.filter(|n| *n > 0) {
             // Safety: before the program, its threads or any child of it.
@@ -737,6 +745,9 @@ fn command() {
             let selected = select(&packages.selection(), &path);
             let profile = profile.resolve(&path);
             let target = target.with(&profile);
+            // What is built depends on it: a strategy for memory, or an image
+            // to interpret in place of an executable.
+            target.configure();
             match &selected.paths[..] {
                 [one] => build(
                     one,
@@ -769,7 +780,6 @@ fn command() {
             sample_every,
             sample_hz,
             train,
-            gc,
             target,
             args,
         }) => {
@@ -777,7 +787,7 @@ fn command() {
             let resolved = profile.resolve(&path);
             let target = target.with(&resolved);
             target.configure();
-            if let Some(gc) = gc {
+            if let Some(gc) = &target.gc {
                 meadow_glade::heap::configure(meadow_glade::heap::GcConfig {
                     collector: match gc.as_str() {
                         "copying" => meadow_glade::heap::Collector::Copying,
@@ -1586,7 +1596,18 @@ fn finish(
             }
             Ok(exe) => {
                 status::status("Running", format!("`{}`", shown(&exe)));
-                let status = std::process::Command::new(&exe)
+                let mut command = if aot::is_image(&exe) {
+                    let vm = aot::interpreter().unwrap_or_else(|e| {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    });
+                    let mut c = std::process::Command::new(vm);
+                    c.arg(&exe);
+                    c
+                } else {
+                    std::process::Command::new(&exe)
+                };
+                let status = command
                     .args(meadow_compiler::core::args::get())
                     .status()
                     .unwrap_or_else(|e| {

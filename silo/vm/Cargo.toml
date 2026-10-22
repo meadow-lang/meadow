@@ -1,0 +1,17 @@
+[package]
+name = "meadow-silo-vm"
+description = "Silo's interpreter: a program of AxCut run on Silo's runtime without compiling it -- counted or traced, as the program is built for. The engine a debug build runs on the merged runtime (docs/RUNTIME-MERGE.md, phase 5)."
+version = "0.3.0"
+edition = "2024"
+
+[[bin]]
+name = "meadow-silo-vm"
+path = "src/main.rs"
+
+[dependencies]
+meadow-silo = { path = ".." }
+meadow-axcut = { path = "../../compiler/meadow-axcut" }
+meadow-rt = { path = "../../compiler/meadow-rt" }
+meadow-intern = { path = "../../compiler/meadow-intern" }
+# Argument lists and frames' captures without a heap allocation each.
+smallvec = { version = "1.13", features = ["union"] }

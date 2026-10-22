@@ -222,9 +222,11 @@ impl World for Here {
         Ok(show::displayed(v.word(), v.bits().1))
     }
 
-    /// A native program is its own process: what it was given is its own.
+    /// A native program is its own process, and what it was given is its
+    /// own -- unless something runs it, as Silo's interpreter does, and says
+    /// what it was given.
     fn argv(&self) -> Vec<String> {
-        std::env::args().skip(1).collect()
+        meadow_rt::args::get()
     }
 
     fn ffi_failure(&mut self) -> String {

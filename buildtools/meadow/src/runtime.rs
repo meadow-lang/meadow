@@ -597,6 +597,33 @@ pub fn run_tests_parallel(
 /// `()`, compiled; and the entry the first of them has. They are compiled with
 /// everything else, so the image is built once and each test is simply a
 /// different place to start.
+/// The test executable of `program`, whose entries are `labels`, compiled
+/// and linked in `dir`.
+fn link_tests(
+    program: &meadow_seq::Program,
+    labels: &[meadow_seq::Label],
+    opt: OptLevel,
+    dir: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let units = meadow_llvm::compile_tests_with(
+        program,
+        labels,
+        meadow_llvm::UNIT,
+        meadow_llvm::CallConv::host(),
+        crate::aot::gc(),
+    )
+    .map_err(|e| e.msg)?;
+    let target = crate::aot::Target::host()?.with_runtime(crate::aot::Runtime::Silo);
+    let runtime = crate::aot::runtimes(target)?
+        .into_iter()
+        .next()
+        .ok_or("no Silo runtime library")?;
+    let modules = crate::aot::write_units(dir, "tests", &units)?;
+    let exe = dir.join(format!("tests{}", std::env::consts::EXE_SUFFIX));
+    crate::aot::clang_link(&modules, &[], &runtime, &exe, opt, target, false)?;
+    Ok(exe)
+}
+
 /// Run `tests` compiled by the native backend (`docs/SILO.md`): one executable
 /// holding every test, built once, and run once per test -- a process each,
 /// `threads` at a time -- with the test's number as its argument. A test
@@ -620,26 +647,19 @@ pub fn run_tests_native(
     let labels: Vec<meadow_seq::Label> = (0..tests.len())
         .map(|i| meadow_seq::Label((base + i) as u32))
         .collect();
-    let units = meadow_llvm::compile_tests_with(
-        &lowered.program,
-        &labels,
-        meadow_llvm::UNIT,
-        meadow_llvm::CallConv::host(),
-        crate::aot::gc(),
-    )
-    .map_err(|e| e.msg)?;
-    let target = crate::aot::Target::host()?.with_runtime(crate::aot::Runtime::Silo);
-    let runtime = crate::aot::runtimes(target)?
-        .into_iter()
-        .next()
-        .ok_or("no Silo runtime library")?;
     let dir = std::env::temp_dir()
         .join("meadow-silo-tests")
         .join(std::process::id().to_string());
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let modules = crate::aot::write_units(&dir, "tests", &units)?;
-    let exe = dir.join(format!("tests{}", std::env::consts::EXE_SUFFIX));
-    crate::aot::clang_link(&modules, &[], &runtime, &exe, opt, target, false)?;
+    // Interpreted: an image of the tests, which Silo's interpreter runs one of
+    // by its number, as the executable would.
+    let (exe, before) = if crate::aot::interpret() {
+        let image = dir.join("tests.image");
+        crate::aot::write_image(&image, lowered.program, labels)?;
+        (crate::aot::interpreter()?, Some(image))
+    } else {
+        (link_tests(&lowered.program, &labels, opt, &dir)?, None)
+    };
 
     let threads = threads.clamp(1, tests.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -653,7 +673,11 @@ pub fn run_tests_native(
                     if i >= tests.len() {
                         return;
                     }
-                    let told = match std::process::Command::new(&exe).arg(i.to_string()).output() {
+                    let told = match std::process::Command::new(&exe)
+                        .args(before.iter())
+                        .arg(i.to_string())
+                        .output()
+                    {
                         Err(e) => Told {
                             result: Err(format!("could not run the test executable: {e}")),
                             output: String::new(),
