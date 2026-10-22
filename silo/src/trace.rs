@@ -91,6 +91,12 @@ const PAGE_WORDS: usize = 1 << 13;
 /// The least a heap allocates between collections, in words: below it a
 /// collection would cost more than the memory it gives back.
 const LEAST: usize = 1 << 20;
+/// How much a heap allocates between collections, for each word the last one
+/// kept. With no generations, every collection marks everything live: at
+/// twice, a heap grows to three times what it keeps before it is marked
+/// again, and a program building something large pays for marking it a few
+/// times over rather than once for each of its size it allocates.
+const GROWTH: usize = 2;
 /// A collection's number never reaches this, so it is never mistaken for a
 /// region block's count (`heap::REGION_FLOOR` is above it).
 const EPOCHS: u32 = 1 << 27;
@@ -369,7 +375,7 @@ pub fn collect(cx: &mut Ctx) {
         unsafe { crate::region::release(r as *const crate::region::Region) };
     }
     space.since = 0;
-    space.budget = kept_words.max(LEAST);
+    space.budget = (GROWTH * kept_words).max(LEAST);
     space.collections += 1;
     if space.due {
         space.due = false;
