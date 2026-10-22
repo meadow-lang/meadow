@@ -254,12 +254,88 @@ Each phase lands on its own, and is checked against the reference semantics
    `silo/` and `glade/` crates go. What remains is one runtime crate and two
    engines, with the JIT reattached through the LIR.
 
+## Status (2026-10-22, branch `runtime-merge`)
+
+**Phase 1, started.** Two things that both runtimes implemented now exist once:
+- what an unhandled effect operation does, in `meadow_rt::world`;
+- how a value is shown, in `meadow_rt::look`.
+
+Each runtime says only what shape a value of its own has.
+
+**Phase 2, done.** `linear`, the memory pass, lives in `meadow-axcut` beside
+AxCut. `meadow-llvm` re-exports it, and so does every engine that counts
+references.
+
+**Phase 4, done in a simpler form than planned.** `--gc tracing` on the LLVM
+path:
+- emits no counting, no reuse and no cycle collection;
+- polls at definition and method entries, recording the parameters on the
+  shadow chain;
+- collects with a non-moving mark-sweep over size-class pages
+  (`silo/src/trace.rs`).
+
+Nothing moves, so no barriers are needed and the layout is Silo's unchanged.
+The roots are the shadow records, which are already made for effects, the
+thread's context, and suspended segments.
+
+The heap grows to three times what the last collection kept before it
+collects again. The standard library's 350 tests pass under it, release and
+debug.
+
+What is not done is the plan's generational collector: a nursery, and
+barriers at the few stores into existing objects. Tracing pays for its
+absence on programs that build something large:
+- rbtree is reuse's best case, which tracing gives up;
+- binarytrees is a nursery's best case, which this collector does not have.
+
+Programs that build nothing large cost about what counting does.
+
+**Phase 5, the engine, done; the debugger, not yet.** `meadow-silo-vm`
+(`silo/vm`) is an interpreter on Silo's runtime, under both strategies:
+`meadow run|build|test --runtime silo --interpret`.
+
+- **What it runs.** `meadow` writes an image (`meadow_axcut::image`) that
+  holds the program after the memory pass. The interpreter compiles each
+  linear block once, at load, to code over numbered slots, with descriptors
+  and primitives resolved. It is not a separate bytecode: AxCut-M is close
+  enough to an instruction set that it is the interpreter's.
+- **Calls.** A non-tail call is a native call of the interpreter's loop, and
+  a tail call is a jump within it.
+- **Continuations.** A continuation that only continues one call is not built
+  as an object. Its code is compiled into the caller's slots after the call,
+  as native code would place it.
+- **Effects.** Effects run on Silo's stack segments.
+
+Against Glade's bytecode interpreter (`meadow exec --backend vm`) on the
+benchmarks, measured on one Windows machine:
+
+| task | Glade VM | Silo VM |
+|---|---|---|
+| fib | 474 ms | 329 ms |
+| binarytrees | 12.0 s | 8.7 s |
+| matmul | 2.06 s | 1.96 s |
+| rbtree | 56.9 s | 61.7 s |
+| wordfreq | 33 ms | 40 ms |
+
+Building MiniML takes:
+- Glade's bytecode: 0.34 s;
+- an image to interpret: 0.59 s;
+- a native executable through LLVM: 4.4 s.
+
+Every example prints the same as native Silo does. The standard library's
+350 tests pass under both strategies.
+
+Glade is unchanged. It is still the engine for the debugger, the REPL and
+introspection. Porting those to the new interpreter is what phase 5 has
+left, along with frame records that a debugger can read.
+
 ## Open questions
 
-- **Interpreter speed on the native stack.** Glade rebuilds a register file
-  in memory at every call. A recursive interpreter keeps that cost, and adds
-  the Rust frame around it. This needs measuring early in phase 5. Phase 1's
-  benchmarks give the baseline.
+- **Interpreter speed on the native stack.** It was a question, and it is
+  answered: see the status above. A recursive interpreter matches Glade's,
+  because the continuation of a call is code after the call, not a frame
+  rebuilt. The Rust frame around each call costs less than the register
+  file Glade rebuilds.
 - **The cost of frame records under tracing on LLVM.** It is a few stores
   per non-tail call. Measure it against reference counting on the same
   benchmarks.

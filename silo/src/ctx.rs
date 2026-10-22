@@ -126,6 +126,11 @@ pub struct Ctx {
     /// Inside a call C made into a library, on a segment of its own: a
     /// failure ends the call, not the process. See `crate::sched::export_run`.
     pub guarded: bool,
+    /// What the engine running this thread keeps for it, if it is not
+    /// compiled code: Silo's interpreter keeps the frames it reuses. Here
+    /// rather than in a thread-local, because a thread moves between OS
+    /// threads with its context -- mid-call, when it waits.
+    pub engine: Option<Box<dyn std::any::Any>>,
 }
 
 // Safety: a context is used by one OS thread at a time -- the one running its
@@ -155,6 +160,7 @@ impl Ctx {
             spill: vec![0; unsafe { meadow_spill_words }.max(0) as usize],
             tid,
             guarded: false,
+            engine: None,
         });
         c.spill_at = c.spill.as_mut_ptr();
         c

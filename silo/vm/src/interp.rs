@@ -490,6 +490,13 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
             c.procs.len(),
             c.methods.len()
         );
+        let slots: Vec<usize> = c.procs.iter().flatten().map(|p| p.slots).collect();
+        let over = slots.iter().filter(|n| **n > 16).count();
+        eprintln!(
+            "vm: {over} of {} procedures have over 16 slots; the most is {}",
+            slots.len(),
+            slots.iter().max().unwrap_or(&0)
+        );
     }
     let threads = c.threads;
     let vm = Vm {
@@ -1999,20 +2006,48 @@ impl Vm {
 
 // --- helpers ------------------------------------------------------------------
 
-// No pool of frames kept per thread: a green thread can be resumed on
-// another OS thread mid-call, and what was the thread's pool when the call
-// began is another's by the time it returns.
+/// Frames given back, for the next non-tail call to have without asking the
+/// allocator -- which many threads share, and the runtime keeps to two
+/// arenas. One pool for each Meadow thread, in its context
+/// (`meadow_silo::ctx::Ctx::engine`): not in a thread-local, since a thread
+/// is resumed on another OS thread mid-call, and what was this OS thread's
+/// pool when the call began would be another thread's by the time it
+/// returns.
+type Pool = Vec<Box<Frame>>;
 
-fn new_frame(proc: u32, base: u32) -> Box<Frame> {
-    Box::new(Frame {
-        proc,
-        base,
-        captured: SmallVec::new(),
-    })
+/// This thread's pool. The context is this thread's alone while it runs, and
+/// nothing holds the pool across a call.
+fn pool() -> &'static mut Pool {
+    // Safety: the running thread's context, used by it alone.
+    let cx = unsafe { &mut *meadow_silo::ctx::get() };
+    cx.engine
+        .get_or_insert_with(|| Box::new(Pool::new()))
+        .downcast_mut::<Pool>()
+        .expect("the interpreter's pool")
 }
 
-fn recycle(fr: Box<Frame>) {
-    drop(fr);
+fn new_frame(proc: u32, base: u32) -> Box<Frame> {
+    match pool().pop() {
+        Some(mut fr) => {
+            fr.proc = proc;
+            fr.base = base;
+            fr
+        }
+        None => Box::new(Frame {
+            proc,
+            base,
+            captured: SmallVec::new(),
+        }),
+    }
+}
+
+fn recycle(mut fr: Box<Frame>) {
+    // Emptied first: what it held may give back frames of its own.
+    fr.captured.clear();
+    let pool = pool();
+    if pool.len() < 64 {
+        pool.push(fr);
+    }
 }
 
 /// A descriptor's value, in `env`.
