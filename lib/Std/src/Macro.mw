@@ -267,6 +267,75 @@ impl Reflect Float {
     | other -> Err (expected "a Float" other)
 }
 
+-- A `Float32` is held as the `Float` it widens to, and read back narrowed.
+impl Reflect Float32 {
+  fun toDatum x = Datum.Float (toFloat64 x)
+  fun fromDatum d =
+    match d with
+    | Datum.Float x -> Ok (toFloat32 x)
+    | other -> Err (expected "a Float32" other)
+}
+
+-- A `Char` is held as its code point, and read back only if that is one.
+impl Reflect Char {
+  fun toDatum c = Datum.Int (charCode c)
+  fun fromDatum d =
+    match d with
+    | Datum.Int n if n >= 0 and n <= 1114111 and (n < 55296 or n > 57343) -> Ok (charFromCode n)
+    | other -> Err (expected "a Char's code point" other)
+}
+
+-- Each fixed-width integer is held as the `Int` it is, and read back only if
+-- it fits: a value out of range is wrong, not wrapped.
+impl Reflect Int8 {
+  fun toDatum n = Datum.Int (toInt n)
+  fun fromDatum d = mapOk toInt8 (within "an Int8" (0 - 128) 127 d)
+}
+
+impl Reflect Int16 {
+  fun toDatum n = Datum.Int (toInt n)
+  fun fromDatum d = mapOk toInt16 (within "an Int16" (0 - 32768) 32767 d)
+}
+
+impl Reflect Int32 {
+  fun toDatum n = Datum.Int (toInt n)
+  fun fromDatum d = mapOk toInt32 (within "an Int32" (0 - 2147483648) 2147483647 d)
+}
+
+impl Reflect UInt8 {
+  fun toDatum n = Datum.Int (toInt n)
+  fun fromDatum d = mapOk toUInt8 (within "a UInt8" 0 255 d)
+}
+
+impl Reflect UInt16 {
+  fun toDatum n = Datum.Int (toInt n)
+  fun fromDatum d = mapOk toUInt16 (within "a UInt16" 0 65535 d)
+}
+
+impl Reflect UInt32 {
+  fun toDatum n = Datum.Int (toInt n)
+  fun fromDatum d = mapOk toUInt32 (within "a UInt32" 0 4294967295 d)
+}
+
+-- A `UInt64` past `Int`'s top is held as the negative `Int` of its bits.
+impl Reflect UInt64 {
+  fun toDatum n = Datum.Int (toInt n)
+  fun fromDatum d =
+    match d with
+    | Datum.Int n -> Ok (toUInt64 n)
+    | other -> Err (expected "a UInt64" other)
+}
+
+-- The `Int` `d` holds, if it is one from `lo` to `hi`.
+fun within (what : String) (lo : Int) (hi : Int) (d : Datum) : Result String Int =
+  match d with
+  | Datum.Int n if n >= lo and n <= hi -> Ok n
+  | Datum.Int n -> Err "expected ${what}, not ${show n}, which is out of its range"
+  | other -> Err (expected what other)
+
+fun mapOk (f : a -> b) (r : Result String a) : Result String b =
+  match r with | Ok x -> Ok (f x) | Err e -> Err e
+
 impl Reflect Bool {
   fun toDatum b = Datum.Bool b
   fun fromDatum d =
@@ -300,6 +369,40 @@ impl Reflect [a] where Reflect a {
           (Ok V.empty)
           ds
     | other -> Err (expected "a list" other)
+}
+
+-- A tuple is a `List` of its parts, in order.
+impl Reflect (a, b) where Reflect a, Reflect b {
+  fun toDatum p = match p with | (x, y) -> Datum.List [toDatum x, toDatum y]
+  fun fromDatum d =
+    match d with
+    | Datum.List ds if V.len ds == 2 ->
+        (match (V.get ds 0, V.get ds 1) with
+         | (Just dx, Just dy) ->
+             (match (fromDatum dx, fromDatum dy) with
+              | (Ok x, Ok y) -> Ok (x, y)
+              | (Err e, _) -> Err e
+              | (_, Err e) -> Err e)
+         | _ -> Err (expected "a pair" d))
+    | other -> Err (expected "a pair" other)
+}
+
+impl Reflect (a, b, c) where Reflect a, Reflect b, Reflect c {
+  fun toDatum t =
+    match t with
+    | (x, y, z) -> Datum.List [toDatum x, toDatum y, toDatum z]
+  fun fromDatum d =
+    match d with
+    | Datum.List ds if V.len ds == 3 ->
+        (match (V.get ds 0, V.get ds 1, V.get ds 2) with
+         | (Just dx, Just dy, Just dz) ->
+             (match (fromDatum dx, fromDatum dy, fromDatum dz) with
+              | (Ok x, Ok y, Ok z) -> Ok (x, y, z)
+              | (Err e, _, _) -> Err e
+              | (_, Err e, _) -> Err e
+              | (_, _, Err e) -> Err e)
+         | _ -> Err (expected "a triple" d))
+    | other -> Err (expected "a triple" other)
 }
 
 impl Reflect (Maybe a) where Reflect a {
@@ -473,6 +576,30 @@ fun wireDatum (d : Datum) : Wire =
 -- --- tests -------------------------------------------------------------------
 
 use Std.Test (assertEq, assertTrue, assertFalse)
+
+@test fun charsAndFixedWidthNumbersGoThroughADatumAndBack () =
+  let (c : Result String Char) = fromDatum (toDatum 'λ') in
+  let a = assertEq c (Ok 'λ') "a Char" in
+  let (x : Result String Float32) = fromDatum (toDatum (toFloat32 0.5)) in
+  let b = assertEq x (Ok (toFloat32 0.5)) "a Float32" in
+  let (i : Result String Int8) = fromDatum (toDatum (toInt8 (0 - 128))) in
+  let e = assertEq i (Ok (toInt8 (0 - 128))) "an Int8 at its bottom" in
+  let (u : Result String UInt64) = fromDatum (toDatum (toUInt64 (toInt (0 - 1)))) in
+  let f = assertEq u (Ok (toUInt64 (toInt (0 - 1)))) "a UInt64 at its top" in
+  let (big : Result String UInt8) = fromDatum (Datum.Int 256) in
+  let g = assertFalse (isOk big) "256 is not a UInt8" in
+  let (surrogate : Result String Char) = fromDatum (Datum.Int 55296) in
+  assertFalse (isOk surrogate) "a surrogate is not a Char"
+
+@test fun tuplesGoThroughADatumAndBack () =
+  let (p : Result String [(Int, String)]) = fromDatum (toDatum [(1, "one"), (2, "two")]) in
+  let a = assertEq p (Ok [(1, "one"), (2, "two")]) "a list of pairs" in
+  let (t : Result String (Bool, Char, Float)) = fromDatum (toDatum (True, 'x', 1.5)) in
+  let b = assertEq t (Ok (True, 'x', 1.5)) "a triple" in
+  let (short : Result String (Int, Int)) = fromDatum (Datum.List [Datum.Int 1]) in
+  assertFalse (isOk short) "one thing is not a pair"
+
+fun isOk (r : Result String a) : Bool = match r with | Ok _ -> True | Err _ -> False
 
 @test fun textWritesATokenBack () =
   let a = assertEq (text (Word "fun" Nowhere)) "fun" "a word" in
