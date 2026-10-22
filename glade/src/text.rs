@@ -59,15 +59,6 @@ impl Vm<'_> {
             .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
     }
 
-    /// The text of `v` if it is a string, for printing.
-    pub(crate) fn text_of(&self, v: Value) -> Option<String> {
-        match v {
-            Value::Str(s) => Some(s.to_string()),
-            v => self
-                .text_at(v)
-                .map(|a| String::from_utf8_lossy(&self.heap.packed_bytes(a)).into_owned()),
-        }
-    }
 }
 
 impl Heap {

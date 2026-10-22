@@ -4,8 +4,7 @@
 
 use crate::heap::{self, Word};
 use meadow_rt::desc;
-use meadow_rt::roles::{Role, TUPLE};
-use std::fmt::Write;
+use meadow_rt::roles::Role;
 
 /// The program's tables the emitted module defines: constructor names and
 /// named fields by tag, and interned names -- with the order records keep
@@ -132,13 +131,6 @@ pub fn ctor_field_index(tag: usize, label: usize) -> Option<usize> {
     n.fields.get(tag)?.as_ref()?.iter().position(|f| f == name)
 }
 
-fn bare_ctor(name: &str) -> &str {
-    match name.rsplit_once('.') {
-        Some((_, c)) => c,
-        None => name,
-    }
-}
-
 /// The constructor playing `role` -- empty, which no constructor is called,
 /// where the program declares none. See `meadow_rt::roles`.
 pub fn role(role: Role) -> &'static str {
@@ -244,176 +236,71 @@ pub fn array_elems(v: Word) -> Option<Vec<(Word, i64)>> {
     (heap::is_block(v) && heap::kind(v) == heap::ARRAY).then(|| fields_of(v))
 }
 
-fn list_items(mut v: Word) -> Option<Vec<(Word, i64)>> {
-    let mut out = Vec::new();
-    loop {
-        match role_of(&ctor_of(v)?) {
-            Some(Role::Nil) => return Some(out),
-            Some(Role::Cons) => {
-                let f = fields_of(v);
-                if f.len() != 2 {
-                    return None;
-                }
-                out.push(f[0]);
-                v = f[1].0;
-            }
-            _ => return None,
-        }
-    }
-}
-
-/// `v`, described by `d`, as `show` renders it.
+/// `v`, described by `d`, as `show` renders it (`meadow_rt::look`).
 pub fn show(v: Word, d: i64) -> String {
-    let mut out = String::new();
-    render(&mut out, v, d);
-    out
+    meadow_rt::look::show(&Shown, (v, d))
 }
 
 /// What `print` writes: a string as itself, anything else as shown.
 pub fn displayed(v: Word, d: i64) -> String {
-    if d == desc::REF && heap::is_block(v) && heap::kind(v) == heap::STRING {
-        return String::from_utf8_lossy(&heap::bytes(v)).into_owned();
-    }
-    if d == desc::STR {
-        return sym_name(v as usize);
-    }
-    show(v, d)
+    meadow_rt::look::displayed(&Shown, (v, d))
 }
 
-fn render(out: &mut String, v: Word, d: i64) {
-    match d {
-        desc::INT => {
-            let _ = write!(out, "{}", v as i64);
-        }
-        desc::FLOAT => out.push_str(&meadow_rt::fmt_float(f64::from_bits(v))),
-        desc::FLOAT32 => out.push_str(&meadow_rt::num::fmt_float32(f32::from_bits(v as u32))),
-        desc::BOOL => out.push_str(if v != 0 { "True" } else { "False" }),
-        desc::UNIT => out.push_str("()"),
-        desc::CHAR => match char::from_u32(v as u32) {
-            Some(c) => {
-                let _ = write!(out, "{c:?}");
+/// A value and its descriptor, for the printer every runtime shares.
+struct Shown;
+
+impl meadow_rt::look::Look for Shown {
+    type Value = (Word, i64);
+
+    fn shape(&self, (v, d): (Word, i64)) -> meadow_rt::look::Shape<(Word, i64)> {
+        use meadow_rt::look::Shape;
+        match d {
+            desc::INT => Shape::Int(v as i64),
+            desc::FLOAT => Shape::Float(f64::from_bits(v)),
+            desc::FLOAT32 => Shape::Float32(f32::from_bits(v as u32)),
+            desc::BOOL => Shape::Bool(v != 0),
+            desc::UNIT => Shape::Unit,
+            desc::CHAR => Shape::Char(char::from_u32(v as u32)),
+            desc::STR => Shape::Sym(sym_name(v as usize)),
+            d if (desc::WORD..desc::WORD + 7).contains(&d) => {
+                Shape::Word(meadow_rt::num::Width::ALL[(d - desc::WORD) as usize], v)
             }
-            None => out.push('?'),
-        },
-        desc::STR => {
-            let _ = write!(out, "{:?}", sym_name(v as usize));
-        }
-        d if (desc::WORD..desc::WORD + 7).contains(&d) => {
-            let w = meadow_rt::num::Width::ALL[(d - desc::WORD) as usize];
-            let _ = write!(out, "{}", w.value(v));
-        }
-        _ => render_ref(out, v),
-    }
-}
-
-fn join(out: &mut String, items: &[(Word, i64)], sep: &str) {
-    for (i, (x, d)) in items.iter().enumerate() {
-        if i > 0 {
-            out.push_str(sep);
-        }
-        render(out, *x, *d);
-    }
-}
-
-fn render_ref(out: &mut String, v: Word) {
-    if v == 0 {
-        out.push_str("<continuation>");
-        return;
-    }
-    if v & 1 == 1 || heap::kind(v) == heap::DATA {
-        render_data(out, v);
-        return;
-    }
-    match heap::kind(v) {
-        heap::STRING => {
-            let text = String::from_utf8_lossy(&heap::bytes(v)).into_owned();
-            let _ = write!(out, "{text:?}");
-        }
-        heap::BIGINT => {
-            let _ = write!(
-                out,
-                "{}",
-                crate::value::bigint(v).expect("a BigInt's block")
-            );
-        }
-        heap::ARRAY => {
-            out.push_str("#[");
-            join(out, &fields_of(v), ", ");
-            out.push(']');
-        }
-        heap::MUT_ARRAY => {
-            out.push_str("mut #[");
-            join(out, &fields_of(v), ", ");
-            out.push(']');
-        }
-        heap::RECORD => {
-            out.push_str("{ ");
-            let f = fields_of(v);
-            for j in 0..f.len() / 2 {
-                if j > 0 {
-                    out.push_str(", ");
+            _ if v == 0 => Shape::Continuation,
+            _ if v & 1 == 1 || heap::kind(v) == heap::DATA => {
+                let tag = if v & 1 == 1 {
+                    v >> 1
+                } else {
+                    u64::from(heap::meta(v))
+                };
+                let name = ctor_of(v).filter(|n| !n.is_empty());
+                Shape::Data(name, tag, fields_of(v))
+            }
+            _ => match heap::kind(v) {
+                heap::STRING => Shape::Str(String::from_utf8_lossy(&heap::bytes(v)).into_owned()),
+                heap::BIGINT => Shape::BigInt(crate::value::bigint(v).expect("a BigInt's block")),
+                heap::ARRAY => Shape::Array(fields_of(v)),
+                heap::MUT_ARRAY => Shape::MutArray(fields_of(v)),
+                heap::RECORD => {
+                    let f = fields_of(v);
+                    Shape::Record(
+                        (0..f.len() / 2)
+                            .map(|j| (sym_name(f[2 * j].0 as usize), f[2 * j + 1]))
+                            .collect(),
+                    )
                 }
-                let _ = write!(out, "{} = ", sym_name(f[2 * j].0 as usize));
-                render(out, f[2 * j + 1].0, f[2 * j + 1].1);
-            }
-            out.push_str(" }");
-        }
-        heap::CELL => {
-            out.push_str("ref ");
-            render(out, heap::field(v, 0), heap::field_desc(v, 0));
-        }
-        heap::COMPACT => {
-            out.push_str("compact ");
-            render(out, heap::field(v, 0), heap::field_desc(v, 0));
-        }
-        heap::CLOSURE => out.push_str("<closure>"),
-        heap::ONCE | heap::STACK => out.push_str("<continuation>"),
-        heap::CHANNEL => out.push_str("<channel>"),
-        heap::TASK => out.push_str("<thread>"),
-        heap::TVAR => out.push_str("<tvar>"),
-        k => {
-            let _ = write!(out, "<object of kind {k}>");
+                heap::CELL => Shape::Ref((heap::field(v, 0), heap::field_desc(v, 0))),
+                heap::COMPACT => Shape::Compact((heap::field(v, 0), heap::field_desc(v, 0))),
+                heap::CLOSURE => Shape::Closure,
+                heap::ONCE | heap::STACK => Shape::Continuation,
+                heap::CHANNEL => Shape::Channel,
+                heap::TASK => Shape::Task,
+                heap::TVAR => Shape::TVar,
+                k => Shape::Other(format!("<object of kind {k}>")),
+            },
         }
     }
-}
 
-fn render_data(out: &mut String, v: Word) {
-    let name = ctor_of(v).unwrap_or_default();
-    let f = fields_of(v);
-    match name.as_str() {
-        "" => {
-            let _ = write!(out, "#{}(..)", if v & 1 == 1 { v >> 1 } else { 0 });
-        }
-        TUPLE => {
-            out.push('(');
-            join(out, &f, ", ");
-            out.push(')');
-        }
-        n if matches!(role_of(n), Some(Role::Nil | Role::Cons)) => match list_items(v) {
-            Some(xs) => {
-                out.push('[');
-                join(out, &xs, "; ");
-                out.push(']');
-            }
-            None => {
-                let _ = write!(out, "{}(..)", bare_ctor(&name));
-            }
-        },
-        n if is_vector_ctor(n) => match vector_elems(v) {
-            Some(xs) => {
-                out.push('[');
-                join(out, &xs, ", ");
-                out.push(']');
-            }
-            None => {
-                let _ = write!(out, "{}(..)", bare_ctor(&name));
-            }
-        },
-        _ if f.is_empty() => out.push_str(bare_ctor(&name)),
-        _ => {
-            let _ = write!(out, "{}(", bare_ctor(&name));
-            join(out, &f, ", ");
-            out.push(')');
-        }
+    fn role_of(&self, name: &str) -> Option<Role> {
+        role_of(name)
     }
 }

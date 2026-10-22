@@ -18,6 +18,7 @@ pub mod desc;
 pub mod ffi;
 pub mod hash;
 pub mod log;
+pub mod look;
 pub mod net;
 pub mod num;
 pub mod roles;
