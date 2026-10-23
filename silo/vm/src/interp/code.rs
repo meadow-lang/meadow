@@ -1,11 +1,18 @@
 //! **The VM's code**: every procedure's instructions in one array, addressed
 //! by a pc, as Glade's are (`docs/RUNTIME-MERGE.md`, "The VM").
 //!
-//! An instruction is sixteen bytes. The ones a loop is made of -- arithmetic,
-//! a compare and branch, a share or an erase -- carry their registers in
-//! themselves; the rest name an entry in a table of their kind, where what
-//! does not fit (a list of arguments, a switch's arms) is kept. Registers are
-//! a procedure's slots, in a window of its own each time it runs.
+//! An instruction is eight bytes, as Glade's are: an opcode, and what fits
+//! beside it. The ones a loop is made of -- arithmetic, a compare and branch,
+//! a share or an erase -- carry their registers in themselves, a byte each,
+//! and a constant or a target in a word; the rest name an entry in a table of
+//! their kind, where what does not fit (a list of arguments, a switch's arms)
+//! is kept. Registers are a procedure's slots, in a window of its own each
+//! time it runs.
+//!
+//! A procedure of more than 256 registers, or a constant too big for the
+//! word it would go in, takes the same instruction's *wide* form
+//! ([`Ins::Wide`]), with its operands in [`Code::wides`]: what does not fit
+//! costs a look in a table, and never a wrong answer.
 //!
 //! Control never joins: every path through a procedure ends in a jump, an
 //! invoke, a return or a failure, as AxCut's statements do. So a branch has
@@ -49,15 +56,18 @@ impl Dc {
     }
 }
 
+/// A register, as an instruction names it: one of a procedure's first 256.
+pub(super) type R = u8;
+
 /// One instruction.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Ins {
     Share {
-        s: Slot,
+        s: R,
         d: Dc,
     },
     Erase {
-        s: Slot,
+        s: R,
         d: Dc,
     },
     Rename(u32),
@@ -76,48 +86,59 @@ pub(super) enum Ins {
     Prim(u32),
     Bin {
         op: B,
-        a: Slot,
-        b: Slot,
-        dst: Slot,
+        a: R,
+        b: R,
+        dst: R,
     },
+    /// `op` on a register and the constant `k` of [`Code::consts`].
     BinK {
         op: B,
-        a: Slot,
+        a: R,
+        dst: R,
         k: u32,
-        dst: Slot,
     },
     /// [`Ins::BinK`] with a constant small enough to be in the instruction.
     BinI {
         op: B,
-        a: Slot,
+        a: R,
+        dst: R,
         k: i32,
-        dst: Slot,
     },
     /// `op` on two registers: on at the next pc if it holds, at `no` if not.
     IfBin {
         op: B,
-        a: Slot,
-        b: Slot,
+        a: R,
+        b: R,
         no: u32,
     },
-    IfBinK {
-        op: B,
-        a: Slot,
-        k: u32,
-        no: u32,
-    },
+    /// `op` on a register and a constant of a byte.
     IfBinI {
         op: B,
-        a: Slot,
-        k: i32,
+        a: R,
+        k: i8,
         no: u32,
     },
-    Branch {
-        test: u32,
-        no: u32,
-    },
+    /// Any other test: entry `n` of [`Code::tests`], which says where to go
+    /// when it fails.
+    Branch(u32),
+    /// An instruction whose operands do not fit in one: entry `n` of
+    /// [`Code::wides`].
+    Wide(u32),
     Segment(u32),
     Error(u32),
+}
+
+// What makes it eight bytes: no variant above may need more.
+const _: () = assert!(std::mem::size_of::<Ins>() == 8);
+
+/// The wide form of an instruction: what [`Ins`]'s would be, at full width.
+pub(super) enum WideI {
+    Share { s: Slot, d: D },
+    Erase { s: Slot, d: D },
+    Bin { op: B, a: Slot, b: Slot, dst: Slot },
+    BinK { op: B, a: Slot, k: Word, dst: Slot },
+    IfBin { op: B, a: Slot, b: Slot, no: u32 },
+    IfBinK { op: B, a: Slot, k: Word, no: u32 },
 }
 
 pub(super) struct LetI {
@@ -171,6 +192,8 @@ pub(super) struct PrimI {
 pub(super) struct TestI {
     pub(super) test: Test,
     pub(super) args: Vec<U>,
+    /// Where to go when it fails.
+    pub(super) no: u32,
 }
 
 pub(super) struct SegmentI {
@@ -209,12 +232,24 @@ pub(super) struct Code {
     pub(super) tests: Vec<TestI>,
     pub(super) segments: Vec<SegmentI>,
     pub(super) errors: Vec<&'static str>,
+    pub(super) wides: Vec<WideI>,
 }
 
 /// A constant that fits in an instruction: one whose word is a sign-extended
 /// 32-bit integer.
 fn small(k: Word) -> Option<i32> {
     i32::try_from(k as i64).ok()
+}
+
+/// A slot as an instruction's register, if it is one of the first 256 --
+/// and never, under `MEADOW_VM_WIDE`, which lays every instruction down in
+/// its wide form so that the wide forms can be tested on any program.
+fn reg(s: Slot) -> Option<R> {
+    static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *WIDE.get_or_init(|| std::env::var_os("MEADOW_VM_WIDE").is_some()) {
+        return None;
+    }
+    R::try_from(s).ok()
 }
 
 /// An index into a table, which never holds four billion of anything.
@@ -227,6 +262,12 @@ impl Code {
         self.ins.push(i);
         self.locs.push(loc);
         self.ins.len() - 1
+    }
+
+    fn wide(&mut self, w: WideI, loc: Option<Loc>) -> usize {
+        self.wides.push(w);
+        let i = at(&self.wides) - 1;
+        self.push(Ins::Wide(i), loc)
     }
 
     fn konst(&mut self, k: Word) -> u32 {
@@ -250,23 +291,17 @@ impl Code {
                     *rest
                 }
                 I::Share(u, rest) => {
-                    self.push(
-                        Ins::Share {
-                            s: u.s,
-                            d: Dc::of(u.d),
-                        },
-                        loc,
-                    );
+                    match reg(u.s) {
+                        Some(s) => self.push(Ins::Share { s, d: Dc::of(u.d) }, loc),
+                        None => self.wide(WideI::Share { s: u.s, d: u.d }, loc),
+                    };
                     *rest
                 }
                 I::Erase(u, rest) => {
-                    self.push(
-                        Ins::Erase {
-                            s: u.s,
-                            d: Dc::of(u.d),
-                        },
-                        loc,
-                    );
+                    match reg(u.s) {
+                        Some(s) => self.push(Ins::Erase { s, d: Dc::of(u.d) }, loc),
+                        None => self.wide(WideI::Erase { s: u.s, d: u.d }, loc),
+                    };
                     *rest
                 }
                 I::Rename(pairs, rest) => {
@@ -337,7 +372,10 @@ impl Code {
                     dst,
                     rest,
                 } => {
-                    self.push(Ins::Bin { op, a, b, dst }, loc);
+                    match (reg(a), reg(b), reg(dst)) {
+                        (Some(a), Some(b), Some(dst)) => self.push(Ins::Bin { op, a, b, dst }, loc),
+                        _ => self.wide(WideI::Bin { op, a, b, dst }, loc),
+                    };
                     *rest
                 }
                 I::BinK {
@@ -347,12 +385,15 @@ impl Code {
                     dst,
                     rest,
                 } => {
-                    match small(k) {
-                        Some(k) => self.push(Ins::BinI { op, a, k, dst }, loc),
-                        None => {
-                            let k = self.konst(k);
-                            self.push(Ins::BinK { op, a, k, dst }, loc)
+                    match (reg(a), reg(dst), small(k)) {
+                        (Some(a), Some(dst), Some(k)) => {
+                            self.push(Ins::BinI { op, a, dst, k }, loc)
                         }
+                        (Some(a), Some(dst), None) => {
+                            let k = self.konst(k);
+                            self.push(Ins::BinK { op, a, dst, k }, loc)
+                        }
+                        _ => self.wide(WideI::BinK { op, a, k, dst }, loc),
                     };
                     *rest
                 }
@@ -374,27 +415,22 @@ impl Code {
                 }
                 // What branches: the way it holds next, the other after.
                 I::IfBin { op, a, b, no, yes } => {
-                    let pc = self.push(Ins::IfBin { op, a, b, no: 0 }, loc);
+                    let pc = match (reg(a), reg(b)) {
+                        (Some(a), Some(b)) => self.push(Ins::IfBin { op, a, b, no: 0 }, loc),
+                        _ => self.wide(WideI::IfBin { op, a, b, no: 0 }, loc),
+                    };
                     self.emit(*yes, loc);
-                    let to = self.here();
-                    if let Ins::IfBin { no, .. } = &mut self.ins[pc] {
-                        *no = to;
-                    }
+                    self.patch(pc);
                     *no
                 }
                 I::IfBinK { op, a, k, no, yes } => {
-                    let pc = match small(k) {
-                        Some(k) => self.push(Ins::IfBinI { op, a, k, no: 0 }, loc),
-                        None => {
-                            let k = self.konst(k);
-                            self.push(Ins::IfBinK { op, a, k, no: 0 }, loc)
-                        }
+                    let byte = i8::try_from(k as i64).ok();
+                    let pc = match (reg(a), byte) {
+                        (Some(a), Some(k)) => self.push(Ins::IfBinI { op, a, k, no: 0 }, loc),
+                        _ => self.wide(WideI::IfBinK { op, a, k, no: 0 }, loc),
                     };
                     self.emit(*yes, loc);
-                    let to = self.here();
-                    if let Ins::IfBinK { no, .. } | Ins::IfBinI { no, .. } = &mut self.ins[pc] {
-                        *no = to;
-                    }
+                    self.patch(pc);
                     *no
                 }
                 I::Branch {
@@ -403,14 +439,10 @@ impl Code {
                     no,
                     yes,
                 } => {
-                    self.tests.push(TestI { test, args });
-                    let t = at(&self.tests) - 1;
-                    let pc = self.push(Ins::Branch { test: t, no: 0 }, loc);
+                    self.tests.push(TestI { test, args, no: 0 });
+                    let pc = self.push(Ins::Branch(at(&self.tests) - 1), loc);
                     self.emit(*yes, loc);
-                    let to = self.here();
-                    if let Ins::Branch { no, .. } = &mut self.ins[pc] {
-                        *no = to;
-                    }
+                    self.patch(pc);
                     *no
                 }
                 I::Switch {
@@ -477,6 +509,21 @@ impl Code {
                     return;
                 }
             }
+        }
+    }
+
+    /// Say where the branch at `pc` goes when it fails: here, after the code
+    /// it takes when it holds.
+    fn patch(&mut self, pc: usize) {
+        let to = self.here();
+        match self.ins[pc] {
+            Ins::IfBin { ref mut no, .. } | Ins::IfBinI { ref mut no, .. } => *no = to,
+            Ins::Branch(t) => self.tests[t as usize].no = to,
+            Ins::Wide(w) => match &mut self.wides[w as usize] {
+                WideI::IfBin { no, .. } | WideI::IfBinK { no, .. } => *no = to,
+                _ => unreachable!("a wide branch"),
+            },
+            _ => unreachable!("a branch"),
         }
     }
 
@@ -576,19 +623,28 @@ impl Code {
                 format!("{to}{} ({})", show_op(&p.op), uses(&p.args))
             }
             Ins::Bin { op, a, b, dst } => format!("r{dst} = {op:?} r{a} r{b}"),
-            Ins::BinK { op, a, k: c, dst } => format!("r{dst} = {op:?} r{a} {}", k(c)),
-            Ins::BinI { op, a, k, dst } => format!("r{dst} = {op:?} r{a} #{k}"),
+            Ins::BinK { op, a, dst, k: c } => format!("r{dst} = {op:?} r{a} {}", k(c)),
+            Ins::BinI { op, a, dst, k } => format!("r{dst} = {op:?} r{a} #{k}"),
             Ins::IfBin { op, a, b, no } => format!("unless {op:?} r{a} r{b} -> {no}"),
-            Ins::IfBinK { op, a, k: c, no } => format!("unless {op:?} r{a} {} -> {no}", k(c)),
             Ins::IfBinI { op, a, k, no } => format!("unless {op:?} r{a} #{k} -> {no}"),
-            Ins::Branch { test, no } => {
-                let t = &self.tests[test as usize];
+            Ins::Branch(t) => {
+                let t = &self.tests[t as usize];
                 let what = match &t.test {
                     Test::Truth => "true".to_string(),
                     Test::Prim(p, _) | Test::PrimK(p, ..) => format!("{p:?}"),
                 };
-                format!("unless {what} ({}) -> {no}", uses(&t.args))
+                format!("unless {what} ({}) -> {}", uses(&t.args), t.no)
             }
+            Ins::Wide(w) => match &self.wides[w as usize] {
+                WideI::Share { s, d } => format!("share.w r{s}:{}", show_d(*d)),
+                WideI::Erase { s, d } => format!("erase.w r{s}:{}", show_d(*d)),
+                WideI::Bin { op, a, b, dst } => format!("r{dst} = {op:?}.w r{a} r{b}"),
+                WideI::BinK { op, a, k, dst } => format!("r{dst} = {op:?}.w r{a} #{}", *k as i64),
+                WideI::IfBin { op, a, b, no } => format!("unless {op:?}.w r{a} r{b} -> {no}"),
+                WideI::IfBinK { op, a, k, no } => {
+                    format!("unless {op:?}.w r{a} #{} -> {no}", *k as i64)
+                }
+            },
             Ins::Segment(i) => {
                 let s = &self.segments[i as usize];
                 format!(
@@ -619,8 +675,9 @@ fn name(i: &Ins) -> &'static str {
         Ins::Call(_) => "call",
         Ins::Prim(_) => "prim",
         Ins::Bin { .. } | Ins::BinK { .. } | Ins::BinI { .. } => "bin",
-        Ins::IfBin { .. } | Ins::IfBinK { .. } | Ins::IfBinI { .. } => "ifbin",
-        Ins::Branch { .. } => "branch",
+        Ins::IfBin { .. } | Ins::IfBinI { .. } => "ifbin",
+        Ins::Branch(_) => "branch",
+        Ins::Wide(_) => "wide",
         Ins::Segment(_) => "segment",
         Ins::Error(_) => "error",
     }

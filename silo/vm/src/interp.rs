@@ -43,7 +43,7 @@ use smallvec::SmallVec;
 
 mod code;
 pub mod debug;
-use code::{Code, Ins};
+use code::{Code, Ins, WideI};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::sync::OnceLock;
@@ -1338,19 +1338,12 @@ impl Vm {
             // patched in -- all inside the array.
             match unsafe { *code.ins.get_unchecked(pc) } {
                 Ins::Share { s, d: dd } => {
-                    let v = self.val(s, &mut env);
+                    let v = self.val(s.into(), &mut env);
                     self.share(v, d(dd.get(), &env));
                     pc += 1;
                 }
                 Ins::Erase { s, d: dd } => {
-                    match std::mem::take(&mut env[s as usize]) {
-                        V::Frame(fr) => {
-                            self.erase_frame(&fr);
-                            recycle(fr);
-                        }
-                        V::Val(v) => self.erase(v, d(dd.get(), &env)),
-                        V::Empty => fail("a name not in scope was erased"),
-                    }
+                    self.erase_slot(s.into(), dd.get(), &mut env);
                     pc += 1;
                 }
                 Ins::Rename(i) => {
@@ -1556,40 +1549,65 @@ impl Vm {
                     pc += 1;
                 }
                 Ins::Bin { op, a, b, dst } => {
-                    let r = op.run(self.word(a, &mut env), self.word(b, &mut env));
+                    let r = op.run(self.word(a.into(), &mut env), self.word(b.into(), &mut env));
                     env[dst as usize] = V::Val(r);
                     pc += 1;
                 }
-                Ins::BinK { op, a, k, dst } => {
-                    let r = op.run(self.word(a, &mut env), code.consts[k as usize]);
+                Ins::BinK { op, a, dst, k } => {
+                    let r = op.run(self.word(a.into(), &mut env), code.consts[k as usize]);
                     env[dst as usize] = V::Val(r);
                     pc += 1;
                 }
-                Ins::BinI { op, a, k, dst } => {
-                    let r = op.run(self.word(a, &mut env), k as i64 as Word);
+                Ins::BinI { op, a, dst, k } => {
+                    let r = op.run(self.word(a.into(), &mut env), k as i64 as Word);
                     env[dst as usize] = V::Val(r);
                     pc += 1;
-                }
-                Ins::IfBinI { op, a, k, no } => {
-                    let r = op.run(self.word(a, &mut env), k as i64 as Word);
-                    pc = if r != 0 { pc + 1 } else { no as usize };
                 }
                 Ins::IfBin { op, a, b, no } => {
-                    let r = op.run(self.word(a, &mut env), self.word(b, &mut env));
+                    let r = op.run(self.word(a.into(), &mut env), self.word(b.into(), &mut env));
                     pc = if r != 0 { pc + 1 } else { no as usize };
                 }
-                Ins::IfBinK { op, a, k, no } => {
-                    let r = op.run(self.word(a, &mut env), code.consts[k as usize]);
+                Ins::IfBinI { op, a, k, no } => {
+                    let r = op.run(self.word(a.into(), &mut env), k as i64 as Word);
                     pc = if r != 0 { pc + 1 } else { no as usize };
                 }
-                Ins::Branch { test, no } => {
-                    let t = &code.tests[test as usize];
+                Ins::Branch(t) => {
+                    let t = &code.tests[t as usize];
                     pc = if self.test(&t.test, &t.args, &mut env) {
                         pc + 1
                     } else {
-                        no as usize
+                        t.no as usize
                     };
                 }
+                Ins::Wide(w) => match code.wides[w as usize] {
+                    WideI::Share { s, d: dd } => {
+                        let v = self.val(s, &mut env);
+                        self.share(v, d(dd, &env));
+                        pc += 1;
+                    }
+                    WideI::Erase { s, d: dd } => {
+                        self.erase_slot(s, dd, &mut env);
+                        pc += 1;
+                    }
+                    WideI::Bin { op, a, b, dst } => {
+                        let r = op.run(self.word(a, &mut env), self.word(b, &mut env));
+                        env[dst as usize] = V::Val(r);
+                        pc += 1;
+                    }
+                    WideI::BinK { op, a, k, dst } => {
+                        let r = op.run(self.word(a, &mut env), k);
+                        env[dst as usize] = V::Val(r);
+                        pc += 1;
+                    }
+                    WideI::IfBin { op, a, b, no } => {
+                        let r = op.run(self.word(a, &mut env), self.word(b, &mut env));
+                        pc = if r != 0 { pc + 1 } else { no as usize };
+                    }
+                    WideI::IfBinK { op, a, k, no } => {
+                        let r = op.run(self.word(a, &mut env), k);
+                        pc = if r != 0 { pc + 1 } else { no as usize };
+                    }
+                },
                 Ins::Segment(i) => {
                     let sg = &code.segments[i as usize];
                     let vals: Words = sg
@@ -1643,6 +1661,20 @@ impl Vm {
             }
         }
         out
+    }
+
+    /// Erase what slot `s` holds, described by `dd`: a word, or a frame
+    /// nobody will call.
+    #[inline(always)]
+    fn erase_slot(&self, s: Slot, dd: D, env: &mut Env) {
+        match std::mem::take(&mut env[s as usize]) {
+            V::Frame(fr) => {
+                self.erase_frame(&fr);
+                recycle(fr);
+            }
+            V::Val(v) => self.erase(v, d(dd, env)),
+            V::Empty => fail("a name not in scope was erased"),
+        }
     }
 
     /// The arguments of a call, as values: every frame among them built,
