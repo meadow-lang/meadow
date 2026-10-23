@@ -150,6 +150,17 @@ pub fn write_image(
     program: meadow_seq::Program,
     tests: Vec<meadow_seq::Label>,
 ) -> Result<(), String> {
+    write_image_with(path, program, tests, config())
+}
+
+/// [`write_image`], run as `config` says rather than as this build is: a
+/// debugger's, which wants a stack that grows whatever the build's does.
+pub fn write_image_with(
+    path: &Path,
+    program: meadow_seq::Program,
+    tests: Vec<meadow_seq::Label>,
+    config: meadow_llvm::Config,
+) -> Result<(), String> {
     // The memory pass, done here once rather than by every run: where it
     // starts is the entry, or each test.
     let roots = match (tests.is_empty(), program.entry) {
@@ -165,7 +176,7 @@ pub fn write_image(
     }
     let image = meadow_seq::image::Image {
         program,
-        config: config(),
+        config,
         tests,
         linear,
     };

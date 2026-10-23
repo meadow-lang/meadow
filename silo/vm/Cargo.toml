@@ -15,3 +15,5 @@ meadow-rt = { path = "../../compiler/meadow-rt" }
 meadow-intern = { path = "../../compiler/meadow-intern" }
 # Argument lists and frames' captures without a heap allocation each.
 smallvec = { version = "1.13", features = ["union"] }
+# The protocol a debugger drives the VM by: see `src/interp/debug.rs`.
+serde_json = "1"

@@ -160,6 +160,11 @@
 								"description": "Stop before the first line of `main` runs.",
 								"default": false
 							},
+							"runtime": {
+								"type": "string",
+								"enum": ["glade", "silo"],
+								"description": "Which runtime to debug on: Glade's VM, or Silo's interpreter, running on the runtime a native build uses. By default, what the package's debug profile says."
+							},
 							"entry": {
 								"type": "object",
 								"description": "Start at an expression instead of `main` -- what the \"Debug\" link above a definition fills in.",

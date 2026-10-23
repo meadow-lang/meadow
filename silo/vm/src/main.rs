@@ -5,6 +5,7 @@
 //! meadow-silo-vm PROGRAM.image [ARGS...]
 //! meadow-silo-vm TESTS.image N
 //! meadow-silo-vm --dis PROGRAM.image
+//! meadow-silo-vm --debug PORT PROGRAM.image
 //! ```
 //!
 //! An image of tests runs the one numbered `N`, as a test executable does.
@@ -82,6 +83,20 @@ extern "C" fn entry() -> Word {
     interp::vm().run_entry()
 }
 
+/// How the program's answer is described, under a debugger: which reports
+/// it itself, so the runtime is told the answer is `()` and prints nothing.
+static ANSWER: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(meadow_rt::desc::UNIT);
+
+/// [`entry`], under a debugger.
+extern "C" fn entry_debugged() -> Word {
+    let v = interp::vm().run_entry();
+    let d = ANSWER.load(std::sync::atomic::Ordering::Relaxed);
+    let shown = (d != meadow_rt::desc::UNIT).then(|| meadow_silo::show::show(v, d));
+    interp::debug::exited(shown);
+    v
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().collect();
     // `--dis`: the program's code, as the VM runs it, and nothing run.
@@ -89,8 +104,26 @@ fn main() {
     if dis {
         args.remove(1);
     }
+    // `--debug PORT`: run under the debugger listening there.
+    let debug = match args.get(1).map(String::as_str) {
+        Some("--debug") => {
+            let port = args.get(2).and_then(|p| p.parse::<u16>().ok());
+            args.drain(1..3.min(args.len()));
+            match port {
+                Some(p) => Some(p),
+                None => {
+                    eprintln!("usage: meadow-silo-vm --debug PORT PROGRAM.image");
+                    std::process::exit(2);
+                }
+            }
+        }
+        _ => None,
+    };
+    if debug.is_some() {
+        interp::debugging();
+    }
     let Some(path) = args.get(1) else {
-        eprintln!("usage: meadow-silo-vm [--dis] PROGRAM.image [ARGS...]");
+        eprintln!("usage: meadow-silo-vm [--dis | --debug PORT] PROGRAM.image [ARGS...]");
         std::process::exit(2);
     };
     let bytes = match std::fs::read(path) {
@@ -123,6 +156,20 @@ fn main() {
     if dis {
         print!("{}", interp::vm().disassemble());
         return;
+    }
+    if let Some(port) = debug {
+        // Safety: before the runtime starts, which reads it.
+        unsafe {
+            ANSWER.store(meadow_result_desc, std::sync::atomic::Ordering::Relaxed);
+            meadow_result_desc = meadow_rt::desc::UNIT;
+        }
+        if let Err(e) = interp::debug::start(port) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        // Safety: as below.
+        let status = unsafe { meadow_silo::meadow_run(entry_debugged, 0, std::ptr::null()) };
+        std::process::exit(status)
     }
     if let Some(n) = interp::vm().tests() {
         let Some(i) = args

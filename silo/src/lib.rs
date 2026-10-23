@@ -20,6 +20,7 @@
 
 pub mod ctx;
 pub mod cycles;
+pub mod frames;
 pub mod heap;
 pub mod memory;
 pub mod native;
@@ -94,9 +95,22 @@ pub unsafe extern "C" fn meadow_fail(msg: *const u8, len: i64) -> ! {
     fail(&String::from_utf8_lossy(text))
 }
 
+/// What runs first when the program fails, if anything was set to: a
+/// debugger's, which stops there to be looked at. See [`on_failure`].
+static FAILING: std::sync::OnceLock<fn(&str)> = std::sync::OnceLock::new();
+
+/// Have `hook` told of a failure, before anything else happens: on the
+/// thread that failed, with its frames still in place.
+pub fn on_failure(hook: fn(&str)) {
+    let _ = FAILING.set(hook);
+}
+
 /// Stop the program with `msg` on stderr and a failing status -- or, in a
 /// thread other than `main`, just that thread: see [`sched::fail_thread`].
 pub fn fail(msg: &str) -> ! {
+    if let Some(hook) = FAILING.get() {
+        hook(msg);
+    }
     sched::fail_thread(msg);
     use std::io::Write;
     let _ = std::io::stdout().flush();

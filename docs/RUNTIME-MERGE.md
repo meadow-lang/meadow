@@ -455,6 +455,37 @@ What it costs and allows, on this machine:
 One thing is lost: a piece in use by a continuation that is abandoned, rather
 than finished, is not given back.
 
+### Silo's speed, kept (measured 2026-10-23)
+
+Counting on the LLVM path compiles to the same code as before the merge. For
+a counted program, the LLVM IR of every benchmark is master's, except for
+an unused declaration, one constant and the runtime's fingerprint. What
+could differ is the runtime library:
+- **Allocation:** a counted program calls `meadow_acquire`, which is master's
+  code word for word. A traced program calls `meadow_acquire_traced` instead.
+- **Elsewhere:** the counting paths gained one predictable branch on a
+  constant.
+
+Interleaved on one machine, master against the branch, four rounds:
+- **EPYC 9554:** every task matched or improved once allocation was split.
+  The one regression, matmul's 18%, came from the tracing branch moving how
+  the allocator compiled, and splitting the allocation path removed it.
+- **EPYC 7543:** matmul showed 8% and binarytrees 3% with the runtime as
+  built, while fib and rbtree were 6% faster.
+
+To tell layout from cost, both runtimes were rebuilt with every function and
+loop aligned to 64 bytes:
+
+| task | master | branch |
+|---|---|---|
+| matmul | 29.05 ms | 27.23 ms |
+| binarytrees | 1,077 ms | 1,078 ms |
+| fib | 18.19 ms | 18.16 ms |
+| rbtree | 3,577 ms | 3,316 ms |
+
+With layout held still, the branch is as fast as master or faster. The
+differences in the plain builds were layout.
+
 ## Open questions
 
 - **Interpreter speed on the native stack.** It was a question, and it is

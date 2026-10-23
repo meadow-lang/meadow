@@ -138,6 +138,9 @@ pub struct Ctx {
     /// Pieces of stack a growable program has moved to and come back from,
     /// to move to again: see `crate::stack`.
     pub chunks: Vec<corosensei::stack::DefaultStack>,
+    /// The head of the frame records an engine keeps for a debugger: see
+    /// `crate::frames`.
+    pub frames: Word,
 }
 
 // Safety: a context is used by one OS thread at a time -- the one running its
@@ -170,6 +173,7 @@ impl Ctx {
             guarded: false,
             engine: None,
             chunks: Vec::new(),
+            frames: 0,
         });
         c.spill_at = c.spill.as_mut_ptr();
         c

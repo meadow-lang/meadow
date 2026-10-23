@@ -42,6 +42,7 @@ use meadow_silo::heap::{self, Word};
 use smallvec::SmallVec;
 
 mod code;
+pub mod debug;
 use code::{Code, Ins};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -109,6 +110,10 @@ struct Proc {
     /// What it is, for the disassembler and the debugger: a definition's
     /// name, or the method, frame or packed code of one.
     name: String,
+    /// The variable each register holds, by its number -- for a debugger's
+    /// locals -- and how it is described.
+    slot_vars: Vec<Option<u32>>,
+    slot_descs: Vec<D>,
 }
 
 /// A literal operand.
@@ -406,6 +411,9 @@ pub struct Vm {
     methods: Vec<(u32, usize)>,
     syms: HashMap<InternedString, usize>,
     tracing: bool,
+    /// Whether a debugger watches: then every activation keeps a record, and
+    /// every instruction is a place it may stop.
+    debugging: bool,
     /// Whether a call that begins with too little stack left runs on a new
     /// piece of it: see `meadow_silo::stack`.
     growable: bool,
@@ -423,6 +431,14 @@ static VM: OnceLock<Vm> = OnceLock::new();
 
 /// Which of the entries runs.
 static CHOSEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether the program runs under a debugger: see [`debug`].
+static DEBUGGING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Run the program under a debugger, which [`debug::start`] connects.
+pub fn debugging() {
+    DEBUGGING.store(true, Ordering::Relaxed);
+}
 
 pub fn vm() -> &'static Vm {
     VM.get().expect("the program was loaded")
@@ -527,6 +543,7 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
         methods: c.methods,
         syms: c.syms,
         tracing,
+        debugging: DEBUGGING.load(Ordering::Relaxed),
         growable,
         shadow: tracing || c.detaches,
     };
@@ -612,11 +629,27 @@ impl Compiler {
         let entry = self.code.here();
         self.code.emit(body, None);
         self.naming = outer;
+        // Which variable is in which register: the lowest numbered of the
+        // names that share one, which is the one a person wrote before the
+        // copies the compiler made of it.
+        let n = scope.slots.len();
+        let mut slot_vars: Vec<Option<u32>> = vec![None; n];
+        let mut slot_descs = vec![D::K(desc::ANY); n];
+        for (name, slot) in &scope.slots {
+            let i = *slot as usize;
+            if linear::is_token(*name) || slot_vars[i].is_some_and(|v| v <= name.0) {
+                continue;
+            }
+            slot_vars[i] = Some(name.0);
+            slot_descs[i] = self.desc(*name, &scope);
+        }
         Proc {
-            slots: scope.slots.len(),
+            slots: n,
             params,
             entry,
             name,
+            slot_vars,
+            slot_descs,
         }
     }
 
@@ -1260,15 +1293,46 @@ impl Vm {
         }
     }
 
-    fn exec(&self, mut p: u32, mut env: Env) -> Word {
+    fn exec(&self, p: u32, env: Env) -> Word {
         // Every call the interpreter makes natively begins here: where a
         // growable program checks it has stack enough left.
         if self.growable && meadow_silo::stack::low() {
             return meadow_silo::stack::grow(move || self.exec(p, env));
         }
+        if self.debugging {
+            self.run::<true>(p, env)
+        } else {
+            self.run::<false>(p, env)
+        }
+    }
+
+    /// The interpreter's loop, from the start of procedure `p`: with a
+    /// debugger's record kept and its stops checked when `DEBUG`, which a
+    /// program run without one never pays for.
+    fn run<const DEBUG: bool>(&self, mut p: u32, mut env: Env) -> Word {
         let code = &self.code;
         let mut pc = self.procs[p as usize].entry as usize;
+        // The record a debugger reads this activation by, on the running
+        // segment's chain while it runs.
+        let parent = if DEBUG { meadow_silo::frames::top() } else { 0 };
+        let mut act = debug::Act {
+            parent,
+            depth: debug::Act::depth_of(parent) + 1,
+            proc: p,
+            pc,
+            env: &env as *const Env,
+        };
+        let _popped = DEBUG.then(|| {
+            meadow_silo::frames::set_top(&act as *const debug::Act as Word);
+            Popped(parent)
+        });
+        let watching = if DEBUG { debug::debugger() } else { None };
         loop {
+            if DEBUG && let Some(w) = watching {
+                act.proc = p;
+                act.pc = pc;
+                w.at(&act);
+            }
             // Safety: every pc is a procedure's entry, an instruction's
             // successor within its procedure, or a target `Code::emit`
             // patched in -- all inside the array.
@@ -2025,6 +2089,16 @@ impl Vm {
 }
 
 // --- helpers ------------------------------------------------------------------
+
+/// Puts a debugger's chain back as it was before an activation began, when
+/// the activation ends -- however it ends.
+struct Popped(Word);
+
+impl Drop for Popped {
+    fn drop(&mut self) {
+        meadow_silo::frames::set_top(self.0);
+    }
+}
 
 /// Frames given back, for the next non-tail call to have without asking the
 /// allocator -- which many threads share, and the runtime keeps to two

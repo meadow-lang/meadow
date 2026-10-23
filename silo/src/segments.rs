@@ -121,11 +121,14 @@ fn run(closure: Word, arg: Word) -> Word {
 /// is resumed with -- perhaps on another OS thread.
 pub(crate) fn suspend(y: *const Yielder<Down, Up>, up: Up) -> Down {
     cx().running.pop();
-    // Whatever runs before this segment does again has a stack of its own.
+    // Whatever runs before this segment does again has a stack of its own,
+    // and frames of its own.
     let limit = crate::stack::limit();
+    let frames = crate::frames::top();
     // Safety: the yielder of the innermost segment running, which is this one.
     let down = unsafe { &*y }.suspend(up);
     crate::stack::set_limit(limit);
+    crate::frames::set_top(frames);
     cx().running.push(y as *const ());
     down
 }
@@ -246,6 +249,8 @@ fn drive(
     // And this frame's stack's limit, which the segment's replaces while it
     // runs.
     let limit = crate::stack::limit();
+    // And its frames' records (`crate::frames`), likewise.
+    let frames = crate::frames::top();
     // Where this frame's part of the parked segments begins: those above it
     // were parked by the frames inside `segment`, and go into a continuation
     // taken here. It is counted from the top, not kept as a place, wherever
@@ -268,6 +273,7 @@ fn drive(
         }
         let result = segment.resume(down);
         crate::stack::set_limit(limit);
+        crate::frames::set_top(frames);
         if traced {
             cx().outer_chains.pop();
         }
