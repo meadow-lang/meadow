@@ -479,6 +479,16 @@ impl<'p> Module<'p> {
         ));
     }
 
+    /// The runtime's entry a block is allocated through: counting's own, as it
+    /// always was, or tracing's, so that neither asks which it is.
+    fn acquire_fn(&self) -> &'static str {
+        if self.tracing {
+            "meadow_acquire_traced"
+        } else {
+            "meadow_acquire"
+        }
+    }
+
     fn safe_point(&self, f: &mut Fun) {
         // A program that cannot spawn has nothing to give way to.
         if !self.threaded {
@@ -1130,7 +1140,8 @@ impl<'p> Module<'p> {
         let n = vals.len();
         let b = f.t();
         f.i(format!(
-            "{b} = call i64 @meadow_acquire(i64 {}, i64 {})",
+            "{b} = call i64 @{}(i64 {}, i64 {})",
+            self.acquire_fn(),
             self.cx(),
             2 + n.div_ceil(16) + n
         ));
@@ -1184,7 +1195,8 @@ impl<'p> Module<'p> {
             None => {
                 let b = f.t();
                 f.i(format!(
-                    "{b} = call i64 @meadow_acquire(i64 {}, i64 {})",
+                    "{b} = call i64 @{}(i64 {}, i64 {})",
+                    self.acquire_fn(),
                     self.cx(),
                     2 + dw + n
                 ));
@@ -1206,7 +1218,8 @@ impl<'p> Module<'p> {
                 f.label(&fresh);
                 let a = f.t();
                 f.i(format!(
-                    "{a} = call i64 @meadow_acquire(i64 {}, i64 {})",
+                    "{a} = call i64 @{}(i64 {}, i64 {})",
+                    self.acquire_fn(),
                     self.cx(),
                     2 + dw + n
                 ));
@@ -3061,6 +3074,7 @@ fn declarations(body: &str, arity: &HashMap<&str, usize>, cc: &str) -> String {
 /// What the emitted code calls in the runtime, `silo/src/lib.rs`.
 const RUNTIME: &str = "\
 declare i64 @meadow_acquire(i64, i64)
+declare i64 @meadow_acquire_traced(i64, i64)
 declare void @meadow_export_enter()
 declare i32 @meadow_export_run(ptr, ptr)
 declare void @meadow_free(i64, i64)

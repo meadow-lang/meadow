@@ -60,6 +60,12 @@ pub extern "C" fn meadow_acquire(c: *mut ctx::Ctx, words: i64) -> Word {
     heap::acquire_in(ctx::given(c), words as usize)
 }
 
+/// [`meadow_acquire`], in a traced program: see `crate::trace`.
+#[unsafe(no_mangle)]
+pub extern "C" fn meadow_acquire_traced(c: *mut ctx::Ctx, words: i64) -> Word {
+    heap::acquire_traced(ctx::given(c), words as usize)
+}
+
 /// The last reference to the block at `v` was erased: it is block `v` and its
 /// count is zero, which the emitted code has checked. Its fields are erased
 /// later, a few at a time: see [`heap`].

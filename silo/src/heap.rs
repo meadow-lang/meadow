@@ -676,17 +676,23 @@ pub fn died_in(c: *mut crate::ctx::Ctx, v: Word) {
     with_in(c, |h| h.pending.push((ptr(v), 0)));
 }
 
-/// A block of `words` words, count 0, the rest for the caller to write.
+/// A block of `words` words, count 0, the rest for the caller to write: what
+/// the runtime's own allocations go through, in a counted program or a
+/// traced one.
 pub fn acquire(words: usize) -> Word {
-    acquire_in(crate::ctx::get(), words)
+    let c = crate::ctx::get();
+    if crate::trace::on() {
+        acquire_traced(c, words)
+    } else {
+        acquire_in(c, words)
+    }
 }
 
-/// [`acquire_in`] under tracing: out of the way of counting's path, which is
-/// every allocation a counted program makes, so that it compiles as it did
-/// before tracing was there.
-#[cold]
-#[inline(never)]
-fn acquire_traced(c: *mut crate::ctx::Ctx, words: usize) -> Word {
+/// [`acquire`] under tracing, from context `c`'s: what a traced program's
+/// code allocates through (`meadow_acquire_traced`), apart from counting's,
+/// whose path every allocation of a counted program takes and which is as it
+/// was before tracing was there.
+pub fn acquire_traced(c: *mut crate::ctx::Ctx, words: usize) -> Word {
     with_in(c, |h| {
         h.space
             .get_or_insert_with(|| Box::new(crate::trace::Space::new()))
@@ -694,11 +700,8 @@ fn acquire_traced(c: *mut crate::ctx::Ctx, words: usize) -> Word {
     })
 }
 
-/// [`acquire`], from context `c`'s heap.
+/// [`acquire`] in a counted program, from context `c`'s heap.
 pub fn acquire_in(c: *mut crate::ctx::Ctx, words: usize) -> Word {
-    if crate::trace::on() {
-        return acquire_traced(c, words);
-    }
     with_in(c, |h| {
         // Work off what is pending: one step always, more while nothing clean
         // of this size is to be had.
