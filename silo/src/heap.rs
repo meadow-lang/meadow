@@ -681,14 +681,23 @@ pub fn acquire(words: usize) -> Word {
     acquire_in(crate::ctx::get(), words)
 }
 
+/// [`acquire_in`] under tracing: out of the way of counting's path, which is
+/// every allocation a counted program makes, so that it compiles as it did
+/// before tracing was there.
+#[cold]
+#[inline(never)]
+fn acquire_traced(c: *mut crate::ctx::Ctx, words: usize) -> Word {
+    with_in(c, |h| {
+        h.space
+            .get_or_insert_with(|| Box::new(crate::trace::Space::new()))
+            .take(words)
+    })
+}
+
 /// [`acquire`], from context `c`'s heap.
 pub fn acquire_in(c: *mut crate::ctx::Ctx, words: usize) -> Word {
     if crate::trace::on() {
-        return with_in(c, |h| {
-            h.space
-                .get_or_insert_with(|| Box::new(crate::trace::Space::new()))
-                .take(words)
-        });
+        return acquire_traced(c, words);
     }
     with_in(c, |h| {
         // Work off what is pending: one step always, more while nothing clean
