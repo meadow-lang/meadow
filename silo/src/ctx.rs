@@ -75,7 +75,7 @@ impl std::hash::Hasher for AddressHasher {
     }
 }
 
-/// Laid out as C would, for the first two words' sake: emitted code reads
+/// Laid out as C would, for the first three words' sake: emitted code reads
 /// them off the context it is handed (`meadow_llvm::emit`'s `CTX`), so they
 /// must be where it looks.
 #[repr(C)]
@@ -86,6 +86,10 @@ pub struct Ctx {
     /// Word 1: the running segment's shadow chain: see `crate::shadow`.
     /// Here for a program with threads; one without keeps it in a global.
     pub shadow: Word,
+    /// Word 2: the running stack's limit, where a growable program moves to a
+    /// new piece of stack: see `crate::stack`. Here for a program with
+    /// threads; one without keeps it in a global.
+    pub stack_limit: usize,
     pub heap: Heap,
     /// This thread's own counts of references into the regions it last
     /// touched: see `crate::region::Tallies`.
@@ -131,6 +135,9 @@ pub struct Ctx {
     /// rather than in a thread-local, because a thread moves between OS
     /// threads with its context -- mid-call, when it waits.
     pub engine: Option<Box<dyn std::any::Any>>,
+    /// Pieces of stack a growable program has moved to and come back from,
+    /// to move to again: see `crate::stack`.
+    pub chunks: Vec<corosensei::stack::DefaultStack>,
 }
 
 // Safety: a context is used by one OS thread at a time -- the one running its
@@ -142,6 +149,7 @@ impl Ctx {
         let mut c = Box::new(Ctx {
             spill_at: std::ptr::null_mut(),
             shadow: 0,
+            stack_limit: 0,
             heap: Heap::new(),
             regions: crate::region::Tallies::new(),
             running: Vec::new(),
@@ -161,6 +169,7 @@ impl Ctx {
             tid,
             guarded: false,
             engine: None,
+            chunks: Vec::new(),
         });
         c.spill_at = c.spill.as_mut_ptr();
         c

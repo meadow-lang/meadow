@@ -20,6 +20,7 @@
 //! block whose count is zero takes them without touching a count.
 
 use crate::linear::{L, LBlock, SwitchArm};
+use meadow_axcut::config::{Config, Memory, Stack};
 use meadow_axcut::{Extern, Name, Program, Rep, VarId};
 use meadow_rt::desc;
 use meadow_rt::{Lit, Prim};
@@ -247,20 +248,26 @@ pub struct Module<'p> {
     /// The most words any call passes through the spill area, or any function
     /// reads from it: how big the area has to be. See [`spill`].
     spill_words: usize,
-    /// Whether memory is traced rather than counted: see [`Collect`]. Then
+    /// Whether memory is traced rather than counted: see [`Memory`]. Then
     /// nothing is shared or erased, no block is reused, and the program is
     /// collected at safe points, where everything it holds is in a record.
     tracing: bool,
+    /// Whether a function that begins with too little stack left runs on a
+    /// new piece of it: see [`Stack`] and [`Module::stack_point`].
+    growable: bool,
+    /// The trampoline of the function being written, which goes with it:
+    /// see [`Module::stack_point`].
+    trampoline: Option<String>,
 }
 
 impl<'p> Module<'p> {
     pub fn new(program: &'p Program, conv: CallConv) -> Module<'p> {
-        Module::with(program, conv, Collect::Count)
+        Module::with(program, conv, Config::default())
     }
 
-    /// [`Module::new`], with memory managed as `collect` says.
-    pub fn with(program: &'p Program, conv: CallConv, collect: Collect) -> Module<'p> {
-        let tracing = collect == Collect::Trace;
+    /// [`Module::new`], run as `config` says.
+    pub fn with(program: &'p Program, conv: CallConv, config: Config) -> Module<'p> {
+        let tracing = config.memory == Memory::Trace;
         Module {
             program,
             cc: conv.keyword(),
@@ -295,6 +302,8 @@ impl<'p> Module<'p> {
             shadow: tracing || uses(program, &[Prim::Detach]),
             spill_words: 0,
             tracing,
+            growable: config.stack == Stack::Growable,
+            trampoline: None,
         }
     }
 
@@ -386,6 +395,88 @@ impl<'p> Module<'p> {
     /// [`spill`].
     fn spill(&self, f: &mut Fun, ops: &[String]) {
         spill(f, ops, self.regs(), self.threaded);
+    }
+
+    /// Under a growable stack, where a function begins: if the stack pointer
+    /// is below the running stack's limit (`silo/src/stack.rs`), the function
+    /// is run again on a new piece of stack, through its trampoline, and what
+    /// that answers is what it answers. The trampoline takes the context and
+    /// the arguments from a buffer, and calls the function as any call does.
+    fn stack_point(&mut self, f: &mut Fun) {
+        if !self.growable {
+            return;
+        }
+        let (grow, on) = (f.b(), f.b());
+        // The stack pointer itself: under `ghccc` the frame pointer's
+        // register carries an argument, so `llvm.frameaddress` is not it.
+        let sp = f.t();
+        f.i(format!("{sp} = call ptr @llvm.stacksave()"));
+        let at = f.t();
+        f.i(format!("{at} = ptrtoint ptr {sp} to i64"));
+        let slot = if self.threaded {
+            let c = f.ptr(CTX);
+            let s = f.t();
+            f.i(format!("{s} = getelementptr i64, ptr {c}, i64 2"));
+            s
+        } else {
+            "@meadow_stack_limit_single".to_string()
+        };
+        let limit = f.t();
+        f.i(format!("{limit} = load i64, ptr {slot}"));
+        let low = f.t();
+        f.i(format!("{low} = icmp ult i64 {at}, {limit}"));
+        f.i(format!("br i1 {low}, label %{grow}, label %{on}, !prof !1"));
+        f.label(&grow);
+        let ctx = usize::from(self.threaded);
+        let words = ctx + f.params.len();
+        let buf = f.t();
+        f.alloca(format!("{buf} = alloca [{} x i64]", words.max(1)));
+        let store = |f: &mut Fun, i: usize, v: &str| {
+            let q = f.t();
+            f.i(format!("{q} = getelementptr i64, ptr {buf}, i64 {i}"));
+            f.i(format!("store i64 {v}, ptr {q}"));
+        };
+        if self.threaded {
+            store(f, 0, CTX);
+        }
+        for (i, p) in f.params.clone().iter().enumerate() {
+            store(f, ctx + i, p);
+        }
+        let tramp = format!("@grow.{}", &f.name[1..]);
+        let r = f.t();
+        f.i(format!(
+            "{r} = call i64 @meadow_stack_grow(ptr {tramp}, ptr {buf})"
+        ));
+        f.i(format!("ret i64 {r}"));
+        f.label(&on);
+        // The trampoline: the arguments back out of the buffer, and the call.
+        let mut t = Fun::new(tramp.clone(), Vec::new());
+        let load = |t: &mut Fun, i: usize, into: &str| {
+            let q = t.t();
+            t.i(format!("{q} = getelementptr i64, ptr %args, i64 {i}"));
+            t.i(format!("{into} = load i64, ptr {q}"));
+        };
+        if self.threaded {
+            load(&mut t, 0, CTX);
+        }
+        let args: Vec<String> = (0..f.params.len()).map(|i| format!("%arg{i}")).collect();
+        for (i, a) in args.iter().enumerate() {
+            load(&mut t, ctx + i, a);
+        }
+        self.spill(&mut t, &args);
+        self.spill_words = self.spill_words.max(t.spill);
+        let r = t.t();
+        t.i(format!(
+            "{r} = call {} i64 {}({})",
+            self.cc,
+            f.name,
+            self.arg_list(&args)
+        ));
+        t.i(format!("ret i64 {r}"));
+        self.trampoline = Some(format!(
+            "define internal i64 {tramp}(ptr %args) noinline {{\nentry:\n{}{}}}\n\n",
+            t.allocas, t.body
+        ));
     }
 
     fn safe_point(&self, f: &mut Fun) {
@@ -531,6 +622,7 @@ impl<'p> Module<'p> {
         self.stem_methods = 0;
         self.stem_frames = 0;
         let mut f = Fun::new(name, params.clone());
+        self.stack_point(&mut f);
         self.safe_point(&mut f);
         let mut env = HashMap::new();
         for (n, p) in b.params.iter().zip(&params) {
@@ -662,7 +754,7 @@ impl<'p> Module<'p> {
             .spill_words
             .max(f.spill)
             .max(f.params.len().saturating_sub(regs));
-        let text = format!(
+        let mut text = format!(
             "define {linkage} {} i64 {}({}) noinline {{\nentry:\n{}{}{}}}\n\n",
             self.cc,
             f.name,
@@ -671,6 +763,10 @@ impl<'p> Module<'p> {
             f.allocas,
             f.body
         );
+        // In the same text, so in the same unit: it is internal to it.
+        if let Some(t) = self.trampoline.take() {
+            text.push_str(&t);
+        }
         let words = f.params.len().min(regs) + usize::from(self.threaded);
         let size = self
             .sizes
@@ -689,6 +785,7 @@ impl<'p> Module<'p> {
         let mut params = vec!["%obj".to_string()];
         params.extend((0..nargs).map(|i| format!("%a{i}")));
         let mut f = Fun::new(name.to_string(), params);
+        self.stack_point(&mut f);
         self.safe_point(&mut f);
         let mut env = HashMap::new();
         let caps = &m.params[..ncap];
@@ -2686,11 +2783,22 @@ impl<'p> Module<'p> {
     /// the unit that defines what the others share.
     fn threads_part(&self, first: bool) -> String {
         let mut out = String::new();
+        if self.tracing || self.growable {
+            // The branch to a collection, or to a new piece of stack, is cold.
+            out.push_str("!1 = !{!\"branch_weights\", i32 1, i32 65536}\n");
+        }
+        if self.growable {
+            // See [`Module::stack_point`].
+            out.push_str("declare ptr @llvm.stacksave()\n");
+            out.push_str("declare i64 @meadow_stack_grow(ptr, ptr)\n");
+            if !self.threaded {
+                out.push_str("@meadow_stack_limit_single = external global i64\n");
+            }
+        }
         if self.tracing {
             // Set by the runtime when a heap wants collecting: see
-            // [`Module::collect_point`]. The branch to it is cold.
+            // [`Module::collect_point`].
             out.push_str("@meadow_gc_due = external global i8\n");
-            out.push_str("!1 = !{!\"branch_weights\", i32 1, i32 65536}\n");
             if !self.threaded && !self.shadow {
                 out.push_str("@meadow_shadow_single = external global i64\n");
             }
@@ -3125,32 +3233,6 @@ const CTX: &str = "%ctx";
 /// Either way **nothing is passed on the stack**: a function takes as many
 /// words as the convention has registers for ([`CallConv::regs`]), and the
 /// rest go through the spill area ([`spill`]).
-/// How the program's memory is managed (`docs/RUNTIME-MERGE.md`).
-///
-/// - **`Count`**: the AxCut paper's reference counting, with reuse and
-///   borrowing, as `docs/SILO.md` has it. Silo's own, and the default.
-/// - **`Trace`**: the same blocks, found rather than counted. Nothing is
-///   shared, erased or reused; the runtime marks what the program's records
-///   and its context reach and sweeps the rest, at safe points where a
-///   function begins ([`Module::collect_point`]). Nothing moves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Collect {
-    #[default]
-    Count,
-    Trace,
-}
-
-impl Collect {
-    /// By the name a command line gives it: `rc` or `tracing`.
-    pub fn named(name: &str) -> Option<Collect> {
-        match name {
-            "rc" | "count" | "counting" => Some(Collect::Count),
-            "tracing" | "trace" => Some(Collect::Trace),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallConv {
     Ghc,

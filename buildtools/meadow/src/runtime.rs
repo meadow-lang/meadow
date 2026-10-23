@@ -610,7 +610,7 @@ fn link_tests(
         labels,
         meadow_llvm::UNIT,
         meadow_llvm::CallConv::host(),
-        crate::aot::gc(),
+        crate::aot::config(),
     )
     .map_err(|e| e.msg)?;
     let target = crate::aot::Target::host()?.with_runtime(crate::aot::Runtime::Silo);

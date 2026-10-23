@@ -396,6 +396,9 @@ pub struct Vm {
     methods: Vec<(u32, usize)>,
     syms: HashMap<InternedString, usize>,
     tracing: bool,
+    /// Whether a call that begins with too little stack left runs on a new
+    /// piece of it: see `meadow_silo::stack`.
+    growable: bool,
     /// Whether a frame waiting on a call puts what it holds on the shadow
     /// chain: when continuations can be abandoned, or memory is traced.
     shadow: bool,
@@ -475,7 +478,8 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
                 .ok_or("an entry the program does not have")
         })
         .collect::<Result<Vec<u32>, _>>()?;
-    let tracing = image.tracing;
+    let tracing = image.config.memory == meadow_axcut::config::Memory::Trace;
+    let growable = image.config.stack == meadow_axcut::config::Stack::Growable;
     // What loading made of the program, for whoever is making it faster.
     if std::env::var_os("MEADOW_VM_STATS").is_some() {
         let mut kinds: HashMap<&'static str, usize> = HashMap::new();
@@ -507,6 +511,7 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
         methods: c.methods,
         syms: c.syms,
         tracing,
+        growable,
         shadow: tracing || c.detaches,
     };
     // Safety: set before the runtime starts, which reads them.
@@ -1255,6 +1260,11 @@ impl Vm {
     }
 
     fn exec(&self, mut p: u32, mut env: Env) -> Word {
+        // Every call the interpreter makes natively begins here: where a
+        // growable program checks it has stack enough left.
+        if self.growable && meadow_silo::stack::low() {
+            return meadow_silo::stack::grow(move || self.exec(p, env));
+        }
         let mut s: &I = &self.procs[p as usize].body;
         loop {
             match s {

@@ -433,6 +433,14 @@ struct TargetArgs {
     /// same.
     #[arg(long)]
     interpret: bool,
+    /// How deep a program's calls may go on Silo: `fixed`, as deep as a
+    /// thread's stack (a gigabyte for `main`), at no cost, or `growable`, as
+    /// deep as memory allows, as Glade's always are, for a compare where each
+    /// function begins. Growable in a debug build and fixed in a release one,
+    /// unless `stack = "…"` in a profile says otherwise. `MEADOW_STACK` says
+    /// the same.
+    #[arg(long, value_name = "STACK", value_parser = stack_kind)]
+    stack: Option<meadow_llvm::Stack>,
     /// How large Glade's collector lets a thread's nursery grow: `8M`, `512K`,
     /// `1G`, or bytes, from 256K to 1G. 2M by default. A larger one collects
     /// less often and promotes less, which a program that allocates a great
@@ -460,6 +468,12 @@ struct TargetArgs {
     all_features: bool,
 }
 
+/// `--stack`'s kind, by name.
+fn stack_kind(s: &str) -> Result<meadow_llvm::Stack, String> {
+    meadow_llvm::Stack::named(s)
+        .ok_or_else(|| format!("`{s}` is not a stack: `fixed` or `growable`"))
+}
+
 impl TargetArgs {
     /// These, with what the resolved profile says for whatever the command
     /// line left out -- the runtime above all, which only the profile knows.
@@ -480,6 +494,7 @@ impl TargetArgs {
             threads: self.threads.or(profile.threads),
             gc: self.gc.clone(),
             interpret: self.interpret,
+            stack: self.stack.or(Some(profile.stack)),
             nursery: self.nursery.or(profile.nursery),
             leaks: self.leaks || profile.leaks,
             features: self.features.clone(),
@@ -494,6 +509,9 @@ impl TargetArgs {
     fn configure(&self) {
         if self.interpret {
             meadow::aot::set_interpret();
+        }
+        if let Some(s) = self.stack {
+            meadow::aot::set_stack(s);
         }
         if let Some(g) = &self.gc {
             meadow::aot::set_gc(meadow::aot::strategy(g));
@@ -628,6 +646,8 @@ impl ProfileArgs {
             threads: None,
             // Asked for with `--nursery`, which `TargetArgs` reads.
             nursery: None,
+            // Asked for with `--stack`, likewise.
+            stack: None,
             leaks: None,
             target: None,
         }

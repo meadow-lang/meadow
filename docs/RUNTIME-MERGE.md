@@ -329,6 +329,54 @@ Glade is unchanged. It is still the engine for the debugger, the REPL and
 introspection. Porting those to the new interpreter is what phase 5 has
 left, along with frame records that a debugger can read.
 
+### Every feature an option (Chris, 2026-10-22)
+
+The aim is not to choose between the runtimes' features. What either had
+becomes an option on both engines. AxCut, after the memory pass, is the
+interface:
+- run as it is, by the interpreter, as a bytecode would be;
+- or lowered, by the LLVM back end.
+
+How it is run is a configuration the program carries
+(`meadow_axcut::config::Config`), which both engines read. So far it has two
+choices:
+
+| choice | options | default |
+|---|---|---|
+| memory | `--gc rc` (counting, with reuse) or `tracing` | rc |
+| stack | `--stack fixed` (Silo's) or `growable` (Glade's) | growable in a debug build, fixed in a release one; `stack = "…"` in a profile |
+
+`--gc` is one option for both runtimes. Glade's names for its two collectors,
+`generational` and `copying`, choose tracing on Silo.
+
+**Growable stacks** (`silo/src/stack.rs`):
+- Every stack the runtime runs code on has a limit: `main`'s, a thread's, and
+  a handler's segment.
+- Where a function begins, a growable program compares the stack pointer
+  with that limit.
+  - In native code this is two loads and a compare, on a cold branch.
+  - In the interpreter it is the same check, where each native call of its
+    loop begins.
+- Past the limit, the function runs on a new 64 MB piece of stack and comes
+  back when it returns. Pieces are kept for reuse.
+- A native function gets there through a small trampoline, emitted beside
+  it, that calls it again with its arguments from a buffer.
+- The limit is the thread's, kept in its context. A segment takes its own
+  back each time it is resumed, so continuations captured deep and resumed
+  later work across pieces, as do abandoned ones.
+
+What it costs and allows, on this machine:
+- A recursion 100 million deep runs in 5.9 s native.
+- 20 million levels, inside a spawned thread and inside handlers whose
+  continuations are resumed or abandoned, pass on both engines and under both
+  strategies.
+- With a fixed stack the same programs stop.
+- The check costs nothing measurable on fib, and 30% on a recursion that does
+  nothing but call.
+
+One thing is lost: a piece in use by a continuation that is abandoned, rather
+than finished, is not given back.
+
 ## Open questions
 
 - **Interpreter speed on the native stack.** It was a question, and it is

@@ -68,6 +68,14 @@ pub enum Profile {
 }
 
 impl Profile {
+    /// How deep calls may go before a manifest or a flag has had its say.
+    pub const fn stack(self) -> meadow_seq::config::Stack {
+        match self {
+            Profile::Debug => meadow_seq::config::Stack::Growable,
+            Profile::Release => meadow_seq::config::Stack::Fixed,
+        }
+    }
+
     /// What this profile means before a manifest or a flag has had its say.
     pub const fn options(self) -> Options {
         match self {
@@ -127,6 +135,11 @@ pub struct Resolved {
     pub threads: Option<usize>,
     /// `nursery` from the manifest, in bytes: `--nursery`'s default.
     pub nursery: Option<u64>,
+    /// How deep calls may go: `stack` from the manifest, or the profile's --
+    /// growable, as Glade's always are, for the edit-run loop, where a
+    /// recursion too deep for a fixed stack should not stop the program; fixed
+    /// for a release, where it costs nothing. `--stack` overrides it.
+    pub stack: meadow_seq::config::Stack,
     /// `leaks = true` from the manifest: `--leaks`'s default.
     pub leaks: bool,
     /// `target` from the manifest: `--target`'s default.
@@ -149,6 +162,7 @@ impl Resolved {
             runtime: crate::aot::Runtime::Glade,
             threads: None,
             nursery: None,
+            stack: profile.stack(),
             leaks: false,
             target: None,
         }
@@ -200,6 +214,7 @@ impl Resolved {
             runtime,
             threads: flags.threads.or(from_manifest.threads),
             nursery: from_manifest.nursery,
+            stack: from_manifest.stack.unwrap_or(profile.stack()),
             leaks: flags.leaks.or(from_manifest.leaks).unwrap_or(false),
             target: flags.target.or(from_manifest.target),
         }

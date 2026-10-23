@@ -31,6 +31,7 @@ pub mod sched;
 pub mod segments;
 pub mod shadow;
 pub mod show;
+pub mod stack;
 pub mod trace;
 pub mod value;
 
@@ -158,6 +159,10 @@ pub extern "C" fn meadow_bigint(n: i64) -> Word {
 /// A program that never spawns needs none of the scheduler: it runs here, on
 /// this thread's stack, with one context and no thread-locals at all. See
 /// `ctx::threaded`.
+/// The stack of the OS thread `main` runs on: non-tail recursion over a long
+/// list is ordinary Meadow. Reserved, and committed only as it is touched.
+const MAIN_STACK: usize = 1 << 30;
+
 fn run_main(entry: extern "C" fn() -> Word) -> (Box<Ctx>, Word) {
     if ctx::threaded() {
         let (mut c, v) = sched::main(move || entry());
@@ -166,6 +171,8 @@ fn run_main(entry: extern "C" fn() -> Word) -> (Box<Ctx>, Word) {
     }
     let mut c = Ctx::new(0);
     ctx::set(&mut *c);
+    // The thread `meadow_run` started for it, of `MAIN_STACK` bytes.
+    stack::set_limit(stack::below_here(MAIN_STACK));
     let v = entry();
     (c, v)
 }
@@ -246,7 +253,7 @@ pub unsafe extern "C" fn meadow_run_test(
 pub fn run_one_test(entry: extern "C" fn() -> Word) -> i32 {
     let ran = std::thread::Builder::new()
         .name("main".into())
-        .stack_size(1 << 30)
+        .stack_size(MAIN_STACK)
         .spawn(move || {
             allocator();
             let (c, _) = run_main(entry);
@@ -374,7 +381,7 @@ pub unsafe extern "C" fn meadow_run(
     // committed only as it is touched.
     let answer = std::thread::Builder::new()
         .name("main".into())
-        .stack_size(1 << 30)
+        .stack_size(MAIN_STACK)
         .spawn(run)
         .expect("the main thread starts")
         .join();

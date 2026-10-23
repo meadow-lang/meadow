@@ -9,19 +9,20 @@
 //! so that a reader built from other sources refuses it rather than
 //! misreading it.
 
+use crate::config::Config;
 use crate::linear::LBlock;
 use crate::{Label, Program};
 
 /// What a file of this kind starts with.
-const MAGIC: &[u8] = b"meadow axcut image 2\n";
+const MAGIC: &[u8] = b"meadow axcut image 3\n";
 
 /// A program to run, and how.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(bound(deserialize = "'de: 'static"))]
 pub struct Image {
     pub program: Program,
-    /// Whether memory is traced rather than counted.
-    pub tracing: bool,
+    /// How it is run: its memory, its stack.
+    pub config: Config,
     /// For a program of tests, where each begins: the one run is the one
     /// numbered by the first argument, as a test executable's is. Empty for
     /// a program, which begins at its entry.

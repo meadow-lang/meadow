@@ -468,9 +468,11 @@ fn coroutine(size: usize, body: impl FnOnce() -> Word + 'static) -> SendSegment 
         DefaultStack::new(size)
             .unwrap_or_else(|e| crate::fail(&format!("could not make a thread's stack: {e}")))
     });
+    let limit = crate::stack::limit_of(&stack);
     SendSegment(Coroutine::with_stack(
         stack,
         move |y: &Yielder<Down, Up>, _: Down| {
+            crate::stack::set_limit(limit);
             segments::enter_thread(y);
             let v = body();
             segments::leave_thread();
@@ -1218,14 +1220,19 @@ pub fn export_run(body: extern "C" fn(*mut std::ffi::c_void), env: *mut std::ffi
             })
         });
     let env = env as usize;
+    let outside = crate::stack::limit();
+    let limit = crate::stack::limit_of(&stack);
     let mut co: segments::Segment =
         Coroutine::with_stack(stack, move |y: &Yielder<Down, Up>, _: Down| {
+            crate::stack::set_limit(limit);
             segments::enter_thread(y);
             body(env as *mut std::ffi::c_void);
             segments::leave_thread();
             0
         });
-    let failed = match co.resume(Down::Start) {
+    let resumed = co.resume(Down::Start);
+    crate::stack::set_limit(outside);
+    let failed = match resumed {
         CoroutineResult::Return(_) => None,
         CoroutineResult::Yield(up) => {
             let why = match (up, cx().request.take()) {

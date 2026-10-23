@@ -121,8 +121,11 @@ fn run(closure: Word, arg: Word) -> Word {
 /// is resumed with -- perhaps on another OS thread.
 pub(crate) fn suspend(y: *const Yielder<Down, Up>, up: Up) -> Down {
     cx().running.pop();
+    // Whatever runs before this segment does again has a stack of its own.
+    let limit = crate::stack::limit();
     // Safety: the yielder of the innermost segment running, which is this one.
     let down = unsafe { &*y }.suspend(up);
+    crate::stack::set_limit(limit);
     cx().running.push(y as *const ());
     down
 }
@@ -186,15 +189,15 @@ pub extern "C" fn meadow_enter(target: Word, body: Word) -> Word {
     let record: [i64; 4] = [crate::shadow::head() as i64, 1, after as i64, desc::REF];
     crate::shadow::set(record.as_ptr() as Word);
     LIVE.fetch_add(1, Ordering::Relaxed);
-    let segment = Coroutine::with_stack(
-        take_stack(SEGMENT),
-        move |y: &Yielder<Down, Up>, _: Down| {
-            cx().running.push(y as *const _ as *const ());
-            let v = run(body, 0);
-            cx().running.pop();
-            v
-        },
-    );
+    let stack = take_stack(SEGMENT);
+    let limit = crate::stack::limit_of(&stack);
+    let segment = Coroutine::with_stack(stack, move |y: &Yielder<Down, Up>, _: Down| {
+        crate::stack::set_limit(limit);
+        cx().running.push(y as *const _ as *const ());
+        let v = run(body, 0);
+        cx().running.pop();
+        v
+    });
     let v = drive(segment, Down::Start, handler, Vec::new(), 0);
     crate::shadow::set(record[0] as Word);
     // The handle is done: carry on where its value was to go, on this stack.
@@ -240,6 +243,9 @@ fn drive(
     mut shadow: Word,
 ) -> Word {
     let here = crate::shadow::head();
+    // And this frame's stack's limit, which the segment's replaces while it
+    // runs.
+    let limit = crate::stack::limit();
     // Where this frame's part of the parked segments begins: those above it
     // were parked by the frames inside `segment`, and go into a continuation
     // taken here. It is counted from the top, not kept as a place, wherever
@@ -261,6 +267,7 @@ fn drive(
             cx().outer_chains.push(here);
         }
         let result = segment.resume(down);
+        crate::stack::set_limit(limit);
         if traced {
             cx().outer_chains.pop();
         }

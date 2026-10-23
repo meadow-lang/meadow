@@ -87,20 +87,46 @@ impl Runtime {
 /// How a native program's memory is managed: Silo counts references unless
 /// told to trace (`docs/RUNTIME-MERGE.md`). `--gc` sets it for a command, and
 /// `MEADOW_GC=tracing` for everything that runs.
-static GC: std::sync::OnceLock<meadow_llvm::Collect> = std::sync::OnceLock::new();
+static GC: std::sync::OnceLock<meadow_llvm::Memory> = std::sync::OnceLock::new();
 
 /// Say how memory is managed, before anything is built: `--gc`.
-pub fn set_gc(collect: meadow_llvm::Collect) {
-    let _ = GC.set(collect);
+pub fn set_gc(memory: meadow_llvm::Memory) {
+    let _ = GC.set(memory);
 }
 
 /// How memory is managed: what `--gc` said, or `MEADOW_GC`, or counting.
-pub fn gc() -> meadow_llvm::Collect {
+pub fn gc() -> meadow_llvm::Memory {
     *GC.get_or_init(|| {
         std::env::var("MEADOW_GC")
             .ok()
             .map_or_else(Default::default, |g| strategy(&g))
     })
+}
+
+/// How deep a program for Silo's calls may go: what the profile, the
+/// manifest or `--stack` said, or `MEADOW_STACK`.
+static STACK: std::sync::OnceLock<meadow_llvm::Stack> = std::sync::OnceLock::new();
+
+/// Say how deep calls may go, before anything is built.
+pub fn set_stack(stack: meadow_llvm::Stack) {
+    let _ = STACK.set(stack);
+}
+
+pub fn stack() -> meadow_llvm::Stack {
+    *STACK.get_or_init(|| {
+        std::env::var("MEADOW_STACK")
+            .ok()
+            .and_then(|s| meadow_llvm::Stack::named(&s))
+            .unwrap_or_default()
+    })
+}
+
+/// How a program for Silo is run, by either engine.
+pub fn config() -> meadow_llvm::Config {
+    meadow_llvm::Config {
+        memory: gc(),
+        stack: stack(),
+    }
 }
 
 /// Whether a program for Silo is interpreted rather than compiled: `--interpret`
@@ -139,7 +165,7 @@ pub fn write_image(
     }
     let image = meadow_seq::image::Image {
         program,
-        tracing: gc() == meadow_llvm::Collect::Trace,
+        config: config(),
         tests,
         linear,
     };
@@ -181,10 +207,10 @@ pub fn interpreter() -> Result<PathBuf, String> {
 /// Silo's strategy for a name `--gc` takes: counting for `rc`, and its one
 /// tracing collector for any name of one -- Glade's `generational` and
 /// `copying` among them, so that a strategy means the same on either runtime.
-pub fn strategy(name: &str) -> meadow_llvm::Collect {
+pub fn strategy(name: &str) -> meadow_llvm::Memory {
     match name {
-        "generational" | "copying" => meadow_llvm::Collect::Trace,
-        g => meadow_llvm::Collect::named(g).unwrap_or_default(),
+        "generational" | "copying" => meadow_llvm::Memory::Trace,
+        g => meadow_llvm::Memory::named(g).unwrap_or_default(),
     }
 }
 
@@ -363,8 +389,9 @@ pub fn build_native_of(
             .chain(opt.name().bytes())
             .chain(target.triple().bytes())
             .chain(linked_with.iter().copied())
-            // Traced and counted, the same program is two executables.
-            .chain(std::iter::once(gc() as u8))
+            // Traced and counted, the same program is two executables;
+            // with a fixed stack and a growable one, two more.
+            .chain([gc() as u8, stack() as u8])
         {
             h ^= u64::from(b);
             h = h.wrapping_mul(0x0100_0000_01b3);
@@ -404,7 +431,7 @@ pub fn build_native_of(
     };
     let stamp = exe.with_extension("stamp");
     let units =
-        meadow_llvm::compile_split_with(&lowered, meadow_llvm::UNIT, target.call_conv(), gc())
+        meadow_llvm::compile_split_with(&lowered, meadow_llvm::UNIT, target.call_conv(), config())
             .map_err(|e| e.msg)?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("could not create {}: {e}", dir.display()))?;

@@ -471,6 +471,7 @@ pub mod machine;
 
 /// A program as a file, for an engine that runs in a process of its own:
 /// Silo's interpreter (`silo/vm`).
+pub mod config;
 pub mod image;
 
 mod print;
