@@ -1362,6 +1362,9 @@ impl<'p> Module<'p> {
 
     fn stmt(&mut self, s: &L, env: &mut HashMap<Name, V>, f: &mut Fun) -> Result<(), Error> {
         match s {
+            // Where it was written: for a debugger's line table, which native
+            // code does not have yet.
+            L::Mark(_, rest) => self.stmt(rest, env, f),
             L::Share(n, rest) => {
                 let v = self.val(*n, env, f)?;
                 let d = self.desc(*n, env);

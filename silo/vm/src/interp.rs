@@ -40,6 +40,9 @@ use meadow_intern::InternedString;
 use meadow_rt::{Lit, Prim, desc};
 use meadow_silo::heap::{self, Word};
 use smallvec::SmallVec;
+
+mod code;
+use code::{Code, Ins};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::sync::OnceLock;
@@ -101,7 +104,11 @@ struct Proc {
     slots: usize,
     /// How each parameter is described, in this procedure's own slots.
     params: Vec<D>,
-    body: I,
+    /// Where its code begins.
+    entry: u32,
+    /// What it is, for the disassembler and the debugger: a definition's
+    /// name, or the method, frame or packed code of one.
+    name: String,
 }
 
 /// A literal operand.
@@ -376,6 +383,8 @@ enum I {
         captures: Vec<U>,
     },
     Error(&'static str),
+    /// Where the rest was written: for the line table.
+    Mark(meadow_rt::Loc, Box<I>),
 }
 
 #[derive(Clone, Copy)]
@@ -391,6 +400,7 @@ pub struct Vm {
     entries: Vec<u32>,
     is_tests: bool,
     procs: Vec<Proc>,
+    code: Code,
     /// Every method, by its place in the table a closure's header indexes,
     /// and how many of its parameters are the closure's captures.
     methods: Vec<(u32, usize)>,
@@ -454,19 +464,28 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
         syms: HashMap::new(),
         threads: false,
         detaches: false,
+        code: Code::default(),
+        naming: String::new(),
     };
     // Each definition's procedure is numbered first, so that a jump to one
     // not yet compiled knows where it will be.
-    let blocks: Vec<(Label, &'static LBlock)> = lin
+    let blocks: Vec<(Label, String, &'static LBlock)> = lin
         .into_iter()
-        .map(|(_, label, b)| (label, &*Box::leak(Box::new(b))))
+        .map(|(i, label, b)| {
+            let d = &program.defs[i];
+            (
+                label,
+                format!("{}.{}", d.module, d.name),
+                &*Box::leak(Box::new(b)),
+            )
+        })
         .collect();
-    for (i, (label, _)) in blocks.iter().enumerate() {
+    for (i, (label, ..)) in blocks.iter().enumerate() {
         c.labels.insert(*label, i as u32);
         c.procs.push(None);
     }
-    for (i, (_, b)) in blocks.iter().enumerate() {
-        let p = c.proc(b);
+    for (i, (_, name, b)) in blocks.iter().enumerate() {
+        let p = c.proc(b, name.clone());
         c.procs[i] = Some(p);
     }
     let entries = entries
@@ -482,17 +501,13 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
     let growable = image.config.stack == meadow_axcut::config::Stack::Growable;
     // What loading made of the program, for whoever is making it faster.
     if std::env::var_os("MEADOW_VM_STATS").is_some() {
-        let mut kinds: HashMap<&'static str, usize> = HashMap::new();
-        for p in c.procs.iter().flatten() {
-            census(&p.body, &mut kinds);
-        }
-        let mut kinds: Vec<_> = kinds.into_iter().collect();
-        kinds.sort();
         eprintln!(
-            "vm: loaded in {:?}; {} procedures, {} methods; {kinds:?}",
+            "vm: loaded in {:?}; {} procedures, {} methods, {} instructions; {:?}",
             began.elapsed(),
             c.procs.len(),
-            c.methods.len()
+            c.methods.len(),
+            c.code.ins.len(),
+            c.code.census()
         );
         let slots: Vec<usize> = c.procs.iter().flatten().map(|p| p.slots).collect();
         let over = slots.iter().filter(|n| **n > 16).count();
@@ -508,6 +523,7 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
         entries,
         is_tests,
         procs: c.procs.into_iter().map(|p| p.expect("compiled")).collect(),
+        code: c.code,
         methods: c.methods,
         syms: c.syms,
         tracing,
@@ -543,6 +559,11 @@ struct Compiler {
     syms: HashMap<InternedString, usize>,
     threads: bool,
     detaches: bool,
+    /// Every procedure's instructions.
+    code: Code,
+    /// The name of the procedure being compiled, which what it makes is
+    /// named after.
+    naming: String,
 }
 
 /// One procedure's names, as slots. A name read but never bound has a slot
@@ -574,8 +595,10 @@ fn leak(s: String) -> &'static str {
 }
 
 impl Compiler {
-    /// `b` as a procedure: its parameters are its first slots.
-    fn proc(&mut self, b: &'static LBlock) -> Proc {
+    /// `b` as a procedure, named `name`: its parameters are its first slots,
+    /// and its code goes into the array of all of it.
+    fn proc(&mut self, b: &'static LBlock, name: String) -> Proc {
+        let outer = std::mem::replace(&mut self.naming, name.clone());
         let mut scope = Scope {
             slots: HashMap::new(),
             frames: Default::default(),
@@ -586,10 +609,14 @@ impl Compiler {
         }
         let params = b.params.iter().map(|p| self.desc(*p, &scope)).collect();
         let body = self.stmt(&b.body, &mut scope);
+        let entry = self.code.here();
+        self.code.emit(body, None);
+        self.naming = outer;
         Proc {
             slots: scope.slots.len(),
             params,
-            body,
+            entry,
+            name,
         }
     }
 
@@ -755,7 +782,9 @@ impl Compiler {
                             .extend(std::iter::repeat_n((0, 0), methods.len()));
                         let mut procs = Vec::with_capacity(methods.len());
                         for (i, m) in methods.iter().enumerate() {
-                            let p = self.proc(m);
+                            let kind = if *frame { "frame" } else { "method" };
+                            let name = format!("{}/{kind}{i}", self.naming);
+                            let p = self.proc(m, name);
                             let p = self.add_proc(p);
                             self.methods[base + i] = (p, captures.len());
                             procs.push(p);
@@ -836,6 +865,7 @@ impl Compiler {
             },
             L::Extern { op, args, blocks } => self.extern_(op, args, blocks, scope),
             L::Error(msg) => I::Error(msg),
+            L::Mark(loc, rest) => I::Mark(*loc, Box::new(self.stmt(rest, scope))),
         }
     }
 
@@ -999,7 +1029,8 @@ impl Compiler {
                     }));
                     let base = self.methods.len();
                     self.methods.push((0, 0));
-                    let compiled = self.proc(code);
+                    let name = format!("{}/after{base}", self.naming);
+                    let compiled = self.proc(code, name);
                     let compiled = self.add_proc(compiled);
                     self.methods[base] = (compiled, caps.len());
                     self.codes.insert(key, (base as u32, caps.clone()));
@@ -1086,37 +1117,6 @@ impl Compiler {
     }
 }
 
-/// How many of each statement `i` is.
-fn census(i: &I, out: &mut HashMap<&'static str, usize>) {
-    let (name, next): (&'static str, Vec<&I>) = match i {
-        I::Share(_, r) => ("share", vec![r]),
-        I::Erase(_, r) => ("erase", vec![r]),
-        I::Rename(_, r) => ("rename", vec![r]),
-        I::Let { rest, .. } => ("let", vec![rest]),
-        I::Clean(_, r) => ("clean", vec![r]),
-        I::DropReuse { rest, .. } => ("drop_reuse", vec![rest]),
-        I::Switch { arms, default, .. } => {
-            let mut v: Vec<&I> = arms.iter().map(|a| &a.body).collect();
-            v.push(default);
-            ("switch", v)
-        }
-        I::New { frame, rest, .. } => (if frame.is_some() { "frame" } else { "new" }, vec![rest]),
-        I::Jump { .. } => ("jump", vec![]),
-        I::Invoke { .. } => ("invoke", vec![]),
-        I::Call { then, .. } => ("call", vec![then]),
-        I::Prim { rest, .. } => ("prim", vec![rest]),
-        I::Bin { rest, .. } | I::BinK { rest, .. } => ("bin", vec![rest]),
-        I::IfBin { no, yes, .. } | I::IfBinK { no, yes, .. } => ("ifbin", vec![no, yes]),
-        I::Branch { no, yes, .. } => ("branch", vec![no, yes]),
-        I::Segment { .. } => ("segment", vec![]),
-        I::Error(_) => ("error", vec![]),
-    };
-    *out.entry(name).or_default() += 1;
-    for n in next {
-        census(n, out);
-    }
-}
-
 /// Whether the frame `k` made of `captures` can be left unmade: whether
 /// the statements after it reach, without branching, a call that takes it
 /// as its continuation and uses it for nothing else, and without touching it
@@ -1127,6 +1127,7 @@ fn direct_ahead(mut l: &L, k: Name, captures: &[Name]) -> bool {
     let mine = |n: &Name, ks: &[Name]| ks.contains(n) || captures.contains(n);
     loop {
         match l {
+            L::Mark(_, rest) => l = rest,
             L::Share(n, rest) => {
                 if ks.contains(n) {
                     return false;
@@ -1265,84 +1266,75 @@ impl Vm {
         if self.growable && meadow_silo::stack::low() {
             return meadow_silo::stack::grow(move || self.exec(p, env));
         }
-        let mut s: &I = &self.procs[p as usize].body;
+        let code = &self.code;
+        let mut pc = self.procs[p as usize].entry as usize;
         loop {
-            match s {
-                I::Share(u, rest) => {
-                    let v = self.val(u.s, &mut env);
-                    self.share(v, d(u.d, &env));
-                    s = rest;
+            // Safety: every pc is a procedure's entry, an instruction's
+            // successor within its procedure, or a target `Code::emit`
+            // patched in -- all inside the array.
+            match unsafe { *code.ins.get_unchecked(pc) } {
+                Ins::Share { s, d: dd } => {
+                    let v = self.val(s, &mut env);
+                    self.share(v, d(dd.get(), &env));
+                    pc += 1;
                 }
-                I::Erase(u, rest) => {
-                    match std::mem::take(&mut env[u.s as usize]) {
+                Ins::Erase { s, d: dd } => {
+                    match std::mem::take(&mut env[s as usize]) {
                         V::Frame(fr) => {
                             self.erase_frame(&fr);
                             recycle(fr);
                         }
-                        V::Val(v) => self.erase(v, d(u.d, &env)),
+                        V::Val(v) => self.erase(v, d(dd.get(), &env)),
                         V::Empty => fail("a name not in scope was erased"),
                     }
-                    s = rest;
+                    pc += 1;
                 }
-                I::Rename(pairs, rest) => {
-                    let moved: SmallVec<[(Slot, V); 4]> = pairs
+                Ins::Rename(i) => {
+                    let moved: SmallVec<[(Slot, V); 4]> = code.renames[i as usize]
                         .iter()
                         .map(|(to, from)| (*to, take_val(&mut env, *from)))
                         .collect();
                     for (to, v) in moved {
                         env[to as usize] = v;
                     }
-                    s = rest;
+                    pc += 1;
                 }
-                I::Let {
-                    dst,
-                    tag,
-                    fields,
-                    reuse,
-                    rest,
-                } => {
-                    let vals: Words = fields.iter().map(|u| self.val(u.s, &mut env)).collect();
-                    let descs: Descs = fields.iter().map(|u| d(u.d, &env)).collect();
-                    let token = reuse.map(|t| {
+                Ins::Let(i) => {
+                    let l = &code.lets[i as usize];
+                    let vals: Words = l.fields.iter().map(|u| self.val(u.s, &mut env)).collect();
+                    let descs: Descs = l.fields.iter().map(|u| d(u.d, &env)).collect();
+                    let token = l.reuse.map(|t| {
                         let v = self.val(t, &mut env);
                         env[t as usize] = V::Empty;
                         v
                     });
-                    let v = self.build_in(*tag, &vals, &descs, token);
-                    env[*dst as usize] = V::Val(v);
-                    s = rest;
+                    let v = self.build_in(l.tag, &vals, &descs, token);
+                    env[l.dst as usize] = V::Val(v);
+                    pc += 1;
                 }
-                I::Clean(t, rest) => {
-                    let tok = self.val(*t, &mut env);
+                Ins::Clean(t) => {
+                    let tok = self.val(t, &mut env);
                     self.clean_token(tok);
-                    env[*t as usize] = V::Empty;
-                    s = rest;
+                    env[t as usize] = V::Empty;
+                    pc += 1;
                 }
-                I::DropReuse {
-                    src,
-                    fields,
-                    token,
-                    rest,
-                } => {
-                    let v = self.val(*src, &mut env);
-                    let tok = self.drop_reuse(v, fields, &env);
-                    env[*src as usize] = V::Empty;
-                    env[*token as usize] = V::Val(tok);
-                    s = rest;
+                Ins::DropReuse(i) => {
+                    let x = &code.drops[i as usize];
+                    let v = self.val(x.src, &mut env);
+                    let tok = self.drop_reuse(v, &x.fields, &env);
+                    env[x.src as usize] = V::Empty;
+                    env[x.token as usize] = V::Val(tok);
+                    pc += 1;
                 }
-                I::Switch {
-                    scrutinee,
-                    arms,
-                    default,
-                    keep_default,
-                } => {
-                    let v = self.val(*scrutinee, &mut env);
+                Ins::Switch(i) => {
+                    let sw = &code.switches[i as usize];
+                    let v = self.val(sw.scrutinee, &mut env);
                     let tag = if v & 1 == 1 {
                         v >> 1
                     } else {
                         u64::from(heap::meta(v))
                     };
-                    match arms.iter().find(|a| a.tag == tag) {
+                    match sw.arms.iter().find(|a| a.tag == tag) {
                         Some(a) => {
                             let loaded = load_fields(v, a.fields.len());
                             for (u, x) in a.fields.iter().zip(&loaded) {
@@ -1358,27 +1350,22 @@ impl Vm {
                                     None => self.release(v, &loaded, &descs),
                                 }
                             }
-                            s = &a.body;
+                            pc = a.pc as usize;
                         }
                         None => {
-                            if !keep_default {
+                            if !sw.keep_default {
                                 self.erase(v, desc::REF);
                             }
-                            s = default;
+                            pc = sw.default as usize;
                         }
                     }
                 }
-                I::New {
-                    dst,
-                    captures,
-                    base,
-                    frame,
-                    rest,
-                } => {
-                    let v = match frame {
+                Ins::New(i) => {
+                    let x = &code.news[i as usize];
+                    let v = match &x.frame {
                         Some((fp, holds)) => {
-                            let mut fr = new_frame(*fp, *base);
-                            for (u, h) in captures.iter().zip(holds) {
+                            let mut fr = new_frame(*fp, x.base);
+                            for (u, h) in x.captures.iter().zip(holds) {
                                 let dd = d(u.d, &env);
                                 fr.captured.push((take_val(&mut env, u.s), dd, *h));
                             }
@@ -1386,21 +1373,23 @@ impl Vm {
                         }
                         None => {
                             let vals: Words =
-                                captures.iter().map(|u| self.val(u.s, &mut env)).collect();
-                            let descs: Descs = captures.iter().map(|u| d(u.d, &env)).collect();
-                            V::Val(build_closure(*base, &vals, &descs))
+                                x.captures.iter().map(|u| self.val(u.s, &mut env)).collect();
+                            let descs: Descs = x.captures.iter().map(|u| d(u.d, &env)).collect();
+                            V::Val(build_closure(x.base, &vals, &descs))
                         }
                     };
-                    env[*dst as usize] = v;
-                    s = rest;
+                    env[x.dst as usize] = v;
+                    pc += 1;
                 }
-                I::Jump { proc, args } => {
+                Ins::Jump(i) => {
+                    let j = &code.jumps[i as usize];
+                    let args = &j.args;
                     if !args.iter().any(|a| matches!(env[*a as usize], V::Frame(_))) {
                         // No frame among them: the words, into the frame of
                         // words this procedure's slots reuse. What is left in
                         // the others is never read before it is written.
                         let words: Words = args.iter().map(|a| self.word(*a, &mut env)).collect();
-                        p = *proc;
+                        p = j.proc;
                         let need = self.procs[p as usize].slots.max(words.len());
                         if env.len() < need {
                             env.resize_with(need, V::default);
@@ -1409,28 +1398,30 @@ impl Vm {
                             *slot = V::Val(w);
                         }
                         self.safe_point(p, &env);
-                        s = &self.procs[p as usize].body;
+                        pc = self.procs[p as usize].entry as usize;
                         continue;
                     }
                     let (vals, frame) = self.transfer(args, &mut env);
                     match frame {
                         None => {
-                            p = *proc;
+                            p = j.proc;
                             self.bind(p, vals, &mut env);
                             self.safe_point(p, &env);
                         }
                         Some(fr) => {
-                            let callee = *proc;
+                            let callee = j.proc;
                             let r = self.waiting(&fr, || self.call(callee, vals));
                             p = self.enter_frame(fr, V::Val(r), &mut env);
                         }
                     }
-                    s = &self.procs[p as usize].body;
+                    pc = self.procs[p as usize].entry as usize;
                 }
-                I::Invoke { target, tag, args } => {
-                    if let V::Frame(_) = &env[*target as usize] {
+                Ins::Invoke(i) => {
+                    let iv = &code.invokes[i as usize];
+                    let (target, tag, args) = (iv.target, iv.tag, &iv.args);
+                    if let V::Frame(_) = &env[target as usize] {
                         // Our own frame, entered directly: its code, here.
-                        let V::Frame(fr) = std::mem::take(&mut env[*target as usize]) else {
+                        let V::Frame(fr) = std::mem::take(&mut env[target as usize]) else {
                             unreachable!()
                         };
                         let [a] = args.as_slice() else {
@@ -1438,16 +1429,16 @@ impl Vm {
                         };
                         let a = take_val(&mut env, *a);
                         p = self.enter_frame(fr, a, &mut env);
-                        s = &self.procs[p as usize].body;
+                        pc = self.procs[p as usize].entry as usize;
                         continue;
                     }
-                    let t = self.val(*target, &mut env);
+                    let t = self.val(target, &mut env);
                     // A continuation of one argument may be the null one:
                     // return natively.
-                    if *tag == 0 && args.len() == 1 && t == 0 {
+                    if tag == 0 && args.len() == 1 && t == 0 {
                         return self.val(args[0], &mut env);
                     }
-                    let (m, ncap) = self.methods[method_of(t) + *tag as usize];
+                    let (m, ncap) = self.methods[method_of(t) + tag as usize];
                     let (vals, frame) = self.transfer(args, &mut env);
                     match frame {
                         None => {
@@ -1464,111 +1455,130 @@ impl Vm {
                             p = self.enter_frame(fr, V::Val(r), &mut env);
                         }
                     }
-                    s = &self.procs[p as usize].body;
+                    pc = self.procs[p as usize].entry as usize;
                 }
-                I::Call {
-                    callee,
-                    args,
-                    held,
-                    answer,
-                    then,
-                } => {
-                    let mut vals: Args = args
+                Ins::Call(i) => {
+                    let c = &code.calls[i as usize];
+                    let mut vals: Args = c
+                        .args
                         .iter()
                         .map(|a| V::Val(self.val(*a, &mut env)))
                         .collect();
                     vals.push(V::Val(0));
-                    let r = match *callee {
-                        Callee::Proc(q) => self.waiting_in(held, &env, || self.call(q, vals)),
+                    let r = match c.callee {
+                        Callee::Proc(q) => self.waiting_in(&c.held, &env, || self.call(q, vals)),
                         Callee::Method { target, tag } => {
                             let t = self.val(target, &mut env);
                             if t == 0 {
                                 fail("the null continuation was given a frame");
                             }
                             let (m, ncap) = self.methods[method_of(t) + tag as usize];
-                            self.waiting_in(held, &env, || {
+                            self.waiting_in(&c.held, &env, || {
                                 let e = self.enter_method(t, m, ncap, vals);
                                 self.safe_point(m, &e);
                                 self.exec(m, e)
                             })
                         }
                     };
-                    env[*answer as usize] = V::Val(r);
-                    s = then;
+                    env[c.answer as usize] = V::Val(r);
+                    pc += 1;
                 }
-                I::Prim {
-                    op,
-                    args,
-                    result,
-                    rest,
-                } => {
-                    let v = self.op(op, args, &mut env);
-                    if let Some(r) = result {
-                        env[*r as usize] = V::Val(v);
+                Ins::Prim(i) => {
+                    let x = &code.prims[i as usize];
+                    let v = self.op(&x.op, &x.args, &mut env);
+                    if let Some(r) = x.result {
+                        env[r as usize] = V::Val(v);
                     }
-                    s = rest;
+                    pc += 1;
                 }
-                I::Bin {
-                    op,
-                    a,
-                    b,
-                    dst,
-                    rest,
-                } => {
-                    let r = op.run(self.word(*a, &mut env), self.word(*b, &mut env));
-                    env[*dst as usize] = V::Val(r);
-                    s = rest;
+                Ins::Bin { op, a, b, dst } => {
+                    let r = op.run(self.word(a, &mut env), self.word(b, &mut env));
+                    env[dst as usize] = V::Val(r);
+                    pc += 1;
                 }
-                I::BinK {
-                    op,
-                    a,
-                    k,
-                    dst,
-                    rest,
-                } => {
-                    let r = op.run(self.word(*a, &mut env), *k);
-                    env[*dst as usize] = V::Val(r);
-                    s = rest;
+                Ins::BinK { op, a, k, dst } => {
+                    let r = op.run(self.word(a, &mut env), code.consts[k as usize]);
+                    env[dst as usize] = V::Val(r);
+                    pc += 1;
                 }
-                I::IfBin { op, a, b, no, yes } => {
-                    let r = op.run(self.word(*a, &mut env), self.word(*b, &mut env));
-                    s = if r != 0 { yes } else { no };
+                Ins::BinI { op, a, k, dst } => {
+                    let r = op.run(self.word(a, &mut env), k as i64 as Word);
+                    env[dst as usize] = V::Val(r);
+                    pc += 1;
                 }
-                I::IfBinK { op, a, k, no, yes } => {
-                    let r = op.run(self.word(*a, &mut env), *k);
-                    s = if r != 0 { yes } else { no };
+                Ins::IfBinI { op, a, k, no } => {
+                    let r = op.run(self.word(a, &mut env), k as i64 as Word);
+                    pc = if r != 0 { pc + 1 } else { no as usize };
                 }
-                I::Branch {
-                    test,
-                    args,
-                    no,
-                    yes,
-                } => {
-                    s = if self.test(test, args, &mut env) {
-                        yes
+                Ins::IfBin { op, a, b, no } => {
+                    let r = op.run(self.word(a, &mut env), self.word(b, &mut env));
+                    pc = if r != 0 { pc + 1 } else { no as usize };
+                }
+                Ins::IfBinK { op, a, k, no } => {
+                    let r = op.run(self.word(a, &mut env), code.consts[k as usize]);
+                    pc = if r != 0 { pc + 1 } else { no as usize };
+                }
+                Ins::Branch { test, no } => {
+                    let t = &code.tests[test as usize];
+                    pc = if self.test(&t.test, &t.args, &mut env) {
+                        pc + 1
                     } else {
-                        no
+                        no as usize
                     };
                 }
-                I::Segment {
-                    prim,
-                    arg,
-                    base,
-                    captures,
-                } => {
-                    let vals: Words = captures.iter().map(|u| self.val(u.s, &mut env)).collect();
-                    let descs: Descs = captures.iter().map(|u| d(u.d, &env)).collect();
-                    let code = build_closure(*base, &vals, &descs);
-                    let a = self.val(arg.s, &mut env);
-                    return match prim {
-                        Prim::Enter => meadow_silo::segments::meadow_enter(a, code),
-                        Prim::Detach => meadow_silo::segments::meadow_detach(a, code),
-                        _ => meadow_silo::segments::meadow_reattach(a, code),
+                Ins::Segment(i) => {
+                    let sg = &code.segments[i as usize];
+                    let vals: Words = sg
+                        .captures
+                        .iter()
+                        .map(|u| self.val(u.s, &mut env))
+                        .collect();
+                    let descs: Descs = sg.captures.iter().map(|u| d(u.d, &env)).collect();
+                    let packed = build_closure(sg.base, &vals, &descs);
+                    let a = self.val(sg.arg.s, &mut env);
+                    return match sg.prim {
+                        Prim::Enter => meadow_silo::segments::meadow_enter(a, packed),
+                        Prim::Detach => meadow_silo::segments::meadow_detach(a, packed),
+                        _ => meadow_silo::segments::meadow_reattach(a, packed),
                     };
                 }
-                I::Error(msg) => fail(msg),
+                Ins::Error(i) => fail(code.errors[i as usize]),
             }
         }
+    }
+
+    /// The whole program's code, procedure by procedure, as `--dis` writes it.
+    pub fn disassemble(&self) -> String {
+        use std::fmt::Write;
+        let mut order: Vec<usize> = (0..self.procs.len()).collect();
+        order.sort_by_key(|i| self.procs[*i].entry);
+        let mut out = String::new();
+        for (k, i) in order.iter().enumerate() {
+            let pr = &self.procs[*i];
+            let end = order
+                .get(k + 1)
+                .map_or(self.code.ins.len(), |j| self.procs[*j].entry as usize);
+            let _ = writeln!(
+                out,
+                "p{i} {} ({} registers, {} parameters)",
+                pr.name,
+                pr.slots,
+                pr.params.len()
+            );
+            let mut last = None;
+            for pc in pr.entry as usize..end {
+                let loc = self.code.locs[pc];
+                let at = if loc != last && loc.is_some() {
+                    let l = loc.expect("some");
+                    format!("  ; source {} at {}", l.source, l.span.start)
+                } else {
+                    String::new()
+                };
+                last = loc;
+                let _ = writeln!(out, "  {pc:6}  {}{at}", self.code.show(pc));
+            }
+        }
+        out
     }
 
     /// The arguments of a call, as values: every frame among them built,

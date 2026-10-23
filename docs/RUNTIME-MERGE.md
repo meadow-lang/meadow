@@ -329,6 +329,84 @@ Glade is unchanged. It is still the engine for the debugger, the REPL and
 introspection. Porting those to the new interpreter is what phase 5 has
 left, along with frame records that a debugger can read.
 
+### The end state: one runtime, four choices (Chris, 2026-10-23)
+
+There is no "Glade for debug, Silo for release". There is one runtime,
+configured per build along four axes. A profile picks the defaults:
+
+| axis | options | what it means |
+|---|---|---|
+| engine | bytecode VM, or native | a register VM in Glade's manner (a pc, debugging, introspection, hot loading), or LLVM |
+| memory | counting with reuse, tracing (later generational) | who frees a block |
+| stack | native fixed, native growable, heap frames | where activations live: the native stack, as Silo's do, or frames on the heap, as Glade's |
+| object representation | Silo's layout; others behind the same interface | how a block is laid out: its header, its fields, how a value is told apart from a block |
+
+The first three exist today for the native engine. Of the last, Silo's
+layout is the only one. "One layout for now, kept open" now means the layout
+becomes a real choice. For the VM, everything that reads a block goes through
+one interface (`meadow_rt::look` and `world` are the start). For native code,
+the lowering takes the layout's description: header size, where the length
+and kind are, and how a field is addressed.
+
+### The VM: a register machine with a pc (Chris, 2026-10-23)
+
+Silo's interpreter becomes a register VM in Glade's manner, with Glade's
+debugging and introspection, and hot loading, which Glade does not have.
+
+**What Glade has, to match.**
+- **Bytecode:** 53 opcodes of 8 bytes each (`compiler/meadow-bytecode`), over
+  one flat file of 256 registers. There is no call or return instruction:
+  every call is a tail call, and a non-tail call first pushes a continuation
+  onto a frame stack on the heap.
+- **Debug information:** one source location per instruction, which name is
+  in which register at each pc, and each function's region. It is built only
+  for debug builds, and never written into an image.
+- **Debugger** (`meadow dap`): line breakpoints, step in, over and out,
+  pause, stack traces, scopes, locals, and `evaluate` of a name in scope. A
+  frame is told by its return continuation; stepping is by line.
+- **Introspection:**
+  - `meadow dis`;
+  - coverage (`Process.covered`);
+  - a sampling profiler (`--profile-to`);
+  - GC statistics.
+
+  There is no stack trace on failure outside the debugger.
+- **No hot loading.** The REPL compiles every line as a new whole program and
+  runs it on a fresh VM. A redefinition shadows the old one.
+
+**The design.**
+- **Code.** Each linear block compiles to a run of fixed-size instructions in
+  one array, addressed by a pc.
+  - Registers are the block's slots, in a window per activation.
+  - Lists of arguments and a switch's arms are in side tables, so every
+    instruction is the same size.
+  - What the current interpreter learned stays: no frame is made for a call
+    whose frame only continues it, inline arithmetic and branches, and
+    descriptors resolved at load.
+- **Debug information.** The memory pass keeps AxCut's `Mark`s, which become a
+  line table, one location per pc. A register-name table says which name each
+  register holds. Both come from what a debug build already marks.
+- **Frames.** One interface, two homes:
+  - the native stack, as now;
+  - heap frames, as Glade's, where a frame is an object the debugger and hot
+    loading can walk without the native stack's help.
+- **Debugger.** The VM runs in its own process. `meadow dap` drives it over a
+  debug channel, and the protocol code moves to a crate both share. The
+  session logic (breakpoints to pcs, stepping by frame, stack traces, locals)
+  is written once against the VM's frames, and reads values through
+  `meadow_rt::look`, not a heap layout.
+- **Hot loading.** New. A running program takes a new image. Definitions are
+  replaced by label, so a call made after the swap runs the new code, while a
+  frame already running finishes in the code it began in. Top-level values are
+  kept unless their definitions changed.
+- **Order of work:**
+  1. the register VM on the native stack, at least as fast as the tree it
+     replaces;
+  2. the line table and `dis`;
+  3. the debugger;
+  4. heap frames;
+  5. hot loading.
+
 ### Every feature an option (Chris, 2026-10-22)
 
 The aim is not to choose between the runtimes' features. What either had

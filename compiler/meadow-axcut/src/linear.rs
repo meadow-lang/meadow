@@ -160,6 +160,10 @@ pub enum L {
         blocks: Vec<(Vec<Name>, L)>,
     },
     Error(#[serde(deserialize_with = "crate::leaked")] &'static str),
+    /// `rest`, which a person wrote at the location: AxCut's `Mark`, kept
+    /// for an engine that says where the program is -- a debugger's line
+    /// table. It does nothing, and is only there in a debug build.
+    Mark(meadow_rt::Loc, Box<L>),
 }
 
 /// An arm of a [`L::Switch`].
@@ -432,7 +436,9 @@ pub fn program(program: &Program, pinned: &[Label]) -> Result<Vec<(usize, Label,
 /// Every block the linear statement `l` jumps to, its methods' included.
 fn l_jumps(l: &L, out: &mut HashSet<Label>) {
     match l {
-        L::Share(_, r) | L::Erase(_, r) | L::Rename(_, r) | L::Clean(_, r) => l_jumps(r, out),
+        L::Share(_, r) | L::Erase(_, r) | L::Rename(_, r) | L::Clean(_, r) | L::Mark(_, r) => {
+            l_jumps(r, out)
+        }
         L::Let { rest, .. } | L::DropReuse { rest, .. } => l_jumps(rest, out),
         L::Switch { arms, default, .. } => {
             for a in arms {
@@ -913,7 +919,9 @@ impl<'p> Pass<'p> {
     fn live(&mut self, s: &'p Statement, env: &[Name], owned: HashSet<Name>) -> Result<L, Error> {
         let mut owned = owned;
         match s {
-            Statement::Mark(_, inner) => self.live(inner, env, owned),
+            Statement::Mark(loc, inner) => {
+                Ok(L::Mark(*loc, Box::new(self.live(inner, env, owned)?)))
+            }
             Statement::Error(msg) => Ok(L::Error(msg)),
 
             Statement::Substitute(sel, block) => {
@@ -1394,6 +1402,7 @@ pub fn free(l: &L) -> Vec<Name> {
             }
         };
         match l {
+            L::Mark(_, rest) => go(rest, bound, out),
             L::Share(n, rest) | L::Erase(n, rest) => {
                 use_(*n, bound, out);
                 go(rest, bound, out);
@@ -1550,9 +1559,11 @@ fn has_site(l: &L, n: usize) -> bool {
             rest,
             ..
         } => (fields.len() == n && reuse.is_none()) || has_site(rest, n),
-        L::Share(_, rest) | L::Erase(_, rest) | L::Rename(_, rest) | L::Clean(_, rest) => {
-            has_site(rest, n)
-        }
+        L::Share(_, rest)
+        | L::Erase(_, rest)
+        | L::Rename(_, rest)
+        | L::Clean(_, rest)
+        | L::Mark(_, rest) => has_site(rest, n),
         L::DropReuse { rest, .. } => has_site(rest, n),
         L::New { rest, .. } => {
             has_site(rest, n) || frame_method(l).is_some_and(|m| has_site(&m.body, n))

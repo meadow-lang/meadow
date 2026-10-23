@@ -4,6 +4,7 @@
 //! ```text
 //! meadow-silo-vm PROGRAM.image [ARGS...]
 //! meadow-silo-vm TESTS.image N
+//! meadow-silo-vm --dis PROGRAM.image
 //! ```
 //!
 //! An image of tests runs the one numbered `N`, as a test executable does.
@@ -82,9 +83,14 @@ extern "C" fn entry() -> Word {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    // `--dis`: the program's code, as the VM runs it, and nothing run.
+    let dis = args.get(1).is_some_and(|a| a == "--dis");
+    if dis {
+        args.remove(1);
+    }
     let Some(path) = args.get(1) else {
-        eprintln!("usage: meadow-silo-vm PROGRAM.image [ARGS...]");
+        eprintln!("usage: meadow-silo-vm [--dis] PROGRAM.image [ARGS...]");
         std::process::exit(2);
     };
     let bytes = match std::fs::read(path) {
@@ -113,6 +119,10 @@ fn main() {
     if let Err(e) = interp::load(image) {
         eprintln!("error: {e}");
         std::process::exit(1);
+    }
+    if dis {
+        print!("{}", interp::vm().disassemble());
+        return;
     }
     if let Some(n) = interp::vm().tests() {
         let Some(i) = args
