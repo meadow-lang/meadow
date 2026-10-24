@@ -23,16 +23,55 @@ use crate::linear::{L, LBlock, SwitchArm};
 use meadow_axcut::config::{Config, Memory, Stack};
 use meadow_axcut::{Extern, Name, Program, Rep, VarId};
 use meadow_rt::desc;
+use meadow_rt::layout::{Field, Layout};
 use meadow_rt::{Lit, Prim};
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::rc::Rc;
 
-/// What a block's second word says it is. Shared with the runtime, which
-/// must agree: see `silo/src/heap.rs`.
-pub mod kind {
-    pub const DATA: u64 = 1;
-    pub const CLOSURE: u64 = 2;
+/// The object layout the emitted code reads and writes blocks by: Silo's,
+/// which the runtime it is linked with has too (`meadow_rt::layout`). Every
+/// word, shift, mask and kind of a block the code names is taken from it, by
+/// way of [`Module::layout`], so another layout is a change here.
+const LAYOUT: Layout = meadow_rt::layout::SILO;
+
+/// What the shape of the emitted code takes for granted of a layout, beyond
+/// the numbers it reads from it: that a block's count is the integer its
+/// address points at; that a small value is one whose single tag bit is set;
+/// that one store writes a new block's count and length, and one its kind and
+/// `meta`, with the uniform bit and the one descriptor beside them, as the
+/// cycle collector's bits are; that a shift alone reads the length and the
+/// `meta`; and that descriptors are packed so that a shift finds one.
+fn suits(l: &Layout) {
+    assert!(
+        l.count.word == 0 && l.count.shift == 0 && [8, 16, 32, 64].contains(&l.count.bits),
+        "the count is the integer at a block's address"
+    );
+    assert!(
+        l.imm_mask.is_power_of_two() && l.imm_tag == l.imm_mask,
+        "a small value is told by one bit"
+    );
+    assert_eq!(l.len.word, l.count.word, "the length is beside the count");
+    for f in [l.meta, l.elem_desc, l.uniform, l.colour, l.mutable] {
+        assert_eq!(f.word, l.kind.word, "the kind's word holds the rest");
+    }
+    for f in [l.len, l.meta] {
+        assert_eq!(
+            f.shift + f.bits,
+            64,
+            "the length and `meta` top their words"
+        );
+    }
+    assert!(
+        l.descs_per_word.is_power_of_two() && l.desc_bits.is_power_of_two(),
+        "descriptors are found by shifting"
+    );
+}
+
+/// The LLVM type of a block's count, as it is loaded and stored: `i32` for
+/// Silo's.
+fn count_ty(l: &Layout) -> String {
+    format!("i{}", l.count.bits)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,6 +297,8 @@ pub struct Module<'p> {
     /// The trampoline of the function being written, which goes with it:
     /// see [`Module::stack_point`].
     trampoline: Option<String>,
+    /// How a block is laid out: see [`LAYOUT`].
+    layout: Layout,
 }
 
 impl<'p> Module<'p> {
@@ -268,6 +309,8 @@ impl<'p> Module<'p> {
     /// [`Module::new`], run as `config` says.
     pub fn with(program: &'p Program, conv: CallConv, config: Config) -> Module<'p> {
         let tracing = config.memory == Memory::Trace;
+        let layout = LAYOUT;
+        suits(&layout);
         Module {
             program,
             cc: conv.keyword(),
@@ -304,6 +347,7 @@ impl<'p> Module<'p> {
             tracing,
             growable: config.stack == Stack::Growable,
             trampoline: None,
+            layout,
         }
     }
 
@@ -866,20 +910,21 @@ impl<'p> Module<'p> {
     }
 
     /// Share `v`, described by `d`, `times` times: a call to one of the
-    /// module's helpers ([`HELPERS`]), which LLVM inlines where it judges it
+    /// module's helpers ([`helpers_text`]), which LLVM inlines where it judges it
     /// worth it -- the inline sequence at every one of the many places a
     /// linear program shares made the module several times the size.
     fn share(&self, f: &mut Fun, v: &str, d: &D, times: usize) {
         if self.tracing {
             return;
         }
+        let c = count_ty(&self.layout);
         match d {
             D::Known(k) if *k == desc::REF => {
-                f.i(format!("call void @mw.share(i64 {v}, i32 {times})"));
+                f.i(format!("call void @mw.share(i64 {v}, {c} {times})"));
             }
             D::Known(_) => {}
             D::Dyn(r) => f.i(format!(
-                "call void @mw.share_d(i64 {v}, i64 {r}, i32 {times})"
+                "call void @mw.share_d(i64 {v}, i64 {r}, {c} {times})"
             )),
         }
     }
@@ -914,7 +959,7 @@ impl<'p> Module<'p> {
         if n == 0 {
             return Vec::new();
         }
-        let first = 2 + n.div_ceil(16);
+        let first = self.layout.first_field(n, false);
         let p = f.ptr(v);
         (0..n)
             .map(|i| {
@@ -952,12 +997,13 @@ impl<'p> Module<'p> {
             self.erase(f, v, &D::Known(desc::REF));
             return Ok(());
         }
+        let c = count_ty(&self.layout);
         let p = f.ptr(v);
         let rc = f.t();
-        f.i(format!("{rc} = load i32, ptr {p}"));
+        f.i(format!("{rc} = load {c}, ptr {p}"));
         let (clean, shared, done) = (f.b(), f.b(), f.b());
         let last = f.t();
-        f.i(format!("{last} = icmp eq i32 {rc}, 0"));
+        f.i(format!("{last} = icmp eq {c} {rc}, 0"));
         f.i(format!("br i1 {last}, label %{clean}, label %{shared}"));
         f.label(&clean);
         f.i(format!(
@@ -967,8 +1013,8 @@ impl<'p> Module<'p> {
         f.i(format!("br label %{done}"));
         f.label(&shared);
         let rc2 = f.t();
-        f.i(format!("{rc2} = sub i32 {rc}, 1"));
-        f.i(format!("store i32 {rc2}, ptr {p}"));
+        f.i(format!("{rc2} = sub {c} {rc}, 1"));
+        f.i(format!("store {c} {rc2}, ptr {p}"));
         for (n, x) in names.iter().zip(loaded) {
             let d = self.desc(*n, env);
             self.share(f, x, &d, 1);
@@ -993,7 +1039,11 @@ impl<'p> Module<'p> {
         }
         let inreg = f.t();
         let (gone, on) = (f.b(), f.b());
-        f.i(format!("{inreg} = icmp ugt i32 {rc}, 536870912"));
+        f.i(format!(
+            "{inreg} = icmp ugt {} {rc}, {}",
+            count_ty(&self.layout),
+            self.layout.region_floor
+        ));
         f.i(format!("br i1 {inreg}, label %{gone}, label %{on}"));
         f.label(&gone);
         f.i(format!("call void @meadow_region_erased(i64 {v})"));
@@ -1019,19 +1069,20 @@ impl<'p> Module<'p> {
         if self.tracing {
             return Ok("0".to_string());
         }
+        let c = count_ty(&self.layout);
         let p = f.ptr(v);
         let rc = f.t();
-        f.i(format!("{rc} = load i32, ptr {p}"));
+        f.i(format!("{rc} = load {c}, ptr {p}"));
         let (mine, shared, shared_end, done) = (f.b(), f.b(), f.b(), f.b());
         let last = f.t();
-        f.i(format!("{last} = icmp eq i32 {rc}, 0"));
+        f.i(format!("{last} = icmp eq {c} {rc}, 0"));
         f.i(format!("br i1 {last}, label %{mine}, label %{shared}"));
         f.label(&mine);
         f.i(format!("br label %{done}"));
         f.label(&shared);
         let rc2 = f.t();
-        f.i(format!("{rc2} = sub i32 {rc}, 1"));
-        f.i(format!("store i32 {rc2}, ptr {p}"));
+        f.i(format!("{rc2} = sub {c} {rc}, 1"));
+        f.i(format!("store {c} {rc2}, ptr {p}"));
         for (n, x) in names.iter().zip(loaded) {
             let d = self.desc(*n, env);
             self.share(f, x, &d, 1);
@@ -1070,12 +1121,13 @@ impl<'p> Module<'p> {
         if self.tracing {
             return Ok("0".to_string());
         }
+        let c = count_ty(&self.layout);
         let p = f.ptr(v);
         let rc = f.t();
-        f.i(format!("{rc} = load i32, ptr {p}"));
+        f.i(format!("{rc} = load {c}, ptr {p}"));
         let (mine, shared, done) = (f.b(), f.b(), f.b());
         let last = f.t();
-        f.i(format!("{last} = icmp eq i32 {rc}, 0"));
+        f.i(format!("{last} = icmp eq {c} {rc}, 0"));
         f.i(format!("br i1 {last}, label %{mine}, label %{shared}"));
         f.label(&mine);
         let loaded = self.load_fields(f, v, names.len());
@@ -1127,14 +1179,16 @@ impl<'p> Module<'p> {
     /// number, which would change this unit's text whenever a method was
     /// added anywhere before it.
     fn build_closure(&self, f: &mut Fun, base: usize, vals: &[String], descs: &[D]) -> String {
+        let l = self.layout;
         let index = Self::method_index(&self.methods[base]);
         let m = f.t();
         f.i(format!("{m} = load i64, ptr {index}"));
         if vals.is_empty() {
+            // A small value: `l.immediate(m)`, of an `m` read at run time.
             let s = f.t();
-            f.i(format!("{s} = shl i64 {m}, 1"));
+            f.i(format!("{s} = shl i64 {m}, {}", l.imm_shift));
             let v = f.t();
-            f.i(format!("{v} = or i64 {s}, 1"));
+            f.i(format!("{v} = or i64 {s}, {}", l.imm_tag));
             return v;
         }
         let n = vals.len();
@@ -1143,18 +1197,22 @@ impl<'p> Module<'p> {
             "{b} = call i64 @{}(i64 {}, i64 {})",
             self.acquire_fn(),
             self.cx(),
-            2 + n.div_ceil(16) + n
+            l.first_field(n, false) + n
         ));
         // Written as method 0 -- the number itself must not be in the text --
         // and then again with what was read: LLVM drops the first store.
-        self.write_block(f, &b, kind::CLOSURE, 0, vals, descs, None);
+        let closure = l.kinds.closure;
+        self.write_block(f, &b, closure, 0, vals, descs, None);
         let p = f.ptr(&b);
         let w1 = f.t();
-        f.i(format!("{w1} = getelementptr i64, ptr {p}, i64 1"));
+        f.i(format!(
+            "{w1} = getelementptr i64, ptr {p}, i64 {}",
+            l.meta.word
+        ));
         let hi = f.t();
-        f.i(format!("{hi} = shl i64 {m}, 32"));
+        f.i(format!("{hi} = shl i64 {m}, {}", l.meta.shift));
         let word = f.t();
-        f.i(format!("{word} = or i64 {hi}, {}", kind::CLOSURE));
+        f.i(format!("{word} = or i64 {hi}, {}", l.kind.put(closure)));
         f.i(format!("store i64 {word}, ptr {w1}"));
         b
     }
@@ -1187,18 +1245,17 @@ impl<'p> Module<'p> {
         reuse: Option<&str>,
     ) -> String {
         if vals.is_empty() {
-            return format!("{}", (meta << 1) | 1);
+            return format!("{}", self.layout.immediate(meta));
         }
         let n = vals.len();
-        let dw = n.div_ceil(16);
+        let words = self.layout.first_field(n, false) + n;
         match reuse {
             None => {
                 let b = f.t();
                 f.i(format!(
-                    "{b} = call i64 @{}(i64 {}, i64 {})",
+                    "{b} = call i64 @{}(i64 {}, i64 {words})",
                     self.acquire_fn(),
                     self.cx(),
-                    2 + dw + n
                 ));
                 self.write_block(f, &b, kind, meta, vals, descs, None);
                 b
@@ -1218,10 +1275,9 @@ impl<'p> Module<'p> {
                 f.label(&fresh);
                 let a = f.t();
                 f.i(format!(
-                    "{a} = call i64 @{}(i64 {}, i64 {})",
+                    "{a} = call i64 @{}(i64 {}, i64 {words})",
                     self.acquire_fn(),
                     self.cx(),
-                    2 + dw + n
                 ));
                 self.write_block(f, &a, kind, meta, vals, descs, None);
                 let fresh_end = f.b();
@@ -1252,41 +1308,52 @@ impl<'p> Module<'p> {
         descs: &[D],
         reused: Option<Option<&Origin>>,
     ) {
+        let l = self.layout;
         let n = vals.len();
-        let dw = n.div_ceil(16);
         let same = match reused {
-            Some(Some(o)) if o.meta == meta && kind == kind::DATA && o.fields.len() == n => Some(o),
+            Some(Some(o)) if o.meta == meta && kind == l.kinds.data && o.fields.len() == n => {
+                Some(o)
+            }
             _ => None,
         };
         let p = f.ptr(b);
         if reused.is_none() {
-            f.i(format!("store i64 {}, ptr {p}", (n as u64) << 32));
+            // Its count, zero, and its length: the word the block's address
+            // points at.
+            f.i(format!("store i64 {}, ptr {p}", l.len.put(n as u64)));
         }
         if same.is_none() {
             let w1 = f.t();
-            f.i(format!("{w1} = getelementptr i64, ptr {p}, i64 1"));
-            f.i(format!("store i64 {}, ptr {w1}", kind | (meta << 32)));
+            f.i(format!(
+                "{w1} = getelementptr i64, ptr {p}, i64 {}",
+                l.kind.word
+            ));
+            f.i(format!(
+                "store i64 {}, ptr {w1}",
+                l.kind.put(kind) | l.meta.put(meta)
+            ));
         }
         let same_descs = same.is_some_and(|o| {
             o.descs.as_slice() == descs && descs.iter().all(|d| matches!(d, D::Known(_)))
         });
-        for w in 0..dw {
+        let per = l.descs_per_word;
+        for w in 0..l.desc_words(n) {
             if same_descs {
                 break;
             }
             let mut known: u64 = 0;
-            let mut dynamic: Vec<(usize, String)> = Vec::new();
-            for (j, d) in descs.iter().enumerate().skip(16 * w).take(16) {
-                let shift = 4 * (j - 16 * w);
+            let mut dynamic: Vec<(u32, String)> = Vec::new();
+            for (j, d) in descs.iter().enumerate().skip(per * w).take(per) {
+                let (_, shift) = l.desc_at(j);
                 match d {
-                    D::Known(k) => known |= ((*k as u64) & 15) << shift,
+                    D::Known(k) => known |= ((*k as u64) & l.desc_mask()) << shift,
                     D::Dyn(r) => dynamic.push((shift, r.clone())),
                 }
             }
             let mut acc = format!("{known}");
             for (shift, r) in dynamic {
                 let m = f.t();
-                f.i(format!("{m} = and i64 {r}, 15"));
+                f.i(format!("{m} = and i64 {r}, {}", l.desc_mask()));
                 let s = f.t();
                 f.i(format!("{s} = shl i64 {m}, {shift}"));
                 let o = f.t();
@@ -1294,9 +1361,13 @@ impl<'p> Module<'p> {
                 acc = o;
             }
             let q = f.t();
-            f.i(format!("{q} = getelementptr i64, ptr {p}, i64 {}", 2 + w));
+            f.i(format!(
+                "{q} = getelementptr i64, ptr {p}, i64 {}",
+                l.desc_at(per * w).0
+            ));
             f.i(format!("store i64 {acc}, ptr {q}"));
         }
+        let first = l.first_field(n, false);
         for (i, v) in vals.iter().enumerate() {
             if same.is_some_and(|o| o.fields[i] == *v) {
                 continue;
@@ -1304,7 +1375,7 @@ impl<'p> Module<'p> {
             let q = f.t();
             f.i(format!(
                 "{q} = getelementptr i64, ptr {p}, i64 {}",
-                2 + dw + i
+                first + i
             ));
             f.i(format!("store i64 {v}, ptr {q}"));
         }
@@ -1422,7 +1493,8 @@ impl<'p> Module<'p> {
                     }
                     None => None,
                 };
-                let v = self.build_in(f, kind::DATA, *tag as u64, &vals, &descs, token.as_deref());
+                let data = self.layout.kinds.data;
+                let v = self.build_in(f, data, *tag as u64, &vals, &descs, token.as_deref());
                 env.insert(*name, V::Val(v));
                 self.stmt(rest, env, f)
             }
@@ -1640,28 +1712,7 @@ impl<'p> Module<'p> {
 
     /// The function pointer of method `tag` of the object in `t`.
     fn method_ptr(&self, f: &mut Fun, t: &str, tag: u32) -> String {
-        let (imm, blk, join) = (f.b(), f.b(), f.b());
-        let low = f.t();
-        f.i(format!("{low} = and i64 {t}, 1"));
-        let odd = f.t();
-        f.i(format!("{odd} = icmp ne i64 {low}, 0"));
-        f.i(format!("br i1 {odd}, label %{imm}, label %{blk}"));
-        f.label(&imm);
-        let m1 = f.t();
-        f.i(format!("{m1} = lshr i64 {t}, 1"));
-        f.i(format!("br label %{join}"));
-        f.label(&blk);
-        let p = f.ptr(t);
-        let q = f.t();
-        f.i(format!("{q} = getelementptr i64, ptr {p}, i64 1"));
-        let w1 = f.t();
-        f.i(format!("{w1} = load i64, ptr {q}"));
-        let m2 = f.t();
-        f.i(format!("{m2} = lshr i64 {w1}, 32"));
-        f.i(format!("br label %{join}"));
-        f.label(&join);
-        let m = f.t();
-        f.i(format!("{m} = phi i64 [ {m1}, %{imm} ], [ {m2}, %{blk} ]"));
+        let m = self.meta_of(f, t);
         let idx = f.t();
         f.i(format!("{idx} = add i64 {m}, {tag}"));
         let slot = f.t();
@@ -1671,6 +1722,38 @@ impl<'p> Module<'p> {
         let fp = f.t();
         f.i(format!("{fp} = load ptr, ptr {slot}"));
         fp
+    }
+
+    /// The `meta` of `v` -- a closure's first method, a constructor's tag --
+    /// which a small value carries in itself and a block in its header.
+    fn meta_of(&self, f: &mut Fun, v: &str) -> String {
+        let l = self.layout;
+        let (imm, blk, join) = (f.b(), f.b(), f.b());
+        let low = f.t();
+        f.i(format!("{low} = and i64 {v}, {}", l.imm_mask));
+        let small = f.t();
+        f.i(format!("{small} = icmp ne i64 {low}, 0"));
+        f.i(format!("br i1 {small}, label %{imm}, label %{blk}"));
+        f.label(&imm);
+        let m1 = f.t();
+        f.i(format!("{m1} = lshr i64 {v}, {}", l.imm_shift));
+        f.i(format!("br label %{join}"));
+        f.label(&blk);
+        let p = f.ptr(v);
+        let q = f.t();
+        f.i(format!(
+            "{q} = getelementptr i64, ptr {p}, i64 {}",
+            l.meta.word
+        ));
+        let w1 = f.t();
+        f.i(format!("{w1} = load i64, ptr {q}"));
+        let m2 = f.t();
+        f.i(format!("{m2} = lshr i64 {w1}, {}", l.meta.shift));
+        f.i(format!("br label %{join}"));
+        f.label(&join);
+        let m = f.t();
+        f.i(format!("{m} = phi i64 [ {m1}, %{imm} ], [ {m2}, %{blk} ]"));
+        m
     }
 
     /// Hand control to `callee` -- after `first`, the object of an invoke --
@@ -1733,30 +1816,7 @@ impl<'p> Module<'p> {
         f: &mut Fun,
     ) -> Result<(), Error> {
         let s = self.val(scrutinee, env, f)?;
-        let (imm, blk, dispatch) = (f.b(), f.b(), f.b());
-        let low = f.t();
-        f.i(format!("{low} = and i64 {s}, 1"));
-        let odd = f.t();
-        f.i(format!("{odd} = icmp ne i64 {low}, 0"));
-        f.i(format!("br i1 {odd}, label %{imm}, label %{blk}"));
-        f.label(&imm);
-        let t1 = f.t();
-        f.i(format!("{t1} = lshr i64 {s}, 1"));
-        f.i(format!("br label %{dispatch}"));
-        f.label(&blk);
-        let p = f.ptr(&s);
-        let q = f.t();
-        f.i(format!("{q} = getelementptr i64, ptr {p}, i64 1"));
-        let w1 = f.t();
-        f.i(format!("{w1} = load i64, ptr {q}"));
-        let t2 = f.t();
-        f.i(format!("{t2} = lshr i64 {w1}, 32"));
-        f.i(format!("br label %{dispatch}"));
-        f.label(&dispatch);
-        let tag = f.t();
-        f.i(format!(
-            "{tag} = phi i64 [ {t1}, %{imm} ], [ {t2}, %{blk} ]"
-        ));
+        let tag = self.meta_of(f, &s);
         let def = f.b();
         let labels: Vec<String> = arms.iter().map(|_| f.b()).collect();
         let mut sw = format!("switch i64 {tag}, label %{def} [");
@@ -2238,11 +2298,15 @@ impl<'p> Module<'p> {
     /// cover -- an index out of bounds, a code past the surrogates -- calls
     /// the runtime, which says what is wrong as it always has.
     /// `setRef r v`, where `d` describes `v`: a `Ref` is a block of one field,
-    /// its value word 3 and the four bits saying how to read it in word 2.
+    /// its value, and the descriptor saying how to read it.
     fn set_ref(&self, f: &mut Fun, r: &str, v: &str, d: &D) {
+        let l = self.layout;
         let p = f.ptr(r);
         let q = f.t();
-        f.i(format!("{q} = getelementptr i64, ptr {p}, i64 3"));
+        f.i(format!(
+            "{q} = getelementptr i64, ptr {p}, i64 {}",
+            l.first_field(1, false)
+        ));
         let old = f.t();
         f.i(format!("{old} = load i64, ptr {q}"));
         // What it held is gone; what it holds now is one more reference. The
@@ -2253,14 +2317,19 @@ impl<'p> Module<'p> {
         self.erase(f, &old, d);
         if let D::Dyn(dv) = d {
             // A value of a type variable's type: the block says how to read
-            // it, so say it.
+            // it, so say it. The first field's descriptor is at the bottom of
+            // its word.
+            let (at, _) = l.desc_at(0);
             let w = f.t();
-            f.i(format!("{w} = getelementptr i64, ptr {p}, i64 2"));
+            f.i(format!("{w} = getelementptr i64, ptr {p}, i64 {at}"));
             let had = f.t();
             f.i(format!("{had} = load i64, ptr {w}"));
             let (cleared, bits, now) = (f.t(), f.t(), f.t());
-            f.i(format!("{cleared} = and i64 {had}, -16"));
-            f.i(format!("{bits} = and i64 {dv}, 15"));
+            f.i(format!(
+                "{cleared} = and i64 {had}, {}",
+                !l.desc_mask() as i64
+            ));
+            f.i(format!("{bits} = and i64 {dv}, {}", l.desc_mask()));
             f.i(format!("{now} = or i64 {cleared}, {bits}"));
             f.i(format!("store i64 {now}, ptr {w}"));
         }
@@ -2276,28 +2345,25 @@ impl<'p> Module<'p> {
         f: &mut Fun,
     ) -> Option<String> {
         use Prim::*;
-        let word = |f: &mut Fun, v: &str, i: String| {
+        let l = self.layout;
+        // A header field of the block at `v`: its length, its `meta` -- which
+        // for a string is how many bytes it has.
+        let header = move |f: &mut Fun, v: &str, field: Field| {
             let p = f.ptr(v);
             let q = f.t();
-            f.i(format!("{q} = getelementptr i64, ptr {p}, i64 {i}"));
+            f.i(format!(
+                "{q} = getelementptr i64, ptr {p}, i64 {}",
+                field.word
+            ));
+            let w = f.t();
+            f.i(format!("{w} = load i64, ptr {q}"));
             let x = f.t();
-            f.i(format!("{x} = load i64, ptr {q}"));
-            (x, q)
-        };
-        let high = |f: &mut Fun, w: &str| {
-            let x = f.t();
-            f.i(format!("{x} = lshr i64 {w}, 32"));
+            f.i(format!("{x} = lshr i64 {w}, {}", field.shift));
             x
         };
         match (p, vals) {
-            (ArrayLen | StArrayLen, [a]) => {
-                let (w0, _) = word(f, a, "0".into());
-                Some(high(f, &w0))
-            }
-            (StringByteLength, [s]) => {
-                let (w1, _) = word(f, s, "1".into());
-                Some(high(f, &w1))
-            }
+            (ArrayLen | StArrayLen, [a]) => Some(header(f, a, l.len)),
+            (StringByteLength, [s]) => Some(header(f, s, l.meta)),
             (CharCode, [c]) if self.rep(args[0]) == Some(Rep::Bits(desc::CHAR)) => Some(c.clone()),
             (ToInt, [x]) if self.rep(args[0]) == Some(Rep::Int) => Some(x.clone()),
             (ToInt, [x])
@@ -2317,8 +2383,7 @@ impl<'p> Module<'p> {
             (StringByteAt, [s, i]) if self.rep(args[1]) == Some(Rep::Int) => {
                 let (s, i) = (s.clone(), i.clone());
                 Some(self.guarded(p, args, vals, env, f, move |f| {
-                    let (w1, _) = word(f, &s, "1".into());
-                    let n = high(f, &w1);
+                    let n = header(f, &s, l.meta);
                     let c = f.t();
                     f.i(format!("{c} = icmp ult i64 {i}, {n}"));
                     // Only read past the check: computed on the fast path.
@@ -2329,8 +2394,7 @@ impl<'p> Module<'p> {
                 let d = result.map_or(D::Known(desc::REF), |r| self.desc(r, env));
                 let (a, i) = (a.clone(), i.clone());
                 Some(self.guarded(p, args, vals, env, f, move |f| {
-                    let (w0, _) = word(f, &a, "0".into());
-                    let n = high(f, &w0);
+                    let n = header(f, &a, l.len);
                     let c = f.t();
                     f.i(format!("{c} = icmp ult i64 {i}, {n}"));
                     (c, format!("elem:{a}:{i}"))
@@ -2351,22 +2415,24 @@ impl<'p> Module<'p> {
             {
                 let (a, i, v) = (a.clone(), i.clone(), v.clone());
                 Some(self.guarded(p, args, vals, env, f, move |f| {
-                    let (w0, _) = word(f, &a, "0".into());
-                    let n = high(f, &w0);
+                    let n = header(f, &a, l.len);
                     let c = f.t();
                     f.i(format!("{c} = icmp ult i64 {i}, {n}"));
                     (c, format!("store:{a}:{i}:{v}"))
                 }))
             }
-            // A `Ref` is a block of one field: its value is word 3, and the
-            // four bits saying how to read it are in word 2. Reading and
-            // writing one is what a loop with a counter in it does at every
-            // turn, so neither is a call.
+            // A `Ref` is a block of one field: its value, with the descriptor
+            // saying how to read it before it. Reading and writing one is what
+            // a loop with a counter in it does at every turn, so neither is a
+            // call.
             (GetRef, [r]) => {
                 let d = result.map_or(D::Known(desc::REF), |n| self.desc(n, env));
                 let p = f.ptr(r);
                 let q = f.t();
-                f.i(format!("{q} = getelementptr i64, ptr {p}, i64 3"));
+                f.i(format!(
+                    "{q} = getelementptr i64, ptr {p}, i64 {}",
+                    l.first_field(1, false)
+                ));
                 let x = f.t();
                 f.i(format!("{x} = load i64, ptr {q}"));
                 self.share(f, &x, &d, 1);
@@ -2391,13 +2457,15 @@ impl<'p> Module<'p> {
             {
                 let d = self.desc(args[2], env);
                 let p = f.ptr(o);
+                // The length is in the word the block's address points at.
                 let w0 = f.t();
                 f.i(format!("{w0} = load i64, ptr {p}"));
-                let (n, n15, dw, at, idx) = (f.t(), f.t(), f.t(), f.t(), f.t());
-                f.i(format!("{n} = lshr i64 {w0}, 32"));
-                f.i(format!("{n15} = add i64 {n}, 15"));
-                f.i(format!("{dw} = lshr i64 {n15}, 4"));
-                f.i(format!("{at} = add i64 {dw}, 2"));
+                let (n, up, dw, at, idx) = (f.t(), f.t(), f.t(), f.t(), f.t());
+                let per = l.descs_per_word;
+                f.i(format!("{n} = lshr i64 {w0}, {}", l.len.shift));
+                f.i(format!("{up} = add i64 {n}, {}", per - 1));
+                f.i(format!("{dw} = lshr i64 {up}, {}", per.trailing_zeros()));
+                f.i(format!("{at} = add i64 {dw}, {}", l.header_words));
                 f.i(format!("{idx} = add i64 {at}, {i}"));
                 let q = f.t();
                 f.i(format!("{q} = getelementptr i64, ptr {p}, i64 {idx}"));
@@ -2432,6 +2500,9 @@ impl<'p> Module<'p> {
         f: &mut Fun,
         check: impl FnOnce(&mut Fun) -> (String, String),
     ) -> String {
+        // A string and an array are uniform: a string's bytes, and an array's
+        // elements, start straight after the header.
+        let first = self.layout.first_field(0, true);
         let (c, answer) = check(f);
         let (fast, slow, done) = (f.b(), f.b(), f.b());
         f.i(format!("br i1 {c}, label %{fast}, label %{slow}"));
@@ -2440,7 +2511,10 @@ impl<'p> Module<'p> {
             let (s, i) = rest.split_once(':').expect("byte:s:i");
             let p = f.ptr(s);
             let q = f.t();
-            f.i(format!("{q} = getelementptr i8, ptr {p}, i64 16"));
+            f.i(format!(
+                "{q} = getelementptr i8, ptr {p}, i64 {}",
+                8 * first
+            ));
             let r = f.t();
             f.i(format!("{r} = getelementptr i8, ptr {q}, i64 {i}"));
             let b = f.t();
@@ -2451,7 +2525,7 @@ impl<'p> Module<'p> {
         } else if let Some(rest) = answer.strip_prefix("elem:") {
             let (a, i) = rest.split_once(':').expect("elem:a:i");
             let k = f.t();
-            f.i(format!("{k} = add i64 {i}, 2"));
+            f.i(format!("{k} = add i64 {i}, {first}"));
             let p = f.ptr(a);
             let q = f.t();
             f.i(format!("{q} = getelementptr i64, ptr {p}, i64 {k}"));
@@ -2466,7 +2540,7 @@ impl<'p> Module<'p> {
                 parts.next().expect("store:a:i:v"),
             );
             let k = f.t();
-            f.i(format!("{k} = add i64 {i}, 2"));
+            f.i(format!("{k} = add i64 {i}, {first}"));
             let p = f.ptr(a);
             let q = f.t();
             f.i(format!("{q} = getelementptr i64, ptr {p}, i64 {k}"));
@@ -2769,7 +2843,7 @@ impl<'p> Module<'p> {
                         "; A Meadow program, compiled by meadow-llvm: part {i}.\n"
                     );
                     out.push_str(RUNTIME);
-                    out.push_str(&helpers(self.cycles, self.regions));
+                    out.push_str(&helpers(&self.layout, self.cycles, self.regions));
                     // Of no stated length: how many methods the program has
                     // is not this unit's to say, and would be one more thing
                     // that changed its text when another unit changed.
@@ -2871,8 +2945,8 @@ impl<'p> Module<'p> {
         let mut out = String::new();
         let _ = writeln!(out, "; A Meadow program, compiled by meadow-llvm.\n");
         out.push_str(RUNTIME);
-        out.push_str(&helpers(self.cycles, self.regions));
-        out.push_str(&invokers(self.cc, self.threaded));
+        out.push_str(&helpers(&self.layout, self.cycles, self.regions));
+        out.push_str(&invokers(&self.layout, self.cc, self.threaded));
         let _ = writeln!(out, "@meadow_silo_{fingerprint} = external global i8");
         let _ = writeln!(
             out,
@@ -3592,50 +3666,54 @@ fn export_fn(
     Ok(())
 }
 
-/// Sharing and erasing, the paper's `share` and `erase`, as the module's own
-/// small functions: skip `0` and odd words (no block), and a value whose
-/// descriptor says it is no reference; add to the count, or take from it --
-/// handing the block to the runtime when it was the last.
-/// The helpers as a program gets them. One that can tie a knot hands every
-/// block whose count went down without reaching zero to the collector, which
-/// is where a cycle is noticed (`silo/src/cycles.rs`); one that cannot has no
-/// such call anywhere in it.
-fn helpers(cycles: bool, regions: bool) -> String {
+/// The helpers as a program gets them: [`helpers_text`], for its layout. One
+/// that can tie a knot hands every block whose count went down without
+/// reaching zero to the collector, which is where a cycle is noticed
+/// (`silo/src/cycles.rs`); one that cannot has no such call anywhere in it.
+fn helpers(l: &Layout, cycles: bool, regions: bool) -> String {
+    let c = count_ty(l);
     // The test before the call is inline, and on a program that makes no
     // cycles it is the whole cost, so it is one mask and one compare against
     // a constant. A block is worth keeping only if it is a `Ref` or a mutable
     // array -- the two kinds a cycle must contain, marked as such when they
     // are built -- and only the first time its count goes down, since it is
     // coloured until a collection looks at it. Both questions are in the same
-    // word, so both are asked at once: `MUTABLE` set and the colour black.
-    // `silo/src/cycles.rs` says why those two kinds, `silo/src/heap.rs` has the
-    // bits, and the two must agree.
+    // word, so both are asked at once: `mutable` set and the colour black,
+    // which is zero. `silo/src/cycles.rs` says why those two kinds, and the
+    // layout has the bits.
     let candidate = if cycles {
-        "  %w1a = getelementptr i64, ptr %p, i64 1
+        format!(
+            "  %w1a = getelementptr i64, ptr %p, i64 {word}
   %w1 = load i64, ptr %w1a
-  %ask = and i64 %w1, 286720
-  %want = icmp eq i64 %ask, 262144
+  %ask = and i64 %w1, {ask}
+  %want = icmp eq i64 %ask, {want}
   br i1 %want, label %cand, label %done, !prof !0
 cand:
   call void @meadow_candidate(i64 %v)
   br label %done
-"
+",
+            word = l.mutable.word,
+            ask = l.mutable.bits_in_place() | l.colour.bits_in_place(),
+            want = l.mutable.bits_in_place(),
+        )
     } else {
-        "  br label %done\n"
+        "  br label %done\n".to_string()
     };
     // A block inside a compact region carries far more references than it
     // has, so the count a share or an erase has already loaded says whether
     // it is touching one -- and the region has to be told, since that is what
     // keeps it alive while anything points into it. `silo/src/region.rs` says
-    // why, and `silo/src/heap.rs` has the number, which must be this one.
+    // why, and the layout has the number.
+    let floor = l.region_floor;
     let share_tail = if regions {
-        "  %inreg = icmp ugt i32 %rc2, 536870912
+        format!(
+            "  %inreg = icmp ugt {c} %rc2, {floor}
   br i1 %inreg, label %rshare, label %done, !prof !0
 rshare:
   call void @meadow_region_shared(i64 %v)
   br label %done
 "
-        .to_string()
+        )
     } else {
         "  br label %done\n".to_string()
     };
@@ -3644,7 +3722,7 @@ rshare:
     // nothing in it can change.
     let erase_tail = if regions {
         format!(
-            "  %inreg = icmp ugt i32 %rc, 536870912
+            "  %inreg = icmp ugt {c} %rc, {floor}
   br i1 %inreg, label %rerase, label %noreg, !prof !0
 rerase:
   call void @meadow_region_erased(i64 %v)
@@ -3653,7 +3731,7 @@ noreg:
 {candidate}"
         )
     } else {
-        candidate.to_string()
+        candidate
     };
     // Counting happens everywhere and both of these are rare, so say which
     // way the tests go: the calls and their setup are laid out away from the
@@ -3663,122 +3741,145 @@ noreg:
     } else {
         ""
     };
-    HELPERS
+    helpers_text(l)
         .replace("; region-share\n", &share_tail)
         .replace("; candidate\n", &erase_tail)
         + cold
 }
 
-const HELPERS: &str = "\
-define internal void @mw.share(i64 %v, i32 %n) alwaysinline {
+/// Sharing and erasing, the paper's `share` and `erase`, as the module's own
+/// small functions: skip the null word and a small value (no block), and a
+/// value whose descriptor says it is no reference; add to the count, or take
+/// from it -- handing the block to the runtime when it was the last. And
+/// `@mw.field`, a field read from a block whose shape is not known here.
+fn helpers_text(l: &Layout) -> String {
+    let c = count_ty(l);
+    let (tag, null, r) = (l.imm_mask, l.null, desc::REF);
+    let per = l.descs_per_word;
+    format!(
+        "\
+define internal void @mw.share(i64 %v, {c} %n) alwaysinline {{
 entry:
-  %low = and i64 %v, 1
+  %low = and i64 %v, {tag}
   %even = icmp eq i64 %low, 0
-  %nz = icmp ne i64 %v, 0
+  %nz = icmp ne i64 %v, {null}
   %block = and i1 %even, %nz
   br i1 %block, label %go, label %done
 go:
   %p = inttoptr i64 %v to ptr
-  %rc = load i32, ptr %p
-  %rc2 = add i32 %rc, %n
-  store i32 %rc2, ptr %p
+  %rc = load {c}, ptr %p
+  %rc2 = add {c} %rc, %n
+  store {c} %rc2, ptr %p
 ; region-share
 done:
   ret void
-}
+}}
 
-define internal void @mw.erase(i64 %ctx, i64 %v) alwaysinline {
+define internal void @mw.erase(i64 %ctx, i64 %v) alwaysinline {{
 entry:
-  %low = and i64 %v, 1
+  %low = and i64 %v, {tag}
   %even = icmp eq i64 %low, 0
-  %nz = icmp ne i64 %v, 0
+  %nz = icmp ne i64 %v, {null}
   %block = and i1 %even, %nz
   br i1 %block, label %go, label %done
 go:
   %p = inttoptr i64 %v to ptr
-  %rc = load i32, ptr %p
-  %last = icmp eq i32 %rc, 0
+  %rc = load {c}, ptr %p
+  %last = icmp eq {c} %rc, 0
   br i1 %last, label %free, label %dec
 free:
   call void @meadow_free(i64 %ctx, i64 %v)
   br label %done
 dec:
-  %rc2 = sub i32 %rc, 1
-  store i32 %rc2, ptr %p
+  %rc2 = sub {c} %rc, 1
+  store {c} %rc2, ptr %p
 ; candidate
 done:
   ret void
-}
+}}
 
-define internal void @mw.share_d(i64 %v, i64 %d, i32 %n) alwaysinline {
+define internal void @mw.share_d(i64 %v, i64 %d, {c} %n) alwaysinline {{
 entry:
-  %isref = icmp eq i64 %d, 0
+  %isref = icmp eq i64 %d, {r}
   br i1 %isref, label %go, label %done
 go:
-  call void @mw.share(i64 %v, i32 %n)
+  call void @mw.share(i64 %v, {c} %n)
   br label %done
 done:
   ret void
-}
+}}
 
-define internal void @mw.erase_d(i64 %ctx, i64 %v, i64 %d) alwaysinline {
+define internal void @mw.erase_d(i64 %ctx, i64 %v, i64 %d) alwaysinline {{
 entry:
-  %isref = icmp eq i64 %d, 0
+  %isref = icmp eq i64 %d, {r}
   br i1 %isref, label %go, label %done
 go:
   call void @mw.erase(i64 %ctx, i64 %v)
   br label %done
 done:
   ret void
-}
+}}
 
 ; Field %i of the block at %v, shared: `meadow_field` without the call. A
 ; uniform block's fields start at word 2 and share word 1's descriptor; any
 ; other's start past its descriptor words, sixteen four-bit descriptors to a
 ; word. Called with a constant %i, all but the loads folds away.
-define internal i64 @mw.field(i64 %v, i64 %i) alwaysinline {
+define internal i64 @mw.field(i64 %v, i64 %i) alwaysinline {{
 entry:
   %p = inttoptr i64 %v to ptr
-  %w1p = getelementptr i64, ptr %p, i64 1
+  %w1p = getelementptr i64, ptr %p, i64 {w1}
   %w1 = load i64, ptr %w1p
-  %uni = and i64 %w1, 4096
+  %uni = and i64 %w1, {uniform}
   %isuni = icmp ne i64 %uni, 0
   br i1 %isuni, label %uniform, label %mixed
 uniform:
-  %ud0 = lshr i64 %w1, 8
-  %ud = and i64 %ud0, 15
+  %ud0 = lshr i64 %w1, {ud_shift}
+  %ud = and i64 %ud0, {ud_mask}
   br label %load
 mixed:
   %w0 = load i64, ptr %p
-  %len = lshr i64 %w0, 32
-  %len15 = add i64 %len, 15
-  %dws = lshr i64 %len15, 4
-  %mfirst = add i64 %dws, 2
-  %slot0 = lshr i64 %i, 4
-  %slot = add i64 %slot0, 2
+  %len = lshr i64 %w0, {len_shift}
+  %len15 = add i64 %len, {per_less}
+  %dws = lshr i64 %len15, {per_log}
+  %mfirst = add i64 %dws, {header}
+  %slot0 = lshr i64 %i, {per_log}
+  %slot = add i64 %slot0, {header}
   %dwp = getelementptr i64, ptr %p, i64 %slot
   %dw = load i64, ptr %dwp
-  %nib = and i64 %i, 15
-  %shift = shl i64 %nib, 2
+  %nib = and i64 %i, {per_less}
+  %shift = shl i64 %nib, {bits_log}
   %md0 = lshr i64 %dw, %shift
-  %md = and i64 %md0, 15
+  %md = and i64 %md0, {desc_mask}
   br label %load
 load:
-  %first = phi i64 [ 2, %uniform ], [ %mfirst, %mixed ]
+  %first = phi i64 [ {uniform_first}, %uniform ], [ %mfirst, %mixed ]
   %d = phi i64 [ %ud, %uniform ], [ %md, %mixed ]
   %at = add i64 %first, %i
   %xp = getelementptr i64, ptr %p, i64 %at
   %x = load i64, ptr %xp
-  call void @mw.share_d(i64 %x, i64 %d, i32 1)
+  call void @mw.share_d(i64 %x, i64 %d, {c} 1)
   ret i64 %x
+}}
+
+",
+        w1 = l.uniform.word,
+        uniform = l.uniform.bits_in_place(),
+        ud_shift = l.elem_desc.shift,
+        ud_mask = l.elem_desc.mask(),
+        len_shift = l.len.shift,
+        per_less = per - 1,
+        per_log = per.trailing_zeros(),
+        header = l.header_words,
+        bits_log = l.desc_bits.trailing_zeros(),
+        desc_mask = l.desc_mask(),
+        uniform_first = l.first_field(0, true),
+    )
 }
 
-";
-
-/// [`INVOKE1`] in the module's convention, handing the method it calls the
+/// [`invoke1`] in the module's convention, handing the method it calls the
 /// running thread's context where the program has one to hand.
-fn invokers(cc: &str, threaded: bool) -> String {
-    let text = INVOKE1.replace("ghccc", cc);
+fn invokers(l: &Layout, cc: &str, threaded: bool) -> String {
+    let text = invoke1(l).replace("ghccc", cc);
     if threaded {
         text.replace("  %slot = ", "  %ctx = call i64 @meadow_ctx()\n  %slot = ")
             .replace(" i64 %fp(i64 %obj", " i64 %fp(i64 %ctx, i64 %obj")
@@ -3792,52 +3893,50 @@ fn invokers(cc: &str, threaded: bool) -> String {
 /// calling convention Rust cannot call: method 0 of `obj`, found as an
 /// `invoke` finds it, called from the C convention. Written for `ghccc`, and
 /// given the module's own convention where it is used.
-const INVOKE1: &str = "\
-define i64 @meadow_invoke1(i64 %obj, i64 %arg) {
-entry:
-  %low = and i64 %obj, 1
+fn invoke1(l: &Layout) -> String {
+    // The first method's index, as [`Module::meta_of`] finds it.
+    let meta = format!(
+        "  %low = and i64 %obj, {tag}
   %odd = icmp ne i64 %low, 0
   br i1 %odd, label %imm, label %blk
 imm:
-  %m1 = lshr i64 %obj, 1
+  %m1 = lshr i64 %obj, {imm_shift}
   br label %go
 blk:
   %p = inttoptr i64 %obj to ptr
-  %q = getelementptr i64, ptr %p, i64 1
+  %q = getelementptr i64, ptr %p, i64 {word}
   %w = load i64, ptr %q
-  %m2 = lshr i64 %w, 32
+  %m2 = lshr i64 %w, {shift}
   br label %go
 go:
   %m = phi i64 [ %m1, %imm ], [ %m2, %blk ]
-  %slot = getelementptr ptr, ptr @meadow_methods, i64 %m
+",
+        tag = l.imm_mask,
+        imm_shift = l.imm_shift,
+        word = l.meta.word,
+        shift = l.meta.shift,
+    );
+    format!(
+        "\
+define i64 @meadow_invoke1(i64 %obj, i64 %arg) {{
+entry:
+{meta}  %slot = getelementptr ptr, ptr @meadow_methods, i64 %m
   %fp = load ptr, ptr %slot
   %r = call ghccc i64 %fp(i64 %obj, i64 %arg)
   ret i64 %r
-}
+}}
 
-define i64 @meadow_apply(i64 %obj, i64 %arg, i64 %ev) {
+define i64 @meadow_apply(i64 %obj, i64 %arg, i64 %ev) {{
 entry:
-  %low = and i64 %obj, 1
-  %odd = icmp ne i64 %low, 0
-  br i1 %odd, label %imm, label %blk
-imm:
-  %m1 = lshr i64 %obj, 1
-  br label %go
-blk:
-  %p = inttoptr i64 %obj to ptr
-  %q = getelementptr i64, ptr %p, i64 1
-  %w = load i64, ptr %q
-  %m2 = lshr i64 %w, 32
-  br label %go
-go:
-  %m = phi i64 [ %m1, %imm ], [ %m2, %blk ]
-  %slot = getelementptr ptr, ptr @meadow_methods, i64 %m
+{meta}  %slot = getelementptr ptr, ptr @meadow_methods, i64 %m
   %fp = load ptr, ptr %slot
   %r = call ghccc i64 %fp(i64 %obj, i64 %arg, i64 0, i64 %ev)
   ret i64 %r
-}
+}}
 
-";
+"
+    )
+}
 
 /// The primitives with an entry of their own in the runtime, and which of
 /// their arguments it wants a descriptor beside. These are the ones a program
