@@ -636,6 +636,28 @@ versioned, so its IR is what it was.
 Tests: `buildtools/meadow/tests/hot_reload.rs`, among them a changed type
 with old and new values alive at once, and a build that opted out.
 
+### Replacing Glade in full (2026-10-24)
+
+The merged runtime is to be Glade's next release, so it has to do all that
+Glade's VM does. Where it stands:
+
+| Glade has | on the merged runtime |
+|---|---|
+| a debugger (`meadow dap`) | yes, on the VM |
+| a REPL | `:silo` runs each entry on the VM, a fresh machine a line as Glade's |
+| a sampling profiler (`--profile-to`) | yes, by time or by work, as folded stacks |
+| coverage (`Process.covered`) | yes: `Std.Test.Fuzz` steers on it |
+| GC statistics (`--gc-stats`) | yes, on both engines, under both strategies |
+| `meadow exec` of an image | yes, of an image of AxCut |
+| growable stacks, heap frames | yes, on both engines |
+| a generational, moving collector | not yet: it comes with a Glade-like layout |
+| a JIT of hot blocks | not planned: the LLVM path compiles a whole program |
+
+A block no person wrote -- a join point, a group of local functions, a
+`perform`'s search -- is named at load after the definition that jumps to
+it, `Fib.fib/<join>`, so a debugger's frames and a profile's samples say
+whose code it is, as Glade's do.
+
 ### Silo's speed, kept (measured 2026-10-23)
 
 Counting on the LLVM path compiles to the same code as before the merge. For
