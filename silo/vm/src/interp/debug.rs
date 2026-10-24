@@ -78,6 +78,16 @@ struct State {
     /// The key the running step began on, and the depth.
     from: u64,
     depth: u32,
+    /// The continuation the frame the step began in returns to, and the one
+    /// its caller does: how a frame is told when frames are on the heap,
+    /// where calls do not nest natively and depth says nothing. Kept alive
+    /// while the step runs, so that no other continuation is made where
+    /// they were.
+    from_k: Word,
+    /// `None` when there is no telling: a caller on the native stack, which
+    /// depth tells instead. `Some(0)` is the null continuation, a caller of
+    /// its own.
+    parent_k: Option<Word>,
     /// Values shown since the last stop, for `children` to take apart.
     handles: Vec<(Word, i64)>,
 }
@@ -120,6 +130,8 @@ pub fn start(port: u16) -> Result<(), String> {
             mode: Mode::Continue,
             from: 0,
             depth: 0,
+            from_k: 0,
+            parent_k: None,
             handles: Vec::new(),
         }),
     };
@@ -258,12 +270,37 @@ impl Debugger {
                 // change of frame counts as moving too.
                 let moved = self.key(pc) != st.from;
                 let (here, from) = (act.depth, st.depth);
+                // The same frame: as deep on the native stack, and returning
+                // to the same continuation. Returned: shallower, or now
+                // returning where the step's frame was to.
+                let k = ret_of(act);
+                let same = here == from && k == st.from_k;
+                let returned = here < from || st.parent_k == Some(k);
+                if let Some(f) = std::env::var_os("MEADOW_VM_TRACE_FILE")
+                    && !matches!(st.mode, Mode::Continue)
+                {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(f)
+                    {
+                        let _ = writeln!(
+                            f,
+                            "pc {pc} proc {} {} depth {here}/{from} k {k:#x} from {:#x} parent {:?} moved {moved}",
+                            act.proc,
+                            vm().procs[act.proc as usize].name,
+                            st.from_k,
+                            st.parent_k
+                        );
+                    }
+                }
                 let stop = match &st.mode {
                     Mode::Continue => false,
                     Mode::Enter(procs) => procs.contains(&act.proc),
-                    Mode::In => moved || here != from,
-                    Mode::Over => (here == from && moved) || here < from,
-                    Mode::Out => here < from,
+                    Mode::In => moved || !same,
+                    Mode::Over => (same && moved) || returned,
+                    Mode::Out => returned,
                 };
                 stop.then_some(match st.mode {
                     Mode::Enter(_) => "entry",
@@ -292,9 +329,16 @@ impl Debugger {
             } else if let Some(run) = msg.get("run") {
                 let mut st = self.state();
                 st.mode = mode(run);
+                unpin(st.from_k);
+                unpin(st.parent_k.unwrap_or(0));
+                (st.from_k, st.parent_k) = (0, None);
                 if let Some(a) = act {
                     st.from = self.key(a.pc);
                     st.depth = a.depth;
+                    st.from_k = ret_of(a);
+                    st.parent_k = parent_of(st.from_k);
+                    pin(st.from_k);
+                    pin(st.parent_k.unwrap_or(0));
                 }
                 st.handles.clear();
                 return;
@@ -326,9 +370,96 @@ impl Debugger {
                 vars.push(json!([var, shown, handle]));
             }
             out.push(json!({ "proc": a.proc, "pc": a.pc, "vars": vars }));
+            // What it returns to, when that is an object rather than the
+            // native stack: under `--stack heap` every caller is one.
+            let k = p.slot_vars.iter().enumerate().find_map(|(slot, var)| {
+                let var = (*var)?;
+                v.program
+                    .returns
+                    .contains(&meadow_axcut::VarId(var))
+                    .then_some(())?;
+                match env.get(slot) {
+                    Some(V::Val(w)) => Some(*w),
+                    _ => None,
+                }
+            });
+            if let Some(k) = k {
+                self.continued(k, max, &mut out);
+            }
             at = Act::at(a.parent);
         }
         out
+    }
+
+    /// The frames waiting in continuation `k` and the ones it returns to, as
+    /// Glade's session walks them: each a return continuation's code, with
+    /// what it captured as its variables. A continuation of the same call
+    /// -- `f (g x)` waiting on `g` before `f` -- is passed through, not
+    /// shown; the null continuation is the native stack's, where the walk
+    /// ends.
+    fn continued(&self, k: Word, max: usize, out: &mut Vec<Json>) {
+        let v = vm();
+        let mut k = k;
+        let mut show = true;
+        // A chain is as long as the program's nesting; the cap is for a
+        // cycle nothing should make.
+        for _ in 0..100_000 {
+            if out.len() >= max || k == 0 {
+                return;
+            }
+            let closure = k & 1 == 1 || (heap::is_block(k) && heap::kind(k) == heap::CLOSURE);
+            if !closure {
+                return;
+            }
+            let base = if k & 1 == 1 {
+                (k >> 1) as usize
+            } else {
+                heap::meta(k) as usize
+            };
+            let Some(&(proc, ncap)) = v.methods.get(base) else {
+                return;
+            };
+            let p = &v.procs[proc as usize];
+            let n = if heap::is_block(k) {
+                ncap.min(heap::len(k))
+            } else {
+                0
+            };
+            let captured: Vec<(Option<u32>, Word, i64)> = (0..n)
+                .map(|i| {
+                    (
+                        p.slot_vars.get(i).copied().flatten(),
+                        heap::field(k, i),
+                        heap::field_desc(k, i),
+                    )
+                })
+                .collect();
+            if show {
+                let vars: Vec<Json> = captured
+                    .iter()
+                    .filter_map(|(var, w, dd)| {
+                        let (shown, handle) = self.value(*w, *dd);
+                        var.map(|var| json!([var, shown, handle]))
+                    })
+                    .collect();
+                out.push(json!({ "proc": proc, "pc": p.entry, "vars": vars }));
+            }
+            let named = |set: &std::collections::HashSet<meadow_axcut::Name>| {
+                captured
+                    .iter()
+                    .find(|(var, ..)| var.is_some_and(|x| set.contains(&meadow_axcut::VarId(x))))
+                    .map(|(_, w, _)| *w)
+            };
+            // Its caller's, which is a frame to show; or one of the same
+            // call's, which is walked through.
+            (k, show) = match named(&v.program.returns) {
+                Some(caller) => (caller, true),
+                None => match named(&v.program.continuations) {
+                    Some(inner) => (inner, false),
+                    None => return,
+                },
+            };
+        }
     }
 
     /// `w`, described by `d`, as a debugger shows it, and the handle its
@@ -419,6 +550,85 @@ impl Debugger {
     }
 }
 
+/// The continuation the activation `act` returns to: the null one when its
+/// caller called it natively.
+fn ret_of(act: &Act) -> Word {
+    let v = vm();
+    let Some(slot) = v.procs[act.proc as usize].ret_slot else {
+        return 0;
+    };
+    // Safety: the activation's registers, read between its instructions.
+    let env: &Env = unsafe { &*act.env };
+    match env.get(slot as usize) {
+        Some(V::Val(w)) => *w,
+        _ => 0,
+    }
+}
+
+/// The continuation the frame waiting in `k` returns to: through the
+/// continuations of the same call, to the first that is a caller's -- `None`
+/// when `k` is no frame's at all.
+fn parent_of(k: Word) -> Option<Word> {
+    let v = vm();
+    let mut k = k;
+    for _ in 0..100_000 {
+        let closure = k & 1 == 1 || (heap::is_block(k) && heap::kind(k) == heap::CLOSURE);
+        if k == 0 || !closure || !heap::is_block(k) {
+            return None;
+        }
+        let Some(&(proc, ncap)) = v.methods.get(heap::meta(k) as usize) else {
+            return None;
+        };
+        let p = &v.procs[proc as usize];
+        let n = ncap.min(heap::len(k));
+        let find = |set: &std::collections::HashSet<meadow_axcut::Name>| {
+            (0..n)
+                .find(|i| {
+                    p.slot_vars
+                        .get(*i)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|x| set.contains(&meadow_axcut::VarId(x)))
+                })
+                .map(|i| heap::field(k, i))
+        };
+        if let Some(caller) = find(&v.program.returns) {
+            return Some(caller);
+        }
+        k = find(&v.program.continuations)?;
+    }
+    None
+}
+
+/// Keep `k` alive, whatever the program does with it, until [`unpin`]:
+/// one reference more where blocks are counted, a root where traced.
+fn pin(k: Word) {
+    if !heap::is_block(k) {
+        return;
+    }
+    if meadow_silo::trace::on() {
+        // Safety: the running thread's context.
+        unsafe { (*meadow_silo::ctx::get()).kept.push((k, desc::REF)) };
+    } else {
+        heap::share(k, desc::REF);
+    }
+}
+
+fn unpin(k: Word) {
+    if !heap::is_block(k) {
+        return;
+    }
+    if meadow_silo::trace::on() {
+        // Safety: as above.
+        let kept = unsafe { &mut (*meadow_silo::ctx::get()).kept };
+        if let Some(i) = kept.iter().position(|(w, _)| *w == k) {
+            kept.swap_remove(i);
+        }
+    } else {
+        heap::erase(k, desc::REF);
+    }
+}
+
 /// What the runtime calls first when the program fails: say so, and stay to
 /// be looked at, until the adapter lets the program end.
 fn failed(msg: &str) {
@@ -450,6 +660,21 @@ impl Vm {
                 .get(k + 1)
                 .map_or(self.code.ins.len(), |j| self.procs[*j].entry as usize);
             procs[*i] = json!({ "name": p.name, "entry": p.entry, "end": end });
+        }
+        // Where each procedure a `new` makes was made: where a frame on the
+        // heap is waiting, as a debugger shows it.
+        let mut origin = vec![Json::Null; self.procs.len()];
+        for (pc, i) in self.code.ins.iter().enumerate() {
+            if let super::code::Ins::New(n) = i
+                && let Some(&(proc, _)) =
+                    self.methods.get(self.code.news[*n as usize].base as usize)
+                && origin[proc as usize].is_null()
+            {
+                origin[proc as usize] = json!(pc);
+            }
+        }
+        for (p, o) in procs.iter_mut().zip(origin) {
+            p["origin"] = o;
         }
         let locs: Vec<Json> = self
             .code

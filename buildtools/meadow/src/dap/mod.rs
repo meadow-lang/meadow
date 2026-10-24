@@ -358,7 +358,9 @@ impl Adapter {
                     }
                 };
                 let launched = if silo {
-                    silo::SiloSession::launch_at(path, entry.as_ref()).map(Debuggee::Silo)
+                    // `stack`: `heap` for frames on the heap, as Glade's are.
+                    let stack = args["stack"].as_str().and_then(meadow_llvm::Stack::named);
+                    silo::SiloSession::launch_with(path, entry.as_ref(), stack).map(Debuggee::Silo)
                 } else {
                     Session::launch_at(path, entry.as_ref()).map(Debuggee::Glade)
                 };

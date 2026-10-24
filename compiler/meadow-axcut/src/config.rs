@@ -41,6 +41,12 @@ impl Memory {
 ///   that begins with too little of its stack left runs on a new piece of
 ///   stack, and comes back to the old one when it returns: a compare where
 ///   each function begins, and a switch of stacks only when one is used up.
+/// - **`Heap`**: no stack at all for the program's own calls, as Glade's
+///   frames are on its heap. Every continuation is an object -- the frames a
+///   function makes for its non-tail calls included, which otherwise live on
+///   the native stack -- and every call is a tail call: as deep as memory
+///   allows, a frame a debugger or a reload can find on the heap, and an
+///   allocation for each non-tail call. See [`Config::without_frames`].
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
 )]
@@ -48,6 +54,7 @@ pub enum Stack {
     #[default]
     Fixed,
     Growable,
+    Heap,
 }
 
 impl Stack {
@@ -56,8 +63,19 @@ impl Stack {
         match name {
             "fixed" => Some(Stack::Fixed),
             "growable" | "grow" => Some(Stack::Growable),
+            "heap" => Some(Stack::Heap),
             _ => None,
         }
+    }
+}
+
+impl Config {
+    /// Whether the program's frames are to be objects: then `program` is to
+    /// be made linear with no name a frame, so that every continuation is a
+    /// closure the memory pass owns the captures of, and both engines build
+    /// it on the heap. See [`Stack::Heap`].
+    pub fn without_frames(&self) -> bool {
+        self.stack == Stack::Heap
     }
 }
 

@@ -20,7 +20,10 @@
 //!
 //! `MEADOW_VM_STATS` reports how long the image took to read and load, and
 //! what loading made of it; `MEADOW_VM_FRAMES`, each frame left to be built
-//! at run time rather than run as the native call it continues.
+//! at run time rather than run as the native call it continues;
+//! `MEADOW_VM_WIDE`, lays every instruction down in its wide form; and under
+//! a debugger, `MEADOW_VM_TRACE_FILE` writes each boundary a step looks at,
+//! and why it went on.
 //!
 //! The runtime expects an emitted module beside it, defining a few constants
 //! and tables and two ways back into the program's code. This executable

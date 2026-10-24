@@ -348,6 +348,24 @@ one interface (`meadow_rt::look` and `world` are the start). For native code,
 the lowering takes the layout's description: header size, where the length
 and kind are, and how a field is addressed.
 
+**The second layout is Glade-like** (Chris, 2026-10-23), and more of the
+layout may become configurable later. So the interface is a description of
+a layout, which the runtime, the VM and the lowering all read, not two
+layouts written in by hand. Silo's layout and a Glade-like one are its first
+two instances. A description has to say:
+- **References:** what a reference is (a machine pointer, or a slot number in
+  a heap of slots).
+- **Small values:** how a value with no block is told from one that has a
+  block.
+- **Headers:** what the header holds (count or mark, length, kind, meta), and
+  where.
+- **Fields:** how a field and its descriptor are found.
+- **Collection:** whether blocks may move. A moving layout needs forwarding,
+  and so the moving collector it was made for.
+
+That last point ties the layout to the memory axis: a Glade-like layout
+comes with a generational, moving collector on the shared runtime.
+
 ### The VM: a register machine with a pc (Chris, 2026-10-23)
 
 Silo's interpreter becomes a register VM in Glade's manner, with Glade's
@@ -395,10 +413,15 @@ debugging and introspection, and hot loading, which Glade does not have.
   session logic (breakpoints to pcs, stepping by frame, stack traces, locals)
   is written once against the VM's frames, and reads values through
   `meadow_rt::look`, not a heap layout.
-- **Hot loading.** New. A running program takes a new image. Definitions are
-  replaced by label, so a call made after the swap runs the new code, while a
-  frame already running finishes in the code it began in. Top-level values are
-  kept unless their definitions changed.
+- **Hot loading** (Chris, 2026-10-23). New, since Glade has none. Names have
+  versions:
+  - A reload adds a version of each definition it changes.
+  - Newly loaded code is used only by new invocations. A call by name
+    resolves to the newest version at the moment it is made.
+  - Nothing already running changes. An activation finishes in the version it
+    began in. A closure or continuation already made keeps its version, since
+    its captures are laid out for that version's code.
+  - A top-level value is kept unless its definition changed.
 - **Order of work:**
   1. the register VM on the native stack, at least as fast as the tree it
      replaces;
@@ -426,6 +449,28 @@ choices:
 
 `--gc` is one option for both runtimes. Glade's names for its two collectors,
 `generational` and `copying`, choose tracing on Silo.
+
+**Heap frames** (`--stack heap`). The front end marks which continuations
+are *frames*: made for one non-tail call, and entered once. Those, and only
+those, live on the native stack:
+- the memory pass lets them borrow;
+- both engines turn their call into a native one.
+
+With no name a frame, every continuation is an ordinary closure on the heap,
+and every call is a tail call. This is Glade's model, on both engines, with
+no mechanism of its own: the frame set is emptied before the memory pass
+(`Config::without_frames`).
+
+The debugger follows return continuations through the heap, as Glade's does,
+and tells a frame in a step by the continuation it returns to. On this
+machine:
+- A recursion 10 million deep runs in 0.74 s on the VM, against 8.4 s with a
+  growable native stack, and in 0.39 s native.
+- Each non-tail call allocates. Fib takes 563 ms on the VM, against 345 with
+  a native stack and 474 on Glade's VM; native fib takes 88 ms, against 49.
+- Loops cost nothing more: matmul is unchanged.
+- Glade puts its frames on a stack of chunks rather than the general heap,
+  which is cheaper. Doing the same is a later step.
 
 **Growable stacks** (`silo/src/stack.rs`):
 - Every stack the runtime runs code on has a limit: `main`'s, a thread's, and

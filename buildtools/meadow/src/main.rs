@@ -433,12 +433,14 @@ struct TargetArgs {
     /// same.
     #[arg(long)]
     interpret: bool,
-    /// How deep a program's calls may go on Silo: `fixed`, as deep as a
-    /// thread's stack (a gigabyte for `main`), at no cost, or `growable`, as
-    /// deep as memory allows, as Glade's always are, for a compare where each
-    /// function begins. Growable in a debug build and fixed in a release one,
-    /// unless `stack = "…"` in a profile says otherwise. `MEADOW_STACK` says
-    /// the same.
+    /// Where a program's frames live on Silo: `fixed`, the native stack, as
+    /// deep as a thread's (a gigabyte for `main`), at no cost; `growable`,
+    /// the native stack, as deep as memory allows, for a compare where each
+    /// function begins; or `heap`, as Glade's frames are -- every
+    /// continuation an object, as deep as memory allows, for an allocation
+    /// at each non-tail call. Growable in a debug build and fixed in a
+    /// release one, unless `stack = "…"` in a profile says otherwise.
+    /// `MEADOW_STACK` says the same.
     #[arg(long, value_name = "STACK", value_parser = stack_kind)]
     stack: Option<meadow_llvm::Stack>,
     /// How large Glade's collector lets a thread's nursery grow: `8M`, `512K`,

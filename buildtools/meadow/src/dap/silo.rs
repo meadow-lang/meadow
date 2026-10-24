@@ -30,6 +30,8 @@ struct Proc {
     name: String,
     entry: usize,
     end: usize,
+    /// Where the `new` that makes it is, for one a `new` makes.
+    origin: Option<usize>,
 }
 
 /// A variable a frame holds, as the VM showed it.
@@ -79,6 +81,18 @@ impl SiloSession {
     /// Build `path` for debugging, starting at `entry` if there is one, and
     /// stand it at its start on the VM, not yet run.
     pub fn launch_at(path: &Path, entry: Option<&Entry>) -> Result<SiloSession, LaunchError> {
+        SiloSession::launch_with(path, entry, None)
+    }
+
+    /// [`SiloSession::launch_at`], its frames kept as `stack` says: on the
+    /// heap, as Glade's are, or on a native stack that grows -- which is
+    /// what it is unless the launch or `MEADOW_STACK` says `heap`. A fixed
+    /// stack is never what a debugger wants.
+    pub fn launch_with(
+        path: &Path,
+        entry: Option<&Entry>,
+        stack: Option<meadow_llvm::Stack>,
+    ) -> Result<SiloSession, LaunchError> {
         let began = Instant::now();
         let say = |what: &str| {
             if std::env::var_os("MEADOW_DAP_TIMES").is_some() {
@@ -102,9 +116,17 @@ impl SiloSession {
         // A debugger's program counts as the build would, and its stack grows
         // as Glade's does: a deep recursion is something to look at, not a
         // reason to stop.
+        let asked = stack.or_else(|| {
+            std::env::var("MEADOW_STACK")
+                .ok()
+                .and_then(|s| meadow_llvm::Stack::named(&s))
+        });
         let config = meadow_llvm::Config {
             memory: crate::aot::gc(),
-            stack: meadow_llvm::Stack::Growable,
+            stack: match asked {
+                Some(meadow_llvm::Stack::Heap) => meadow_llvm::Stack::Heap,
+                _ => meadow_llvm::Stack::Growable,
+            },
         };
         crate::aot::write_image_with(&image, program, Vec::new(), config)?;
         say("image written");
@@ -170,6 +192,7 @@ impl SiloSession {
                 name: p["name"].as_str().unwrap_or("?").to_string(),
                 entry: p["entry"].as_u64().unwrap_or(0) as usize,
                 end: p["end"].as_u64().unwrap_or(0) as usize,
+                origin: p["origin"].as_u64().map(|o| o as usize),
             })
             .collect();
         let mut locs = vec![None; n];
@@ -517,7 +540,14 @@ impl SiloSession {
                     let def = p.name.split('/').next().unwrap_or("?");
                     def.rsplit('.').next().unwrap_or(def)
                 })),
-                loc: self.loc_near(pc),
+                // A frame waiting on the heap is where the call that made
+                // its continuation is, as Glade's frames show it.
+                loc: match self.procs.get(proc) {
+                    Some(p) if pc == p.entry && p.origin.is_some() => {
+                        p.origin.and_then(|o| self.loc_near(o))
+                    }
+                    _ => self.loc_near(pc),
+                },
                 vars: Vec::new(),
             })
             .collect()

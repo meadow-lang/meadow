@@ -147,8 +147,8 @@ cli! {
       interpret : Flag "Interpret what is built for Silo rather than compiling it"
       stack
         : Option
-          ("fixed" | "growable")
-          "How deep a program's calls may go on Silo: as deep as a thread's stack, or as memory allows"
+          ("fixed" | "growable" | "heap")
+          "Where a program's frames live on Silo: a thread's stack, one that grows, or the heap"
           value
           "STACK"
       leaks : Flag "After running, report the blocks the program left behind"

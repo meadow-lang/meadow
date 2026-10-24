@@ -91,6 +91,15 @@ pub fn compile_split(program: &Program, unit: usize, conv: CallConv) -> Result<V
     compile_split_with(program, unit, conv, Config::default())
 }
 
+/// `program` with no name a frame: every continuation an object, as
+/// [`Stack::Heap`] wants -- the memory pass then owns every capture, and the
+/// lowering builds every continuation on the heap and tail-calls.
+fn without_frames(program: &Program) -> Program {
+    let mut p = program.clone();
+    p.frames.clear();
+    p
+}
+
 /// [`compile_split`], run as `config` says.
 pub fn compile_split_with(
     program: &Program,
@@ -98,6 +107,13 @@ pub fn compile_split_with(
     conv: CallConv,
     config: Config,
 ) -> Result<Vec<Unit>, Error> {
+    let heaped;
+    let program = if config.without_frames() {
+        heaped = without_frames(program);
+        &heaped
+    } else {
+        program
+    };
     if !program.exports.is_empty() {
         return compile_library_with(program, unit, conv, config);
     }
@@ -175,6 +191,13 @@ pub fn compile_library_with(
     conv: CallConv,
     config: Config,
 ) -> Result<Vec<Unit>, Error> {
+    let heaped;
+    let program = if config.without_frames() {
+        heaped = without_frames(program);
+        &heaped
+    } else {
+        program
+    };
     let roots: Vec<meadow_axcut::Label> = program.exports.iter().map(|e| e.label).collect();
     let mut module = emit::Module::with(program, conv, config);
     let blocks = linear::program(program, &roots)?;
@@ -220,6 +243,13 @@ pub fn compile_tests_with(
     conv: CallConv,
     config: Config,
 ) -> Result<Vec<Unit>, Error> {
+    let heaped;
+    let program = if config.without_frames() {
+        heaped = without_frames(program);
+        &heaped
+    } else {
+        program
+    };
     let mut module = emit::Module::with(program, conv, config);
     let blocks = linear::program(program, tests)?;
     module.name_labels(blocks.iter().map(|(i, label, _)| {

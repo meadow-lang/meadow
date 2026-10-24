@@ -114,6 +114,9 @@ struct Proc {
     /// locals -- and how it is described.
     slot_vars: Vec<Option<u32>>,
     slot_descs: Vec<D>,
+    /// The register holding the continuation it returns to, if it has one:
+    /// what a debugger tells a frame by, when frames are on the heap.
+    ret_slot: Option<Slot>,
 }
 
 /// A literal operand.
@@ -643,6 +646,12 @@ impl Compiler {
             slot_vars[i] = Some(name.0);
             slot_descs[i] = self.desc(*name, &scope);
         }
+        let ret_slot = scope
+            .slots
+            .iter()
+            .filter(|(name, _)| self.program.returns.contains(name))
+            .map(|(_, slot)| *slot)
+            .min();
         Proc {
             slots: n,
             params,
@@ -650,6 +659,7 @@ impl Compiler {
             name,
             slot_vars,
             slot_descs,
+            ret_slot,
         }
     }
 

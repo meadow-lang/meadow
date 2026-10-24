@@ -168,9 +168,13 @@ pub fn write_image_with(
         (true, None) => return Err("the program has no entry point".into()),
         (false, _) => tests.clone(),
     };
+    // Every continuation an object, if the stack is to be the heap.
+    let mut program = program;
+    if config.without_frames() {
+        program.frames.clear();
+    }
     let linear = meadow_llvm::linear::program(&program, &roots).map_err(|e| e.msg)?;
     // What the definitions were before the pass is not read again.
-    let mut program = program;
     for d in &mut program.defs {
         d.block.body = meadow_seq::Statement::Error("made linear");
     }
