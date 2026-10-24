@@ -7,13 +7,16 @@
 //! meadow-silo-vm --dis PROGRAM.image
 //! meadow-silo-vm --debug PORT PROGRAM.image
 //! meadow-silo-vm --watch PROGRAM.image [ARGS...]
+//! meadow-silo-vm --answer FILE PROGRAM.image [ARGS...]
 //! ```
 //!
 //! An image of tests runs the one numbered `N`, as a test executable does.
 //! `--watch` runs the program and, whenever the image is written anew, loads
 //! the new one into it as it runs (`interp::Vm::reload`): what `meadow run
 //! --watch` writes. Each new build says on stderr what it replaced, or why it
-//! was refused.
+//! was refused. `--answer FILE` writes what the program answers to `FILE`,
+//! shown as `meadow` shows a value, rather than printing it after what the
+//! program printed: what the REPL reads an entry's value from.
 //!
 //! `meadow` writes the image (`meadow_axcut::image`): the program made linear
 //! (`meadow_axcut::linear`, the same pass Silo's compiler runs, done once when
@@ -96,6 +99,23 @@ extern "C" fn entry() -> Word {
 static ANSWER: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(meadow_rt::desc::UNIT);
 
+/// Where `--answer` writes the program's answer.
+static ANSWER_TO: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// [`entry`], its answer written where `--answer` says: shown whatever it
+/// is, `()` too, since whoever asked for it reads it as a value.
+extern "C" fn entry_answered() -> Word {
+    let v = interp::vm().run_entry();
+    let d = ANSWER.load(std::sync::atomic::Ordering::Relaxed);
+    let shown = meadow_silo::show::show(v, d);
+    if let Some(to) = ANSWER_TO.get()
+        && let Err(e) = std::fs::write(to, shown)
+    {
+        eprintln!("error: {}: {e}", to.display());
+    }
+    v
+}
+
 /// [`entry`], under a debugger.
 extern "C" fn entry_debugged() -> Word {
     let v = interp::vm().run_entry();
@@ -148,6 +168,14 @@ fn main() {
             Some("--watch") => {
                 watching = true;
                 args.remove(1);
+            }
+            Some("--answer") => {
+                let Some(to) = args.get(2).cloned() else {
+                    eprintln!("usage: meadow-silo-vm --answer FILE PROGRAM.image");
+                    std::process::exit(2);
+                };
+                let _ = ANSWER_TO.set(std::path::PathBuf::from(to));
+                args.drain(1..3);
             }
             Some("--debug") => {
                 let port = args.get(2).and_then(|p| p.parse::<u16>().ok());
@@ -203,6 +231,16 @@ fn main() {
     }
     if watching {
         watch(std::path::PathBuf::from(path));
+    }
+    if ANSWER_TO.get().is_some() && interp::vm().tests().is_none() {
+        // Safety: before the runtime starts, which reads it.
+        unsafe {
+            ANSWER.store(meadow_result_desc, std::sync::atomic::Ordering::Relaxed);
+            meadow_result_desc = meadow_rt::desc::UNIT;
+        }
+        // Safety: as below.
+        let status = unsafe { meadow_silo::meadow_run(entry_answered, 0, std::ptr::null()) };
+        std::process::exit(status)
     }
     if let Some(port) = debug {
         // Safety: before the runtime starts, which reads it.

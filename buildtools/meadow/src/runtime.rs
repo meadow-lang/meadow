@@ -87,6 +87,64 @@ pub struct Timings {
 }
 
 /// [`run`], saying how long each part took.
+/// `program`, lowered to AxCut and run by Silo's interpreter -- the merged
+/// runtime's VM -- in a process of its own, with what it prints going where
+/// this process's does: its answer, shown, or why it failed. What the REPL's
+/// `:silo` runs an entry on.
+pub fn run_on_vm(program: &core::Program, opt: OptLevel) -> (Result<String, String>, Timings) {
+    use std::time::Instant;
+    let start = Instant::now();
+    let dir = std::env::temp_dir().join(format!("meadow-repl-{}", std::process::id()));
+    let image = dir.join("entry.image");
+    let answer = dir.join("entry.answer");
+    let lowered = meadow_seq::lower_program(program, opt);
+    let written = if !lowered.unsupported.is_empty() {
+        Err(format!(
+            "the back end cannot translate {:?} yet",
+            lowered.unsupported
+        ))
+    } else {
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("could not create {}: {e}", dir.display()))
+            .and_then(|()| {
+                // A stack that grows, as an edit-run loop's should.
+                let config = meadow_llvm::Config {
+                    memory: crate::aot::gc(),
+                    stack: meadow_llvm::Stack::Growable,
+                };
+                crate::aot::write_image_with(&image, lowered.program, Vec::new(), config)
+            })
+    };
+    let compile = Some(start.elapsed());
+    let start = Instant::now();
+    let result = written.and_then(|()| {
+        let _ = std::fs::remove_file(&answer);
+        let status = std::process::Command::new(crate::aot::interpreter()?)
+            .arg("--answer")
+            .arg(&answer)
+            .arg(&image)
+            .status()
+            .map_err(|e| format!("could not run Silo's interpreter: {e}"))?;
+        match std::fs::read_to_string(&answer) {
+            Ok(shown) if status.success() => Ok(shown),
+            // What went wrong it has said already, on stderr.
+            _ => Err(format!(
+                "the program failed ({})",
+                status
+                    .code()
+                    .map_or("killed".to_string(), |c| format!("exit status {c}"))
+            )),
+        }
+    });
+    (
+        result,
+        Timings {
+            compile,
+            run: start.elapsed(),
+        },
+    )
+}
+
 pub fn run_timed(
     program: &core::Program,
     engine: Engine,

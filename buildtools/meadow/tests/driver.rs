@@ -647,3 +647,15 @@ fn the_repl_shows_a_definition_in_each_ir() {
     // And something not defined is said to be.
     assert!(repl(":ir nope\n:q\n").contains("nothing called `nope` is defined"));
 }
+
+#[test]
+fn the_repl_evaluates_on_the_merged_runtime_s_vm() {
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    let out = repl(":silo\nfun f x = x * 2\nf 21\n\"ab\" ++ \"c\"\nprintln \"hi\"\nf\n:q\n");
+    for want in ["= 42", "= \"abc\"", "hi\n= ()", "= <closure>"] {
+        assert!(out.contains(want), "no `{want}` in:\n{out}");
+    }
+}
