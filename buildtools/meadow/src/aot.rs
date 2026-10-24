@@ -257,8 +257,7 @@ pub fn interpreter() -> Result<PathBuf, String> {
 
 /// Silo's strategy for a name `--gc` takes: counting for `rc`, tracing for
 /// `tracing`, and for Glade's `generational` and `copying` the collector with
-/// a young generation -- on Silo's interpreter, which can follow blocks that
-/// move; native code traces without moving.
+/// a young generation, on either engine.
 pub fn strategy(name: &str) -> meadow_llvm::Memory {
     match name {
         "generational" | "copying" => meadow_llvm::Memory::Generational,

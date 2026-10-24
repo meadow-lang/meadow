@@ -291,6 +291,12 @@ pub struct Module<'p> {
     /// nothing is shared or erased, no block is reused, and the program is
     /// collected at safe points, where everything it holds is in a record.
     tracing: bool,
+    /// Whether blocks move (`Memory::Generational`): then what a record holds
+    /// is read back after the poll or the call it was made for, and a store
+    /// into a block that may be older than what it stores tells the runtime
+    /// (`silo/src/trace.rs`, "The young generation"). Nothing it does is
+    /// written otherwise, so a counted or a traced program's IR is as it was.
+    moving: bool,
     /// Whether a function that begins with too little stack left runs on a
     /// new piece of it: see [`Stack`] and [`Module::stack_point`].
     growable: bool,
@@ -308,8 +314,8 @@ impl<'p> Module<'p> {
 
     /// [`Module::new`], run as `config` says.
     pub fn with(program: &'p Program, conv: CallConv, config: Config) -> Module<'p> {
-        // A native program traces without moving, generational or not.
         let tracing = config.memory.traced();
+        let moving = config.memory == Memory::Generational;
         let layout = LAYOUT;
         suits(&layout);
         Module {
@@ -346,6 +352,7 @@ impl<'p> Module<'p> {
             shadow: tracing || uses(program, &[Prim::Detach]),
             spill_words: 0,
             tracing,
+            moving,
             growable: config.stack == Stack::Growable,
             trampoline: None,
             layout,
@@ -557,23 +564,34 @@ impl<'p> Module<'p> {
     /// program holds is in one: the callers' frames are, from the calls they
     /// are waiting on, and the heap is reached from them. Nothing moves, so
     /// nothing is read back. A loop is a tail call, so every loop passes one.
-    fn collect_point(&self, f: &mut Fun, held: &[(String, D)]) {
+    /// Answers `held`'s values as the code after it is to use them: as they
+    /// were, unless blocks move, when what a collection left there is read
+    /// back.
+    fn collect_point(&self, f: &mut Fun, held: &[(String, D)]) -> Vec<String> {
+        let mut now: Vec<String> = held.iter().map(|(v, _)| v.clone()).collect();
         if !self.tracing {
-            return;
+            return now;
         }
         let (run, on) = (f.b(), f.b());
         let flag = f.t();
         f.i(format!("{flag} = load volatile i8, ptr @meadow_gc_due"));
         let c = f.t();
         f.i(format!("{c} = icmp ne i8 {flag}, 0"));
+        let from = f.cur.clone();
         f.i(format!("br i1 {c}, label %{run}, label %{on}, !prof !1"));
         f.label(&run);
+        let mut which = Vec::new();
         let refs: Vec<(String, String)> = held
             .iter()
-            .filter_map(|(v, d)| match d {
-                D::Known(k) if *k == desc::REF => Some((v.clone(), k.to_string())),
+            .enumerate()
+            .filter_map(|(i, (v, d))| match d {
+                D::Known(k) if *k == desc::REF => Some((i, v.clone(), k.to_string())),
                 D::Known(_) => None,
-                D::Dyn(d) => Some((v.clone(), d.clone())),
+                D::Dyn(d) => Some((i, v.clone(), d.clone())),
+            })
+            .map(|(i, v, d)| {
+                which.push(i);
+                (v, d)
             })
             .collect();
         let words = 2 + 2 * refs.len();
@@ -605,8 +623,57 @@ impl<'p> Module<'p> {
         f.i(format!("store i64 {at}, ptr {slot}"));
         f.i(format!("call void @meadow_gc_poll(i64 {})", self.cx()));
         f.i(format!("store i64 {prev}, ptr {slot}"));
+        // Where the collection left what the record held, if it moved it.
+        let mut reloaded = Vec::new();
+        if self.moving {
+            for k in 0..which.len() {
+                let (q, x) = (f.t(), f.t());
+                f.i(format!(
+                    "{q} = getelementptr i64, ptr {rec}, i64 {}",
+                    2 + 2 * k
+                ));
+                f.i(format!("{x} = load i64, ptr {q}"));
+                reloaded.push(x);
+            }
+        }
+        let polled = f.cur.clone();
         f.i(format!("br label %{on}"));
         f.label(&on);
+        for (k, i) in which.into_iter().enumerate().filter(|_| self.moving) {
+            let x = f.t();
+            f.i(format!(
+                "{x} = phi i64 [ {}, %{from} ], [ {}, %{polled} ]",
+                now[i], reloaded[k]
+            ));
+            now[i] = x;
+        }
+        now
+    }
+
+    /// What a unit declares of the runtime besides [`RUNTIME`]: the write
+    /// barrier, where blocks move.
+    fn remembering(&self) -> &'static str {
+        if self.moving {
+            "declare void @meadow_remember(i64, i64, i64)\n"
+        } else {
+            ""
+        }
+    }
+
+    /// The write barrier: `v`, described by `d`, is stored in the block `into`,
+    /// which may be older than it. Written only where blocks move.
+    fn remember(&self, f: &mut Fun, into: &str, v: &str, d: &D) {
+        if !self.moving {
+            return;
+        }
+        let d = match d {
+            D::Known(k) if *k == desc::REF => k.to_string(),
+            D::Known(_) => return,
+            D::Dyn(d) => d.clone(),
+        };
+        f.i(format!(
+            "call void @meadow_remember(i64 {into}, i64 {v}, i64 {d})"
+        ));
     }
 
     /// A definition: its function.
@@ -689,7 +756,10 @@ impl<'p> Module<'p> {
             .zip(&params)
             .map(|(n, p)| (p.clone(), self.desc(*n, &env)))
             .collect();
-        self.collect_point(&mut f, &held);
+        let now = self.collect_point(&mut f, &held);
+        for (n, v) in b.params.iter().zip(now) {
+            env.insert(*n, V::Val(v));
+        }
         self.stmt(&b.body, &mut env, &mut f)?;
         self.finish(f);
         self.drain()
@@ -858,12 +928,27 @@ impl<'p> Module<'p> {
         for (i, n) in m.params[ncap..].iter().enumerate() {
             env.insert(*n, V::Val(format!("%a{i}")));
         }
-        // The object holds the captures, so it is what is kept of them.
+        // The object holds the captures, so it is what is kept of them --
+        // unless blocks move, when what was loaded out of it must be found
+        // where the collection left it too.
         let mut held = vec![("%obj".to_string(), D::Known(desc::REF))];
+        let mut names = vec![None];
+        if self.moving {
+            for (n, v) in caps.iter().zip(&loaded) {
+                held.push((v.clone(), self.desc(*n, &env)));
+                names.push(Some(*n));
+            }
+        }
         for (i, n) in m.params[ncap..].iter().enumerate() {
             held.push((format!("%a{i}"), self.desc(*n, &env)));
+            names.push(Some(*n));
         }
-        self.collect_point(&mut f, &held);
+        let now = self.collect_point(&mut f, &held);
+        for (n, v) in names.into_iter().zip(now) {
+            if let Some(n) = n {
+                env.insert(n, V::Val(v));
+            }
+        }
         self.stmt(&m.body, &mut env, &mut f)?;
         self.finish(f);
         Ok(())
@@ -1609,7 +1694,7 @@ impl<'p> Module<'p> {
         fr: &Frame,
         env: &HashMap<Name, V>,
         f: &mut Fun,
-    ) -> Option<(String, String)> {
+    ) -> Option<(String, String, String, usize)> {
         if !self.shadow {
             return None;
         }
@@ -1646,7 +1731,7 @@ impl<'p> Module<'p> {
         let at = f.t();
         f.i(format!("{at} = ptrtoint ptr {rec} to i64"));
         f.i(format!("store i64 {at}, ptr {slot}"));
-        Some((slot, prev))
+        Some((slot, prev, rec, held.len()))
     }
 
     /// What giving `fr` up would give up, as [`Module::erase_frame`] would:
@@ -1654,8 +1739,9 @@ impl<'p> Module<'p> {
     /// whose descriptor is known not to be a reference has nothing to give up.
     fn shadow_entries(&self, fr: &Frame, env: &HashMap<Name, V>, out: &mut Vec<(String, String)>) {
         for (i, c) in fr.captured.iter().enumerate() {
-            // Borrowed: never the frame's to give up.
-            if fr.method.borrows(i) {
+            // Borrowed: never the frame's to give up -- but where blocks move,
+            // as much a reference to rewrite as any.
+            if fr.method.borrows(i) && !self.moving {
                 continue;
             }
             match c {
@@ -1669,6 +1755,43 @@ impl<'p> Module<'p> {
                     D::Dyn(d) => out.push((v.clone(), d)),
                 },
             }
+        }
+    }
+
+    /// `fr`, with what [`Module::shadow_entries`] recorded of it replaced by
+    /// `vals`, in the same order: the frame to enter once a collection that
+    /// moves blocks may have moved what it held.
+    fn reframe(
+        &self,
+        fr: &Frame,
+        env: &HashMap<Name, V>,
+        vals: &mut impl Iterator<Item = String>,
+    ) -> Frame {
+        let captured = fr
+            .captured
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if fr.method.borrows(i) && !self.moving {
+                    return c.clone();
+                }
+                match c {
+                    V::Frame(inner) => V::Frame(Rc::new(self.reframe(inner, env, vals))),
+                    V::Val(_) if crate::linear::is_token(fr.method.params[i]) => {
+                        V::Val(vals.next().expect("a token recorded"))
+                    }
+                    V::Val(_) => match self.desc(fr.method.params[i], env) {
+                        D::Known(k) if k == desc::REF => V::Val(vals.next().expect("recorded")),
+                        D::Known(_) => c.clone(),
+                        D::Dyn(_) => V::Val(vals.next().expect("recorded")),
+                    },
+                }
+            })
+            .collect();
+        Frame {
+            id: fr.id,
+            captured,
+            method: fr.method.clone(),
         }
     }
 
@@ -1799,8 +1922,24 @@ impl<'p> Module<'p> {
                 let pushed = self.shadow_push(&fr, env, f);
                 let r = f.t();
                 f.i(format!("{r} = call {} i64 {callee}({list})", self.cc));
-                if let Some((slot, prev)) = pushed {
+                let mut fr = fr;
+                if let Some((slot, prev, rec, n)) = pushed {
                     f.i(format!("store i64 {prev}, ptr {slot}"));
+                    // What the frame held, where a collection during the call
+                    // left it.
+                    if self.moving {
+                        let mut vals = Vec::with_capacity(n);
+                        for k in 0..n {
+                            let (q, x) = (f.t(), f.t());
+                            f.i(format!(
+                                "{q} = getelementptr i64, ptr {rec}, i64 {}",
+                                2 + 2 * k
+                            ));
+                            f.i(format!("{x} = load i64, ptr {q}"));
+                            vals.push(x);
+                        }
+                        fr = Rc::new(self.reframe(&fr, env, &mut vals.into_iter()));
+                    }
                 }
                 self.call_frame(&fr, vec![r], f)
             }
@@ -2314,6 +2453,7 @@ impl<'p> Module<'p> {
         // old one is erased by the same descriptor, since a `Ref` holds one
         // type.
         self.share(f, v, d, 1);
+        self.remember(f, r, v, d);
         f.i(format!("store i64 {v}, ptr {q}"));
         self.erase(f, &old, d);
         if let D::Dyn(dv) = d {
@@ -2473,6 +2613,7 @@ impl<'p> Module<'p> {
                 let old = f.t();
                 f.i(format!("{old} = load i64, ptr {q}"));
                 self.share(f, v, &d, 1);
+                self.remember(f, o, v, &d);
                 f.i(format!("store i64 {v}, ptr {q}"));
                 self.erase(f, &old, &d);
                 Some("0".to_string())
@@ -2803,7 +2944,11 @@ impl<'p> Module<'p> {
              @meadow_spill_words = constant i64 {}\n\n",
             u8::from(self.threaded),
             u8::from(self.cycles),
-            u8::from(self.tracing),
+            if self.moving {
+                2
+            } else {
+                u8::from(self.tracing)
+            },
             self.spill_area()
         );
         let string_sizes: HashMap<&str, usize> = self
@@ -2844,6 +2989,7 @@ impl<'p> Module<'p> {
                         "; A Meadow program, compiled by meadow-llvm: part {i}.\n"
                     );
                     out.push_str(RUNTIME);
+                    out.push_str(self.remembering());
                     out.push_str(&helpers(&self.layout, self.cycles, self.regions));
                     // Of no stated length: how many methods the program has
                     // is not this unit's to say, and would be one more thing
@@ -2946,6 +3092,7 @@ impl<'p> Module<'p> {
         let mut out = String::new();
         let _ = writeln!(out, "; A Meadow program, compiled by meadow-llvm.\n");
         out.push_str(RUNTIME);
+        out.push_str(self.remembering());
         out.push_str(&helpers(&self.layout, self.cycles, self.regions));
         out.push_str(&invokers(&self.layout, self.cc, self.threaded));
         let _ = writeln!(out, "@meadow_silo_{fingerprint} = external global i8");

@@ -504,7 +504,7 @@ choices:
 
 | choice | options | default |
 |---|---|---|
-| memory | `--gc rc` (counting, with reuse), `tracing`, or `generational` (a nursery, on the VM) | rc |
+| memory | `--gc rc` (counting, with reuse), `tracing`, or `generational` (with a nursery) | rc |
 | stack | `--stack fixed` (Silo's) or `growable` (Glade's) | growable in a debug build, fixed in a release one; `stack = "…"` in a profile |
 
 `--gc` is one option for both runtimes. Glade's names for its two collectors,
@@ -706,14 +706,22 @@ nursery is full counts as one, since it may be given young fields as it is
 built.
 
 The VM reads back what its records held, after a safe point and after a call
-it waited on, and records a frame's borrowed values too. Native code cannot
-yet, since its SSA values hold addresses across calls, so under
-`generational` it traces without moving.
+it waited on, and records a frame's borrowed values too. So does native code
+under `generational`, and only there:
+- a function's poll is followed by loads of what its record held, joined by
+  a phi;
+- a method's record holds the captures it loaded as well;
+- a frame that waits on a call is entered with what its record holds after
+  the call;
+- a `Ref` or a hole stored into inline calls `meadow_remember`.
+
+Counted and traced programs' IR is as it was.
 
 Every example prints the same with the smallest nursery (32K words), and the
 standard library's 350 tests pass on the VM under `generational` with the
-default nursery, with the smallest, and with heap frames, as they do natively
-(Linux, 2026-10-24, with the full suite). On the VM, binarytrees spends 7.7% of its run collecting, against 10.6% traced. The
+default nursery, with the smallest, and with heap frames (Linux, 2026-10-24,
+with the full suite). Natively, binarytrees takes 1.13 s against 1.57 s
+traced, and 0.91 s with an 8 MB nursery (`--nursery 8M`). On the VM, binarytrees spends 7.7% of its run collecting, against 10.6% traced. The
 run itself is about the same, since interpreting it costs most. A larger
 nursery (`MEADOW_GC_NURSERY`, in words) spends less: 4.8% at 16M words.
 
@@ -731,7 +739,7 @@ Glade's VM does. Where it stands:
 | GC statistics (`--gc-stats`) | yes, on both engines, under both strategies |
 | `meadow exec` of an image | yes, of an image of AxCut |
 | growable stacks, heap frames | yes, on both engines |
-| a generational, moving collector | on the VM: `--gc generational`; native code traces without moving |
+| a generational, moving collector | `--gc generational`, on both engines |
 | a JIT of hot blocks | not planned: the LLVM path compiles a whole program |
 
 A block no person wrote -- a join point, a group of local functions, a

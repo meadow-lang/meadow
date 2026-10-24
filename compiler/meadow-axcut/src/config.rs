@@ -15,9 +15,9 @@
 /// - **`Generational`**: traced, with a young generation as Glade's has. A
 ///   block is made in a nursery, and those still reached when it fills are
 ///   copied out to where `Trace` keeps its blocks; most die young and cost
-///   nothing to collect. Blocks move, so it needs an engine that holds every
-///   reference where the collector can rewrite it: Silo's interpreter does,
-///   and native code, which cannot yet, runs as under `Trace`.
+///   nothing to collect. Blocks move, so both engines hold every reference
+///   where the collector can rewrite it, and read it back after each place
+///   one may run.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
 )]

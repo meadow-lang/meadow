@@ -51,8 +51,7 @@
 //!
 //! # The young generation
 //!
-//! Under `--gc generational`, on an engine that can follow blocks that move
-//! ([`moving`]: Silo's interpreter), a small block is made in a nursery, a
+//! Under `--gc generational` ([`moving`]), a small block is made in a nursery, a
 //! region of the heap's own taken from the front, and most die there and are
 //! never looked at. When it fills, the next safe point copies what is still
 //! reached out of it ([`minor`]) to where every other block lives, and the
@@ -238,6 +237,13 @@ pub fn moving() -> bool {
 
 /// A count no block of a heap's has while it is young but one that moved.
 const MOVED_OUT: u32 = u32::MAX - 1;
+
+/// [`remember`], for emitted code: what a store into a block written inline
+/// calls, where blocks move.
+#[unsafe(no_mangle)]
+pub extern "C" fn meadow_remember(into: Word, x: Word, d: i64) {
+    remember(into, x, d);
+}
 
 /// The write barrier: a reference `x`, described by `d`, is being stored in
 /// the block at `into`, which may be older than it. An older block that may
