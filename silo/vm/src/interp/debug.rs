@@ -102,6 +102,9 @@ pub(super) struct Debugger {
     breakpoint: Vec<AtomicBool>,
     pause: AtomicBool,
     state: Mutex<State>,
+    /// Which slots hold a value where, by procedure: worked out for a
+    /// procedure the first time a frame of it is shown.
+    live: Mutex<std::collections::HashMap<u32, std::sync::Arc<super::live::Live>>>,
 }
 
 static DEBUGGER: OnceLock<Debugger> = OnceLock::new();
@@ -126,6 +129,7 @@ pub fn start(port: u16) -> Result<(), String> {
         inbox: Mutex::new(rx),
         breakpoint: (0..n).map(|_| AtomicBool::new(false)).collect(),
         pause: AtomicBool::new(false),
+        live: Mutex::new(std::collections::HashMap::new()),
         state: Mutex::new(State {
             mode: Mode::Continue,
             from: 0,
@@ -352,6 +356,28 @@ impl Debugger {
 
     /// The running chain, innermost first, at most `max` deep: each frame's
     /// procedure, pc, and the named registers that hold something.
+    /// Which of procedure `proc`'s slots hold a value at each of its pcs.
+    fn live_of(&self, proc: u32) -> std::sync::Arc<super::live::Live> {
+        let mut cache = self.live.lock().unwrap_or_else(|p| p.into_inner());
+        cache
+            .entry(proc)
+            .or_insert_with(|| {
+                let v = vm();
+                let seg = v.seg(proc);
+                let entry = v.proc(proc).entry as usize;
+                // It runs to where the next procedure begins.
+                let end = seg
+                    .procs
+                    .iter()
+                    .map(|p| p.entry as usize)
+                    .filter(|e| *e > entry)
+                    .min()
+                    .unwrap_or(seg.code.ins.len());
+                std::sync::Arc::new(super::live::of(&seg.code, entry, end))
+            })
+            .clone()
+    }
+
     fn stack(&self, max: usize) -> Vec<Json> {
         let v = vm();
         let mut out = Vec::new();
@@ -364,11 +390,27 @@ impl Debugger {
             // Safety: the activation's registers, which nothing writes while
             // the program is stopped.
             let env: &Env = unsafe { &*a.env };
+            // Only what its slots still hold for it: the innermost frame is
+            // where it stopped, and every other is waiting on a call, which
+            // its arguments have gone to.
+            let live = self.live_of(a.proc);
+            let live = if out.is_empty() {
+                live.at(a.pc)
+            } else {
+                live.waiting(a.pc)
+            };
             let mut vars = Vec::new();
             for (slot, var) in p.slot_vars.iter().enumerate() {
                 let (Some(var), Some(V::Val(w))) = (var, env.get(slot)) else {
                     continue;
                 };
+                let described = match p.slot_descs[slot] {
+                    super::D::S(s) => live.has(s),
+                    super::D::K(_) => true,
+                };
+                if !live.has(slot as u32) || !described {
+                    continue;
+                }
                 let dd = d(p.slot_descs[slot], env);
                 let (shown, handle) = self.value(*w, dd);
                 vars.push(json!([var, shown, handle]));

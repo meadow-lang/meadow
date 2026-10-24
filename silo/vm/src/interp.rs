@@ -43,6 +43,7 @@ use smallvec::SmallVec;
 
 mod code;
 pub mod debug;
+mod live;
 use code::{Code, Ins, WideI};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
