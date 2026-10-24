@@ -118,7 +118,7 @@ pub fn start(port: u16) -> Result<(), String> {
     let reader = stream.try_clone().map_err(|e| e.to_string())?;
     let (tx, rx) = mpsc::channel();
     let v = vm();
-    let n = v.code.ins.len();
+    let n = v.first().code.ins.len();
     let made = Debugger {
         boundary: OnceLock::new(),
         keys: OnceLock::new(),
@@ -254,6 +254,10 @@ impl Debugger {
 
     /// Before the instruction `act` is at: stop there if anything says to.
     pub(super) fn at(&self, act: &Act) {
+        // The pcs the adapter knows are the first load's.
+        if act.proc >> super::SEG != 0 {
+            return;
+        }
         let pc = act.pc;
         let boundary = self.boundary.get().is_some_and(|b| b[pc]);
         let reason = if self.pause.swap(false, Ordering::Relaxed) {
@@ -289,7 +293,7 @@ impl Debugger {
                             f,
                             "pc {pc} proc {} {} depth {here}/{from} k {k:#x} from {:#x} parent {:?} moved {moved}",
                             act.proc,
-                            vm().procs[act.proc as usize].name,
+                            vm().proc(act.proc).name,
                             st.from_k,
                             st.parent_k
                         );
@@ -356,7 +360,7 @@ impl Debugger {
             if out.len() >= max {
                 break;
             }
-            let p = &v.procs[a.proc as usize];
+            let p = v.proc(a.proc);
             // Safety: the activation's registers, which nothing writes while
             // the program is stopped.
             let env: &Env = unsafe { &*a.env };
@@ -374,7 +378,7 @@ impl Debugger {
             // native stack: under `--stack heap` every caller is one.
             let k = p.slot_vars.iter().enumerate().find_map(|(slot, var)| {
                 let var = (*var)?;
-                v.program
+                v.seg(a.proc).program
                     .returns
                     .contains(&meadow_axcut::VarId(var))
                     .then_some(())?;
@@ -416,10 +420,10 @@ impl Debugger {
             } else {
                 heap::meta(k) as usize
             };
-            let Some(&(proc, ncap)) = v.methods.get(base) else {
+            let Some((proc, ncap)) = v.method_checked(base) else {
                 return;
             };
-            let p = &v.procs[proc as usize];
+            let p = v.proc(proc);
             let n = if heap::is_block(k) {
                 ncap.min(heap::len(k))
             } else {
@@ -452,9 +456,9 @@ impl Debugger {
             };
             // Its caller's, which is a frame to show; or one of the same
             // call's, which is walked through.
-            (k, show) = match named(&v.program.returns) {
+            (k, show) = match named(&v.seg(proc).program.returns) {
                 Some(caller) => (caller, true),
-                None => match named(&v.program.continuations) {
+                None => match named(&v.seg(proc).program.continuations) {
                     Some(inner) => (inner, false),
                     None => return,
                 },
@@ -554,7 +558,7 @@ impl Debugger {
 /// caller called it natively.
 fn ret_of(act: &Act) -> Word {
     let v = vm();
-    let Some(slot) = v.procs[act.proc as usize].ret_slot else {
+    let Some(slot) = v.proc(act.proc).ret_slot else {
         return 0;
     };
     // Safety: the activation's registers, read between its instructions.
@@ -576,10 +580,10 @@ fn parent_of(k: Word) -> Option<Word> {
         if k == 0 || !closure || !heap::is_block(k) {
             return None;
         }
-        let Some(&(proc, ncap)) = v.methods.get(heap::meta(k) as usize) else {
+        let Some((proc, ncap)) = v.method_checked(heap::meta(k) as usize) else {
             return None;
         };
-        let p = &v.procs[proc as usize];
+        let p = v.proc(proc);
         let n = ncap.min(heap::len(k));
         let find = |set: &std::collections::HashSet<meadow_axcut::Name>| {
             (0..n)
@@ -592,10 +596,10 @@ fn parent_of(k: Word) -> Option<Word> {
                 })
                 .map(|i| heap::field(k, i))
         };
-        if let Some(caller) = find(&v.program.returns) {
+        if let Some(caller) = find(&v.seg(proc).program.returns) {
             return Some(caller);
         }
-        k = find(&v.program.continuations)?;
+        k = find(&v.seg(proc).program.continuations)?;
     }
     None
 }
@@ -651,23 +655,24 @@ impl Vm {
     /// What the adapter needs to know of the loaded program: each procedure's
     /// name and code, and where each instruction was written.
     fn description(&self) -> Json {
-        let mut order: Vec<usize> = (0..self.procs.len()).collect();
-        order.sort_by_key(|i| self.procs[*i].entry);
-        let mut procs = vec![Json::Null; self.procs.len()];
+        let first = self.first();
+        let mut order: Vec<usize> = (0..first.procs.len()).collect();
+        order.sort_by_key(|i| first.procs[*i].entry);
+        let mut procs = vec![Json::Null; first.procs.len()];
         for (k, i) in order.iter().enumerate() {
-            let p = &self.procs[*i];
+            let p = &first.procs[*i];
             let end = order
                 .get(k + 1)
-                .map_or(self.code.ins.len(), |j| self.procs[*j].entry as usize);
+                .map_or(first.code.ins.len(), |j| first.procs[*j].entry as usize);
             procs[*i] = json!({ "name": p.name, "entry": p.entry, "end": end });
         }
         // Where each procedure a `new` makes was made: where a frame on the
         // heap is waiting, as a debugger shows it.
-        let mut origin = vec![Json::Null; self.procs.len()];
-        for (pc, i) in self.code.ins.iter().enumerate() {
+        let mut origin = vec![Json::Null; first.procs.len()];
+        for (pc, i) in first.code.ins.iter().enumerate() {
             if let super::code::Ins::New(n) = i
                 && let Some(&(proc, _)) =
-                    self.methods.get(self.code.news[*n as usize].base as usize)
+                    first.methods.get(first.code.news[*n as usize].base as usize)
                 && origin[proc as usize].is_null()
             {
                 origin[proc as usize] = json!(pc);
@@ -676,13 +681,13 @@ impl Vm {
         for (p, o) in procs.iter_mut().zip(origin) {
             p["origin"] = o;
         }
-        let locs: Vec<Json> = self
+        let locs: Vec<Json> = first
             .code
             .locs
             .iter()
             .enumerate()
             .filter_map(|(pc, l)| l.map(|l| json!([pc, l.source, l.span.start, l.span.end])))
             .collect();
-        json!({ "procs": procs, "locs": locs, "code": self.code.ins.len() })
+        json!({ "procs": procs, "locs": locs, "code": first.code.ins.len() })
     }
 }

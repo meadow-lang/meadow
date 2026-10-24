@@ -401,18 +401,48 @@ enum Callee {
     Method { target: Slot, tag: u32 },
 }
 
-/// The program, ready to run.
-pub struct Vm {
+/// How a procedure's or a method's number says which segment it is in: the
+/// bits above these.
+const SEG: u32 = 22;
+const LOCAL: u32 = (1 << SEG) - 1;
+/// How many loads a program can take: its first, and its reloads.
+const SEGMENTS: usize = 1024;
+/// How many definitions, over every load.
+const DEFS: usize = 1 << 18;
+
+/// One load's code: what the program's first image made, or what a reload
+/// added (`docs/RUNTIME-MERGE.md`, "Hot loading"). Nothing in one changes
+/// once it is in place, and nothing moves: code already running, and the
+/// closures made by it, go on in the segment they began in.
+struct Segment {
     program: &'static Program,
-    /// Where it begins: its entry, or each of its tests.
-    entries: Vec<u32>,
-    is_tests: bool,
     procs: Vec<Proc>,
     code: Code,
-    /// Every method, by its place in the table a closure's header indexes,
-    /// and how many of its parameters are the closure's captures.
+    /// Every method, by its number -- what a closure's header holds -- and
+    /// how many of its parameters are the closure's captures.
     methods: Vec<(u32, usize)>,
+}
+
+/// What loading keeps from one load to the next.
+struct LoadState {
+    /// The interned names, numbered once for every load.
     syms: HashMap<InternedString, usize>,
+    /// Each definition's slot, by what it is: see [`def_key`].
+    slots: HashMap<String, u32>,
+    segments: usize,
+    defs: usize,
+}
+
+/// The program, ready to run.
+pub struct Vm {
+    segs: Box<[OnceLock<Segment>]>,
+    /// The version of each definition a call by name runs: its slot's
+    /// procedure, which a reload replaces.
+    defs: Box<[std::sync::atomic::AtomicU32]>,
+    /// Where it begins, by slot: its entry, or each of its tests.
+    entries: Vec<u32>,
+    is_tests: bool,
+    state: std::sync::Mutex<LoadState>,
     tracing: bool,
     /// Whether a debugger watches: then every activation keeps a record, and
     /// every instruction is a place it may stop.
@@ -475,6 +505,7 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
     };
     let mut c = Compiler {
         program,
+        seg: 0,
         news: HashMap::new(),
         codes: HashMap::new(),
         labels: HashMap::new(),
@@ -499,8 +530,15 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
             )
         })
         .collect();
+    // A slot for each definition, and in it, to begin with, its procedure:
+    // the first load's are numbered alike.
+    let keys = def_keys(program);
+    let mut slots = HashMap::new();
     for (i, (label, ..)) in blocks.iter().enumerate() {
         c.labels.insert(*label, i as u32);
+        if let Some(k) = keys.get(label) {
+            slots.insert(k.clone(), i as u32);
+        }
         c.procs.push(None);
     }
     for (i, (_, name, b)) in blocks.iter().enumerate() {
@@ -537,14 +575,29 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
         );
     }
     let threads = c.threads;
-    let vm = Vm {
+    let ndefs = blocks.len();
+    let defs = (0..DEFS)
+        .map(|i| std::sync::atomic::AtomicU32::new(if i < ndefs { i as u32 } else { u32::MAX }))
+        .collect();
+    let segs: Box<[OnceLock<Segment>]> = (0..SEGMENTS).map(|_| OnceLock::new()).collect();
+    let names = names_of(program, &c.syms);
+    let _ = segs[0].set(Segment {
         program,
-        entries,
-        is_tests,
         procs: c.procs.into_iter().map(|p| p.expect("compiled")).collect(),
         code: c.code,
         methods: c.methods,
-        syms: c.syms,
+    });
+    let vm = Vm {
+        segs,
+        defs,
+        entries,
+        is_tests,
+        state: std::sync::Mutex::new(LoadState {
+            syms: c.syms,
+            slots,
+            segments: 1,
+            defs: ndefs,
+        }),
         tracing,
         debugging: DEBUGGING.load(Ordering::Relaxed),
         growable,
@@ -557,7 +610,7 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
         crate::meadow_gc = u8::from(tracing);
         crate::meadow_result_desc = result;
     }
-    meadow_silo::show::install(vm.names());
+    meadow_silo::show::install(names);
     VM.set(vm)
         .map_err(|_| "a program was loaded twice".to_string())
 }
@@ -566,6 +619,9 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
 
 struct Compiler {
     program: &'static Program,
+    /// The segment this load's code goes in: the bits above [`LOCAL`] of
+    /// every procedure and method it numbers.
+    seg: u32,
     /// Where each `new` statement's methods are in the table, by its address:
     /// compiled once however many times the code around it is (a frame's
     /// code is, once in its place and once where its call is).
@@ -665,7 +721,12 @@ impl Compiler {
 
     fn add_proc(&mut self, p: Proc) -> u32 {
         self.procs.push(Some(p));
-        (self.procs.len() - 1) as u32
+        self.global(self.procs.len() - 1)
+    }
+
+    /// This segment's procedure or method `local`, by the number it goes by.
+    fn global(&self, local: usize) -> u32 {
+        (self.seg << SEG) | local as u32
     }
 
     fn sym(&mut self, s: InternedString) -> i64 {
@@ -832,7 +893,7 @@ impl Compiler {
                             self.methods[base + i] = (p, captures.len());
                             procs.push(p);
                         }
-                        let made = (base as u32, procs);
+                        let made = (self.global(base), procs);
                         self.news.insert(l as *const L as usize, made.clone());
                         made
                     }
@@ -1076,8 +1137,9 @@ impl Compiler {
                     let compiled = self.proc(code, name);
                     let compiled = self.add_proc(compiled);
                     self.methods[base] = (compiled, caps.len());
-                    self.codes.insert(key, (base as u32, caps.clone()));
-                    (base as u32, caps)
+                    let base = self.global(base);
+                    self.codes.insert(key, (base, caps.clone()));
+                    (base, caps)
                 }
             };
             return I::Segment {
@@ -1264,6 +1326,61 @@ fn direct(p: Prim) -> bool {
 // --- running --------------------------------------------------------------------
 
 impl Vm {
+    /// The segment procedure or method `id` is in.
+    #[inline(always)]
+    fn seg(&self, id: u32) -> &Segment {
+        // Safety: a number is only made in a segment's compiling, which puts
+        // the segment in place before any code holding the number runs.
+        unsafe {
+            self.segs
+                .get_unchecked((id >> SEG) as usize)
+                .get()
+                .unwrap_unchecked()
+        }
+    }
+
+    #[inline(always)]
+    fn proc(&self, id: u32) -> &Proc {
+        // Safety: as above, a procedure's number is one its segment made.
+        unsafe { self.seg(id).procs.get_unchecked((id & LOCAL) as usize) }
+    }
+
+    /// Method `id`: its procedure, and how many captures it loads.
+    #[inline(always)]
+    fn method(&self, id: usize) -> (u32, usize) {
+        let id = id as u32;
+        // Safety: as above, a closure's method is one its segment made.
+        unsafe { *self.seg(id).methods.get_unchecked((id & LOCAL) as usize) }
+    }
+
+    /// Method `id`, if there is one: for a debugger, which reads words that
+    /// may be anything.
+    fn method_checked(&self, id: usize) -> Option<(u32, usize)> {
+        let id = u32::try_from(id).ok()?;
+        let seg = self.segs.get((id >> SEG) as usize)?.get()?;
+        seg.methods.get((id & LOCAL) as usize).copied()
+    }
+
+    /// The version of the definition in `slot` a call by name runs now.
+    #[inline(always)]
+    fn target(&self, slot: u32) -> u32 {
+        self.defs[slot as usize].load(Ordering::Acquire)
+    }
+
+    /// The first load's segment: what a debugger shows.
+    fn first(&self) -> &Segment {
+        self.seg(0)
+    }
+
+    /// The code procedure `p` is in, and where it begins.
+    #[inline(always)]
+    fn entry(&self, p: u32) -> (&Code, usize) {
+        let s = self.seg(p);
+        // Safety: as in `proc`.
+        let entry = unsafe { s.procs.get_unchecked((p & LOCAL) as usize).entry };
+        (&s.code, entry as usize)
+    }
+
     /// How many tests the program is, or `None` if it is a program.
     pub fn tests(&self) -> Option<usize> {
         self.is_tests.then_some(self.entries.len())
@@ -1274,13 +1391,13 @@ impl Vm {
         let i = CHOSEN.load(Ordering::Relaxed);
         let mut args = Args::new();
         args.push(V::Val(0));
-        self.call(self.entries[i], args)
+        self.call(self.target(self.entries[i]), args)
     }
 
     /// Method `tag` of the closure `obj`, with `args`: entered from the
     /// runtime, as the compiled code's `meadow_invoke1` and `meadow_apply`.
     pub fn invoke(&self, obj: Word, tag: u32, args: &[Word]) -> Word {
-        let (p, ncap) = self.methods[method_of(obj) + tag as usize];
+        let (p, ncap) = self.method(method_of(obj) + tag as usize);
         let env = self.enter_method(obj, p, ncap, args.iter().map(|a| V::Val(*a)).collect());
         self.safe_point(p, &env);
         self.exec(p, env)
@@ -1297,7 +1414,7 @@ impl Vm {
     /// `env` made procedure `p`'s, holding `args` as its first slots.
     fn bind(&self, p: u32, args: Args, env: &mut Env) {
         env.clear();
-        env.resize_with(self.procs[p as usize].slots.max(args.len()), V::default);
+        env.resize_with(self.proc(p).slots.max(args.len()), V::default);
         for (slot, a) in env.iter_mut().zip(args) {
             *slot = a;
         }
@@ -1320,8 +1437,7 @@ impl Vm {
     /// debugger's record kept and its stops checked when `DEBUG`, which a
     /// program run without one never pays for.
     fn run<const DEBUG: bool>(&self, mut p: u32, mut env: Env) -> Word {
-        let code = &self.code;
-        let mut pc = self.procs[p as usize].entry as usize;
+        let (mut code, mut pc) = self.entry(p);
         // The record a debugger reads this activation by, on the running
         // segment's chain while it runs.
         let parent = if DEBUG { meadow_silo::frames::top() } else { 0 };
@@ -1456,8 +1572,8 @@ impl Vm {
                         // words this procedure's slots reuse. What is left in
                         // the others is never read before it is written.
                         let words: Words = args.iter().map(|a| self.word(*a, &mut env)).collect();
-                        p = j.proc;
-                        let need = self.procs[p as usize].slots.max(words.len());
+                        p = self.target(j.proc);
+                        let need = self.proc(p).slots.max(words.len());
                         if env.len() < need {
                             env.resize_with(need, V::default);
                         }
@@ -1465,23 +1581,23 @@ impl Vm {
                             *slot = V::Val(w);
                         }
                         self.safe_point(p, &env);
-                        pc = self.procs[p as usize].entry as usize;
+                        (code, pc) = self.entry(p);
                         continue;
                     }
                     let (vals, frame) = self.transfer(args, &mut env);
                     match frame {
                         None => {
-                            p = j.proc;
+                            p = self.target(j.proc);
                             self.bind(p, vals, &mut env);
                             self.safe_point(p, &env);
                         }
                         Some(fr) => {
-                            let callee = j.proc;
+                            let callee = self.target(j.proc);
                             let r = self.waiting(&fr, || self.call(callee, vals));
                             p = self.enter_frame(fr, V::Val(r), &mut env);
                         }
                     }
-                    pc = self.procs[p as usize].entry as usize;
+                    (code, pc) = self.entry(p);
                 }
                 Ins::Invoke(i) => {
                     let iv = &code.invokes[i as usize];
@@ -1496,7 +1612,7 @@ impl Vm {
                         };
                         let a = take_val(&mut env, *a);
                         p = self.enter_frame(fr, a, &mut env);
-                        pc = self.procs[p as usize].entry as usize;
+                        (code, pc) = self.entry(p);
                         continue;
                     }
                     let t = self.val(target, &mut env);
@@ -1505,7 +1621,7 @@ impl Vm {
                     if tag == 0 && args.len() == 1 && t == 0 {
                         return self.val(args[0], &mut env);
                     }
-                    let (m, ncap) = self.methods[method_of(t) + tag as usize];
+                    let (m, ncap) = self.method(method_of(t) + tag as usize);
                     let (vals, frame) = self.transfer(args, &mut env);
                     match frame {
                         None => {
@@ -1522,7 +1638,7 @@ impl Vm {
                             p = self.enter_frame(fr, V::Val(r), &mut env);
                         }
                     }
-                    pc = self.procs[p as usize].entry as usize;
+                    (code, pc) = self.entry(p);
                 }
                 Ins::Call(i) => {
                     let c = &code.calls[i as usize];
@@ -1533,13 +1649,16 @@ impl Vm {
                         .collect();
                     vals.push(V::Val(0));
                     let r = match c.callee {
-                        Callee::Proc(q) => self.waiting_in(&c.held, &env, || self.call(q, vals)),
+                        Callee::Proc(q) => {
+                            let q = self.target(q);
+                            self.waiting_in(&c.held, &env, || self.call(q, vals))
+                        }
                         Callee::Method { target, tag } => {
                             let t = self.val(target, &mut env);
                             if t == 0 {
                                 fail("the null continuation was given a frame");
                             }
-                            let (m, ncap) = self.methods[method_of(t) + tag as usize];
+                            let (m, ncap) = self.method(method_of(t) + tag as usize);
                             self.waiting_in(&c.held, &env, || {
                                 let e = self.enter_method(t, m, ncap, vals);
                                 self.safe_point(m, &e);
@@ -1642,14 +1761,15 @@ impl Vm {
     /// The whole program's code, procedure by procedure, as `--dis` writes it.
     pub fn disassemble(&self) -> String {
         use std::fmt::Write;
-        let mut order: Vec<usize> = (0..self.procs.len()).collect();
-        order.sort_by_key(|i| self.procs[*i].entry);
+        let first = self.first();
+        let mut order: Vec<usize> = (0..first.procs.len()).collect();
+        order.sort_by_key(|i| first.procs[*i].entry);
         let mut out = String::new();
         for (k, i) in order.iter().enumerate() {
-            let pr = &self.procs[*i];
+            let pr = &first.procs[*i];
             let end = order
                 .get(k + 1)
-                .map_or(self.code.ins.len(), |j| self.procs[*j].entry as usize);
+                .map_or(first.code.ins.len(), |j| first.procs[*j].entry as usize);
             let _ = writeln!(
                 out,
                 "p{i} {} ({} registers, {} parameters)",
@@ -1659,7 +1779,7 @@ impl Vm {
             );
             let mut last = None;
             for pc in pr.entry as usize..end {
-                let loc = self.code.locs[pc];
+                let loc = first.code.locs[pc];
                 let at = if loc != last && loc.is_some() {
                     let l = loc.expect("some");
                     format!("  ; source {} at {}", l.source, l.span.start)
@@ -1667,7 +1787,7 @@ impl Vm {
                     String::new()
                 };
                 last = loc;
-                let _ = writeln!(out, "  {pc:6}  {}{at}", self.code.show(pc));
+                let _ = writeln!(out, "  {pc:6}  {}{at}", first.code.show(pc));
             }
         }
         out
@@ -1774,7 +1894,7 @@ impl Vm {
         }
         let prev = meadow_silo::shadow::head();
         let mut rec: Vec<i64> = vec![prev as i64, 0];
-        for (i, pd) in self.procs[p as usize].params.iter().enumerate() {
+        for (i, pd) in self.proc(p).params.iter().enumerate() {
             if let V::Val(v) = env[i] {
                 let dd = d(*pd, env);
                 if dd == desc::REF {
@@ -1792,7 +1912,7 @@ impl Vm {
     /// A method's entry: its captures loaded out of the closure `obj`, which
     /// is released, and then its arguments.
     fn enter_method(&self, obj: Word, p: u32, ncap: usize, args: Args) -> Env {
-        let proc = &self.procs[p as usize];
+        let proc = self.proc(p);
         let mut env = Env::new();
         env.resize_with(proc.slots.max(ncap + args.len()), V::default);
         let loaded = load_fields(obj, ncap);
@@ -2083,11 +2203,50 @@ impl Vm {
         }
     }
 
-    /// The tables the runtime prints and takes records apart by, as the
-    /// compiler writes them (`meadow_llvm::emit`'s `header`).
-    fn names(&self) -> meadow_silo::show::Names {
-        let mut ctors: Vec<(u32, String)> = self
-            .program
+}
+
+/// What each definition is, across builds of the program: its module, its
+/// name, how its parameters and its answer are represented, and which of the
+/// definitions alike in all that it is -- a function's copies specialized at
+/// different types are told apart by their representations, and those alike
+/// in them too by their order. A reload finds a definition's slot by this.
+fn def_keys(program: &Program) -> HashMap<Label, String> {
+    fn rep(r: Option<&Rep>) -> String {
+        match r {
+            Some(Rep::Ref) | None => "r".into(),
+            Some(Rep::Int) => "i".into(),
+            Some(Rep::Float) => "f".into(),
+            Some(Rep::Str) => "s".into(),
+            Some(Rep::Bits(d)) => format!("b{d}"),
+            // A type variable's descriptor: its name is the build's, not the
+            // program's.
+            Some(Rep::Var(_)) => "v".into(),
+            Some(Rep::Unknown) => "?".into(),
+        }
+    }
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut out = HashMap::new();
+    for d in &program.defs {
+        let params: Vec<String> = d.block.params.iter().map(|p| rep(program.reps.get(p))).collect();
+        let base = format!(
+            "{}.{}({})->{}",
+            d.module,
+            d.name,
+            params.join(","),
+            rep(program.results.get(&d.label))
+        );
+        let n = seen.entry(base.clone()).or_insert(0);
+        out.insert(d.label, format!("{base}#{n}"));
+        *n += 1;
+    }
+    out
+}
+
+/// The tables the runtime prints and takes records apart by, as the compiler
+/// writes them (`meadow_llvm::emit`'s `header`).
+fn names_of(program: &Program, syms: &HashMap<InternedString, usize>) -> meadow_silo::show::Names {
+    {
+        let mut ctors: Vec<(u32, String)> = program
             .tags
             .iter()
             .map(|(n, t)| (*t, n.to_string()))
@@ -2098,8 +2257,7 @@ impl Vm {
         let mut fields = vec![None; count];
         for (t, name) in &ctors {
             names[*t as usize] = Some(name.clone());
-            if let Some(fs) = self
-                .program
+            if let Some(fs) = program
                 .ctor_fields
                 .get(&InternedString::from(name.as_str()))
             {
@@ -2108,10 +2266,10 @@ impl Vm {
         }
         let roles = meadow_rt::roles::Role::ALL
             .into_iter()
-            .map(|r| self.program.role(r).map(|c| c.to_string()))
+            .map(|r| program.role(r).map(|c| c.to_string()))
             .collect();
         let mut syms: Vec<(usize, InternedString)> =
-            self.syms.iter().map(|(s, i)| (*i, *s)).collect();
+            syms.iter().map(|(s, i)| (*i, *s)).collect();
         syms.sort_by_key(|(i, _)| *i);
         // Where each goes among a record's labels: the interned names' order.
         let mut by: Vec<usize> = (0..syms.len()).collect();
