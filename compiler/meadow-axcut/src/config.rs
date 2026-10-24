@@ -12,6 +12,12 @@
 ///   shared, erased or reused; the runtime marks what the program's records
 ///   and its context reach and sweeps the rest, at safe points where a
 ///   function begins. Nothing moves.
+/// - **`Generational`**: traced, with a young generation as Glade's has. A
+///   block is made in a nursery, and those still reached when it fills are
+///   copied out to where `Trace` keeps its blocks; most die young and cost
+///   nothing to collect. Blocks move, so it needs an engine that holds every
+///   reference where the collector can rewrite it: Silo's interpreter does,
+///   and native code, which cannot yet, runs as under `Trace`.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
 )]
@@ -19,16 +25,24 @@ pub enum Memory {
     #[default]
     Count,
     Trace,
+    Generational,
 }
 
 impl Memory {
-    /// By the name a command line gives it: `rc` or `tracing`.
+    /// By the name a command line gives it: `rc`, `tracing`, or
+    /// `generational`.
     pub fn named(name: &str) -> Option<Memory> {
         match name {
             "rc" | "count" | "counting" => Some(Memory::Count),
             "tracing" | "trace" => Some(Memory::Trace),
+            "generational" | "copying" => Some(Memory::Generational),
             _ => None,
         }
+    }
+
+    /// Whether blocks are found by tracing rather than counted.
+    pub fn traced(self) -> bool {
+        self != Memory::Count
     }
 }
 

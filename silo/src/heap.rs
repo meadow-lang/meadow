@@ -151,6 +151,7 @@ pub const CYCLABLE: u64 = 1 << 19;
 /// `x`, described by `d`, is being stored in the mutable array at `arr`.
 #[inline]
 pub fn note_stored(arr: Word, x: Word, d: i64) {
+    crate::trace::remember(arr, x, d);
     if (d == meadow_rt::desc::REF || d == meadow_rt::desc::ANY)
         && is_block(x)
         && crate::cycles::may_cycle(x)
@@ -649,8 +650,10 @@ pub fn field(v: Word, i: usize) -> Word {
     word(v, first_field(v) + i)
 }
 
-/// Write field `i` of the non-uniform block at `v`, and its descriptor.
+/// Write field `i` of the non-uniform block at `v`, and its descriptor --
+/// noted, where blocks move, if `v` is older than `x` (`crate::trace`).
 pub fn set_field(v: Word, i: usize, x: Word, d: i64) {
+    crate::trace::remember(v, x, d);
     set_word(v, first_field(v) + i, x);
     if !uniform(v) {
         let (at, shift) = LAYOUT.desc_at(i);

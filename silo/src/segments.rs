@@ -189,8 +189,8 @@ pub extern "C" fn meadow_enter(target: Word, body: Word) -> Word {
     // This frame holds `after` while the body runs, and a discarded
     // continuation this frame is part of would never give it up: so it is on
     // the chain of the segment this runs on, like a frame's captures.
-    let record: [i64; 4] = [crate::shadow::head() as i64, 1, after as i64, desc::REF];
-    crate::shadow::set(record.as_ptr() as Word);
+    let mut record: [i64; 4] = [crate::shadow::head() as i64, 1, after as i64, desc::REF];
+    crate::shadow::set(record.as_mut_ptr() as Word);
     LIVE.fetch_add(1, Ordering::Relaxed);
     let stack = take_stack(SEGMENT);
     let limit = crate::stack::limit_of(&stack);
@@ -203,6 +203,10 @@ pub extern "C" fn meadow_enter(target: Word, body: Word) -> Word {
     });
     let v = drive(segment, Down::Start, handler, Vec::new(), 0);
     crate::shadow::set(record[0] as Word);
+    // Where a collection that moves blocks left it, which it wrote through
+    // the chain.
+    // Safety: the record is this frame's, and the chain is done with it.
+    let after = unsafe { std::ptr::read_volatile(&record[2]) } as Word;
     // The handle is done: carry on where its value was to go, on this stack.
     match after {
         0 => v,

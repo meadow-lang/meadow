@@ -255,12 +255,13 @@ pub fn interpreter() -> Result<PathBuf, String> {
         })
 }
 
-/// Silo's strategy for a name `--gc` takes: counting for `rc`, and its one
-/// tracing collector for any name of one -- Glade's `generational` and
-/// `copying` among them, so that a strategy means the same on either runtime.
+/// Silo's strategy for a name `--gc` takes: counting for `rc`, tracing for
+/// `tracing`, and for Glade's `generational` and `copying` the collector with
+/// a young generation -- on Silo's interpreter, which can follow blocks that
+/// move; native code traces without moving.
 pub fn strategy(name: &str) -> meadow_llvm::Memory {
     match name {
-        "generational" | "copying" => meadow_llvm::Memory::Trace,
+        "generational" | "copying" => meadow_llvm::Memory::Generational,
         g => meadow_llvm::Memory::named(g).unwrap_or_default(),
     }
 }

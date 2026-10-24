@@ -47,7 +47,31 @@
 //! its own").
 //!
 //! Nothing moves, so nothing anywhere is read back after a collection, and
-//! no store needs a barrier.
+//! no store needs a barrier -- unless the young generation is there.
+//!
+//! # The young generation
+//!
+//! Under `--gc generational`, on an engine that can follow blocks that move
+//! ([`moving`]: Silo's interpreter), a small block is made in a nursery, a
+//! region of the heap's own taken from the front, and most die there and are
+//! never looked at. When it fills, the next safe point copies what is still
+//! reached out of it ([`minor`]) to where every other block lives, and the
+//! nursery is used again from the front.
+//!
+//! What reaches the nursery is the roots above, and the older blocks a young
+//! one was stored into since -- which a store of a reference into a block
+//! notes ([`remember`], the write barrier), and which a block made outside
+//! the nursery, when it is full, is counted among. Every root is somewhere
+//! the copy can rewrite: a record on a chain, the context, an older block's
+//! field. The engine reads back what its records held once the safe point,
+//! or the call it waited on, is over.
+//!
+//! A young block that moved is marked as moved in its count, which nothing
+//! else reads under tracing, and keeps where it went in the header word its
+//! kind was in: its copy has its header whole. A walk over the nursery then
+//! steps over a block that moved by its copy's size, and finds the young
+//! blocks that died still whole, letting go of what one of them held outside
+//! the heap -- a segment, a thread's task, a region.
 //!
 //! # Compact regions
 //!
@@ -125,6 +149,113 @@ pub struct Space {
     words: usize,
     /// Collections run, for a report.
     pub collections: u64,
+    /// The young generation, where blocks move: see the module docs.
+    nursery: Option<Nursery>,
+}
+
+/// A heap's young generation: where small blocks are made, from the front,
+/// while there is room.
+struct Nursery {
+    start: *mut Word,
+    end: *mut Word,
+    top: *mut Word,
+    /// Whether it filled, and a collection of it is due.
+    full: bool,
+    /// The older blocks that may hold a young one: stored into, or made
+    /// while the nursery was full.
+    remembered: Vec<Word>,
+}
+
+/// Words in a nursery: `MEADOW_GC_NURSERY` says, as Glade's does.
+fn nursery_words() -> usize {
+    static WORDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WORDS.get_or_init(|| {
+        std::env::var("MEADOW_GC_NURSERY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map_or(1 << 18, |w| w.clamp(1 << 15, 1 << 27))
+    })
+}
+
+impl Nursery {
+    fn new() -> Nursery {
+        let words = nursery_words();
+        let layout = std::alloc::Layout::array::<Word>(words).expect("a nursery fits memory");
+        // Safety: a non-zero size; zeroed, as a block's second word is until
+        // its header is written.
+        let start = unsafe { std::alloc::alloc_zeroed(layout) } as *mut Word;
+        if start.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        crate::memory::HEAPS.fetch_add(words, Ordering::Relaxed);
+        Nursery {
+            start,
+            // Safety: one past its end.
+            end: unsafe { start.add(words) },
+            top: start,
+            full: false,
+            remembered: Vec::new(),
+        }
+    }
+
+    /// `words` from the front, if there is room.
+    #[inline]
+    fn bump(&mut self, words: usize) -> Option<*mut Word> {
+        let left = (self.end as usize - self.top as usize) / std::mem::size_of::<Word>();
+        if words > left {
+            return None;
+        }
+        let p = self.top;
+        // Safety: within the nursery, as `left` says.
+        self.top = unsafe { p.add(words) };
+        Some(p)
+    }
+
+    #[inline]
+    fn holds(&self, v: Word) -> bool {
+        v >= self.start as Word && v < self.end as Word
+    }
+}
+
+impl Drop for Nursery {
+    fn drop(&mut self) {
+        let words = (self.end as usize - self.start as usize) / std::mem::size_of::<Word>();
+        let layout = std::alloc::Layout::array::<Word>(words).expect("a nursery fits memory");
+        // Safety: allocated with this layout in `new`.
+        unsafe { std::alloc::dealloc(self.start as *mut u8, layout) };
+        crate::memory::HEAPS.fetch_sub(words, Ordering::Relaxed);
+    }
+}
+
+/// Whether blocks move: a young generation, under an engine that holds every
+/// reference where the collector can rewrite it. The emitted module, or the
+/// interpreter, says, as it says whether memory is traced.
+#[inline(always)]
+pub fn moving() -> bool {
+    // Safety: a constant the emitted module defines.
+    unsafe { meadow_gc == 2 }
+}
+
+/// A count no block of a heap's has while it is young but one that moved.
+const MOVED_OUT: u32 = u32::MAX - 1;
+
+/// The write barrier: a reference `x`, described by `d`, is being stored in
+/// the block at `into`, which may be older than it. An older block that may
+/// now hold a young one is remembered for the next collection of the
+/// nursery.
+#[inline]
+pub fn remember(into: Word, x: Word, d: i64) {
+    if !moving() || (d != desc::REF && d != desc::ANY) || !heap::is_block(x) {
+        return;
+    }
+    // Safety: the running thread's context.
+    let cx = unsafe { &mut *crate::ctx::get() };
+    if let Some(n) = cx.heap.space_mut().and_then(|s| s.nursery.as_mut())
+        && n.holds(x)
+        && !n.holds(into)
+    {
+        n.remembered.push(into);
+    }
 }
 
 impl Space {
@@ -141,17 +272,48 @@ impl Space {
             regions: HashSet::new(),
             words: 0,
             collections: 0,
+            nursery: moving().then(Nursery::new),
         }
     }
 
     /// A block of `words` words, its second word zero until the caller writes
     /// its header -- which it does before the program reaches a safe point.
     pub fn take(&mut self, words: usize) -> Word {
-        self.since += words;
-        if self.since >= self.budget && !self.due {
+        if let Some(n) = self.nursery.as_mut()
+            && words < CLASSES
+        {
+            if let Some(p) = n.bump(words) {
+                return p as Word;
+            }
+            if !n.full {
+                n.full = true;
+                self.want();
+            }
+        }
+        let v = self.take_old(words);
+        // Made outside the nursery, it may be given young fields as it is
+        // built: see the module docs.
+        if let Some(n) = self.nursery.as_mut() {
+            n.remembered.push(v);
+        }
+        v
+    }
+
+    /// Say a collection of this heap is due.
+    fn want(&mut self) {
+        if !self.due {
             self.due = true;
             DUE.fetch_add(1, Ordering::Relaxed);
             meadow_gc_due.store(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A block of `words` where the older blocks live: what a block outside
+    /// the nursery is made in, and what one copied out of it is copied to.
+    fn take_old(&mut self, words: usize) -> Word {
+        self.since += words;
+        if self.since >= self.budget {
+            self.want();
         }
         if words >= CLASSES {
             let layout = std::alloc::Layout::array::<Word>(words).expect("a block fits memory");
@@ -255,7 +417,19 @@ pub extern "C" fn meadow_gc_poll(c: *mut Ctx) {
     // Safety: the running thread's context.
     let cx = unsafe { &mut *c };
     if cx.heap.space().is_some_and(Space::due) {
-        collect(cx);
+        if moving() {
+            minor(cx);
+        }
+        // The older blocks' budget used up, by what was copied out among
+        // the rest: everything is marked.
+        if cx.heap.space().is_some_and(|s| s.since >= s.budget) {
+            collect(cx);
+        } else if let Some(space) = cx.heap.space_mut()
+            && space.due
+        {
+            space.due = false;
+            settled();
+        }
     }
 }
 
@@ -267,6 +441,11 @@ fn free(v: Word) -> bool {
 
 /// Mark what `cx`'s thread can reach, and sweep the rest of its heap.
 pub fn collect(cx: &mut Ctx) {
+    // What is young is copied out first, so that marking sees only blocks
+    // that stay where they are.
+    if cx.heap.space().is_some_and(|s| s.nursery.is_some()) {
+        minor(cx);
+    }
     let started = std::time::Instant::now();
     let Some(space) = cx.heap.space_mut() else {
         return;
@@ -395,6 +574,194 @@ pub fn collect(cx: &mut Ctx) {
             kept_words,
             started.elapsed().as_secs_f64() * 1e3
         );
+    }
+}
+
+/// Copy what is still reached out of `cx`'s nursery, rewrite everything that
+/// pointed at it, and empty it: see the module docs.
+pub fn minor(cx: &mut Ctx) {
+    let started = std::time::Instant::now();
+    let Some(space) = cx.heap.space_mut() else {
+        return;
+    };
+    let Some(nursery) = space.nursery.as_mut() else {
+        return;
+    };
+    let (lo, hi, top) = (nursery.start as Word, nursery.end as Word, nursery.top);
+    let remembered = std::mem::take(&mut nursery.remembered);
+    let mut c = Copier {
+        lo,
+        hi,
+        copied: 0,
+        scan: Vec::new(),
+        space: space as *mut Space,
+    };
+    // The roots, rewritten where they are.
+    c.chain(crate::shadow::head());
+    for &head in &cx.outer_chains {
+        c.chain(head);
+    }
+    for p in &cx.parked {
+        c.chain(p.shadow);
+    }
+    // Every suspended segment's frames: a continuation that nothing reaches
+    // is let go of by a full collection, which this is not.
+    for s in cx.suspended.iter().flatten() {
+        c.chain(s.top.shadow);
+        for p in &s.nested {
+            c.chain(p.shadow);
+        }
+    }
+    for (w, d) in cx.globals.iter_mut().flatten() {
+        if *d == desc::REF {
+            *w = c.forward(*w);
+        }
+    }
+    for w in cx.literals.values_mut() {
+        *w = c.forward(*w);
+    }
+    for (w, d) in cx.kept.iter_mut() {
+        if *d == desc::REF {
+            *w = c.forward(*w);
+        }
+    }
+    if let Some(t) = cx.txn.as_mut() {
+        for level in &mut t.writes {
+            for (_, w, d) in level.iter_mut() {
+                if *d == desc::REF {
+                    *w = c.forward(*w);
+                }
+            }
+        }
+    }
+    for v in remembered {
+        c.fields(v);
+    }
+    // And what was copied, field by field.
+    while let Some(v) = c.scan.pop() {
+        c.fields(v);
+    }
+    let copied = c.copied;
+    // The young blocks that died, still whole: what one held outside the
+    // heap is let go of, as a sweep does.
+    let mut at = lo;
+    while at < top as Word {
+        let size = if heap::count(at) == MOVED_OUT {
+            heap::size(heap::word(at, MOVED_TO))
+        } else {
+            finalize(at);
+            heap::size(at)
+        };
+        at += (size.max(1) * std::mem::size_of::<Word>()) as Word;
+    }
+    // Safety: the nursery's used front, which nothing points into now.
+    unsafe {
+        std::ptr::write_bytes(lo as *mut Word, 0, (top as usize - lo as usize) / 8);
+    }
+    let Some(space) = cx.heap.space_mut() else {
+        return;
+    };
+    if let Some(n) = space.nursery.as_mut() {
+        n.top = n.start;
+        n.full = false;
+    }
+    crate::stats::collected(started.elapsed().as_nanos() as u64);
+    if std::env::var_os("MEADOW_SILO_GC").is_some() {
+        eprintln!(
+            "aot: minor gc: {copied} blocks copied out, {:.2} ms",
+            started.elapsed().as_secs_f64() * 1e3
+        );
+    }
+}
+
+/// Where a young block that moved keeps the address it moved to: the word
+/// its kind was in, which its copy has.
+const MOVED_TO: usize = heap::LAYOUT.kind.word;
+
+/// What copies the nursery's survivors out: the nursery's bounds, how many
+/// were copied, and those whose fields are still to be looked at.
+struct Copier {
+    lo: Word,
+    hi: Word,
+    copied: usize,
+    scan: Vec<Word>,
+    space: *mut Space,
+}
+
+impl Copier {
+    #[inline]
+    fn young(&self, v: Word) -> bool {
+        heap::is_block(v) && v >= self.lo && v < self.hi
+    }
+
+    /// Where the block `v` is now: itself, if it is not young; its copy,
+    /// made now if it has none yet.
+    fn forward(&mut self, v: Word) -> Word {
+        if !self.young(v) {
+            return v;
+        }
+        if heap::count(v) == MOVED_OUT {
+            return heap::word(v, MOVED_TO);
+        }
+        let words = heap::size(v);
+        // Safety: the heap's space, which nothing else touches meanwhile.
+        let to = unsafe { (*self.space).take_old(words) };
+        // Safety: both blocks have `words` words.
+        unsafe { std::ptr::copy_nonoverlapping(v as *const Word, to as *mut Word, words) };
+        heap::set_count(to, 0);
+        heap::set_count(v, MOVED_OUT);
+        heap::set_word(v, MOVED_TO, to);
+        self.copied += 1;
+        self.scan.push(to);
+        to
+    }
+
+    /// Every record from `head` down: what each holds, rewritten.
+    fn chain(&mut self, head: Word) {
+        let mut at = head;
+        while at != 0 {
+            let p = at as *mut i64;
+            // Safety: a record on a segment whose stack is intact.
+            let (prev, n) = unsafe { (*p, *p.add(1)) };
+            for i in 0..n.max(0) as usize {
+                // Safety: within the record's `n` pairs.
+                unsafe {
+                    let d = *p.add(3 + 2 * i);
+                    if d == desc::REF || d == crate::shadow::TOKEN {
+                        let slot = p.add(2 + 2 * i);
+                        *slot = self.forward(*slot as Word) as i64;
+                    }
+                }
+            }
+            at = prev as Word;
+        }
+    }
+
+    /// The fields of the block at `v` that are references, rewritten.
+    fn fields(&mut self, v: Word) {
+        if !heap::is_block(v) || heap::count(v) >= heap::REGION_FLOOR {
+            return;
+        }
+        match heap::kind(v) {
+            heap::STRING | heap::BIGINT | heap::STACK => {}
+            _ => {
+                let n = heap::len(v);
+                let first = heap::first_field(v);
+                let uniform = heap::uniform(v);
+                if uniform && heap::field_desc(v, 0) != desc::REF {
+                    return;
+                }
+                for i in 0..n {
+                    if uniform || heap::field_desc(v, i) == desc::REF {
+                        let x = heap::word(v, first + i);
+                        if self.young(x) {
+                            let to = self.forward(x);
+                            heap::set_word(v, first + i, to);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

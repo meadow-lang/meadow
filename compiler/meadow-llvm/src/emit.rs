@@ -308,7 +308,8 @@ impl<'p> Module<'p> {
 
     /// [`Module::new`], run as `config` says.
     pub fn with(program: &'p Program, conv: CallConv, config: Config) -> Module<'p> {
-        let tracing = config.memory == Memory::Trace;
+        // A native program traces without moving, generational or not.
+        let tracing = config.memory.traced();
         let layout = LAYOUT;
         suits(&layout);
         Module {

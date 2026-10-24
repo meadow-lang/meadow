@@ -549,6 +549,9 @@ pub struct Vm {
     is_tests: bool,
     state: std::sync::Mutex<LoadState>,
     tracing: bool,
+    /// Whether blocks move (`--gc generational`): then what a record holds
+    /// is read back after the collection, or the call, it was made for.
+    moving: bool,
     /// Whether a debugger watches: then every activation keeps a record, and
     /// every instruction is a place it may stop.
     debugging: bool,
@@ -621,7 +624,10 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
                 .ok_or("an entry the program does not have")
         })
         .collect::<Result<Vec<u32>, _>>()?;
-    let tracing = image.config.memory == meadow_axcut::config::Memory::Trace;
+    let tracing = image.config.memory.traced();
+    // Blocks that move: what the interpreter can follow, holding every
+    // reference where the collector rewrites it (see `Vm::moving`).
+    let moving = image.config.memory == meadow_axcut::config::Memory::Generational;
     let growable = image.config.stack == meadow_axcut::config::Stack::Growable;
     // What loading made of the program, for whoever is making it faster.
     if std::env::var_os("MEADOW_VM_STATS").is_some() {
@@ -659,6 +665,7 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
         is_tests,
         state: std::sync::Mutex::new(state),
         tracing,
+        moving,
         // A profile reads the debugger's records of the activations.
         debugging: DEBUGGING.load(Ordering::Relaxed) || profile::on(),
         growable,
@@ -672,7 +679,7 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
     unsafe {
         crate::meadow_threaded = u8::from(c.threads);
         crate::meadow_cycles = u8::from(!tracing);
-        crate::meadow_gc = u8::from(tracing);
+        crate::meadow_gc = if moving { 2 } else { u8::from(tracing) };
         crate::meadow_result_desc = result;
     }
     meadow_silo::show::install(names);
@@ -1776,8 +1783,8 @@ impl Vm {
     /// runtime, as the compiled code's `meadow_invoke1` and `meadow_apply`.
     pub fn invoke(&self, obj: Word, tag: u32, args: &[Word]) -> Word {
         let (p, ncap) = self.method(method_of(obj) + tag as usize);
-        let env = self.enter_method(obj, p, ncap, args.iter().map(|a| V::Val(*a)).collect());
-        self.safe_point(p, &env);
+        let mut env = self.enter_method(obj, p, ncap, args.iter().map(|a| V::Val(*a)).collect());
+        self.safe_point(p, &mut env);
         self.exec(p, env)
     }
 
@@ -1785,7 +1792,7 @@ impl Vm {
     fn call(&self, p: u32, args: Args) -> Word {
         let mut env = Env::new();
         self.bind(p, args, &mut env);
-        self.safe_point(p, &env);
+        self.safe_point(p, &mut env);
         self.exec(p, env)
     }
 
@@ -1964,7 +1971,7 @@ impl Vm {
                         for (slot, w) in env.iter_mut().zip(words) {
                             *slot = V::Val(w);
                         }
-                        self.safe_point(p, &env);
+                        self.safe_point(p, &mut env);
                         (code, pc) = self.entry(p);
                         continue;
                     }
@@ -1973,11 +1980,11 @@ impl Vm {
                         None => {
                             p = self.target(j.proc);
                             self.bind(p, vals, &mut env);
-                            self.safe_point(p, &env);
+                            self.safe_point(p, &mut env);
                         }
-                        Some(fr) => {
+                        Some(mut fr) => {
                             let callee = self.target(j.proc);
-                            let r = self.waiting(&fr, || self.call(callee, vals));
+                            let r = self.waiting(&mut fr, || self.call(callee, vals));
                             p = self.enter_frame(fr, V::Val(r), &mut env);
                         }
                     }
@@ -2011,12 +2018,12 @@ impl Vm {
                         None => {
                             p = m;
                             env = self.enter_method(t, m, ncap, vals);
-                            self.safe_point(p, &env);
+                            self.safe_point(p, &mut env);
                         }
-                        Some(fr) => {
-                            let r = self.waiting(&fr, || {
-                                let e = self.enter_method(t, m, ncap, vals);
-                                self.safe_point(m, &e);
+                        Some(mut fr) => {
+                            let r = self.waiting(&mut fr, || {
+                                let mut e = self.enter_method(t, m, ncap, vals);
+                                self.safe_point(m, &mut e);
                                 self.exec(m, e)
                             });
                             p = self.enter_frame(fr, V::Val(r), &mut env);
@@ -2035,7 +2042,7 @@ impl Vm {
                     let r = match c.callee {
                         Callee::Proc(q) => {
                             let q = self.target(q);
-                            self.waiting_in(&c.held, &env, || self.call(q, vals))
+                            self.waiting_in(&c.held, &mut env, || self.call(q, vals))
                         }
                         Callee::Method { target, tag } => {
                             let t = self.val(target, &mut env);
@@ -2043,9 +2050,9 @@ impl Vm {
                                 fail("the null continuation was given a frame");
                             }
                             let (m, ncap) = self.method(method_of(t) + tag as usize);
-                            self.waiting_in(&c.held, &env, || {
-                                let e = self.enter_method(t, m, ncap, vals);
-                                self.safe_point(m, &e);
+                            self.waiting_in(&c.held, &mut env, || {
+                                let mut e = self.enter_method(t, m, ncap, vals);
+                                self.safe_point(m, &mut e);
                                 self.exec(m, e)
                             })
                         }
@@ -2226,7 +2233,7 @@ impl Vm {
     /// Run `call`, which `fr` is waiting on: with what `fr` holds on the
     /// shadow chain while it runs, where a discarded continuation or a
     /// collection can find it (`meadow_silo::shadow`).
-    fn waiting(&self, fr: &Frame, call: impl FnOnce() -> Word) -> Word {
+    fn waiting(&self, fr: &mut Frame, call: impl FnOnce() -> Word) -> Word {
         if !self.shadow {
             return call();
         }
@@ -2234,21 +2241,23 @@ impl Vm {
         let mut rec: SmallVec<[i64; 18]> = SmallVec::new();
         rec.push(prev as i64);
         rec.push(0);
-        held(fr, &mut rec);
+        held(fr, &mut rec, self.moving);
         if rec.len() == 2 {
             return call();
         }
         rec[1] = (rec.len() as i64 - 2) / 2;
-        meadow_silo::shadow::set(rec.as_ptr() as Word);
+        meadow_silo::shadow::set(rec.as_mut_ptr() as Word);
         let r = call();
         meadow_silo::shadow::set(prev);
-        drop(rec);
+        if self.moving {
+            unheld(fr, &rec, &mut 2);
+        }
         r
     }
 
     /// [`Vm::waiting`], for a frame never made: what it would have held is in
     /// `env`, where `held` says.
-    fn waiting_in(&self, held: &[(U, Hold)], env: &[V], call: impl FnOnce() -> Word) -> Word {
+    fn waiting_in(&self, held: &[(U, Hold)], env: &mut [V], call: impl FnOnce() -> Word) -> Word {
         if !self.shadow {
             return call();
         }
@@ -2257,40 +2266,53 @@ impl Vm {
         rec.push(prev as i64);
         rec.push(0);
         for (u, h) in held {
-            hold(&env[u.s as usize], d(u.d, env), *h, &mut rec);
+            hold(&env[u.s as usize], d(u.d, env), *h, &mut rec, self.moving);
         }
         if rec.len() == 2 {
             return call();
         }
         rec[1] = (rec.len() as i64 - 2) / 2;
-        meadow_silo::shadow::set(rec.as_ptr() as Word);
+        meadow_silo::shadow::set(rec.as_mut_ptr() as Word);
         let r = call();
         meadow_silo::shadow::set(prev);
-        drop(rec);
+        // What it held, where the collection left it: in the same order.
+        if self.moving {
+            let mut at = 2;
+            for (u, h) in held {
+                let dd = d(u.d, env);
+                unhold(&mut env[u.s as usize], dd, *h, &rec, &mut at);
+            }
+        }
         r
     }
 
     /// Under tracing, where a function begins: if a collection is due, run it
     /// with the parameters on the shadow chain.
-    fn safe_point(&self, p: u32, env: &[V]) {
+    fn safe_point(&self, p: u32, env: &mut [V]) {
         if !self.tracing || meadow_silo::trace::meadow_gc_due.load(Ordering::Relaxed) == 0 {
             return;
         }
         let prev = meadow_silo::shadow::head();
         let mut rec: Vec<i64> = vec![prev as i64, 0];
+        let mut at = Vec::new();
         for (i, pd) in self.proc(p).params.iter().enumerate() {
             if let V::Val(v) = env[i] {
                 let dd = d(*pd, env);
                 if dd == desc::REF {
                     rec.push(v as i64);
                     rec.push(dd);
+                    at.push(i);
                 }
             }
         }
         rec[1] = (rec.len() as i64 - 2) / 2;
-        meadow_silo::shadow::set(rec.as_ptr() as Word);
+        meadow_silo::shadow::set(rec.as_mut_ptr() as Word);
         meadow_silo::trace::meadow_gc_poll(meadow_silo::ctx::get());
         meadow_silo::shadow::set(prev);
+        // Where the collection left them, if it moved them.
+        for (k, i) in at.into_iter().enumerate() {
+            env[i] = V::Val(rec[2 + 2 * k] as Word);
+        }
     }
 
     /// A method's entry: its captures loaded out of the closure `obj`, which
@@ -2770,17 +2792,48 @@ fn take_val(env: &mut [V], s: Slot) -> V {
 
 /// What giving `fr` up would give up: each value it owns, with its
 /// descriptor, or `TOKEN` for a reuse token.
-fn held(fr: &Frame, out: &mut SmallVec<[i64; 18]>) {
+/// What `fr` holds, onto a record: what it owns -- and what it borrows too,
+/// with `all`, for a collector that moves blocks and must find every
+/// reference to one, not only the one that keeps it alive.
+fn held(fr: &Frame, out: &mut SmallVec<[i64; 18]>, all: bool) {
     for (c, dd, h) in &fr.captured {
-        hold(c, *dd, *h, out);
+        hold(c, *dd, *h, out, all);
+    }
+}
+
+/// What a record made by [`held`] says now, back into `fr`: from `at`, in the
+/// order it was recorded.
+fn unheld(fr: &mut Frame, rec: &[i64], at: &mut usize) {
+    for (c, dd, h) in &mut fr.captured {
+        unhold(c, *dd, *h, rec, at);
+    }
+}
+
+/// One of what a frame holds, read back as [`hold`] recorded it, with
+/// everything recorded.
+fn unhold(c: &mut V, dd: i64, h: Hold, rec: &[i64], at: &mut usize) {
+    match (c, h) {
+        (V::Empty, _) => {}
+        (V::Frame(inner), _) => unheld(inner, rec, at),
+        (V::Val(v), Hold::Token) => {
+            *v = rec[*at] as Word;
+            *at += 2;
+        }
+        (V::Val(v), _) => {
+            if dd == desc::REF || !is_known(dd) {
+                *v = rec[*at] as Word;
+                *at += 2;
+            }
+        }
     }
 }
 
 /// One of what a frame holds, as [`held`] records it.
-fn hold(c: &V, dd: i64, h: Hold, out: &mut SmallVec<[i64; 18]>) {
+fn hold(c: &V, dd: i64, h: Hold, out: &mut SmallVec<[i64; 18]>, all: bool) {
     match (c, h) {
-        (_, Hold::Borrowed) | (V::Empty, _) => {}
-        (V::Frame(inner), _) => held(inner, out),
+        (_, Hold::Borrowed) if !all => {}
+        (V::Empty, _) => {}
+        (V::Frame(inner), _) => held(inner, out, all),
         (V::Val(v), Hold::Token) => {
             out.push(*v as i64);
             out.push(meadow_silo::shadow::TOKEN);
