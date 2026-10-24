@@ -550,12 +550,9 @@ fn copy(inside: &mut Inside, r: *const Region, v: Word, d: i64) -> Result<Word, 
         }
         let new = to as Word;
         // Never counted again: see the module docs.
-        heap::set_word(
-            new,
-            0,
-            ((heap::len(b) as Word) << 32) | Word::from(heap::STICKY),
-        );
+        heap::set_word(new, 0, heap::word(b, 0));
         heap::set_word(new, 1, heap::word(b, 1) & !heap::MARKS);
+        heap::set_count(new, heap::STICKY);
         // A compact inside this one keeps its own region, which this copy of
         // the block now names as well.
         if heap::kind(new) == heap::COMPACT {

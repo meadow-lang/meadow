@@ -205,7 +205,8 @@ impl World for Here {
 
     fn maybe(&self, v: Val, what: &str) -> Result<Option<Val>, String> {
         if let Val::Ref(w) = v {
-            if w & 1 == 1 && show::role_of(&show::ctor_name((w >> 1) as usize)) == Some(Role::None)
+            if heap::is_immediate(w)
+                && show::role_of(&show::ctor_name(heap::payload(w) as usize)) == Some(Role::None)
             {
                 return Ok(None);
             }

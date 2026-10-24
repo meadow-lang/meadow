@@ -444,7 +444,7 @@ unsafe extern "C" {
 
 /// No handlers: what a thread starts with.
 fn no_evidence() -> Word {
-    (u64::from(value::tag(meadow_rt::roles::evidence::NONE)) << 1) | 1
+    heap::immediate(u64::from(value::tag(meadow_rt::roles::evidence::NONE)))
 }
 
 fn cx() -> &'static mut Ctx {

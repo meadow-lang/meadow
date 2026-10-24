@@ -230,13 +230,11 @@ fn cost(v: Word) -> usize {
 /// the header holds one fewer. It goes negative while the mark pass has taken
 /// the inside edges away, which is the whole point of the pass.
 fn refs(v: Word) -> i32 {
-    // Safety: a live block's count.
-    (unsafe { *(v as *const u32) } as i32) + 1
+    (heap::count(v) as i32) + 1
 }
 
 fn set_refs(v: Word, n: i32) {
-    // Safety: as `refs`.
-    unsafe { *(v as *mut u32) = (n - 1) as u32 }
+    heap::set_count(v, (n - 1) as u32)
 }
 
 /// What the collector has done, for `MEADOW_SILO_CYCLES`: runs, candidates

@@ -259,6 +259,12 @@ pub extern "C" fn meadow_gc_poll(c: *mut Ctx) {
     }
 }
 
+/// Whether the block of a page at `v` is free: its kind's word is zero, as a
+/// block on a free list's is, and no live block's ever is.
+fn free(v: Word) -> bool {
+    heap::word(v, heap::LAYOUT.kind.word) == 0
+}
+
 /// Mark what `cx`'s thread can reach, and sweep the rest of its heap.
 pub fn collect(cx: &mut Ctx) {
     let started = std::time::Instant::now();
@@ -323,10 +329,10 @@ pub fn collect(cx: &mut Ctx) {
                 // Safety: block `k` of the page.
                 let b = unsafe { p.add(k * class) };
                 let v = b as Word;
-                if heap::word(v, 1) == 0 {
+                if free(v) {
                     continue;
                 }
-                if heap::word(v, 0) as u32 == epoch {
+                if heap::count(v) == epoch {
                     kept_words += class;
                 } else {
                     dying.push((v, class));
@@ -337,7 +343,7 @@ pub fn collect(cx: &mut Ctx) {
     let mut large_dying = Vec::new();
     for (&p, &words) in &space.large {
         let v = p as Word;
-        if heap::word(v, 0) as u32 == epoch {
+        if heap::count(v) == epoch {
             kept_words += words;
         } else {
             large_dying.push((v, words));
@@ -415,15 +421,14 @@ fn renumber(space: &mut Space) {
             for k in 0..blocks {
                 // Safety: block `k` of the page.
                 let v = unsafe { p.add(k * class) } as Word;
-                if heap::word(v, 1) != 0 {
-                    heap::set_word(v, 0, heap::word(v, 0) & !0xFFFF_FFFF);
+                if !free(v) {
+                    heap::set_count(v, 0);
                 }
             }
         }
     }
     for &p in space.large.keys() {
-        let v = p as Word;
-        heap::set_word(v, 0, heap::word(v, 0) & !0xFFFF_FFFF);
+        heap::set_count(p as Word, 0);
     }
     space.epoch = 1;
 }
@@ -462,7 +467,7 @@ impl Marker {
 
     /// Mark the block at `v`, and queue what it holds.
     fn visit(&mut self, v: Word, cx: &Ctx) {
-        let count = heap::word(v, 0) as u32;
+        let count = heap::count(v);
         if count >= heap::REGION_FLOOR {
             // Inside a compact region, which is never looked inside: what is
             // noted is that the heap still points into it.
@@ -474,11 +479,7 @@ impl Marker {
         if count == self.epoch {
             return;
         }
-        heap::set_word(
-            v,
-            0,
-            (heap::word(v, 0) & !0xFFFF_FFFF) | u64::from(self.epoch),
-        );
+        heap::set_count(v, self.epoch);
         match heap::kind(v) {
             heap::STRING | heap::BIGINT => {}
             // A suspended continuation: what its segments' frames hold.

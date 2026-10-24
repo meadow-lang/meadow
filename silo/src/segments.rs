@@ -415,11 +415,7 @@ pub(crate) fn leave_thread() {
 
 fn set_meta(v: Word, m: u32) {
     if heap::is_block(v) {
-        heap::set_word(
-            v,
-            1,
-            (heap::word(v, 1) & 0xFFFF_FFFF) | (u64::from(m) << 32),
-        );
+        heap::set_meta(v, m);
     }
 }
 

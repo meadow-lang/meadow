@@ -115,7 +115,7 @@ pub fn new_bigint(n: &BigInt) -> Word {
     let limbs = n.magnitude().to_u64_digits();
     let v = heap::build_uniform(heap::BIGINT, meta, limbs.len(), desc::INT);
     for (i, l) in limbs.iter().enumerate() {
-        heap::set_word(v, 2 + i, *l);
+        heap::set_word(v, heap::ELEMS + i, *l);
     }
     v
 }

@@ -188,8 +188,8 @@ fn is_vector_ctor(name: &str) -> bool {
 
 /// The constructor `v` was built with, if it is data.
 fn ctor_of(v: Word) -> Option<String> {
-    if v & 1 == 1 {
-        return Some(ctor_name((v >> 1) as usize));
+    if heap::is_immediate(v) {
+        return Some(ctor_name(heap::payload(v) as usize));
     }
     (heap::is_block(v) && heap::kind(v) == heap::DATA).then(|| ctor_name(heap::meta(v) as usize))
 }
@@ -209,8 +209,8 @@ pub fn vector_elems(v: Word) -> Option<Vec<(Word, i64)>> {
     // what is not a vector: which constructors are a vector's is worked out
     // once, so that saying no costs no name.
     static VECTORS: std::sync::OnceLock<Vec<bool>> = std::sync::OnceLock::new();
-    let tag = if v & 1 == 1 {
-        (v >> 1) as usize
+    let tag = if heap::is_immediate(v) {
+        heap::payload(v) as usize
     } else if heap::is_block(v) && heap::kind(v) == heap::DATA {
         heap::meta(v) as usize
     } else {
@@ -300,12 +300,8 @@ impl meadow_rt::look::Look for Shown {
                 Shape::Word(meadow_rt::num::Width::ALL[(d - desc::WORD) as usize], v)
             }
             _ if v == 0 => Shape::Continuation,
-            _ if v & 1 == 1 || heap::kind(v) == heap::DATA => {
-                let tag = if v & 1 == 1 {
-                    v >> 1
-                } else {
-                    u64::from(heap::meta(v))
-                };
+            _ if heap::is_immediate(v) || heap::kind(v) == heap::DATA => {
+                let tag = u64::from(heap::meta_of(v));
                 let name = ctor_of(v).filter(|n| !n.is_empty());
                 Shape::Data(name, tag, fields_of(v))
             }

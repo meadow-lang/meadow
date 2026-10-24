@@ -500,7 +500,37 @@ fn with_in<T>(c: *mut crate::ctx::Ctx, f: impl FnOnce(&mut Heap) -> T) -> T {
 /// Is `v` the address of a block?
 #[inline]
 pub fn is_block(v: Word) -> bool {
-    v != 0 && v & 1 == 0
+    LAYOUT.is_block(v)
+}
+
+/// Is `v` a value with no block: a constructor with no fields, a closure
+/// with no captures?
+#[inline]
+pub fn is_immediate(v: Word) -> bool {
+    v & LAYOUT.imm_mask == LAYOUT.imm_tag
+}
+
+/// The value with no block that carries `payload` -- a tag, a method base.
+#[inline]
+pub const fn immediate(payload: u64) -> Word {
+    LAYOUT.immediate(payload)
+}
+
+/// What the value with no block `v` carries.
+#[inline]
+pub const fn payload(v: Word) -> u64 {
+    LAYOUT.payload(v)
+}
+
+/// The tag of a constructor, or the method base of a closure, whether it has
+/// a block or not: what a `switch` and an `invoke` read.
+#[inline]
+pub fn meta_of(v: Word) -> u32 {
+    if is_immediate(v) {
+        payload(v) as u32
+    } else {
+        meta(v)
+    }
 }
 
 #[inline]
@@ -522,28 +552,59 @@ pub fn set_word(v: Word, i: usize, w: Word) {
 }
 
 pub fn len(v: Word) -> usize {
-    (word(v, 0) >> 32) as usize
+    LAYOUT.len.get(word(v, LAYOUT.len.word)) as usize
 }
 
 pub fn kind(v: Word) -> u64 {
-    word(v, 1) & 0xFF
+    LAYOUT.kind.get(word(v, LAYOUT.kind.word))
 }
 
 pub fn meta(v: Word) -> u32 {
-    (word(v, 1) >> 32) as u32
+    LAYOUT.meta.get(word(v, LAYOUT.meta.word)) as u32
 }
 
 pub(crate) fn uniform(v: Word) -> bool {
-    word(v, 1) & UNIFORM != 0
+    LAYOUT.uniform.get(word(v, LAYOUT.uniform.word)) != 0
+}
+
+/// The references to `v` besides one.
+#[inline]
+pub fn count(v: Word) -> u32 {
+    LAYOUT.count.get(word(v, LAYOUT.count.word)) as u32
+}
+
+#[inline]
+pub fn set_count(v: Word, rc: u32) {
+    let at = LAYOUT.count.word;
+    set_word(v, at, LAYOUT.count.set(word(v, at), u64::from(rc)));
+}
+
+/// Where a uniform block's elements begin -- an array's, a big integer's
+/// limbs: right after its header, with no descriptors before them.
+pub const ELEMS: usize = LAYOUT.first_field(0, true);
+
+/// Set `v`'s length to `n`, keeping the rest of its header.
+pub fn set_len(v: Word, n: usize) {
+    let at = LAYOUT.len.word;
+    set_word(v, at, LAYOUT.len.set(word(v, at), n as u64));
+}
+
+/// Set the `meta` of the block at `v` -- a constructor's tag, a segment's
+/// number -- keeping the rest of its header.
+pub fn set_meta(v: Word, m: u32) {
+    let at = LAYOUT.meta.word;
+    set_word(v, at, LAYOUT.meta.set(word(v, at), u64::from(m)));
+}
+
+/// Set the one descriptor of the uniform block at `v`'s elements.
+pub fn set_elem_desc(v: Word, d: i64) {
+    let at = LAYOUT.elem_desc.word;
+    set_word(v, at, LAYOUT.elem_desc.set(word(v, at), d as u64));
 }
 
 /// Where the fields start.
 pub fn first_field(v: Word) -> usize {
-    if uniform(v) {
-        2
-    } else {
-        2 + len(v).div_ceil(16)
-    }
+    LAYOUT.first_field(len(v), uniform(v))
 }
 
 /// Words the block takes.
@@ -577,9 +638,10 @@ pub fn array_room(n: usize) -> usize {
 /// Field `i`'s descriptor.
 pub fn field_desc(v: Word, i: usize) -> i64 {
     if uniform(v) {
-        ((word(v, 1) >> DESC_SHIFT) & 15) as i64
+        LAYOUT.elem_desc.get(word(v, LAYOUT.elem_desc.word)) as i64
     } else {
-        ((word(v, 2 + i / 16) >> (4 * (i % 16))) & 15) as i64
+        let (at, shift) = LAYOUT.desc_at(i);
+        ((word(v, at) >> shift) & LAYOUT.desc_mask()) as i64
     }
 }
 
@@ -591,9 +653,9 @@ pub fn field(v: Word, i: usize) -> Word {
 pub fn set_field(v: Word, i: usize, x: Word, d: i64) {
     set_word(v, first_field(v) + i, x);
     if !uniform(v) {
-        let at = 2 + i / 16;
-        let shift = 4 * (i % 16);
-        let w = (word(v, at) & !(15 << shift)) | (((d as u64) & 15) << shift);
+        let (at, shift) = LAYOUT.desc_at(i);
+        let mask = LAYOUT.desc_mask();
+        let w = (word(v, at) & !(mask << shift)) | (((d as u64) & mask) << shift);
         set_word(v, at, w);
     }
 }

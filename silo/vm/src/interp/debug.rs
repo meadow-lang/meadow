@@ -454,15 +454,12 @@ impl Debugger {
             if out.len() >= max || k == 0 {
                 return;
             }
-            let closure = k & 1 == 1 || (heap::is_block(k) && heap::kind(k) == heap::CLOSURE);
+            let closure =
+                heap::is_immediate(k) || (heap::is_block(k) && heap::kind(k) == heap::CLOSURE);
             if !closure {
                 return;
             }
-            let base = if k & 1 == 1 {
-                (k >> 1) as usize
-            } else {
-                heap::meta(k) as usize
-            };
+            let base = heap::meta_of(k) as usize;
             let Some((proc, ncap)) = v.method_checked(base) else {
                 return;
             };
@@ -619,7 +616,8 @@ fn parent_of(k: Word) -> Option<Word> {
     let v = vm();
     let mut k = k;
     for _ in 0..100_000 {
-        let closure = k & 1 == 1 || (heap::is_block(k) && heap::kind(k) == heap::CLOSURE);
+        let closure =
+            heap::is_immediate(k) || (heap::is_block(k) && heap::kind(k) == heap::CLOSURE);
         if k == 0 || !closure || !heap::is_block(k) {
             return None;
         }

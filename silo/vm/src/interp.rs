@@ -1900,11 +1900,7 @@ impl Vm {
                 Ins::Switch(i) => {
                     let sw = &code.switches[i as usize];
                     let v = self.val(sw.scrutinee, &mut env);
-                    let tag = if v & 1 == 1 {
-                        v >> 1
-                    } else {
-                        u64::from(heap::meta(v))
-                    };
+                    let tag = u64::from(heap::meta_of(v));
                     match sw.arms.iter().find(|a| a.tag == tag) {
                         Some(a) => {
                             let loaded = load_fields(v, a.fields.len());
@@ -2466,7 +2462,7 @@ impl Vm {
     /// block.
     fn build_in(&self, tag: u32, vals: &[Word], descs: &[i64], token: Option<Word>) -> Word {
         if vals.is_empty() {
-            return (u64::from(tag) << 1) | 1;
+            return heap::immediate(u64::from(tag));
         }
         match token {
             Some(t) if t != 0 => {
@@ -2833,7 +2829,7 @@ fn binary(p: Prim, kind: PK, a: Word, b: Word, left: i64) -> Word {
 /// A closure whose first method is `base` in the table.
 fn build_closure(base: u32, vals: &[Word], descs: &[i64]) -> Word {
     if vals.is_empty() {
-        return (u64::from(base) << 1) | 1;
+        return heap::immediate(u64::from(base));
     }
     heap::build(heap::CLOSURE, base, vals, descs)
 }
@@ -2841,11 +2837,7 @@ fn build_closure(base: u32, vals: &[Word], descs: &[i64]) -> Word {
 /// Where in the method table the closure `obj`'s methods begin: the number a
 /// closure with no block carries, or its block's `meta`.
 fn method_of(obj: Word) -> usize {
-    if obj & 1 == 1 {
-        (obj >> 1) as usize
-    } else {
-        heap::meta(obj) as usize
-    }
+    heap::meta_of(obj) as usize
 }
 
 /// `n` fields of the non-uniform block `v`.
@@ -2853,34 +2845,43 @@ fn load_fields(v: Word, n: usize) -> Words {
     if n == 0 {
         return Words::new();
     }
-    let first = 2 + n.div_ceil(16);
+    let first = heap::LAYOUT.first_field(n, false);
     (0..n).map(|i| heap::word(v, first + i)).collect()
 }
 
 /// The references to `v` besides one.
 fn count(v: Word) -> u32 {
-    heap::word(v, 0) as u32
+    heap::count(v)
 }
 
 fn set_count(v: Word, rc: u32) {
-    heap::set_word(v, 0, (heap::word(v, 0) & !0xFFFF_FFFF) | u64::from(rc));
+    heap::set_count(v, rc)
 }
 
-/// Write the block at `b` whole: what `heap::build` writes into new memory.
+/// Write the block at `b` whole: what `heap::build` writes into new memory --
+/// its count none beyond the one, its length, kind and `meta`, its fields'
+/// descriptors packed as the layout packs them, and its fields.
 fn write_block(b: Word, kind: u64, meta: u32, vals: &[Word], descs: &[i64]) {
+    let l = heap::LAYOUT;
     let n = vals.len();
-    let dw = n.div_ceil(16);
-    heap::set_word(b, 0, (n as u64) << 32);
-    heap::set_word(b, 1, kind | (u64::from(meta) << 32));
-    for w in 0..dw {
-        let mut bits = 0u64;
-        for (j, d) in descs.iter().enumerate().skip(16 * w).take(16) {
-            bits |= ((*d as u64) & 15) << (4 * (j - 16 * w));
-        }
-        heap::set_word(b, 2 + w, bits);
+    let mut header = [0u64; 4];
+    header[l.len.word] |= l.len.put(n as u64);
+    header[l.kind.word] |= l.kind.put(kind);
+    header[l.meta.word] |= l.meta.put(u64::from(meta));
+    for (i, h) in header.iter().enumerate().take(l.header_words) {
+        heap::set_word(b, i, *h);
     }
+    let per = l.descs_per_word;
+    for w in 0..l.desc_words(n) {
+        let mut bits = 0u64;
+        for (j, d) in descs.iter().enumerate().skip(per * w).take(per) {
+            bits |= ((*d as u64) & l.desc_mask()) << ((j - per * w) as u32 * l.desc_bits);
+        }
+        heap::set_word(b, l.header_words + w, bits);
+    }
+    let first = l.first_field(n, false);
     for (i, x) in vals.iter().enumerate() {
-        heap::set_word(b, 2 + dw + i, *x);
+        heap::set_word(b, first + i, *x);
     }
 }
 
