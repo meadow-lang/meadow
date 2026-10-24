@@ -377,6 +377,7 @@ pub fn collect(cx: &mut Ctx) {
     space.since = 0;
     space.budget = (GROWTH * kept_words).max(LEAST);
     space.collections += 1;
+    crate::stats::collected(started.elapsed().as_nanos() as u64);
     if space.due {
         space.due = false;
         settled();

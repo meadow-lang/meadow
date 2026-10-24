@@ -269,15 +269,39 @@ thread_local! {
     };
 }
 
-/// Is the collector's tally wanted? `MEADOW_SILO_CYCLES`.
+/// Is the collector's tally wanted? `MEADOW_SILO_CYCLES`, or the summary of
+/// `crate::stats`.
 pub fn counting() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| said() || crate::stats::on())
+}
+
+/// Is it to be said in full? `MEADOW_SILO_CYCLES`.
+fn said() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("MEADOW_SILO_CYCLES").is_some())
 }
 
+/// What this thread's collector has done: runs, blocks freed, nanoseconds
+/// in all and the longest.
+pub fn tally() -> Tally {
+    TALLY.with(|t| {
+        let t = t.borrow();
+        Tally {
+            runs: t.runs,
+            candidates: t.candidates,
+            freed: t.freed,
+            nanos: t.nanos,
+            longest: t.longest,
+            deferred: t.deferred,
+            unbounded: t.unbounded,
+        }
+    })
+}
+
 /// What this thread's collector has done.
 pub fn report() {
-    if !counting() {
+    if !said() {
         return;
     }
     TALLY.with(|t| {

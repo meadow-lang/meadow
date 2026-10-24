@@ -34,6 +34,7 @@ pub mod segments;
 pub mod shadow;
 pub mod show;
 pub mod stack;
+pub mod stats;
 pub mod trace;
 pub mod value;
 
@@ -332,6 +333,7 @@ pub unsafe extern "C" fn meadow_run(
     // Safety: the emitted module defines it.
     let d = unsafe { meadow_result_desc };
     let run = move || {
+        let began = std::time::Instant::now();
         // What `main` answers is in its heap, which stays current here.
         allocator();
         memory::start();
@@ -342,6 +344,7 @@ pub unsafe extern "C" fn meadow_run(
         let text = show::show(v, d);
         prims::report();
         cycles::report();
+        stats::report(began.elapsed());
         heap::quarantined();
         heap::erase(v, d);
         if std::env::var_os("MEADOW_SILO_LEAKS").is_some() {

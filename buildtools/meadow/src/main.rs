@@ -72,8 +72,11 @@ enum Cmd {
         profile: ProfileArgs,
         #[command(flatten)]
         engine: EngineArgs,
-        /// After running, report what the garbage collector did (VM only): how
-        /// many collections, how long they took, and how much they copied.
+        /// After running, report what the garbage collector did: on Glade's
+        /// VM, how many collections, how long they took, and how much they
+        /// copied; on Silo, natively or interpreted, its collections and
+        /// pauses when memory is traced, and its blocks and cycle collections
+        /// when it is counted.
         #[arg(long)]
         gc_stats: bool,
         /// Sample where the program spends itself and write folded stacks to
@@ -1702,6 +1705,11 @@ fn finish(
                     std::process::Command::new(&exe)
                 };
                 command.args(meadow_compiler::core::args::get());
+                // What its memory did, said by the runtime at the end: either
+                // engine, either strategy.
+                if gc_stats {
+                    command.env("MEADOW_SILO_GC_STATS", "1");
+                }
                 if let (true, Some((root, _))) = (watching, package) {
                     std::process::exit(meadow::watch::run(command, root));
                 }

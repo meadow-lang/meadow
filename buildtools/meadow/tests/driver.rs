@@ -764,3 +764,47 @@ fn the_merged_runtime_s_vm_says_what_a_program_reached_as_glade_does() {
     assert_eq!(said(&["--runtime", "silo", "--interpret"]), "0 True True");
     assert_eq!(said(&["--runtime", "silo"]), "0 False False");
 }
+
+#[test]
+fn gc_stats_say_what_memory_did_on_the_merged_runtime_s_vm() {
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("meadow-vm-gc-stats-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("Gc/src")).unwrap();
+    std::fs::write(
+        dir.join("Gc/Meadow.toml"),
+        "[package]\nname = \"Gc\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("Gc/src/Main.mw"),
+        "use Std.Collections.Vector as V\n\n\
+         fun main () = println (V.len (V.map (\\x -> [x, x + 1]) (V.range 0 20000)))\n",
+    )
+    .unwrap();
+    for (gc, says) in [("rc", "gc: counted:"), ("tracing", "gc: traced:")] {
+        let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
+            .args([
+                "run",
+                "--runtime",
+                "silo",
+                "--interpret",
+                "--gc",
+                gc,
+                "--gc-stats",
+            ])
+            .arg(dir.join("Gc"))
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{err}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "20000");
+        assert!(
+            err.contains(says) && err.contains("gc: heaps"),
+            "{gc}: {err}"
+        );
+    }
+}
