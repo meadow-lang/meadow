@@ -11,11 +11,25 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+/// A request to GitHub's API for `url`.
+///
+/// With the token in `GITHUB_TOKEN`, where it is set: a CI job's unnamed
+/// requests share its runner's address's rate limit, which a busy provider's
+/// runners use up, and then GitHub answers 403.
+fn api(url: &str) -> Command {
+    let mut curl = Command::new(curl());
+    curl.args(["-fsSL", "-H", "Accept: application/vnd.github+json"]);
+    if let Some(token) = std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty()) {
+        curl.arg("-H").arg(format!("Authorization: Bearer {token}"));
+    }
+    curl.arg(url);
+    curl
+}
+
 /// The tag of the newest release.
 pub fn latest_tag() -> Result<String, String> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let out = Command::new(curl())
-        .args(["-fsSL", "-H", "Accept: application/vnd.github+json", &url])
+    let out = api(&url)
         .output()
         .map_err(|e| format!("could not run curl: {e}"))?;
     if !out.status.success() {
@@ -36,8 +50,7 @@ pub fn release_name(tag: &str) -> Result<String, String> {
         return Err(format!("`{tag}` is not a release tag"));
     }
     let url = format!("https://api.github.com/repos/{REPO}/releases/tags/{tag}");
-    let out = Command::new(curl())
-        .args(["-fsSL", "-H", "Accept: application/vnd.github+json", &url])
+    let out = api(&url)
         .output()
         .map_err(|e| format!("could not run curl: {e}"))?;
     if !out.status.success() {

@@ -187,7 +187,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-axcut"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "meadow-intern",
  "meadow-rt",
@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "meadow-hir",
  "meadow-infer",
@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-diagnostics"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ariadne",
  "chumsky",
@@ -221,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-eval"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "meadow-core",
  "meadow-intern",
@@ -231,7 +231,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-hir"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "meadow-axcut",
  "meadow-intern",
@@ -244,7 +244,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-infer"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "meadow-diagnostics",
  "meadow-hir",
@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-intern"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "lasso",
  "once_cell",
@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-rt"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "meadow-intern",
@@ -279,7 +279,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-span"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chumsky",
  "serde",
