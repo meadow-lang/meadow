@@ -27,33 +27,38 @@
 //! field; Meadow has arrays and strings, which want indexing, so blocks come in
 //! a size class per word count, with anything bigger allocated on its own.
 
-/// What word 1's low byte says a block is. `meadow_llvm::emit::kind` agrees.
-pub const DATA: u64 = 1;
-pub const CLOSURE: u64 = 2;
-pub const STRING: u64 = 3;
-pub const ARRAY: u64 = 4;
-pub const BIGINT: u64 = 5;
-pub const CELL: u64 = 6;
-pub const RECORD: u64 = 7;
-pub const MUT_ARRAY: u64 = 8;
-/// A resumption's one-shot flag.
-pub const ONCE: u64 = 9;
-pub const COMPACT: u64 = 10;
-pub const CHANNEL: u64 = 11;
-pub const TASK: u64 = 12;
-pub const TVAR: u64 = 13;
-/// A suspended stack segment: see `crate::segments`.
-pub const STACK: u64 = 14;
-/// What a compact's values live in: see `crate::prims`, `Compact`.
-pub const REGION: u64 = 15;
+/// The layout all of this is: `meadow_rt::layout::SILO`, which the emitted
+/// code and the interpreter read too. The constants below are its, by the
+/// names this module has always given them.
+pub const LAYOUT: meadow_rt::layout::Layout = meadow_rt::layout::SILO;
 
-pub const DESC_SHIFT: u32 = 8;
-pub const UNIFORM: u64 = 1 << 12;
+/// What word 1's low byte says a block is.
+pub const DATA: u64 = LAYOUT.kinds.data;
+pub const CLOSURE: u64 = LAYOUT.kinds.closure;
+pub const STRING: u64 = LAYOUT.kinds.string;
+pub const ARRAY: u64 = LAYOUT.kinds.array;
+pub const BIGINT: u64 = LAYOUT.kinds.bigint;
+pub const CELL: u64 = LAYOUT.kinds.cell;
+pub const RECORD: u64 = LAYOUT.kinds.record;
+pub const MUT_ARRAY: u64 = LAYOUT.kinds.mut_array;
+/// A resumption's one-shot flag.
+pub const ONCE: u64 = LAYOUT.kinds.once;
+pub const COMPACT: u64 = LAYOUT.kinds.compact;
+pub const CHANNEL: u64 = LAYOUT.kinds.channel;
+pub const TASK: u64 = LAYOUT.kinds.task;
+pub const TVAR: u64 = LAYOUT.kinds.tvar;
+/// A suspended stack segment: see `crate::segments`.
+pub const STACK: u64 = LAYOUT.kinds.stack;
+/// What a compact's values live in: see `crate::prims`, `Compact`.
+pub const REGION: u64 = LAYOUT.kinds.region;
+
+pub const DESC_SHIFT: u32 = LAYOUT.elem_desc.shift;
+pub const UNIFORM: u64 = LAYOUT.uniform.bits_in_place();
 
 /// What the cycle collector keeps in word 1, where a fresh block has zeroes:
 /// a colour, whether the block is waiting in the candidate buffer, and
 /// whether it died while it was waiting. See [`crate::cycles`].
-pub const COLOUR_SHIFT: u32 = 13;
+pub const COLOUR_SHIFT: u32 = LAYOUT.colour.shift;
 pub const BLACK: u64 = 0;
 pub const GRAY: u64 = 1;
 pub const WHITE: u64 = 2;
@@ -72,12 +77,12 @@ const MOVED: u64 = 1 << 17;
 /// and it puts the count somewhere no ordinary block's ever is, so a share or
 /// an erase can tell it is touching a region from the count it has loaded
 /// anyway.
-pub const STICKY: u32 = 1 << 30;
+pub const STICKY: u32 = LAYOUT.sticky as u32;
 
 /// A count this big is a block inside a compact region and nothing else: half
 /// the bias, so no amount of drift in either direction is mistaken either
 /// way. `meadow_llvm::emit`'s helpers test the same number inline.
-pub const REGION_FLOOR: u32 = STICKY / 2;
+pub const REGION_FLOOR: u32 = LAYOUT.region_floor as u32;
 
 /// Is `v` a block inside a compact region? Ask only of a word a descriptor
 /// says is a reference: an `Int` that happens to be even is not an address.
@@ -92,7 +97,7 @@ pub fn in_region(v: Word) -> bool {
 /// block is built and never changed, so that the emitted counting helper can
 /// ask this and the colour in one test -- `meadow_llvm::emit::helpers`, which
 /// has the constant, must agree with these bits.
-pub const MUTABLE: u64 = 1 << 18;
+pub const MUTABLE: u64 = LAYOUT.mutable.bits_in_place();
 
 /// Everything in word 1 that is one heap's collector talking to itself: the
 /// colour, whether the block is waiting in that heap's candidate list, and

@@ -17,6 +17,7 @@ pub mod console;
 pub mod desc;
 pub mod ffi;
 pub mod hash;
+pub mod layout;
 pub mod log;
 pub mod look;
 pub mod net;
