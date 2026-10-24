@@ -3,7 +3,7 @@
 [package]
 name = "meadow-eval"
 description = "The Meadow back end: a CEK abstract machine that evaluates lowered `core` programs, with algebraic-effect handlers. Its own workspace; depends on the compiler only for the `core` IR."
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 
 [lib]
