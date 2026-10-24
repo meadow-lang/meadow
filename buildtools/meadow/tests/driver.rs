@@ -659,3 +659,64 @@ fn the_repl_evaluates_on_the_merged_runtime_s_vm() {
         assert!(out.contains(want), "no `{want}` in:\n{out}");
     }
 }
+
+#[test]
+fn a_profile_of_a_program_on_the_merged_runtime_s_vm_names_its_functions() {
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("meadow-vm-profile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("Prof/src")).unwrap();
+    std::fs::write(
+        dir.join("Prof/Meadow.toml"),
+        "[package]\nname = \"Prof\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("Prof/src/Main.mw"),
+        "fun fib (n : Int) : Int = if n < 2 then n else fib (n - 1) + fib (n - 2)\n\n\
+         fun main () = println (fib 24)\n",
+    )
+    .unwrap();
+    let to = dir.join("prof.folded");
+    let run = |to: &std::path::Path| {
+        let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
+            .args([
+                "run",
+                "--runtime",
+                "silo",
+                "--interpret",
+                "--sample-every",
+                "1000",
+                "--profile-to",
+            ])
+            .arg(to)
+            .arg(dir.join("Prof"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "46368");
+        std::fs::read_to_string(to).unwrap()
+    };
+    let folded = run(&to);
+    // Outermost first: `main`, then `fib` as deep as it was.
+    assert!(
+        folded
+            .lines()
+            .any(|l| l.starts_with("Prof.main;Prof.fib;Prof.fib")),
+        "{folded}"
+    );
+    // A profile of work is the same profile every time.
+    let mut a: Vec<&str> = folded.lines().collect();
+    let again = run(&dir.join("again.folded"));
+    let mut b: Vec<&str> = again.lines().collect();
+    a.sort();
+    b.sort();
+    assert_eq!(a, b);
+}

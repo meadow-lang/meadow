@@ -44,6 +44,7 @@ use smallvec::SmallVec;
 mod code;
 pub mod debug;
 mod live;
+pub mod profile;
 use code::{Code, Ins, WideI};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -658,7 +659,8 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
         is_tests,
         state: std::sync::Mutex::new(state),
         tracing,
-        debugging: DEBUGGING.load(Ordering::Relaxed),
+        // A profile reads the debugger's records of the activations.
+        debugging: DEBUGGING.load(Ordering::Relaxed) || profile::on(),
         growable,
         shadow: tracing || c.detaches,
     };
@@ -754,6 +756,68 @@ impl Vm {
     }
 }
 
+/// A block no person wrote -- a join point, a group of local functions, the
+/// search a `perform` makes, which the front end names `<join>`,
+/// `<letrec>` and `<perform E.op>` -- named after the definition whose code
+/// it is: the one that jumps to it, through others like it if need be.
+/// `Fib.fib/<join>`, then, which is what a debugger's frames and a profile's
+/// samples call it, as Glade's call such code by the function it is in.
+fn name_blocks(
+    blocks: &[(Label, String, &'static LBlock)],
+    owned: &[std::ops::Range<usize>],
+    jumps: &[(usize, Label)],
+    procs: &mut [Option<Proc>],
+) {
+    let made = |name: &str| name.rsplit('.').next().is_some_and(|n| n.starts_with('<'));
+    let index: HashMap<Label, usize> = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, (l, ..))| (*l, i))
+        .collect();
+    let mut from: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (caller, label) in jumps {
+        if let Some(callee) = index.get(label)
+            && *callee != *caller
+        {
+            from.entry(*callee).or_default().push(*caller);
+        }
+    }
+    for (i, (_, name, _)) in blocks.iter().enumerate() {
+        if !made(name) {
+            continue;
+        }
+        // The nearest definition a person wrote that jumps here.
+        let mut seen = std::collections::HashSet::from([i]);
+        let mut frontier = vec![i];
+        let mut found = None;
+        'search: while !frontier.is_empty() {
+            let mut next = Vec::new();
+            for at in frontier {
+                for caller in from.get(&at).into_iter().flatten() {
+                    if !made(&blocks[*caller].1) {
+                        found = Some(*caller);
+                        break 'search;
+                    }
+                    if seen.insert(*caller) {
+                        next.push(*caller);
+                    }
+                }
+            }
+            frontier = next;
+        }
+        let Some(parent) = found else { continue };
+        let own = name.rsplit('.').next().unwrap_or(name);
+        let renamed = format!("{}/{own}", blocks[parent].1);
+        for p in std::iter::once(i).chain(owned[i].clone()) {
+            if let Some(proc) = procs[p].as_mut()
+                && let Some(rest) = proc.name.strip_prefix(name.as_str())
+            {
+                proc.name = format!("{renamed}{rest}");
+            }
+        }
+    }
+}
+
 /// One image's code, compiled for segment `seg`.
 struct Compiled {
     segment: Segment,
@@ -784,6 +848,8 @@ fn compile(
         retag,
         globals: state.globals,
         lits: HashMap::new(),
+        current: 0,
+        jumps: Vec::new(),
         global_count: 0,
         opaque_globals: false,
         news: HashMap::new(),
@@ -837,10 +903,16 @@ fn compile(
         defs.push((slot, c.global(i)));
         c.procs.push(None);
     }
+    // Each definition's procedures: its own, and those made inside it.
+    let mut owned = Vec::with_capacity(blocks.len());
     for (i, (_, name, b)) in blocks.iter().enumerate() {
+        c.current = i;
+        let before = c.procs.len();
         let p = c.proc(b, name.clone());
         c.procs[i] = Some(p);
+        owned.push(before..c.procs.len());
     }
+    name_blocks(&blocks, &owned, &c.jumps, &mut c.procs);
     // A reload's caches numbered clear of the running program's: which
     // they cannot be, where how many it has is not known.
     let caches = c.global_count > 0 || c.opaque_globals;
@@ -888,6 +960,11 @@ struct Compiler {
     opaque_globals: bool,
     /// The names bound to integer literals: what a cache is numbered by.
     lits: HashMap<Name, i64>,
+    /// The definition being compiled, by its place among this load's, and
+    /// each jump or direct call one makes to another's label: what a block
+    /// no person wrote is named after (see [`name_blocks`]).
+    current: usize,
+    jumps: Vec<(usize, Label)>,
     /// Where each `new` statement's methods are in the table, by its address:
     /// compiled once however many times the code around it is (a frame's
     /// code is, once in its place and once where its call is).
@@ -1218,6 +1295,7 @@ impl Compiler {
                 if args.last().is_some_and(|a| scope.pending.contains_key(a))
                     && self.labels.contains_key(label) =>
             {
+                self.jumps.push((self.current, *label));
                 let callee = Callee::Proc(self.labels[label]);
                 self.direct(callee, args, scope)
             }
@@ -1232,7 +1310,10 @@ impl Compiler {
             }
             L::Jump { label, args } => match self.labels.get(label) {
                 Some(p) => I::Jump {
-                    proc: *p,
+                    proc: {
+                        self.jumps.push((self.current, *label));
+                        *p
+                    },
                     args: args.iter().map(|a| scope.at(*a)).collect(),
                 },
                 None => I::Error(leak(format!("a jump to {label:?}, which is not compiled"))),
@@ -1747,10 +1828,13 @@ impl Vm {
         });
         let watching = if DEBUG { debug::debugger() } else { None };
         loop {
-            if DEBUG && let Some(w) = watching {
+            if DEBUG {
                 act.proc = p;
                 act.pc = pc;
-                w.at(&act);
+                match watching {
+                    Some(w) => w.at(&act),
+                    None => profile::tick(&act),
+                }
             }
             // Safety: every pc is a procedure's entry, an instruction's
             // successor within its procedure, or a target `Code::emit`

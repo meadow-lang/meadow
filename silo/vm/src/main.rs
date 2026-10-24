@@ -8,6 +8,7 @@
 //! meadow-silo-vm --debug PORT PROGRAM.image
 //! meadow-silo-vm --watch PROGRAM.image [ARGS...]
 //! meadow-silo-vm --answer FILE PROGRAM.image [ARGS...]
+//! meadow-silo-vm --profile FILE [--profile-every N | --profile-hz HZ] PROGRAM.image
 //! ```
 //!
 //! An image of tests runs the one numbered `N`, as a test executable does.
@@ -16,7 +17,10 @@
 //! --watch` writes. Each new build says on stderr what it replaced, or why it
 //! was refused. `--answer FILE` writes what the program answers to `FILE`,
 //! shown as `meadow` shows a value, rather than printing it after what the
-//! program printed: what the REPL reads an entry's value from.
+//! program printed: what the REPL reads an entry's value from. `--profile
+//! FILE` samples where the program spends itself and writes folded stacks to
+//! `FILE` when it ends (`interp::profile`): by time, a thousand times a
+//! second or `--profile-hz`, or every `--profile-every` instructions.
 //!
 //! `meadow` writes the image (`meadow_axcut::image`): the program made linear
 //! (`meadow_axcut::linear`, the same pass Silo's compiler runs, done once when
@@ -159,6 +163,13 @@ fn main() {
     let mut debug = None;
     // `--watch`: load the image again whenever it is written anew.
     let mut watching = false;
+    // `--profile FILE`: where to write a profile, and how to take it.
+    let mut profile_to: Option<std::path::PathBuf> = None;
+    let mut how = interp::profile::How {
+        every: None,
+        hz: 1000,
+        depth: 64,
+    };
     loop {
         match args.get(1).map(String::as_str) {
             Some("--dis") => {
@@ -168,6 +179,25 @@ fn main() {
             Some("--watch") => {
                 watching = true;
                 args.remove(1);
+            }
+            Some(flag @ ("--profile" | "--profile-every" | "--profile-hz")) => {
+                let flag = flag.to_string();
+                let Some(value) = args.get(2).cloned() else {
+                    eprintln!("usage: meadow-silo-vm {flag} VALUE PROGRAM.image");
+                    std::process::exit(2);
+                };
+                let number = || {
+                    value.parse::<u64>().unwrap_or_else(|_| {
+                        eprintln!("error: {flag} takes a number, not `{value}`");
+                        std::process::exit(2);
+                    })
+                };
+                match flag.as_str() {
+                    "--profile" => profile_to = Some(std::path::PathBuf::from(&value)),
+                    "--profile-every" => how.every = Some(number()),
+                    _ => how.hz = number(),
+                }
+                args.drain(1..3);
             }
             Some("--answer") => {
                 let Some(to) = args.get(2).cloned() else {
@@ -193,6 +223,9 @@ fn main() {
     }
     if debug.is_some() {
         interp::debugging();
+    }
+    if profile_to.is_some() {
+        interp::profile::start(how);
     }
     let Some(path) = args.get(1) else {
         eprintln!("usage: meadow-silo-vm [--dis | --debug PORT | --watch] PROGRAM.image [ARGS...]");
@@ -240,7 +273,7 @@ fn main() {
         }
         // Safety: as below.
         let status = unsafe { meadow_silo::meadow_run(entry_answered, 0, std::ptr::null()) };
-        std::process::exit(status)
+        ended(status, profile_to.as_deref())
     }
     if let Some(port) = debug {
         // Safety: before the runtime starts, which reads it.
@@ -271,5 +304,18 @@ fn main() {
     // Safety: `entry` is the program's entry point, as an emitted module's
     // `meadow_entry` would be.
     let status = unsafe { meadow_silo::meadow_run(entry, 0, std::ptr::null()) };
+    ended(status, profile_to.as_deref())
+}
+
+/// The program is over, as `status` says: its profile written, if one was
+/// taken, and the process ended.
+fn ended(status: i32, profile_to: Option<&std::path::Path>) -> ! {
+    if let Some(to) = profile_to {
+        let (folded, said) = interp::profile::finish();
+        eprintln!("{said}");
+        if let Err(e) = std::fs::write(to, folded) {
+            eprintln!("profile: {}: {e}", to.display());
+        }
+    }
     std::process::exit(status)
 }

@@ -1670,6 +1670,32 @@ fn finish(
                     if watching {
                         c.arg("--watch");
                     }
+                    // A profile, as Glade's VM takes one: by time, or by
+                    // work, written as folded stacks where it is asked for,
+                    // or beside the build when the profile says `profile`.
+                    let sampled = sampling.as_ref().map(|(to, how)| (to.clone(), Some(how)));
+                    let sampled = sampled.or_else(|| {
+                        profile.sample.then(|| {
+                            let to = match package {
+                                Some((root, _)) => root
+                                    .join("target")
+                                    .join(profile.profile.name())
+                                    .join("profile.folded"),
+                                None => PathBuf::from("profile.folded"),
+                            };
+                            (to, None)
+                        })
+                    });
+                    if let Some((to, how)) = sampled {
+                        c.arg("--profile").arg(&to);
+                        if let Some(how) = how {
+                            match how.every {
+                                Some(n) => c.arg("--profile-every").arg(n.to_string()),
+                                None => c.arg("--profile-hz").arg(how.hz.to_string()),
+                            };
+                        }
+                        status::status("Profiling", format!("to {}", shown(&to)));
+                    }
                     c.arg(&exe);
                     c
                 } else {
