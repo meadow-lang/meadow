@@ -3,7 +3,7 @@
 [package]
 name = "meadow-silo"
 description = "The runtime of a Meadow program compiled by meadow-llvm: blocks counted by reference as in the AxCut paper, primitives, and the native stack. For production, where a program is run for speed rather than stepped through."
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 
 [lib]

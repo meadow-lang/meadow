@@ -17,6 +17,11 @@
 #   curl -fsSL …/meadowup-init.sh | sh -s -- --version v0.2.0
 #
 # Run with --help for the list.
+#
+# Where `GITHUB_TOKEN` is set, as a CI job can set it to `${{ github.token }}`,
+# the requests to GitHub carry it -- here and in meadowup -- and are held to
+# that token's rate limit rather than to the one every unnamed request from
+# the runner's address shares, which a busy CI provider's runners exhaust.
 
 set -eu
 
@@ -128,7 +133,14 @@ detect_target() {
 
 download() {
     if command -v curl >/dev/null 2>&1; then
-        curl --proto '=https' --tlsv1.2 -fsSL "$1" -o "$2"
+        # curl sends a header given with -H to the host asked, and not on to
+        # the host a release's download redirects to.
+        if [ -n "${GITHUB_TOKEN:-}" ]; then
+            curl --proto '=https' --tlsv1.2 -fsSL \
+                -H "Authorization: Bearer $GITHUB_TOKEN" "$1" -o "$2"
+        else
+            curl --proto '=https' --tlsv1.2 -fsSL "$1" -o "$2"
+        fi
     elif command -v wget >/dev/null 2>&1; then
         wget --https-only -q "$1" -O "$2"
     else

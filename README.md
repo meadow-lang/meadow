@@ -720,7 +720,9 @@ To cut a release:
    version, and set that version in every manifest: the six `Cargo.toml`s
    (`compiler`, `eval`, `glade`, `silo`, `buildtools`, `installer`),
    `lib/Std/Meadow.toml`, `editors/vscode/package.json` and
-   `editors/vscode-theme/package.json`.
+   `editors/vscode-theme/package.json` -- and the lockfiles that pin them --
+   and the `version` MeadowBoot says, in `bootstrap/src/Main.mw`, which
+   `a_command_takes_what_meadow_s_takes` holds to `meadow`'s.
 2. Run `scripts/check.sh --version v0.2.0`, which fails if any of them, or the
    changelog, disagrees with the tag.
 3. Tag that commit and push the tag:

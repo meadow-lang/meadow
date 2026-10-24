@@ -190,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-intern"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "lasso",
  "once_cell",
@@ -199,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-rt"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "meadow-intern",
@@ -214,7 +214,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-silo"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "corosensei",
  "meadow-rt",
@@ -223,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-span"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chumsky",
  "serde",
