@@ -151,6 +151,7 @@ cli! {
           "Where a program's frames live on Silo: a thread's stack, one that grows, or the heap"
           value
           "STACK"
+      noReload : Flag "Build what is interpreted so that no new build of it loads into it as it runs"
       leaks : Flag "After running, report the blocks the program left behind"
       features
         : Option
@@ -247,6 +248,7 @@ cli! {
       gc : Option String "How memory is managed: `rc` or a tracing collector" value "STRATEGY"
       interpret : Flag "Interpret what is built for Silo rather than compiling it"
       stack : Option String "How deep a program's calls may go on Silo" value "STACK"
+      noReload : Flag "Build what is interpreted so that no new build of it loads into it as it runs"
       leaks : Flag "After running, report the blocks the program left behind"
       features : Option String "Features of the package to build with" value "FEATURES"
       noDefaultFeatures : Flag "Build without the package's `default` features"
@@ -478,6 +480,7 @@ fun unheeded (b : CliBuild) : [String] =
     (M.isSome b.gc, "--gc"),
     (b.interpret, "--interpret"),
     (M.isSome b.stack, "--stack"),
+    (b.noReload, "--no-reload"),
     (b.leaks, "--leaks"),
     (M.isSome b.features, "--features"),
     (b.noDefaultFeatures, "--no-default-features"),

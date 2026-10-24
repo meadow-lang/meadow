@@ -11,4 +11,4 @@ pub use meadow_axcut::*;
 
 pub mod cut;
 mod lower;
-pub use lower::{Lowered, Unsupported, lower_program};
+pub use lower::{Lowered, Unsupported, lower_program, lower_program_with};

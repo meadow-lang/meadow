@@ -39,6 +39,7 @@
 //! threads = 4              # OS threads for the green ones: `-j`
 //! nursery = "8M"           # how large Glade's nursery may grow: `--nursery`
 //! stack = "growable"       # "fixed" | "growable": `--stack`
+//! reload = false           # an interpreted build no new build loads into: `--no-reload`
 //! leaks = true             # report what the program left behind: `--leaks`
 //! target = "aarch64"       # the processor a native build is for: `--target`
 //! ```
@@ -266,6 +267,9 @@ pub struct ProfileConfig {
     pub nursery: Option<u64>,
     /// `stack = "growable"`: how deep calls may go, as `--stack` says.
     pub stack: Option<meadow_seq::config::Stack>,
+    /// `reload = false`: an interpreted build that cannot take a new build
+    /// of itself while it runs, as `--no-reload` says.
+    pub reload: Option<bool>,
     /// `leaks = true`: report what the program left behind, as `--leaks`.
     pub leaks: Option<bool>,
     /// `target = "aarch64"`: the processor a native build is for, as
@@ -1273,6 +1277,13 @@ fn parse_manifest(text: &str, dir: &Path) -> (Manifest, Inherits) {
                     "threads" => p.threads = unquote(value).parse().ok().filter(|n| *n > 0),
                     "nursery" => p.nursery = crate::profile::nursery_size(unquote(value)).ok(),
                     "stack" => p.stack = meadow_seq::config::Stack::named(unquote(value)),
+                    "reload" => {
+                        p.reload = match unquote(value) {
+                            "true" => Some(true),
+                            "false" => Some(false),
+                            _ => None,
+                        }
+                    }
                     "leaks" => {
                         p.leaks = match unquote(value) {
                             "true" => Some(true),

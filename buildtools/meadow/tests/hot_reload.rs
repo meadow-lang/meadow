@@ -1,7 +1,8 @@
 //! Loading a new build into a program running on Silo's interpreter
 //! (`meadow-silo-vm --watch`, which `meadow run --watch` drives): a call by
 //! name runs the new version from then on, what is running finishes as it
-//! was, and a build that changes a constructor's fields is refused.
+//! was, and a value of a type the new build changed is taken only by the
+//! code made for it -- old values by old code, new by new.
 //!
 //! Each program waits, before it goes on, for a file the test writes once
 //! the reload is in: what it prints after says which code ran.
@@ -25,6 +26,11 @@ fn scratch(who: &str) -> PathBuf {
 
 /// `src` built as package `Hot` in `dir`, for the interpreter: its image.
 fn image(dir: &Path, src: &str) -> PathBuf {
+    image_with(dir, src, &[])
+}
+
+/// [`image`], built with `flags` besides.
+fn image_with(dir: &Path, src: &str, flags: &[&str]) -> PathBuf {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
         dir.join("Meadow.toml"),
@@ -34,6 +40,7 @@ fn image(dir: &Path, src: &str) -> PathBuf {
     std::fs::write(dir.join("src").join("Main.mw"), src).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
         .args(["build", "--runtime", "silo", "--interpret"])
+        .args(flags)
         .arg(dir)
         .output()
         .unwrap();
@@ -149,18 +156,83 @@ fn a_call_by_name_runs_the_new_version_and_what_runs_finishes_as_it_was() {
     assert_eq!(out, "old two 1 100\nold-closure two 3\nnew two 2 200\n");
 }
 
+/// A program that makes a `Shape` before it waits, and after it shows that
+/// one, and then one made afresh by a function whose type does not mention
+/// `Shape` -- which a new build's version replaces. What a `Circle` holds,
+/// and how its area is worked out, vary between builds.
+fn shapes(dir: &Path, say: &str, field: &str, made: &str, area: &str) -> String {
+    let go = dir.join("go").to_string_lossy().replace('\\', "/");
+    format!(
+        "\
+use Std.Time (sleep)
+use Std.String as S
+use Shape.*
+
+data Shape = Circle {field} | Square Int
+
+fun area (s : Shape) : Int =
+  match s with
+  | Circle r -> {area}
+  | Square w -> w * w
+
+fun describe (s : Shape) : String = S.concatAll [\"{say} \", S.fromInt (area s)]
+
+fun make () : Shape = Circle {made}
+
+fun fresh () : String = describe (make ())
+
+fun wait () = if exists \"{go}\" then () else let _ = sleep 10 in wait ()
+
+fun main () =
+  let old = make () in
+  let _ = wait () in
+  let _ = println (describe old) in
+  let _ = println (fresh ()) in
+  ()
+"
+    )
+}
+
 #[test]
-fn a_build_that_changes_a_constructor_is_refused() {
+fn a_value_of_a_changed_type_goes_to_the_code_made_for_it() {
     if let Err(e) = meadow::aot::interpreter() {
         eprintln!("skipped: {e}");
         return;
     }
-    let dir = scratch("refused");
+    let dir = scratch("types");
+    let old = image(
+        &dir.join("v1"),
+        &shapes(&dir, "one", "Int", "2", "3 * r * r"),
+    );
+    let new = image(
+        &dir.join("v2"),
+        &shapes(&dir, "two", "String", "\"abc\"", "S.byteLength r * 100"),
+    );
+    let (said, out) = run(&dir, &old, &[new]);
+    assert!(said[0].starts_with("reloaded"), "{said:?}");
+    // The `Circle 2` made before is shown by the old `describe`: it is a
+    // `Shape` of the old build's, and the new `describe` takes the new one.
+    // `fresh`, whose type mentions neither, is the new build's, and makes a
+    // `Circle "abc"` and shows it with the new code.
+    assert_eq!(out, "one 12\ntwo 300\n");
+}
+
+#[test]
+fn a_build_without_reloading_is_not_reloaded() {
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    let dir = scratch("unversioned");
     let old = image(&dir.join("v1"), &program(&dir, "one", "old", 10, "Int"));
-    let changed = image(&dir.join("v2"), &program(&dir, "two", "new", 100, "String"));
-    let (said, out) = run(&dir, &old, &[changed]);
+    let plain = image_with(
+        &dir.join("v2"),
+        &program(&dir, "two", "new", 100, "Int"),
+        &["--no-reload"],
+    );
+    let (said, out) = run(&dir, &old, &[plain]);
     assert!(
-        said[0].starts_with("not reloaded: constructor `Shape.Circle` changed"),
+        said[0].starts_with("not reloaded: it was built without hot loading"),
         "{said:?}"
     );
     assert_eq!(out, "old one 1 10\nold-closure one 3\nold one 2 20\n");

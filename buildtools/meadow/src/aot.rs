@@ -130,6 +130,38 @@ pub fn config() -> meadow_llvm::Config {
 }
 
 /// Whether a program for Silo is interpreted rather than compiled: `--interpret`
+/// Whether an interpreted build may take a new build of itself while it runs:
+/// what `--no-reload`, `reload = false` in a profile, or `MEADOW_RELOAD=0`
+/// turns off. See [`lowered_for`].
+static RELOAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Build what is interpreted so that no new build loads into it.
+pub fn set_no_reload() {
+    let _ = RELOAD.set(false);
+}
+
+pub fn reloadable() -> bool {
+    *RELOAD.get_or_init(|| {
+        !matches!(
+            std::env::var("MEADOW_RELOAD").as_deref(),
+            Ok("0" | "false" | "no")
+        )
+    })
+}
+
+/// `program` lowered to AxCut for this build: for one that is interpreted and
+/// may take a new build of itself, with its definitions, constructors and
+/// effects written with the versions of the types they carry, which loading a
+/// new build goes by (`meadow_seq::lower_program_with`). Everything else is
+/// lowered as it always was: a native program is never reloaded, and its IR
+/// is the same either way.
+pub fn lowered_for(
+    program: &meadow_compiler::core::Program,
+    opt: meadow_compiler::OptLevel,
+) -> meadow_seq::Lowered {
+    meadow_seq::lower_program_with(program, opt, interpret() && reloadable())
+}
+
 /// or `MEADOW_INTERPRET`. See [`write_image`].
 static INTERPRET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
@@ -358,7 +390,7 @@ pub fn build_native(
     inputs: Option<u64>,
 ) -> Result<PathBuf, String> {
     build_native_of(root, profile, opt, name, target, inputs, || {
-        let lowered = meadow_seq::lower_program(program, opt);
+        let lowered = lowered_for(program, opt);
         if !lowered.unsupported.is_empty() {
             return Err(format!(
                 "the back end cannot translate {:?} yet",

@@ -13,6 +13,16 @@ The aim is **one runtime** with two engines: an interpreter for bytecode,
 and native code through LLVM. Collection becomes a choice of strategy that
 works with either engine. It is not a property of the engine.
 
+**Its name is Glade** (Chris, 2026-10-24). The merged runtime is Glade's next
+release. Silo is retired, and Glade gains everything Silo has, so that it
+replaces Silo in full: native code through LLVM, counting with reuse, the
+native stack and its segments, Silo's speed. Much of the merged runtime's
+code is Silo's today (`silo/`, the `meadow-silo` crates, `--runtime silo`).
+The names follow when the old Glade's parts are retired (phase 6): the
+merged runtime takes Glade's name and directory, `--runtime glade` selects
+it, configured along the four axes below, and `--runtime silo` stays for a
+while as another way to say the same.
+
 ## What has to survive
 
 - **Glade's fast build.** Debug builds go from AxCut to bytecode in one pass,
@@ -539,12 +549,44 @@ never reloaded runs as before: fib takes 337 ms and matmul 2.12 s, against
 - the module;
 - the name;
 - the type, as the type checker gave it, written the same in every build
-  (`meadow_core::signature`, carried in AxCut's `Program::types`);
+  (`meadow_core::signature`, carried in AxCut's `Program::types`), with the
+  version of every type and effect in it;
 - how its parameters and its answer are represented.
 
 A definition whose type changed is therefore a new definition. Old code that
 calls it by name still reaches the old version, with arguments laid out as
 that version expects.
+
+**Versions of types** (Chris, 2026-10-24). A type's version is a hash of its
+definition: its constructors, their fields' types, and the versions of the
+types those mention, so that `Scene`, holding a `List Shape`, is new when
+`Shape` is (`meadow_core::versions`). A type the new build changed is a new
+type, and everything whose type mentions it is a new definition, even where
+its text did not change. So a value of a changed type never reaches code
+written for the other version:
+- old code holding an old `Shape` calls the old `area`, and new code holding
+  a new one calls the new;
+- code whose type does not mention `Shape` is shared, and builds and reads
+  only the new;
+- generic code passes a `Shape` through without looking into it, and a
+  dictionary for `Show Shape` is a definition with a type like any other.
+
+A constructor of a changed type gets a tag of its own, so old and new values
+are told apart, and each prints with its name.
+
+**Versions of effects.** A handler is found by its operation's name, not by a
+call whose type says anything, so an effect has a version too: the versions
+of the types its handlers and its `perform`s carry. An effect whose
+declaration mentions a type mentions it at every handler and `perform` of
+it, whatever its parameters are instantiated at, so when that type changes
+the effect does, and the evidence key is new: an old handler is not what a
+new `perform` finds, which fails as unhandled rather than misreading a
+value. What an effect's parameters are instantiated at is in the effect rows
+of the functions that perform it, which the signature writes with versions.
+
+A loop whose own parameters are of a changed type stays on its version,
+since it calls itself with old values: it takes new code when it is started
+again.
 
 Some definitions have no key, so each build has its own:
 - **What no person wrote**, such as join points.
@@ -553,12 +595,13 @@ Some definitions have no key, so each build has its own:
   that definition's code, so a closure made of it keeps its version.
 - **Definitions alike in all four parts.**
 
-**Constructors.** Tags are renumbered by constructor name to the running
-program's, and new constructors get new tags. A reload is refused, and
-nothing changes, when:
-- a constructor's field types or labels changed (`Program::ctor_types`, from
-  the variant environment), since values already made of it have the old
-  shape;
+**Constructors.** Tags are renumbered to the running program's by what the
+constructor is: its name and its type's version (`Program::ctor_types`).
+New constructors, and those of changed types, get new tags. A reload is
+refused, and nothing changes, when:
+- a constructor the runtime builds by name changed: a role's (`Maybe`,
+  `List`, a result) or one of `meadow_rt::roles::RECORDS`, since the runtime
+  could not tell which build's it meant;
 - the built-in roles are played by other constructors;
 - it was built to manage memory or the stack another way;
 - it starts threads, or detaches continuations, and the running program was
@@ -575,13 +618,23 @@ it, and the old code goes on reading its own. Keeping the values whose
 definitions did not change would mean knowing what each value depends on.
 Values are pure, so computing them again only costs time.
 
+**Opting out** (Chris, 2026-10-24): `--no-reload`, `reload = false` in a
+profile, or `MEADOW_RELOAD=0` builds what is interpreted with nothing
+versioned and no types written down, and the VM refuses to reload into it or
+from it. What it saves is at build time: MiniML's image is 8% smaller (713 KB
+against 778 KB) and builds about 1% sooner. A call by name costs the same
+either way: reading a definition's slot measured nothing on fib (325 ms) or
+matmul (2.11 s against 2.12 s with calls made direct). A native build is never
+versioned, so its IR is what it was.
+
 **Not yet:**
 - The debugger knows only the first load's code, and does not stop in
   reloaded code.
 - A watching run only reloads. It does not offer a restart when a reload is
   refused.
 
-Tests: `buildtools/meadow/tests/hot_reload.rs`.
+Tests: `buildtools/meadow/tests/hot_reload.rs`, among them a changed type
+with old and new values alive at once, and a build that opted out.
 
 ### Silo's speed, kept (measured 2026-10-23)
 

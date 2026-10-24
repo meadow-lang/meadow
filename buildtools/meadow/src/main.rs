@@ -98,8 +98,9 @@ enum Cmd {
         /// Run on Silo's interpreter and, whenever the package's sources
         /// change, build it again and load the new build into the program as
         /// it runs: from then on a call by name runs the new version, and
-        /// what is running already finishes as it was. A build that changes a
-        /// constructor's fields is refused, and the program goes on as it was.
+        /// what is running already finishes as it was. A type the new build
+        /// changed is a new type: values already made of the old one go on
+        /// being taken by the code made for them.
         #[arg(long)]
         watch: bool,
         #[command(flatten)]
@@ -450,6 +451,14 @@ struct TargetArgs {
     /// `MEADOW_STACK` says the same.
     #[arg(long, value_name = "STACK", value_parser = stack_kind)]
     stack: Option<meadow_llvm::Stack>,
+    /// Build what is interpreted so that no new build of it can be loaded
+    /// into it while it runs (`meadow run --watch`): its definitions,
+    /// constructors and effects are not written with the versions of the
+    /// types they carry, and an image is smaller and lowered sooner. A
+    /// native build is never reloaded, and this changes nothing in it.
+    /// `reload = false` in a profile, or `MEADOW_RELOAD=0`, says the same.
+    #[arg(long)]
+    no_reload: bool,
     /// How large Glade's collector lets a thread's nursery grow: `8M`, `512K`,
     /// `1G`, or bytes, from 256K to 1G. 2M by default. A larger one collects
     /// less often and promotes less, which a program that allocates a great
@@ -504,6 +513,7 @@ impl TargetArgs {
             gc: self.gc.clone(),
             interpret: self.interpret,
             stack: self.stack.or(Some(profile.stack)),
+            no_reload: self.no_reload || !profile.reload,
             nursery: self.nursery.or(profile.nursery),
             leaks: self.leaks || profile.leaks,
             features: self.features.clone(),
@@ -521,6 +531,9 @@ impl TargetArgs {
         }
         if let Some(s) = self.stack {
             meadow::aot::set_stack(s);
+        }
+        if self.no_reload {
+            meadow::aot::set_no_reload();
         }
         if let Some(g) = &self.gc {
             meadow::aot::set_gc(meadow::aot::strategy(g));
@@ -657,6 +670,8 @@ impl ProfileArgs {
             nursery: None,
             // Asked for with `--stack`, likewise.
             stack: None,
+            // And with `--no-reload`.
+            reload: None,
             leaks: None,
             target: None,
         }
@@ -824,6 +839,13 @@ fn command() {
             }
             let resolved = profile.resolve(&path);
             let target = target.with(&resolved);
+            if watch && target.no_reload {
+                status::error(
+                    "`--watch` loads each new build into the program, which `--no-reload` \
+                     (or `reload = false`) builds it not to take",
+                );
+                std::process::exit(2);
+            }
             target.configure();
             if let Some(gc) = &target.gc {
                 meadow_glade::heap::configure(meadow_glade::heap::GcConfig {

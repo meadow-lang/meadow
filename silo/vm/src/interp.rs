@@ -439,12 +439,20 @@ struct LoadState {
     segments: usize,
     /// How many slots are in use.
     defs: usize,
-    /// Every constructor's tag, numbered once for every load, and the next.
-    tags: HashMap<InternedString, u32>,
+    /// Every constructor's tag, by what it is -- its name, and its type's
+    /// version where the program says (`Program::ctor_types`) -- numbered
+    /// once for every load; and the next.
+    tags: HashMap<(InternedString, Option<InternedString>), u32>,
     next_tag: u32,
-    ctor_fields: HashMap<InternedString, Vec<InternedString>>,
-    ctor_types: HashMap<InternedString, InternedString>,
+    /// Each tag's constructor, and its named fields: a constructor's
+    /// versions are told apart by their tags, and may have other fields.
+    tag_names: HashMap<u32, InternedString>,
+    tag_fields: HashMap<u32, Vec<InternedString>>,
     roles: HashMap<meadow_axcut::Role, InternedString>,
+    /// Whether the running program was built to take a new build of itself:
+    /// what a reload finds its definitions and constructors by is only
+    /// written down then (`meadow_seq::lower_program_with`).
+    reloadable: bool,
     /// How many top-level values' caches are numbered: each load's are
     /// numbered after those before it, so that its code computes its own.
     globals: u32,
@@ -466,58 +474,64 @@ impl LoadState {
 
     /// Each of `program`'s tags, by its own number, as the program running
     /// numbers the constructor: the first load's as they are, a reload's by
-    /// name, and those new to it after the rest. A reload is refused whose
-    /// constructor has fields other than it had -- values already made of it
-    /// are the old shape -- or whose roles are other constructors'.
+    /// what the constructor is, and those new to it after the rest.
+    ///
+    /// What a constructor is includes its type's version (see
+    /// `meadow_core::versions`): a constructor of a type the new build
+    /// changed is a new one, with a tag of its own, so that values made by
+    /// the old build and by the new are told apart -- and only the code made
+    /// for each takes it, since every definition whose type mentions it is a
+    /// new definition too. A reload is refused that changes a constructor the
+    /// runtime builds by name -- the roles', and `meadow_rt::roles::RECORDS`
+    /// -- which it could not tell which build's it meant.
     fn tags_of(&mut self, program: &Program) -> Result<Vec<u32>, String> {
         let size = program.tags.values().max().map_or(0, |t| *t as usize + 1);
+        let id = |n: &InternedString| (*n, program.ctor_types.get(n).copied());
+        let fields_of = |n: &InternedString| program.ctor_fields.get(n).cloned();
         if self.segments == 0 {
-            self.tags = program.tags.iter().map(|(n, t)| (*n, *t)).collect();
+            for (n, t) in &program.tags {
+                self.tags.insert(id(n), *t);
+                self.tag_names.insert(*t, *n);
+                if let Some(fs) = fields_of(n) {
+                    self.tag_fields.insert(*t, fs);
+                }
+            }
             self.next_tag = size as u32;
-            self.ctor_fields = program.ctor_fields.clone();
-            self.ctor_types = program.ctor_types.clone();
             self.roles = program.roles.clone();
+            self.reloadable = !program.types.is_empty();
             return Ok((0..size as u32).collect());
         }
         if program.roles != self.roles {
             return Err("its built-in types are other constructors than they were".into());
         }
-        for (n, ty) in &program.ctor_types {
-            if let Some(had) = self.ctor_types.get(n)
-                && had != ty
-            {
-                return Err(format!(
-                    "constructor `{}` changed: its fields were {had}, and are {ty}",
-                    meadow_rt::ctor_spelling(n)
-                ));
-            }
-        }
-        for (n, fs) in &program.ctor_fields {
-            if let Some(had) = self.ctor_fields.get(n)
-                && had != fs
-            {
-                return Err(format!(
-                    "constructor `{}`'s fields changed",
-                    meadow_rt::ctor_spelling(n)
-                ));
-            }
-        }
+        let by_name = |n: &InternedString| {
+            program.roles.values().any(|r| r == n) || meadow_rt::roles::RECORDS.contains(&&**n)
+        };
         let mut by: Vec<(u32, InternedString)> =
             program.tags.iter().map(|(n, t)| (*t, *n)).collect();
         by.sort();
         let mut retag = vec![u32::MAX; size];
         for (t, n) in by {
-            let next = &mut self.next_tag;
-            retag[t as usize] = *self.tags.entry(n).or_insert_with(|| {
-                *next += 1;
-                *next - 1
-            });
-        }
-        for (n, fs) in &program.ctor_fields {
-            self.ctor_fields.entry(*n).or_insert_with(|| fs.clone());
-        }
-        for (n, ty) in &program.ctor_types {
-            self.ctor_types.entry(*n).or_insert(*ty);
+            let key = id(&n);
+            if let Some(had) = self.tags.get(&key) {
+                retag[t as usize] = *had;
+                continue;
+            }
+            // New to the program, or of a type this build changed.
+            if by_name(&n) && self.tags.keys().any(|(m, _)| *m == n) {
+                return Err(format!(
+                    "constructor `{}`, which the runtime builds by name, changed",
+                    meadow_rt::ctor_spelling(&n)
+                ));
+            }
+            let tag = self.next_tag;
+            self.next_tag += 1;
+            self.tags.insert(key, tag);
+            self.tag_names.insert(tag, n);
+            if let Some(fs) = fields_of(&n) {
+                self.tag_fields.insert(tag, fs);
+            }
+            retag[t as usize] = tag;
         }
         Ok(retag)
     }
@@ -668,11 +682,14 @@ impl Vm {
     /// was -- a call under way, a closure or a continuation already made,
     /// runs the code it was made of -- and only what calls a definition by
     /// name after this finds the new version. Its constructors are numbered
-    /// as the running program numbers them, and its top-level values are
-    /// computed again, by its own code, the first time it asks for them.
+    /// as the running program numbers them -- those of a type it changed
+    /// anew, since a definition that takes one is a new definition too (see
+    /// `meadow_core::versions`) -- and its top-level values are computed
+    /// again, by its own code, the first time it asks for them.
     ///
     /// Refused, and nothing changed, when what is already made cannot be
-    /// what the new code expects: a constructor whose fields changed, or a
+    /// what the new code expects: a constructor the runtime builds by name
+    /// that changed, a build with nothing versioned (`--no-reload`), or a
     /// program built to run otherwise. Answers what it replaced and added.
     pub fn reload(&self, image: meadow_axcut::image::Image) -> Result<String, String> {
         let mut held = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -681,6 +698,12 @@ impl Vm {
         }
         if !image.tests.is_empty() {
             return Err("it is a program of tests".into());
+        }
+        if !held.reloadable {
+            return Err("the program running was built without hot loading (`--no-reload`)".into());
+        }
+        if image.program.types.is_empty() {
+            return Err("it was built without hot loading (`--no-reload`)".into());
         }
         let seg = held.segments;
         if seg >= SEGMENTS {
@@ -2540,9 +2563,9 @@ fn names_of(state: &LoadState) -> meadow_silo::show::Names {
     let syms = &state.syms;
     {
         let mut ctors: Vec<(u32, String)> = state
-            .tags
+            .tag_names
             .iter()
-            .map(|(n, t)| (*t, n.to_string()))
+            .map(|(t, n)| (*t, n.to_string()))
             .collect();
         ctors.sort();
         let count = ctors.last().map_or(0, |(t, _)| *t as usize + 1);
@@ -2550,7 +2573,7 @@ fn names_of(state: &LoadState) -> meadow_silo::show::Names {
         let mut fields = vec![None; count];
         for (t, name) in &ctors {
             names[*t as usize] = Some(name.clone());
-            if let Some(fs) = state.ctor_fields.get(&InternedString::from(name.as_str())) {
+            if let Some(fs) = state.tag_fields.get(t) {
                 fields[*t as usize] = Some(fs.iter().map(|f| f.to_string()).collect());
             }
         }

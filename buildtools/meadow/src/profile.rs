@@ -140,6 +140,9 @@ pub struct Resolved {
     /// recursion too deep for a fixed stack should not stop the program; fixed
     /// for a release, where it costs nothing. `--stack` overrides it.
     pub stack: meadow_seq::config::Stack,
+    /// Whether an interpreted build may take a new build of itself while it
+    /// runs: `reload` from the manifest, or yes. `--no-reload` says no.
+    pub reload: bool,
     /// `leaks = true` from the manifest: `--leaks`'s default.
     pub leaks: bool,
     /// `target` from the manifest: `--target`'s default.
@@ -163,6 +166,7 @@ impl Resolved {
             threads: None,
             nursery: None,
             stack: profile.stack(),
+            reload: true,
             leaks: false,
             target: None,
         }
@@ -215,6 +219,7 @@ impl Resolved {
             threads: flags.threads.or(from_manifest.threads),
             nursery: from_manifest.nursery,
             stack: from_manifest.stack.unwrap_or(profile.stack()),
+            reload: from_manifest.reload.unwrap_or(true),
             leaks: flags.leaks.or(from_manifest.leaks).unwrap_or(false),
             target: flags.target.or(from_manifest.target),
         }

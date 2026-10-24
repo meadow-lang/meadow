@@ -135,6 +135,13 @@ pub mod evidence {
     pub const NONE: &str = "#evnone";
 }
 
+/// The records a runtime builds by their constructor's name: `Fs.metadata`'s
+/// `FileMeta`, a name the language knows (`meadow_rename`'s
+/// `LANGUAGE_NAMES`). With the roles' constructors, what a program loaded
+/// into a running one must not change: the runtime finds each by its name,
+/// and would not know which build's it meant.
+pub const RECORDS: &[&str] = &["FileMeta.FileMeta"];
+
 #[cfg(test)]
 mod tests {
     use super::*;
