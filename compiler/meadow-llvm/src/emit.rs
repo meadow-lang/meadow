@@ -1749,13 +1749,34 @@ impl<'p> Module<'p> {
                 V::Val(v) if crate::linear::is_token(fr.method.params[i]) => {
                     out.push((v.clone(), SHADOW_TOKEN.to_string()));
                 }
-                V::Val(v) => match self.desc(fr.method.params[i], env) {
+                V::Val(v) => match self.capture_desc(fr, i, env) {
                     D::Known(k) if k == desc::REF => out.push((v.clone(), k.to_string())),
                     D::Known(_) => {}
                     D::Dyn(d) => out.push((v.clone(), d)),
                 },
             }
         }
+    }
+
+    /// How the frame `fr`'s capture `i` is described: as its parameter is,
+    /// where that is known -- but a value of a type variable's type is
+    /// described by the descriptor that is another of the frame's captures,
+    /// which is not a name of the code making the call: then, under tracing,
+    /// by what the frame captured for it. Without that it is `ANY`, and a
+    /// record would not hold the reference, which the collector then neither
+    /// marks from the frame nor, where blocks move, rewrites.
+    fn capture_desc(&self, fr: &Frame, i: usize, env: &HashMap<Name, V>) -> D {
+        let n = fr.method.params[i];
+        if self.tracing
+            && let Some(Rep::Var(d)) = self.program.reps.get(&n)
+            && *d != meadow_axcut::NO_DESC
+            && !env.contains_key(&VarId(*d))
+            && let Some(j) = fr.method.params.iter().position(|p| *p == VarId(*d))
+            && let Some(V::Val(v)) = fr.captured.get(j)
+        {
+            return D::Dyn(v.clone());
+        }
+        self.desc(n, env)
     }
 
     /// `fr`, with what [`Module::shadow_entries`] recorded of it replaced by
@@ -1780,7 +1801,7 @@ impl<'p> Module<'p> {
                     V::Val(_) if crate::linear::is_token(fr.method.params[i]) => {
                         V::Val(vals.next().expect("a token recorded"))
                     }
-                    V::Val(_) => match self.desc(fr.method.params[i], env) {
+                    V::Val(_) => match self.capture_desc(fr, i, env) {
                         D::Known(k) if k == desc::REF => V::Val(vals.next().expect("recorded")),
                         D::Known(_) => c.clone(),
                         D::Dyn(_) => V::Val(vals.next().expect("recorded")),
