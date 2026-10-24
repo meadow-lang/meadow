@@ -222,6 +222,9 @@ cli! {
         train
           : Flag
             "Run on the JIT and write what each call site was seen to enter, for an `aot` build to guard its calls on"
+        watch
+          : Flag
+            "Run on Silo's interpreter, and load each new build into the program as it runs"
       }
       with
       Build
@@ -401,6 +404,8 @@ fun failure (e : QueryError k) : String =
 fun run (every : CliOptions) (cli : Cli) =
   match cli with
   | Cli.Build r -> driven r.path r.build None
+  -- Loading a build into a running program is `meadow`'s, for now.
+  | Cli.Run r if r.watch -> handedOn ()
   | Cli.Run r -> driven r.path r.build (Just r.args)
   -- The standard library's own tests are `meadow`'s to run, for now.
   | Cli.Test r if r.std -> handedOn ()
