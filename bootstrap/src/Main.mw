@@ -138,6 +138,20 @@ cli! {
           "How large Glade's collector lets a thread's nursery grow: `8M`, `512K`, `1G`, or bytes"
           value
           "SIZE"
+      gc
+        : Option
+          ("rc" | "tracing" | "generational" | "copying")
+          "How memory is managed, on either runtime: `rc`, counting references, or a tracing collector"
+          value
+          "STRATEGY"
+      interpret : Flag "Interpret what is built for Silo rather than compiling it"
+      stack
+        : Option
+          ("fixed" | "growable" | "heap")
+          "Where a program's frames live on Silo: a thread's stack, one that grows, or the heap"
+          value
+          "STACK"
+      noReload : Flag "Build what is interpreted so that no new build of it loads into it as it runs"
       leaks : Flag "After running, report the blocks the program left behind"
       features
         : Option
@@ -209,7 +223,9 @@ cli! {
         train
           : Flag
             "Run on the JIT and write what each call site was seen to enter, for an `aot` build to guard its calls on"
-        gc : Option ("generational" | "copying") "Which collector the VM uses" value "GC"
+        watch
+          : Flag
+            "Run on Silo's interpreter, and load each new build into the program as it runs"
       }
       with
       Build
@@ -229,6 +245,10 @@ cli! {
       target : Option String "The architecture to compile for" value "ARCH"
       threads : Option Int "How many OS threads run the program's green threads" short "j" value "N"
       nursery : Option String "How large the collector lets a thread's nursery grow" value "SIZE"
+      gc : Option String "How memory is managed: `rc` or a tracing collector" value "STRATEGY"
+      interpret : Flag "Interpret what is built for Silo rather than compiling it"
+      stack : Option String "How deep a program's calls may go on Silo" value "STACK"
+      noReload : Flag "Build what is interpreted so that no new build of it loads into it as it runs"
       leaks : Flag "After running, report the blocks the program left behind"
       features : Option String "Features of the package to build with" value "FEATURES"
       noDefaultFeatures : Flag "Build without the package's `default` features"
@@ -386,6 +406,8 @@ fun failure (e : QueryError k) : String =
 fun run (every : CliOptions) (cli : Cli) =
   match cli with
   | Cli.Build r -> driven r.path r.build None
+  -- Loading a build into a running program is `meadow`'s, for now.
+  | Cli.Run r if r.watch -> handedOn ()
   | Cli.Run r -> driven r.path r.build (Just r.args)
   -- The standard library's own tests are `meadow`'s to run, for now.
   | Cli.Test r if r.std -> handedOn ()
@@ -455,6 +477,10 @@ fun unheeded (b : CliBuild) : [String] =
     (b.noPrune, "--no-prune"),
     (M.isSome b.target, "--target"),
     (M.isSome b.nursery, "--nursery"),
+    (M.isSome b.gc, "--gc"),
+    (b.interpret, "--interpret"),
+    (M.isSome b.stack, "--stack"),
+    (b.noReload, "--no-reload"),
     (b.leaks, "--leaks"),
     (M.isSome b.features, "--features"),
     (b.noDefaultFeatures, "--no-default-features"),

@@ -87,6 +87,64 @@ pub struct Timings {
 }
 
 /// [`run`], saying how long each part took.
+/// `program`, lowered to AxCut and run by Silo's interpreter -- the merged
+/// runtime's VM -- in a process of its own, with what it prints going where
+/// this process's does: its answer, shown, or why it failed. What the REPL's
+/// `:silo` runs an entry on.
+pub fn run_on_vm(program: &core::Program, opt: OptLevel) -> (Result<String, String>, Timings) {
+    use std::time::Instant;
+    let start = Instant::now();
+    let dir = std::env::temp_dir().join(format!("meadow-repl-{}", std::process::id()));
+    let image = dir.join("entry.image");
+    let answer = dir.join("entry.answer");
+    let lowered = meadow_seq::lower_program(program, opt);
+    let written = if !lowered.unsupported.is_empty() {
+        Err(format!(
+            "the back end cannot translate {:?} yet",
+            lowered.unsupported
+        ))
+    } else {
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("could not create {}: {e}", dir.display()))
+            .and_then(|()| {
+                // A stack that grows, as an edit-run loop's should.
+                let config = meadow_llvm::Config {
+                    memory: crate::aot::gc(),
+                    stack: meadow_llvm::Stack::Growable,
+                };
+                crate::aot::write_image_with(&image, lowered.program, Vec::new(), config)
+            })
+    };
+    let compile = Some(start.elapsed());
+    let start = Instant::now();
+    let result = written.and_then(|()| {
+        let _ = std::fs::remove_file(&answer);
+        let status = std::process::Command::new(crate::aot::interpreter()?)
+            .arg("--answer")
+            .arg(&answer)
+            .arg(&image)
+            .status()
+            .map_err(|e| format!("could not run Silo's interpreter: {e}"))?;
+        match std::fs::read_to_string(&answer) {
+            Ok(shown) if status.success() => Ok(shown),
+            // What went wrong it has said already, on stderr.
+            _ => Err(format!(
+                "the program failed ({})",
+                status
+                    .code()
+                    .map_or("killed".to_string(), |c| format!("exit status {c}"))
+            )),
+        }
+    });
+    (
+        result,
+        Timings {
+            compile,
+            run: start.elapsed(),
+        },
+    )
+}
+
 pub fn run_timed(
     program: &core::Program,
     engine: Engine,
@@ -597,6 +655,33 @@ pub fn run_tests_parallel(
 /// `()`, compiled; and the entry the first of them has. They are compiled with
 /// everything else, so the image is built once and each test is simply a
 /// different place to start.
+/// The test executable of `program`, whose entries are `labels`, compiled
+/// and linked in `dir`.
+fn link_tests(
+    program: &meadow_seq::Program,
+    labels: &[meadow_seq::Label],
+    opt: OptLevel,
+    dir: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let units = meadow_llvm::compile_tests_with(
+        program,
+        labels,
+        meadow_llvm::UNIT,
+        meadow_llvm::CallConv::host(),
+        crate::aot::config(),
+    )
+    .map_err(|e| e.msg)?;
+    let target = crate::aot::Target::host()?.with_runtime(crate::aot::Runtime::Silo);
+    let runtime = crate::aot::runtimes(target)?
+        .into_iter()
+        .next()
+        .ok_or("no Silo runtime library")?;
+    let modules = crate::aot::write_units(dir, "tests", &units)?;
+    let exe = dir.join(format!("tests{}", std::env::consts::EXE_SUFFIX));
+    crate::aot::clang_link(&modules, &[], &runtime, &exe, opt, target, false)?;
+    Ok(exe)
+}
+
 /// Run `tests` compiled by the native backend (`docs/SILO.md`): one executable
 /// holding every test, built once, and run once per test -- a process each,
 /// `threads` at a time -- with the test's number as its argument. A test
@@ -620,25 +705,19 @@ pub fn run_tests_native(
     let labels: Vec<meadow_seq::Label> = (0..tests.len())
         .map(|i| meadow_seq::Label((base + i) as u32))
         .collect();
-    let units = meadow_llvm::compile_tests(
-        &lowered.program,
-        &labels,
-        meadow_llvm::UNIT,
-        meadow_llvm::CallConv::host(),
-    )
-    .map_err(|e| e.msg)?;
-    let target = crate::aot::Target::host()?.with_runtime(crate::aot::Runtime::Silo);
-    let runtime = crate::aot::runtimes(target)?
-        .into_iter()
-        .next()
-        .ok_or("no Silo runtime library")?;
     let dir = std::env::temp_dir()
         .join("meadow-silo-tests")
         .join(std::process::id().to_string());
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let modules = crate::aot::write_units(&dir, "tests", &units)?;
-    let exe = dir.join(format!("tests{}", std::env::consts::EXE_SUFFIX));
-    crate::aot::clang_link(&modules, &[], &runtime, &exe, opt, target, false)?;
+    // Interpreted: an image of the tests, which Silo's interpreter runs one of
+    // by its number, as the executable would.
+    let (exe, before) = if crate::aot::interpret() {
+        let image = dir.join("tests.image");
+        crate::aot::write_image(&image, lowered.program, labels)?;
+        (crate::aot::interpreter()?, Some(image))
+    } else {
+        (link_tests(&lowered.program, &labels, opt, &dir)?, None)
+    };
 
     let threads = threads.clamp(1, tests.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -652,7 +731,11 @@ pub fn run_tests_native(
                     if i >= tests.len() {
                         return;
                     }
-                    let told = match std::process::Command::new(&exe).arg(i.to_string()).output() {
+                    let told = match std::process::Command::new(&exe)
+                        .args(before.iter())
+                        .arg(i.to_string())
+                        .output()
+                    {
                         Err(e) => Told {
                             result: Err(format!("could not run the test executable: {e}")),
                             output: String::new(),

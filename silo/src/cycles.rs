@@ -230,13 +230,11 @@ fn cost(v: Word) -> usize {
 /// the header holds one fewer. It goes negative while the mark pass has taken
 /// the inside edges away, which is the whole point of the pass.
 fn refs(v: Word) -> i32 {
-    // Safety: a live block's count.
-    (unsafe { *(v as *const u32) } as i32) + 1
+    (heap::count(v) as i32) + 1
 }
 
 fn set_refs(v: Word, n: i32) {
-    // Safety: as `refs`.
-    unsafe { *(v as *mut u32) = (n - 1) as u32 }
+    heap::set_count(v, (n - 1) as u32)
 }
 
 /// What the collector has done, for `MEADOW_SILO_CYCLES`: runs, candidates
@@ -269,15 +267,39 @@ thread_local! {
     };
 }
 
-/// Is the collector's tally wanted? `MEADOW_SILO_CYCLES`.
+/// Is the collector's tally wanted? `MEADOW_SILO_CYCLES`, or the summary of
+/// `crate::stats`.
 pub fn counting() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| said() || crate::stats::on())
+}
+
+/// Is it to be said in full? `MEADOW_SILO_CYCLES`.
+fn said() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("MEADOW_SILO_CYCLES").is_some())
 }
 
+/// What this thread's collector has done: runs, blocks freed, nanoseconds
+/// in all and the longest.
+pub fn tally() -> Tally {
+    TALLY.with(|t| {
+        let t = t.borrow();
+        Tally {
+            runs: t.runs,
+            candidates: t.candidates,
+            freed: t.freed,
+            nanos: t.nanos,
+            longest: t.longest,
+            deferred: t.deferred,
+            unbounded: t.unbounded,
+        }
+    })
+}
+
 /// What this thread's collector has done.
 pub fn report() {
-    if !counting() {
+    if !said() {
         return;
     }
     TALLY.with(|t| {

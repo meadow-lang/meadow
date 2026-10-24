@@ -647,3 +647,207 @@ fn the_repl_shows_a_definition_in_each_ir() {
     // And something not defined is said to be.
     assert!(repl(":ir nope\n:q\n").contains("nothing called `nope` is defined"));
 }
+
+#[test]
+fn the_repl_evaluates_on_the_merged_runtime_s_vm() {
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    let out = repl(":silo\nfun f x = x * 2\nf 21\n\"ab\" ++ \"c\"\nprintln \"hi\"\nf\n:q\n");
+    for want in ["= 42", "= \"abc\"", "hi\n= ()", "= <closure>"] {
+        assert!(out.contains(want), "no `{want}` in:\n{out}");
+    }
+}
+
+#[test]
+fn a_profile_of_a_program_on_the_merged_runtime_s_vm_names_its_functions() {
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("meadow-vm-profile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("Prof/src")).unwrap();
+    std::fs::write(
+        dir.join("Prof/Meadow.toml"),
+        "[package]\nname = \"Prof\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("Prof/src/Main.mw"),
+        "fun fib (n : Int) : Int = if n < 2 then n else fib (n - 1) + fib (n - 2)\n\n\
+         fun main () = println (fib 24)\n",
+    )
+    .unwrap();
+    let to = dir.join("prof.folded");
+    let run = |to: &std::path::Path| {
+        let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
+            .args([
+                "run",
+                "--runtime",
+                "silo",
+                "--interpret",
+                "--sample-every",
+                "1000",
+                "--profile-to",
+            ])
+            .arg(to)
+            .arg(dir.join("Prof"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "46368");
+        std::fs::read_to_string(to).unwrap()
+    };
+    let folded = run(&to);
+    // Outermost first: `main`, then `fib` as deep as it was.
+    assert!(
+        folded
+            .lines()
+            .any(|l| l.starts_with("Prof.main;Prof.fib;Prof.fib")),
+        "{folded}"
+    );
+    // A profile of work is the same profile every time.
+    let mut a: Vec<&str> = folded.lines().collect();
+    let again = run(&dir.join("again.folded"));
+    let mut b: Vec<&str> = again.lines().collect();
+    a.sort();
+    b.sort();
+    assert_eq!(a, b);
+}
+
+#[test]
+fn the_merged_runtime_s_vm_says_what_a_program_reached_as_glade_does() {
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("meadow-vm-covered-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("Cov/src")).unwrap();
+    std::fs::write(
+        dir.join("Cov/Meadow.toml"),
+        "[package]\nname = \"Cov\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("Cov/src/Main.mw"),
+        "use Std.Process as P\nuse Std.String as S\n\n\
+         fun pick (n : Int) : Int = if n > 10 then n * 2 else if n > 5 then n + 1 else 0\n\n\
+         fun main () =\n  let a = P.covered True in\n  let _ = pick 1 in\n  \
+         let b = P.covered False in\n  let _ = pick 20 in\n  let c = P.covered False in\n  \
+         println (S.concatAll [show a, \" \", show (b > a), \" \", show (c > b)])\n",
+    )
+    .unwrap();
+    let said = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
+            .arg("run")
+            .args(args)
+            .arg(dir.join("Cov"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    // Glade's VM, and the merged runtime's: from nothing, and more as the
+    // program gets somewhere new. Native code notes nothing.
+    assert_eq!(said(&["--backend", "vm"]), "0 True True");
+    assert_eq!(said(&["--runtime", "silo", "--interpret"]), "0 True True");
+    assert_eq!(said(&["--runtime", "silo"]), "0 False False");
+}
+
+#[test]
+fn gc_stats_say_what_memory_did_on_the_merged_runtime_s_vm() {
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("meadow-vm-gc-stats-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("Gc/src")).unwrap();
+    std::fs::write(
+        dir.join("Gc/Meadow.toml"),
+        "[package]\nname = \"Gc\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("Gc/src/Main.mw"),
+        "use Std.Collections.Vector as V\n\n\
+         fun main () = println (V.len (V.map (\\x -> [x, x + 1]) (V.range 0 20000)))\n",
+    )
+    .unwrap();
+    for (gc, says) in [("rc", "gc: counted:"), ("tracing", "gc: traced:")] {
+        let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
+            .args([
+                "run",
+                "--runtime",
+                "silo",
+                "--interpret",
+                "--gc",
+                gc,
+                "--gc-stats",
+            ])
+            .arg(dir.join("Gc"))
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{err}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "20000");
+        assert!(
+            err.contains(says) && err.contains("gc: heaps"),
+            "{gc}: {err}"
+        );
+    }
+}
+
+#[test]
+fn exec_runs_an_image_of_axcut_on_the_merged_runtime_s_vm() {
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("meadow-vm-exec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("Ex/src")).unwrap();
+    std::fs::write(
+        dir.join("Ex/Meadow.toml"),
+        "[package]\nname = \"Ex\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("Ex/src/Main.mw"),
+        "use Std.Process as P\n\nfun main () = println (P.argv ())\n",
+    )
+    .unwrap();
+    let built = Command::new(env!("CARGO_BIN_EXE_meadow"))
+        .args(["build", "--runtime", "silo", "--interpret"])
+        .arg(dir.join("Ex"))
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
+        .arg("exec")
+        .arg(dir.join("Ex/target/debug/native/silo/Ex.image"))
+        .args(["--", "a", "b"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "[a, b]");
+}

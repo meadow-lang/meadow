@@ -85,13 +85,15 @@
 //! and erased with the descriptor it is described by, and the emitted code
 //! asks the descriptor.
 
-use meadow_axcut::{Block, Extern, Label, Name, Program, Rep, Statement, Tag};
+use crate::{Block, Extern, Label, Name, Program, Rep, Statement, Tag};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// A linear statement. See the module docs for what each consumes.
-#[derive(Debug, Clone)]
+// Written to an image for Silo's interpreter, which runs the program this
+// pass made of it rather than making it again: see `image`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum L {
     /// One reference more to `name`, which stays owned.
     Share(Name, Box<L>),
@@ -157,11 +159,16 @@ pub enum L {
         args: Vec<Name>,
         blocks: Vec<(Vec<Name>, L)>,
     },
-    Error(&'static str),
+    Error(#[serde(deserialize_with = "crate::leaked")] &'static str),
+    /// `rest`, which a person wrote at the location: AxCut's `Mark`, kept
+    /// for an engine that says where the program is -- a debugger's line
+    /// table. It does nothing, and is only there in a debug build.
+    Mark(meadow_rt::Loc, Box<L>),
 }
 
 /// An arm of a [`L::Switch`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct SwitchArm {
     pub tag: Tag,
     pub fields: Vec<Name>,
@@ -175,7 +182,8 @@ pub struct SwitchArm {
 
 /// A method: what it binds, and its body, which owns all of it but the
 /// parameters `borrowed` says it borrows.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct LBlock {
     pub params: Vec<Name>,
     pub borrowed: Vec<bool>,
@@ -428,7 +436,9 @@ pub fn program(program: &Program, pinned: &[Label]) -> Result<Vec<(usize, Label,
 /// Every block the linear statement `l` jumps to, its methods' included.
 fn l_jumps(l: &L, out: &mut HashSet<Label>) {
     match l {
-        L::Share(_, r) | L::Erase(_, r) | L::Rename(_, r) | L::Clean(_, r) => l_jumps(r, out),
+        L::Share(_, r) | L::Erase(_, r) | L::Rename(_, r) | L::Clean(_, r) | L::Mark(_, r) => {
+            l_jumps(r, out)
+        }
         L::Let { rest, .. } | L::DropReuse { rest, .. } => l_jumps(rest, out),
         L::Switch { arms, default, .. } => {
             for a in arms {
@@ -909,7 +919,9 @@ impl<'p> Pass<'p> {
     fn live(&mut self, s: &'p Statement, env: &[Name], owned: HashSet<Name>) -> Result<L, Error> {
         let mut owned = owned;
         match s {
-            Statement::Mark(_, inner) => self.live(inner, env, owned),
+            Statement::Mark(loc, inner) => {
+                Ok(L::Mark(*loc, Box::new(self.live(inner, env, owned)?)))
+            }
             Statement::Error(msg) => Ok(L::Error(msg)),
 
             Statement::Substitute(sel, block) => {
@@ -1209,7 +1221,7 @@ impl<'p> Pass<'p> {
                 // caller's to erase. See `emit::consumes`.
                 let mut owned = owned;
                 let mut share_first = None;
-                if let Some(i) = crate::emit::consumes(op)
+                if let Some(i) = consumes(op)
                     && let Some(&a) = args.get(i)
                     && self.counted(a)
                     && !owned.contains(&a)
@@ -1217,7 +1229,7 @@ impl<'p> Pass<'p> {
                     // Borrowed: the primitive is handed a reference of its own.
                     self.consumed_borrowed(a);
                     share_first = Some(a);
-                } else if let Some(i) = crate::emit::consumes(op)
+                } else if let Some(i) = consumes(op)
                     && let Some(&a) = args.get(i)
                     && self.counted(a)
                 {
@@ -1390,6 +1402,7 @@ pub fn free(l: &L) -> Vec<Name> {
             }
         };
         match l {
+            L::Mark(_, rest) => go(rest, bound, out),
             L::Share(n, rest) | L::Erase(n, rest) => {
                 use_(*n, bound, out);
                 go(rest, bound, out);
@@ -1546,9 +1559,11 @@ fn has_site(l: &L, n: usize) -> bool {
             rest,
             ..
         } => (fields.len() == n && reuse.is_none()) || has_site(rest, n),
-        L::Share(_, rest) | L::Erase(_, rest) | L::Rename(_, rest) | L::Clean(_, rest) => {
-            has_site(rest, n)
-        }
+        L::Share(_, rest)
+        | L::Erase(_, rest)
+        | L::Rename(_, rest)
+        | L::Clean(_, rest)
+        | L::Mark(_, rest) => has_site(rest, n),
         L::DropReuse { rest, .. } => has_site(rest, n),
         L::New { rest, .. } => {
             has_site(rest, n) || frame_method(l).is_some_and(|m| has_site(&m.body, n))
@@ -1663,7 +1678,7 @@ impl Pass<'_> {
     /// A new reuse token's name.
     fn token(&mut self) -> Name {
         self.tokens += 1;
-        meadow_axcut::VarId(u32::MAX - self.tokens)
+        crate::VarId(u32::MAX - self.tokens)
     }
 
     /// `l`, with the first `let` of `n` fields on each path building in token
@@ -1795,5 +1810,21 @@ impl Pass<'_> {
             },
             other => L::Clean(t, Box::new(other)),
         }
+    }
+}
+
+/// The argument a primitive **consumes** rather than borrows, if it does.
+///
+/// Every other primitive borrows its arguments. One that consumes is handed a
+/// reference of its own: the linearization shares the argument first where it
+/// is used again, and otherwise gives up the caller's. So a count of zero inside
+/// the primitive means nobody else can see the value, and it may be changed in
+/// place -- which is how `arrayPush` grows an array without copying it, and
+/// how a record whose type says where the label is gets its field replaced.
+pub fn consumes(op: &Extern) -> Option<usize> {
+    match op {
+        Extern::Prim(meadow_rt::Prim::ArrayPush | meadow_rt::Prim::ArrayConcat)
+        | Extern::Extend(_, Some(_)) => Some(0),
+        _ => None,
     }
 }

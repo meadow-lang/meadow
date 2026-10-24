@@ -17,7 +17,9 @@ pub mod console;
 pub mod desc;
 pub mod ffi;
 pub mod hash;
+pub mod layout;
 pub mod log;
+pub mod look;
 pub mod net;
 pub mod num;
 pub mod roles;
@@ -25,6 +27,7 @@ pub mod stm;
 pub mod terminal;
 pub mod text;
 pub mod thread;
+pub mod world;
 
 use meadow_intern::InternedString;
 

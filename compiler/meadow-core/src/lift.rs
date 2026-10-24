@@ -77,6 +77,20 @@ pub fn program(p: &Program, opt: OptLevel) -> Program {
     }
 }
 
+/// Whether `d` is a local function this pass made a definition of: named as
+/// it names one, `<outer>Local<n>`, and a copy of something
+/// ([`Program::origins`]), as each it makes is. A person may name a
+/// definition so, but not also make it a copy. What reads this keeps such a
+/// definition with the one it was written in: see `meadow_axcut`'s
+/// `Program::types`.
+pub fn is_lifted(p: &Program, d: &Def) -> bool {
+    let name = d.name.to_string();
+    p.origins.contains_key(&d.var)
+        && name.rsplit_once("Local").is_some_and(|(outer, n)| {
+            !outer.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+        })
+}
+
 /// A local function made a definition: what a mention of it becomes.
 #[derive(Clone)]
 struct Lifted {

@@ -14,7 +14,9 @@
 //! - [`emit`] writes LLVM IR as text, for clang to compile and link.
 
 pub mod emit;
-pub mod linear;
+/// `meadow_axcut::linear`, where it lives now that more than one engine reads
+/// it.
+pub use meadow_axcut::linear;
 
 use meadow_axcut::Program;
 
@@ -49,6 +51,7 @@ pub fn fingerprint() -> &'static str {
 }
 
 pub use emit::CallConv;
+pub use meadow_axcut::config::{Config, Memory, Stack};
 
 /// `program` as an LLVM module, as text, its functions in `conv`.
 pub fn compile(program: &Program, conv: CallConv) -> Result<String, Error> {
@@ -85,13 +88,39 @@ impl Unit {
 /// `emit::Module::units`. Their functions are in `conv`, which is the
 /// target's: see [`CallConv`].
 pub fn compile_split(program: &Program, unit: usize, conv: CallConv) -> Result<Vec<Unit>, Error> {
+    compile_split_with(program, unit, conv, Config::default())
+}
+
+/// `program` with no name a frame: every continuation an object, as
+/// [`Stack::Heap`] wants -- the memory pass then owns every capture, and the
+/// lowering builds every continuation on the heap and tail-calls.
+fn without_frames(program: &Program) -> Program {
+    let mut p = program.clone();
+    p.frames.clear();
+    p
+}
+
+/// [`compile_split`], run as `config` says.
+pub fn compile_split_with(
+    program: &Program,
+    unit: usize,
+    conv: CallConv,
+    config: Config,
+) -> Result<Vec<Unit>, Error> {
+    let heaped;
+    let program = if config.without_frames() {
+        heaped = without_frames(program);
+        &heaped
+    } else {
+        program
+    };
     if !program.exports.is_empty() {
-        return compile_library(program, unit, conv);
+        return compile_library_with(program, unit, conv, config);
     }
     let entry = program.entry.ok_or_else(|| Error {
         msg: "the program has no entry point".into(),
     })?;
-    let mut module = emit::Module::new(program, conv);
+    let mut module = emit::Module::with(program, conv, config);
     let blocks = linear::program(program, &[entry])?;
     module.name_labels(blocks.iter().map(|(i, label, _)| {
         let d = &program.defs[*i];
@@ -152,8 +181,25 @@ fn report_sizes(module: &emit::Module) {
 /// exports, which is all of it that is kept, and no `main`. In modules of
 /// about `unit` bytes, as [`compile_split`] makes them.
 pub fn compile_library(program: &Program, unit: usize, conv: CallConv) -> Result<Vec<Unit>, Error> {
+    compile_library_with(program, unit, conv, Config::default())
+}
+
+/// [`compile_library`], run as `config` says.
+pub fn compile_library_with(
+    program: &Program,
+    unit: usize,
+    conv: CallConv,
+    config: Config,
+) -> Result<Vec<Unit>, Error> {
+    let heaped;
+    let program = if config.without_frames() {
+        heaped = without_frames(program);
+        &heaped
+    } else {
+        program
+    };
     let roots: Vec<meadow_axcut::Label> = program.exports.iter().map(|e| e.label).collect();
-    let mut module = emit::Module::new(program, conv);
+    let mut module = emit::Module::with(program, conv, config);
     let blocks = linear::program(program, &roots)?;
     module.name_labels(blocks.iter().map(|(i, label, _)| {
         let d = &program.defs[*i];
@@ -186,7 +232,25 @@ pub fn compile_tests(
     unit: usize,
     conv: CallConv,
 ) -> Result<Vec<Unit>, Error> {
-    let mut module = emit::Module::new(program, conv);
+    compile_tests_with(program, tests, unit, conv, Config::default())
+}
+
+/// [`compile_tests`], run as `config` says.
+pub fn compile_tests_with(
+    program: &Program,
+    tests: &[meadow_axcut::Label],
+    unit: usize,
+    conv: CallConv,
+    config: Config,
+) -> Result<Vec<Unit>, Error> {
+    let heaped;
+    let program = if config.without_frames() {
+        heaped = without_frames(program);
+        &heaped
+    } else {
+        program
+    };
+    let mut module = emit::Module::with(program, conv, config);
     let blocks = linear::program(program, tests)?;
     module.name_labels(blocks.iter().map(|(i, label, _)| {
         let d = &program.defs[*i];

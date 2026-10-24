@@ -72,8 +72,11 @@ enum Cmd {
         profile: ProfileArgs,
         #[command(flatten)]
         engine: EngineArgs,
-        /// After running, report what the garbage collector did (VM only): how
-        /// many collections, how long they took, and how much they copied.
+        /// After running, report what the garbage collector did: on Glade's
+        /// VM, how many collections, how long they took, and how much they
+        /// copied; on Silo, natively or interpreted, its collections and
+        /// pauses when memory is traced, and its blocks and cycle collections
+        /// when it is counted.
         #[arg(long)]
         gc_stats: bool,
         /// Sample where the program spends itself and write folded stacks to
@@ -95,11 +98,14 @@ enum Cmd {
         /// program to guard its calls on: profile-guided optimization.
         #[arg(long)]
         train: bool,
-        /// Which collector the VM uses: `generational` (the default: a nursery,
-        /// and an old generation marked concurrently, for short pauses) or
-        /// `copying` (one space, copied whole). `MEADOW_GC` sets the same.
-        #[arg(long, value_parser = ["generational", "copying"])]
-        gc: Option<String>,
+        /// Run on Silo's interpreter and, whenever the package's sources
+        /// change, build it again and load the new build into the program as
+        /// it runs: from then on a call by name runs the new version, and
+        /// what is running already finishes as it was. A type the new build
+        /// changed is a new type: values already made of the old one go on
+        /// being taken by the code made for them.
+        #[arg(long)]
+        watch: bool,
         #[command(flatten)]
         target: TargetArgs,
         /// Arguments for the program, after `--`: what `Process.argv` gives
@@ -109,9 +115,10 @@ enum Cmd {
     },
     /// Run a bytecode image: what `meadow build` writes under
     /// `target/<profile>/bytecode/`, or what a compiler written in Meadow
-    /// emits.
+    /// emits -- or an image of AxCut, what `--runtime silo --interpret`
+    /// writes, which Silo's interpreter runs.
     Exec {
-        /// The `.mbc` file.
+        /// The `.mbc` file, or the `.image`.
         image: PathBuf,
         /// `vm` (the interpreter alone) or `jit` (the default). For an
         /// executable, `meadow link` the image.
@@ -423,6 +430,39 @@ struct TargetArgs {
     /// the same, and `threads = N` in a profile; both runtimes read it.
     #[arg(long, short = 'j', value_name = "N")]
     threads: Option<usize>,
+    /// How memory is managed, on either runtime: `rc`, counting references
+    /// with reuse (Silo's default), or a tracing collector -- `tracing`, or
+    /// by Glade's names for its two, `generational` (Glade's default: a
+    /// nursery, and an old generation marked concurrently) and `copying` (one
+    /// space, copied whole). Silo has one tracing collector, which any of the
+    /// three names; Glade has no counting. `MEADOW_GC` says the same.
+    #[arg(long, value_name = "STRATEGY", value_parser = ["rc", "tracing", "generational", "copying"])]
+    gc: Option<String>,
+    /// Interpret what is built for Silo rather than compiling it: the program
+    /// is lowered to AxCut and run by Silo's interpreter on Silo's runtime --
+    /// the same heap, strategies and primitives -- with nothing for LLVM to
+    /// do, so it starts as soon as it is lowered. `MEADOW_INTERPRET` says the
+    /// same.
+    #[arg(long)]
+    interpret: bool,
+    /// Where a program's frames live on Silo: `fixed`, the native stack, as
+    /// deep as a thread's (a gigabyte for `main`), at no cost; `growable`,
+    /// the native stack, as deep as memory allows, for a compare where each
+    /// function begins; or `heap`, as Glade's frames are -- every
+    /// continuation an object, as deep as memory allows, for an allocation
+    /// at each non-tail call. Growable in a debug build and fixed in a
+    /// release one, unless `stack = "…"` in a profile says otherwise.
+    /// `MEADOW_STACK` says the same.
+    #[arg(long, value_name = "STACK", value_parser = stack_kind)]
+    stack: Option<meadow_llvm::Stack>,
+    /// Build what is interpreted so that no new build of it can be loaded
+    /// into it while it runs (`meadow run --watch`): its definitions,
+    /// constructors and effects are not written with the versions of the
+    /// types they carry, and an image is smaller and lowered sooner. A
+    /// native build is never reloaded, and this changes nothing in it.
+    /// `reload = false` in a profile, or `MEADOW_RELOAD=0`, says the same.
+    #[arg(long)]
+    no_reload: bool,
     /// How large Glade's collector lets a thread's nursery grow: `8M`, `512K`,
     /// `1G`, or bytes, from 256K to 1G. 2M by default. A larger one collects
     /// less often and promotes less, which a program that allocates a great
@@ -450,6 +490,12 @@ struct TargetArgs {
     all_features: bool,
 }
 
+/// `--stack`'s kind, by name.
+fn stack_kind(s: &str) -> Result<meadow_llvm::Stack, String> {
+    meadow_llvm::Stack::named(s)
+        .ok_or_else(|| format!("`{s}` is not a stack: `fixed` or `growable`"))
+}
+
 impl TargetArgs {
     /// These, with what the resolved profile says for whatever the command
     /// line left out -- the runtime above all, which only the profile knows.
@@ -468,6 +514,10 @@ impl TargetArgs {
                 .or_else(|| profile.target.map(|t| t.to_string())),
             runtime: profile.runtime,
             threads: self.threads.or(profile.threads),
+            gc: self.gc.clone(),
+            interpret: self.interpret,
+            stack: self.stack.or(Some(profile.stack)),
+            no_reload: self.no_reload || !profile.reload,
             nursery: self.nursery.or(profile.nursery),
             leaks: self.leaks || profile.leaks,
             features: self.features.clone(),
@@ -480,6 +530,23 @@ impl TargetArgs {
     /// runtimes are told, and a program Silo runs is a process
     /// of its own, which inherits it.
     fn configure(&self) {
+        if self.interpret {
+            meadow::aot::set_interpret();
+        }
+        if let Some(s) = self.stack {
+            meadow::aot::set_stack(s);
+        }
+        if self.no_reload {
+            meadow::aot::set_no_reload();
+        }
+        if let Some(g) = &self.gc {
+            meadow::aot::set_gc(meadow::aot::strategy(g));
+            if g == "rc" && self.runtime == aot::Runtime::Glade {
+                status::warning("Glade has no reference counting: its collector traces");
+            }
+            // Glade's collector is chosen by it. Safety: as below.
+            unsafe { std::env::set_var("MEADOW_GC", g) };
+        }
         if let Some(n) = self.threads.filter(|n| *n > 0) {
             // Safety: before the program, its threads or any child of it.
             unsafe { std::env::set_var("MEADOW_THREADS", n.to_string()) };
@@ -605,6 +672,10 @@ impl ProfileArgs {
             threads: None,
             // Asked for with `--nursery`, which `TargetArgs` reads.
             nursery: None,
+            // Asked for with `--stack`, likewise.
+            stack: None,
+            // And with `--no-reload`.
+            reload: None,
             leaks: None,
             target: None,
         }
@@ -722,6 +793,9 @@ fn command() {
             let selected = select(&packages.selection(), &path);
             let profile = profile.resolve(&path);
             let target = target.with(&profile);
+            // What is built depends on it: a strategy for memory, or an image
+            // to interpret in place of an executable.
+            target.configure();
             match &selected.paths[..] {
                 [one] => build(
                     one,
@@ -754,15 +828,30 @@ fn command() {
             sample_every,
             sample_hz,
             train,
-            gc,
+            watch,
             target,
             args,
         }) => {
             meadow_compiler::core::args::set(args);
+            // Reloading is the interpreter's, on Silo.
+            let mut profile = profile;
+            let mut target = target;
+            if watch {
+                profile.runtime = Some("silo".into());
+                target.interpret = true;
+                meadow::watch::set_watching();
+            }
             let resolved = profile.resolve(&path);
             let target = target.with(&resolved);
+            if watch && target.no_reload {
+                status::error(
+                    "`--watch` loads each new build into the program, which `--no-reload` \
+                     (or `reload = false`) builds it not to take",
+                );
+                std::process::exit(2);
+            }
             target.configure();
-            if let Some(gc) = gc {
+            if let Some(gc) = &target.gc {
                 meadow_glade::heap::configure(meadow_glade::heap::GcConfig {
                     collector: match gc.as_str() {
                         "copying" => meadow_glade::heap::Collector::Copying,
@@ -1271,6 +1360,23 @@ fn could_not_compile(name: &str, errors: usize) {
 
 /// `meadow exec`: run the image at `path` on `backend`.
 fn exec(path: &std::path::Path, backend: Backend, opt: OptLevel) {
+    // An image of AxCut, which the merged runtime's VM runs: what a build
+    // that interprets for Silo writes.
+    if aot::is_image(path) {
+        let vm = aot::interpreter().unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        });
+        let status = std::process::Command::new(vm)
+            .arg(path)
+            .args(meadow_compiler::core::args::get())
+            .status()
+            .unwrap_or_else(|e| {
+                eprintln!("error: could not run {}: {e}", path.display());
+                std::process::exit(1);
+            });
+        std::process::exit(status.code().unwrap_or(1));
+    }
     let image = read_image(path);
     let engine = match backend {
         Backend::Vm => Engine::Vm,
@@ -1570,14 +1676,65 @@ fn finish(
                 status::note("Executable", shown(&exe));
             }
             Ok(exe) => {
+                // The program a watching run rebuilt this for is running.
+                if meadow::watch::rebuilding() {
+                    std::process::exit(0);
+                }
                 status::status("Running", format!("`{}`", shown(&exe)));
-                let status = std::process::Command::new(&exe)
-                    .args(meadow_compiler::core::args::get())
-                    .status()
-                    .unwrap_or_else(|e| {
-                        eprintln!("error: could not run {}: {e}", exe.display());
+                let watching = meadow::watch::watching() && aot::is_image(&exe);
+                let mut command = if aot::is_image(&exe) {
+                    let vm = aot::interpreter().unwrap_or_else(|e| {
+                        eprintln!("error: {e}");
                         std::process::exit(1);
                     });
+                    let mut c = std::process::Command::new(vm);
+                    if watching {
+                        c.arg("--watch");
+                    }
+                    // A profile, as Glade's VM takes one: by time, or by
+                    // work, written as folded stacks where it is asked for,
+                    // or beside the build when the profile says `profile`.
+                    let sampled = sampling.as_ref().map(|(to, how)| (to.clone(), Some(how)));
+                    let sampled = sampled.or_else(|| {
+                        profile.sample.then(|| {
+                            let to = match package {
+                                Some((root, _)) => root
+                                    .join("target")
+                                    .join(profile.profile.name())
+                                    .join("profile.folded"),
+                                None => PathBuf::from("profile.folded"),
+                            };
+                            (to, None)
+                        })
+                    });
+                    if let Some((to, how)) = sampled {
+                        c.arg("--profile").arg(&to);
+                        if let Some(how) = how {
+                            match how.every {
+                                Some(n) => c.arg("--profile-every").arg(n.to_string()),
+                                None => c.arg("--profile-hz").arg(how.hz.to_string()),
+                            };
+                        }
+                        status::status("Profiling", format!("to {}", shown(&to)));
+                    }
+                    c.arg(&exe);
+                    c
+                } else {
+                    std::process::Command::new(&exe)
+                };
+                command.args(meadow_compiler::core::args::get());
+                // What its memory did, said by the runtime at the end: either
+                // engine, either strategy.
+                if gc_stats {
+                    command.env("MEADOW_SILO_GC_STATS", "1");
+                }
+                if let (true, Some((root, _))) = (watching, package) {
+                    std::process::exit(meadow::watch::run(command, root));
+                }
+                let status = command.status().unwrap_or_else(|e| {
+                    eprintln!("error: could not run {}: {e}", exe.display());
+                    std::process::exit(1);
+                });
                 std::process::exit(status.code().unwrap_or(1));
             }
             // A release build of a lone file, or on a machine that cannot link

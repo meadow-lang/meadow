@@ -27,33 +27,38 @@
 //! field; Meadow has arrays and strings, which want indexing, so blocks come in
 //! a size class per word count, with anything bigger allocated on its own.
 
-/// What word 1's low byte says a block is. `meadow_llvm::emit::kind` agrees.
-pub const DATA: u64 = 1;
-pub const CLOSURE: u64 = 2;
-pub const STRING: u64 = 3;
-pub const ARRAY: u64 = 4;
-pub const BIGINT: u64 = 5;
-pub const CELL: u64 = 6;
-pub const RECORD: u64 = 7;
-pub const MUT_ARRAY: u64 = 8;
-/// A resumption's one-shot flag.
-pub const ONCE: u64 = 9;
-pub const COMPACT: u64 = 10;
-pub const CHANNEL: u64 = 11;
-pub const TASK: u64 = 12;
-pub const TVAR: u64 = 13;
-/// A suspended stack segment: see `crate::segments`.
-pub const STACK: u64 = 14;
-/// What a compact's values live in: see `crate::prims`, `Compact`.
-pub const REGION: u64 = 15;
+/// The layout all of this is: `meadow_rt::layout::SILO`, which the emitted
+/// code and the interpreter read too. The constants below are its, by the
+/// names this module has always given them.
+pub const LAYOUT: meadow_rt::layout::Layout = meadow_rt::layout::SILO;
 
-pub const DESC_SHIFT: u32 = 8;
-pub const UNIFORM: u64 = 1 << 12;
+/// What word 1's low byte says a block is.
+pub const DATA: u64 = LAYOUT.kinds.data;
+pub const CLOSURE: u64 = LAYOUT.kinds.closure;
+pub const STRING: u64 = LAYOUT.kinds.string;
+pub const ARRAY: u64 = LAYOUT.kinds.array;
+pub const BIGINT: u64 = LAYOUT.kinds.bigint;
+pub const CELL: u64 = LAYOUT.kinds.cell;
+pub const RECORD: u64 = LAYOUT.kinds.record;
+pub const MUT_ARRAY: u64 = LAYOUT.kinds.mut_array;
+/// A resumption's one-shot flag.
+pub const ONCE: u64 = LAYOUT.kinds.once;
+pub const COMPACT: u64 = LAYOUT.kinds.compact;
+pub const CHANNEL: u64 = LAYOUT.kinds.channel;
+pub const TASK: u64 = LAYOUT.kinds.task;
+pub const TVAR: u64 = LAYOUT.kinds.tvar;
+/// A suspended stack segment: see `crate::segments`.
+pub const STACK: u64 = LAYOUT.kinds.stack;
+/// What a compact's values live in: see `crate::prims`, `Compact`.
+pub const REGION: u64 = LAYOUT.kinds.region;
+
+pub const DESC_SHIFT: u32 = LAYOUT.elem_desc.shift;
+pub const UNIFORM: u64 = LAYOUT.uniform.bits_in_place();
 
 /// What the cycle collector keeps in word 1, where a fresh block has zeroes:
 /// a colour, whether the block is waiting in the candidate buffer, and
 /// whether it died while it was waiting. See [`crate::cycles`].
-pub const COLOUR_SHIFT: u32 = 13;
+pub const COLOUR_SHIFT: u32 = LAYOUT.colour.shift;
 pub const BLACK: u64 = 0;
 pub const GRAY: u64 = 1;
 pub const WHITE: u64 = 2;
@@ -72,12 +77,12 @@ const MOVED: u64 = 1 << 17;
 /// and it puts the count somewhere no ordinary block's ever is, so a share or
 /// an erase can tell it is touching a region from the count it has loaded
 /// anyway.
-pub const STICKY: u32 = 1 << 30;
+pub const STICKY: u32 = LAYOUT.sticky as u32;
 
 /// A count this big is a block inside a compact region and nothing else: half
 /// the bias, so no amount of drift in either direction is mistaken either
 /// way. `meadow_llvm::emit`'s helpers test the same number inline.
-pub const REGION_FLOOR: u32 = STICKY / 2;
+pub const REGION_FLOOR: u32 = LAYOUT.region_floor as u32;
 
 /// Is `v` a block inside a compact region? Ask only of a word a descriptor
 /// says is a reference: an `Int` that happens to be even is not an address.
@@ -92,7 +97,7 @@ pub fn in_region(v: Word) -> bool {
 /// block is built and never changed, so that the emitted counting helper can
 /// ask this and the colour in one test -- `meadow_llvm::emit::helpers`, which
 /// has the constant, must agree with these bits.
-pub const MUTABLE: u64 = 1 << 18;
+pub const MUTABLE: u64 = LAYOUT.mutable.bits_in_place();
 
 /// Everything in word 1 that is one heap's collector talking to itself: the
 /// colour, whether the block is waiting in that heap's candidate list, and
@@ -276,6 +281,9 @@ pub struct Heap {
     /// Under `MEADOW_SILO_PRIMS`: how many blocks of each kind this heap has
     /// erased, by what makes them -- a constructor, a closure's code.
     erased: Option<std::collections::HashMap<(u64, u32), u64>>,
+    /// Where a traced program's blocks come from: see [`crate::trace`]. Made
+    /// at its first allocation; never, for a program that counts.
+    space: Option<Box<crate::trace::Space>>,
 }
 
 impl Heap {
@@ -300,7 +308,17 @@ impl Heap {
             large: crate::ctx::ByAddress::default(),
             held: 0,
             erased: crate::prims::counting().then(std::collections::HashMap::new),
+            space: None,
         }
+    }
+
+    /// The traced program's memory, if it has allocated any.
+    pub fn space(&self) -> Option<&crate::trace::Space> {
+        self.space.as_deref()
+    }
+
+    pub fn space_mut(&mut self) -> Option<&mut crate::trace::Space> {
+        self.space.as_deref_mut()
     }
 }
 
@@ -482,7 +500,37 @@ fn with_in<T>(c: *mut crate::ctx::Ctx, f: impl FnOnce(&mut Heap) -> T) -> T {
 /// Is `v` the address of a block?
 #[inline]
 pub fn is_block(v: Word) -> bool {
-    v != 0 && v & 1 == 0
+    LAYOUT.is_block(v)
+}
+
+/// Is `v` a value with no block: a constructor with no fields, a closure
+/// with no captures?
+#[inline]
+pub fn is_immediate(v: Word) -> bool {
+    v & LAYOUT.imm_mask == LAYOUT.imm_tag
+}
+
+/// The value with no block that carries `payload` -- a tag, a method base.
+#[inline]
+pub const fn immediate(payload: u64) -> Word {
+    LAYOUT.immediate(payload)
+}
+
+/// What the value with no block `v` carries.
+#[inline]
+pub const fn payload(v: Word) -> u64 {
+    LAYOUT.payload(v)
+}
+
+/// The tag of a constructor, or the method base of a closure, whether it has
+/// a block or not: what a `switch` and an `invoke` read.
+#[inline]
+pub fn meta_of(v: Word) -> u32 {
+    if is_immediate(v) {
+        payload(v) as u32
+    } else {
+        meta(v)
+    }
 }
 
 #[inline]
@@ -504,28 +552,59 @@ pub fn set_word(v: Word, i: usize, w: Word) {
 }
 
 pub fn len(v: Word) -> usize {
-    (word(v, 0) >> 32) as usize
+    LAYOUT.len.get(word(v, LAYOUT.len.word)) as usize
 }
 
 pub fn kind(v: Word) -> u64 {
-    word(v, 1) & 0xFF
+    LAYOUT.kind.get(word(v, LAYOUT.kind.word))
 }
 
 pub fn meta(v: Word) -> u32 {
-    (word(v, 1) >> 32) as u32
+    LAYOUT.meta.get(word(v, LAYOUT.meta.word)) as u32
 }
 
-fn uniform(v: Word) -> bool {
-    word(v, 1) & UNIFORM != 0
+pub(crate) fn uniform(v: Word) -> bool {
+    LAYOUT.uniform.get(word(v, LAYOUT.uniform.word)) != 0
+}
+
+/// The references to `v` besides one.
+#[inline]
+pub fn count(v: Word) -> u32 {
+    LAYOUT.count.get(word(v, LAYOUT.count.word)) as u32
+}
+
+#[inline]
+pub fn set_count(v: Word, rc: u32) {
+    let at = LAYOUT.count.word;
+    set_word(v, at, LAYOUT.count.set(word(v, at), u64::from(rc)));
+}
+
+/// Where a uniform block's elements begin -- an array's, a big integer's
+/// limbs: right after its header, with no descriptors before them.
+pub const ELEMS: usize = LAYOUT.first_field(0, true);
+
+/// Set `v`'s length to `n`, keeping the rest of its header.
+pub fn set_len(v: Word, n: usize) {
+    let at = LAYOUT.len.word;
+    set_word(v, at, LAYOUT.len.set(word(v, at), n as u64));
+}
+
+/// Set the `meta` of the block at `v` -- a constructor's tag, a segment's
+/// number -- keeping the rest of its header.
+pub fn set_meta(v: Word, m: u32) {
+    let at = LAYOUT.meta.word;
+    set_word(v, at, LAYOUT.meta.set(word(v, at), u64::from(m)));
+}
+
+/// Set the one descriptor of the uniform block at `v`'s elements.
+pub fn set_elem_desc(v: Word, d: i64) {
+    let at = LAYOUT.elem_desc.word;
+    set_word(v, at, LAYOUT.elem_desc.set(word(v, at), d as u64));
 }
 
 /// Where the fields start.
 pub fn first_field(v: Word) -> usize {
-    if uniform(v) {
-        2
-    } else {
-        2 + len(v).div_ceil(16)
-    }
+    LAYOUT.first_field(len(v), uniform(v))
 }
 
 /// Words the block takes.
@@ -559,9 +638,10 @@ pub fn array_room(n: usize) -> usize {
 /// Field `i`'s descriptor.
 pub fn field_desc(v: Word, i: usize) -> i64 {
     if uniform(v) {
-        ((word(v, 1) >> DESC_SHIFT) & 15) as i64
+        LAYOUT.elem_desc.get(word(v, LAYOUT.elem_desc.word)) as i64
     } else {
-        ((word(v, 2 + i / 16) >> (4 * (i % 16))) & 15) as i64
+        let (at, shift) = LAYOUT.desc_at(i);
+        ((word(v, at) >> shift) & LAYOUT.desc_mask()) as i64
     }
 }
 
@@ -573,9 +653,9 @@ pub fn field(v: Word, i: usize) -> Word {
 pub fn set_field(v: Word, i: usize, x: Word, d: i64) {
     set_word(v, first_field(v) + i, x);
     if !uniform(v) {
-        let at = 2 + i / 16;
-        let shift = 4 * (i % 16);
-        let w = (word(v, at) & !(15 << shift)) | (((d as u64) & 15) << shift);
+        let (at, shift) = LAYOUT.desc_at(i);
+        let mask = LAYOUT.desc_mask();
+        let w = (word(v, at) & !(mask << shift)) | (((d as u64) & mask) << shift);
         set_word(v, at, w);
     }
 }
@@ -583,7 +663,7 @@ pub fn set_field(v: Word, i: usize, x: Word, d: i64) {
 /// `n` references more to `v`, described by `d`: one count written, unless
 /// the block is in a region, which counts each.
 pub fn share_n(v: Word, d: i64, n: usize) {
-    if n == 0 || d != meadow_rt::desc::REF || !is_block(v) {
+    if n == 0 || d != meadow_rt::desc::REF || !is_block(v) || crate::trace::on() {
         return;
     }
     if in_region(v) {
@@ -600,7 +680,8 @@ pub fn share_n(v: Word, d: i64, n: usize) {
 /// One reference more to `v`, described by `d`.
 #[inline]
 pub fn share(v: Word, d: i64) {
-    if d == meadow_rt::desc::REF && is_block(v) {
+    // Traced, nothing is counted: see `crate::trace`.
+    if d == meadow_rt::desc::REF && is_block(v) && !crate::trace::on() {
         // Safety: a live block's count.
         let rc = unsafe { &mut *(v as *mut u32) };
         *rc += 1;
@@ -616,7 +697,7 @@ pub fn share(v: Word, d: i64) {
 /// One reference fewer.
 #[inline]
 pub fn erase(v: Word, d: i64) {
-    if d == meadow_rt::desc::REF && is_block(v) {
+    if d == meadow_rt::desc::REF && is_block(v) && !crate::trace::on() {
         // Safety: a live block's count.
         let rc = unsafe { &mut *(v as *mut u32) };
         if *rc == 0 {
@@ -646,6 +727,9 @@ fn died(v: Word) {
 /// [`died`], in context `c`'s heap.
 #[inline]
 pub fn died_in(c: *mut crate::ctx::Ctx, v: Word) {
+    if crate::trace::on() {
+        return;
+    }
     if crate::prims::counting() {
         dropped(v);
     }
@@ -659,12 +743,31 @@ pub fn died_in(c: *mut crate::ctx::Ctx, v: Word) {
     with_in(c, |h| h.pending.push((ptr(v), 0)));
 }
 
-/// A block of `words` words, count 0, the rest for the caller to write.
+/// A block of `words` words, count 0, the rest for the caller to write: what
+/// the runtime's own allocations go through, in a counted program or a
+/// traced one.
 pub fn acquire(words: usize) -> Word {
-    acquire_in(crate::ctx::get(), words)
+    let c = crate::ctx::get();
+    if crate::trace::on() {
+        acquire_traced(c, words)
+    } else {
+        acquire_in(c, words)
+    }
 }
 
-/// [`acquire`], from context `c`'s heap.
+/// [`acquire`] under tracing, from context `c`'s: what a traced program's
+/// code allocates through (`meadow_acquire_traced`), apart from counting's,
+/// whose path every allocation of a counted program takes and which is as it
+/// was before tracing was there.
+pub fn acquire_traced(c: *mut crate::ctx::Ctx, words: usize) -> Word {
+    with_in(c, |h| {
+        h.space
+            .get_or_insert_with(|| Box::new(crate::trace::Space::new()))
+            .take(words)
+    })
+}
+
+/// [`acquire`] in a counted program, from context `c`'s heap.
 pub fn acquire_in(c: *mut crate::ctx::Ctx, words: usize) -> Word {
     with_in(c, |h| {
         // Work off what is pending: one step always, more while nothing clean
@@ -894,6 +997,10 @@ pub fn clean(v: Word) {
 
 /// [`clean`], into context `c`'s heap.
 pub fn clean_in(c: *mut crate::ctx::Ctx, v: Word) {
+    // Traced, a block is freed by the sweep and nothing else.
+    if crate::trace::on() {
+        return;
+    }
     if crate::cycles::possible() && buffered(v) {
         // Waiting in the candidate buffer: hold the memory back, and
         // remember that there is nothing left inside to erase.

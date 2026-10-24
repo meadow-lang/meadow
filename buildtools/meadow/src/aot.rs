@@ -84,6 +84,187 @@ impl Runtime {
     }
 }
 
+/// How a native program's memory is managed: Silo counts references unless
+/// told to trace (`docs/RUNTIME-MERGE.md`). `--gc` sets it for a command, and
+/// `MEADOW_GC=tracing` for everything that runs.
+static GC: std::sync::OnceLock<meadow_llvm::Memory> = std::sync::OnceLock::new();
+
+/// Say how memory is managed, before anything is built: `--gc`.
+pub fn set_gc(memory: meadow_llvm::Memory) {
+    let _ = GC.set(memory);
+}
+
+/// How memory is managed: what `--gc` said, or `MEADOW_GC`, or counting.
+pub fn gc() -> meadow_llvm::Memory {
+    *GC.get_or_init(|| {
+        std::env::var("MEADOW_GC")
+            .ok()
+            .map_or_else(Default::default, |g| strategy(&g))
+    })
+}
+
+/// How deep a program for Silo's calls may go: what the profile, the
+/// manifest or `--stack` said, or `MEADOW_STACK`.
+static STACK: std::sync::OnceLock<meadow_llvm::Stack> = std::sync::OnceLock::new();
+
+/// Say how deep calls may go, before anything is built.
+pub fn set_stack(stack: meadow_llvm::Stack) {
+    let _ = STACK.set(stack);
+}
+
+pub fn stack() -> meadow_llvm::Stack {
+    *STACK.get_or_init(|| {
+        std::env::var("MEADOW_STACK")
+            .ok()
+            .and_then(|s| meadow_llvm::Stack::named(&s))
+            .unwrap_or_default()
+    })
+}
+
+/// How a program for Silo is run, by either engine.
+pub fn config() -> meadow_llvm::Config {
+    meadow_llvm::Config {
+        memory: gc(),
+        stack: stack(),
+    }
+}
+
+/// Whether a program for Silo is interpreted rather than compiled: `--interpret`
+/// Whether an interpreted build may take a new build of itself while it runs:
+/// what `--no-reload`, `reload = false` in a profile, or `MEADOW_RELOAD=0`
+/// turns off. See [`lowered_for`].
+static RELOAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Build what is interpreted so that no new build loads into it.
+pub fn set_no_reload() {
+    let _ = RELOAD.set(false);
+}
+
+pub fn reloadable() -> bool {
+    *RELOAD.get_or_init(|| {
+        !matches!(
+            std::env::var("MEADOW_RELOAD").as_deref(),
+            Ok("0" | "false" | "no")
+        )
+    })
+}
+
+/// `program` lowered to AxCut for this build: for one that is interpreted and
+/// may take a new build of itself, with its definitions, constructors and
+/// effects written with the versions of the types they carry, which loading a
+/// new build goes by (`meadow_seq::lower_program_with`). Everything else is
+/// lowered as it always was: a native program is never reloaded, and its IR
+/// is the same either way.
+pub fn lowered_for(
+    program: &meadow_compiler::core::Program,
+    opt: meadow_compiler::OptLevel,
+) -> meadow_seq::Lowered {
+    meadow_seq::lower_program_with(program, opt, interpret() && reloadable())
+}
+
+/// or `MEADOW_INTERPRET`. See [`write_image`].
+static INTERPRET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Interpret, rather than compile, what is built for Silo: `--interpret`.
+pub fn set_interpret() {
+    let _ = INTERPRET.set(true);
+}
+
+pub fn interpret() -> bool {
+    *INTERPRET.get_or_init(|| std::env::var_os("MEADOW_INTERPRET").is_some())
+}
+
+/// Write `program` as an image for Silo's interpreter (`silo/vm`) to `path`:
+/// what a build that interprets makes in place of an executable. Its tests, if
+/// it is a program of them, are where each begins.
+pub fn write_image(
+    path: &Path,
+    program: meadow_seq::Program,
+    tests: Vec<meadow_seq::Label>,
+) -> Result<(), String> {
+    write_image_with(path, program, tests, config())
+}
+
+/// [`write_image`], run as `config` says rather than as this build is: a
+/// debugger's, which wants a stack that grows whatever the build's does.
+pub fn write_image_with(
+    path: &Path,
+    program: meadow_seq::Program,
+    tests: Vec<meadow_seq::Label>,
+    config: meadow_llvm::Config,
+) -> Result<(), String> {
+    // The memory pass, done here once rather than by every run: where it
+    // starts is the entry, or each test.
+    let roots = match (tests.is_empty(), program.entry) {
+        (true, Some(e)) => vec![e],
+        (true, None) => return Err("the program has no entry point".into()),
+        (false, _) => tests.clone(),
+    };
+    // Every continuation an object, if the stack is to be the heap.
+    let mut program = program;
+    if config.without_frames() {
+        program.frames.clear();
+    }
+    let linear = meadow_llvm::linear::program(&program, &roots).map_err(|e| e.msg)?;
+    // What the definitions were before the pass is not read again.
+    for d in &mut program.defs {
+        d.block.body = meadow_seq::Statement::Error("made linear");
+    }
+    let image = meadow_seq::image::Image {
+        program,
+        config,
+        tests,
+        linear,
+    };
+    // Whole or not at all: an interpreter watching the image (`meadow run
+    // --watch`) reads it as soon as it changes.
+    let partial = path.with_extension("image.part");
+    write(&partial, &meadow_seq::image::encode(&image)?)?;
+    std::fs::rename(&partial, path).map_err(|e| format!("could not write {}: {e}", path.display()))
+}
+
+/// Is `path` an image, which [`interpreter`] runs, rather than an executable?
+pub fn is_image(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "image")
+}
+
+/// Silo's interpreter: `MEADOW_SILO_VM`, or beside this executable, or where
+/// a checkout builds it.
+pub fn interpreter() -> Result<PathBuf, String> {
+    let exe = format!("meadow-silo-vm{}", std::env::consts::EXE_SUFFIX);
+    if let Some(path) = std::env::var_os("MEADOW_SILO_VM") {
+        return Ok(PathBuf::from(path));
+    }
+    let mut candidates = Vec::new();
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(Path::to_path_buf))
+    {
+        candidates.push(dir.join(&exe));
+    }
+    let built = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../silo/target");
+    for profile in ["release", "debug"] {
+        candidates.push(built.join(profile).join(&exe));
+    }
+    candidates
+        .into_iter()
+        .find(|p| p.is_file())
+        .ok_or_else(|| {
+            "Silo's interpreter is not built: `cargo build --release --manifest-path              silo/Cargo.toml -p meadow-silo-vm`, or say where it is with MEADOW_SILO_VM"
+                .to_string()
+        })
+}
+
+/// Silo's strategy for a name `--gc` takes: counting for `rc`, and its one
+/// tracing collector for any name of one -- Glade's `generational` and
+/// `copying` among them, so that a strategy means the same on either runtime.
+pub fn strategy(name: &str) -> meadow_llvm::Memory {
+    match name {
+        "generational" | "copying" => meadow_llvm::Memory::Trace,
+        g => meadow_llvm::Memory::named(g).unwrap_or_default(),
+    }
+}
+
 /// What to compile for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Target {
@@ -209,7 +390,7 @@ pub fn build_native(
     inputs: Option<u64>,
 ) -> Result<PathBuf, String> {
     build_native_of(root, profile, opt, name, target, inputs, || {
-        let lowered = meadow_seq::lower_program(program, opt);
+        let lowered = lowered_for(program, opt);
         if !lowered.unsupported.is_empty() {
             return Err(format!(
                 "the back end cannot translate {:?} yet",
@@ -259,12 +440,27 @@ pub fn build_native_of(
             .chain(opt.name().bytes())
             .chain(target.triple().bytes())
             .chain(linked_with.iter().copied())
+            // Traced and counted, the same program is two executables;
+            // with a fixed stack and a growable one, two more.
+            .chain([gc() as u8, stack() as u8])
         {
             h ^= u64::from(b);
             h = h.wrapping_mul(0x0100_0000_01b3);
         }
         format!("inputs {h:016x}")
     });
+    if interpret() {
+        crate::status::status("Lowering", format!("`{name}` for Silo's interpreter"));
+        let lowered = lowered()?;
+        if !lowered.exports.is_empty() {
+            return Err("a library is compiled, not interpreted".into());
+        }
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+        let image = dir.join(format!("{name}.image"));
+        write_image(&image, lowered, Vec::new())?;
+        return Ok(image);
+    }
     if let Some(want) = &keyed
         && exe.exists()
         && std::fs::read_to_string(&stamp).is_ok_and(|had| had == *want)
@@ -285,8 +481,9 @@ pub fn build_native_of(
         exe
     };
     let stamp = exe.with_extension("stamp");
-    let units = meadow_llvm::compile_split(&lowered, meadow_llvm::UNIT, target.call_conv())
-        .map_err(|e| e.msg)?;
+    let units =
+        meadow_llvm::compile_split_with(&lowered, meadow_llvm::UNIT, target.call_conv(), config())
+            .map_err(|e| e.msg)?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
     // Unchanged module and runtime: the executable there is this one.

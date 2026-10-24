@@ -4,8 +4,7 @@
 
 use crate::heap::{self, Word};
 use meadow_rt::desc;
-use meadow_rt::roles::{Role, TUPLE};
-use std::fmt::Write;
+use meadow_rt::roles::Role;
 
 /// The program's tables the emitted module defines: constructor names and
 /// named fields by tag, and interned names -- with the order records keep
@@ -29,8 +28,42 @@ unsafe extern "C" {
     static meadow_sym_count: i64;
 }
 
-/// The emitted module's tables, read once.
+/// Tables given by whatever runs the program when there is no emitted module
+/// to read them from: an interpreter (`silo/vm`), before the program starts,
+/// and again when it loads a new build of the program. Each is kept for as
+/// long as the program runs -- what read one may still be reading it -- and
+/// each extends the one before: what the old numbered, it numbers alike.
+static INSTALLED: std::sync::atomic::AtomicPtr<Names> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Give the program's tables to the runtime, before anything asks for them.
+pub fn install(names: Names) {
+    INSTALLED.store(
+        Box::into_raw(Box::new(names)),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+/// Replace the tables, as loading a new build of the running program does.
+/// `make` is given the labels the runtime numbered after the program's own
+/// (see [`sym_named`]), and answers tables whose symbols number those as they
+/// were -- after which they are the program's, and not numbered again. Until
+/// it answers, nothing numbers another.
+pub fn reinstall<E>(make: impl FnOnce(&[String]) -> Result<Names, E>) -> Result<(), E> {
+    let mut extra = EXTRA.lock().unwrap_or_else(|p| p.into_inner());
+    let names = make(&extra)?;
+    install(names);
+    extra.clear();
+    Ok(())
+}
+
+/// The program's tables: those installed, or the emitted module's, read once.
 pub fn names() -> &'static Names {
+    let installed = INSTALLED.load(std::sync::atomic::Ordering::Acquire);
+    if !installed.is_null() {
+        // Safety: installed tables are never freed.
+        return unsafe { &*installed };
+    }
     static NAMES: std::sync::OnceLock<Names> = std::sync::OnceLock::new();
     NAMES.get_or_init(|| {
         let read = |p: *const std::ffi::c_char| {
@@ -78,23 +111,23 @@ static EXTRA: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// The name of symbol `i`.
 pub fn sym_name(i: usize) -> String {
+    // The tables read with the labels held, which a reload moves into them.
+    let extra = EXTRA.lock().unwrap_or_else(|p| p.into_inner());
     let n = names();
     match n.syms.get(i) {
         Some(s) => s.clone(),
-        None => EXTRA
-            .lock()
-            .map(|e| e.get(i - n.syms.len()).cloned().unwrap_or_default())
-            .unwrap_or_default(),
+        None => extra.get(i - n.syms.len()).cloned().unwrap_or_default(),
     }
 }
 
 /// The symbol called `name`.
 pub fn sym_named(name: &str) -> usize {
+    // As in `sym_name`.
+    let mut extra = EXTRA.lock().unwrap_or_else(|p| p.into_inner());
     let n = names();
     if let Some(i) = n.syms.iter().position(|s| s == name) {
         return i;
     }
-    let mut extra = EXTRA.lock().unwrap_or_else(|p| p.into_inner());
     let at = match extra.iter().position(|s| s == name) {
         Some(at) => at,
         None => {
@@ -132,13 +165,6 @@ pub fn ctor_field_index(tag: usize, label: usize) -> Option<usize> {
     n.fields.get(tag)?.as_ref()?.iter().position(|f| f == name)
 }
 
-fn bare_ctor(name: &str) -> &str {
-    match name.rsplit_once('.') {
-        Some((_, c)) => c,
-        None => name,
-    }
-}
-
 /// The constructor playing `role` -- empty, which no constructor is called,
 /// where the program declares none. See `meadow_rt::roles`.
 pub fn role(role: Role) -> &'static str {
@@ -162,8 +188,8 @@ fn is_vector_ctor(name: &str) -> bool {
 
 /// The constructor `v` was built with, if it is data.
 fn ctor_of(v: Word) -> Option<String> {
-    if v & 1 == 1 {
-        return Some(ctor_name((v >> 1) as usize));
+    if heap::is_immediate(v) {
+        return Some(ctor_name(heap::payload(v) as usize));
     }
     (heap::is_block(v) && heap::kind(v) == heap::DATA).then(|| ctor_name(heap::meta(v) as usize))
 }
@@ -183,8 +209,8 @@ pub fn vector_elems(v: Word) -> Option<Vec<(Word, i64)>> {
     // what is not a vector: which constructors are a vector's is worked out
     // once, so that saying no costs no name.
     static VECTORS: std::sync::OnceLock<Vec<bool>> = std::sync::OnceLock::new();
-    let tag = if v & 1 == 1 {
-        (v >> 1) as usize
+    let tag = if heap::is_immediate(v) {
+        heap::payload(v) as usize
     } else if heap::is_block(v) && heap::kind(v) == heap::DATA {
         heap::meta(v) as usize
     } else {
@@ -244,176 +270,67 @@ pub fn array_elems(v: Word) -> Option<Vec<(Word, i64)>> {
     (heap::is_block(v) && heap::kind(v) == heap::ARRAY).then(|| fields_of(v))
 }
 
-fn list_items(mut v: Word) -> Option<Vec<(Word, i64)>> {
-    let mut out = Vec::new();
-    loop {
-        match role_of(&ctor_of(v)?) {
-            Some(Role::Nil) => return Some(out),
-            Some(Role::Cons) => {
-                let f = fields_of(v);
-                if f.len() != 2 {
-                    return None;
-                }
-                out.push(f[0]);
-                v = f[1].0;
-            }
-            _ => return None,
-        }
-    }
-}
-
-/// `v`, described by `d`, as `show` renders it.
+/// `v`, described by `d`, as `show` renders it (`meadow_rt::look`).
 pub fn show(v: Word, d: i64) -> String {
-    let mut out = String::new();
-    render(&mut out, v, d);
-    out
+    meadow_rt::look::show(&Shown, (v, d))
 }
 
 /// What `print` writes: a string as itself, anything else as shown.
 pub fn displayed(v: Word, d: i64) -> String {
-    if d == desc::REF && heap::is_block(v) && heap::kind(v) == heap::STRING {
-        return String::from_utf8_lossy(&heap::bytes(v)).into_owned();
-    }
-    if d == desc::STR {
-        return sym_name(v as usize);
-    }
-    show(v, d)
+    meadow_rt::look::displayed(&Shown, (v, d))
 }
 
-fn render(out: &mut String, v: Word, d: i64) {
-    match d {
-        desc::INT => {
-            let _ = write!(out, "{}", v as i64);
-        }
-        desc::FLOAT => out.push_str(&meadow_rt::fmt_float(f64::from_bits(v))),
-        desc::FLOAT32 => out.push_str(&meadow_rt::num::fmt_float32(f32::from_bits(v as u32))),
-        desc::BOOL => out.push_str(if v != 0 { "True" } else { "False" }),
-        desc::UNIT => out.push_str("()"),
-        desc::CHAR => match char::from_u32(v as u32) {
-            Some(c) => {
-                let _ = write!(out, "{c:?}");
+/// A value and its descriptor, for the printer every runtime shares.
+struct Shown;
+
+impl meadow_rt::look::Look for Shown {
+    type Value = (Word, i64);
+
+    fn shape(&self, (v, d): (Word, i64)) -> meadow_rt::look::Shape<(Word, i64)> {
+        use meadow_rt::look::Shape;
+        match d {
+            desc::INT => Shape::Int(v as i64),
+            desc::FLOAT => Shape::Float(f64::from_bits(v)),
+            desc::FLOAT32 => Shape::Float32(f32::from_bits(v as u32)),
+            desc::BOOL => Shape::Bool(v != 0),
+            desc::UNIT => Shape::Unit,
+            desc::CHAR => Shape::Char(char::from_u32(v as u32)),
+            desc::STR => Shape::Sym(sym_name(v as usize)),
+            d if (desc::WORD..desc::WORD + 7).contains(&d) => {
+                Shape::Word(meadow_rt::num::Width::ALL[(d - desc::WORD) as usize], v)
             }
-            None => out.push('?'),
-        },
-        desc::STR => {
-            let _ = write!(out, "{:?}", sym_name(v as usize));
-        }
-        d if (desc::WORD..desc::WORD + 7).contains(&d) => {
-            let w = meadow_rt::num::Width::ALL[(d - desc::WORD) as usize];
-            let _ = write!(out, "{}", w.value(v));
-        }
-        _ => render_ref(out, v),
-    }
-}
-
-fn join(out: &mut String, items: &[(Word, i64)], sep: &str) {
-    for (i, (x, d)) in items.iter().enumerate() {
-        if i > 0 {
-            out.push_str(sep);
-        }
-        render(out, *x, *d);
-    }
-}
-
-fn render_ref(out: &mut String, v: Word) {
-    if v == 0 {
-        out.push_str("<continuation>");
-        return;
-    }
-    if v & 1 == 1 || heap::kind(v) == heap::DATA {
-        render_data(out, v);
-        return;
-    }
-    match heap::kind(v) {
-        heap::STRING => {
-            let text = String::from_utf8_lossy(&heap::bytes(v)).into_owned();
-            let _ = write!(out, "{text:?}");
-        }
-        heap::BIGINT => {
-            let _ = write!(
-                out,
-                "{}",
-                crate::value::bigint(v).expect("a BigInt's block")
-            );
-        }
-        heap::ARRAY => {
-            out.push_str("#[");
-            join(out, &fields_of(v), ", ");
-            out.push(']');
-        }
-        heap::MUT_ARRAY => {
-            out.push_str("mut #[");
-            join(out, &fields_of(v), ", ");
-            out.push(']');
-        }
-        heap::RECORD => {
-            out.push_str("{ ");
-            let f = fields_of(v);
-            for j in 0..f.len() / 2 {
-                if j > 0 {
-                    out.push_str(", ");
+            _ if v == 0 => Shape::Continuation,
+            _ if heap::is_immediate(v) || heap::kind(v) == heap::DATA => {
+                let tag = u64::from(heap::meta_of(v));
+                let name = ctor_of(v).filter(|n| !n.is_empty());
+                Shape::Data(name, tag, fields_of(v))
+            }
+            _ => match heap::kind(v) {
+                heap::STRING => Shape::Str(String::from_utf8_lossy(&heap::bytes(v)).into_owned()),
+                heap::BIGINT => Shape::BigInt(crate::value::bigint(v).expect("a BigInt's block")),
+                heap::ARRAY => Shape::Array(fields_of(v)),
+                heap::MUT_ARRAY => Shape::MutArray(fields_of(v)),
+                heap::RECORD => {
+                    let f = fields_of(v);
+                    Shape::Record(
+                        (0..f.len() / 2)
+                            .map(|j| (sym_name(f[2 * j].0 as usize), f[2 * j + 1]))
+                            .collect(),
+                    )
                 }
-                let _ = write!(out, "{} = ", sym_name(f[2 * j].0 as usize));
-                render(out, f[2 * j + 1].0, f[2 * j + 1].1);
-            }
-            out.push_str(" }");
-        }
-        heap::CELL => {
-            out.push_str("ref ");
-            render(out, heap::field(v, 0), heap::field_desc(v, 0));
-        }
-        heap::COMPACT => {
-            out.push_str("compact ");
-            render(out, heap::field(v, 0), heap::field_desc(v, 0));
-        }
-        heap::CLOSURE => out.push_str("<closure>"),
-        heap::ONCE | heap::STACK => out.push_str("<continuation>"),
-        heap::CHANNEL => out.push_str("<channel>"),
-        heap::TASK => out.push_str("<thread>"),
-        heap::TVAR => out.push_str("<tvar>"),
-        k => {
-            let _ = write!(out, "<object of kind {k}>");
+                heap::CELL => Shape::Ref((heap::field(v, 0), heap::field_desc(v, 0))),
+                heap::COMPACT => Shape::Compact((heap::field(v, 0), heap::field_desc(v, 0))),
+                heap::CLOSURE => Shape::Closure,
+                heap::ONCE | heap::STACK => Shape::Continuation,
+                heap::CHANNEL => Shape::Channel,
+                heap::TASK => Shape::Task,
+                heap::TVAR => Shape::TVar,
+                k => Shape::Other(format!("<object of kind {k}>")),
+            },
         }
     }
-}
 
-fn render_data(out: &mut String, v: Word) {
-    let name = ctor_of(v).unwrap_or_default();
-    let f = fields_of(v);
-    match name.as_str() {
-        "" => {
-            let _ = write!(out, "#{}(..)", if v & 1 == 1 { v >> 1 } else { 0 });
-        }
-        TUPLE => {
-            out.push('(');
-            join(out, &f, ", ");
-            out.push(')');
-        }
-        n if matches!(role_of(n), Some(Role::Nil | Role::Cons)) => match list_items(v) {
-            Some(xs) => {
-                out.push('[');
-                join(out, &xs, "; ");
-                out.push(']');
-            }
-            None => {
-                let _ = write!(out, "{}(..)", bare_ctor(&name));
-            }
-        },
-        n if is_vector_ctor(n) => match vector_elems(v) {
-            Some(xs) => {
-                out.push('[');
-                join(out, &xs, ", ");
-                out.push(']');
-            }
-            None => {
-                let _ = write!(out, "{}(..)", bare_ctor(&name));
-            }
-        },
-        _ if f.is_empty() => out.push_str(bare_ctor(&name)),
-        _ => {
-            let _ = write!(out, "{}(", bare_ctor(&name));
-            join(out, &f, ", ");
-            out.push(')');
-        }
+    fn role_of(&self, name: &str) -> Option<Role> {
+        role_of(name)
     }
 }

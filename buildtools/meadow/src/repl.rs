@@ -852,6 +852,10 @@ const COMMANDS: &[(&str, &str)] = &[
         ":jit / :vm / :cek",
         "switch machines (the JIT is the default)",
     ),
+    (
+        ":silo",
+        "evaluate on the merged runtime's VM, as `meadow run --runtime silo --interpret` does",
+    ),
     (":time", "time every entry from now on, or stop"),
     (":time <expr>", "time just this entry"),
     (":tour", "a guided tour of the language, one step at a time"),
@@ -961,6 +965,10 @@ pub struct Session {
     /// Which machine evaluates a line. `:cek` and `:vm` switch it, which is the
     /// quickest way to decide whether something odd is the language or the VM.
     engine: meadow::Engine,
+    /// Whether a line runs on the merged runtime's VM instead -- Silo's
+    /// interpreter, in a process of its own -- as `:silo` says, until one of
+    /// the others is chosen again.
+    silo: bool,
     /// Report how long every entry took -- `:time` turns it on and off.
     timing: bool,
     /// Which step of the tour is showing, if any. The tour is not a mode: the
@@ -1038,6 +1046,7 @@ impl Session {
             uses: Vec::new(),
             // What a debug build runs on.
             engine: meadow::Engine::Jit,
+            silo: false,
             timing: false,
             tour: None,
             pending: None,
@@ -1268,8 +1277,16 @@ impl Session {
                                 ":jit" => meadow::Engine::Jit,
                                 _ => meadow::Engine::Vm,
                             };
+                            self.silo = false;
                             println!("(evaluating with the {})", self.engine);
                         }
+                        ":silo" => match meadow::aot::interpreter() {
+                            Ok(_) => {
+                                self.silo = true;
+                                println!("(evaluating on the merged runtime's VM)");
+                            }
+                            Err(e) => println!("(no VM to evaluate on: {e})"),
+                        },
                         ":time" => {
                             self.timing = !self.timing;
                             let now = if self.timing { "on" } else { "off" };
@@ -1523,6 +1540,7 @@ impl Session {
                 entry_name: Some("it"),
                 cfg: meadow_compiler::Cfg {
                     backend: match self.engine {
+                        _ if self.silo => "silo",
                         meadow::Engine::Vm => "vm",
                         meadow::Engine::Cek => "cek",
                         meadow::Engine::Jit => "jit",
@@ -1574,7 +1592,20 @@ impl Session {
                 // Every line is compiled and run as a whole program, so the REPL
                 // gets the bytecode VM for free — and `:cek` switches it, the
                 // same as the flag on `meadow run`.
-                let (result, times) = runtime::run_timed(&program, self.engine, self.opts.opt);
+                let (result, times) = if self.silo {
+                    // A closure that captures nothing is a word Silo cannot
+                    // tell from a constructor by itself, so it is shown as
+                    // its type says, as Glade shows one.
+                    let function = compiled
+                        .exports
+                        .last()
+                        .is_some_and(|e| e.scheme.ty.is_fun());
+                    let (result, times) = runtime::run_on_vm(&program, self.opts.opt);
+                    let result = result.map(|v| if function { "<closure>".into() } else { v });
+                    (result, times)
+                } else {
+                    runtime::run_timed(&program, self.engine, self.opts.opt)
+                };
                 match result {
                     Ok(value) => println!("= {value}"),
                     Err(e) => eprintln!("{e}"),

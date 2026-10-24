@@ -56,7 +56,7 @@ pub struct SourceFile {
 }
 
 impl SourceFile {
-    fn new(path: Option<PathBuf>, name: String, content: InternedString) -> SourceFile {
+    pub(super) fn new(path: Option<PathBuf>, name: String, content: InternedString) -> SourceFile {
         let mut line_starts = vec![0];
         for (i, b) in content.bytes().enumerate() {
             if b == b'\n' {
@@ -84,16 +84,16 @@ impl SourceFile {
         (line as u32 + 1, col as u32 + 1)
     }
 
-    fn line_of(&self, offset: u32) -> u32 {
+    pub(super) fn line_of(&self, offset: u32) -> u32 {
         self.position(offset).0
     }
 }
 
 /// A name a person wrote, as a register or a capture holds it.
 #[derive(Debug, Clone)]
-struct VarInfo {
-    name: String,
-    ty: String,
+pub(super) struct VarInfo {
+    pub(super) name: String,
+    pub(super) ty: String,
 }
 
 /// Why the program is not running.
@@ -135,8 +135,9 @@ pub struct Frame {
     pub name: String,
     /// Where it is -- for a pending frame, where it will resume.
     pub loc: Option<Loc>,
-    /// The names it can see, newest first, with their values.
-    vars: Vec<(u32, Value)>,
+    /// The names it can see, newest first, with their values: Glade's; the
+    /// Silo session keeps its own.
+    pub(super) vars: Vec<(u32, Value)>,
 }
 
 /// A row in a variables view.
@@ -216,7 +217,7 @@ pub struct Entry {
 
 /// The name the entry definition gets. It cannot be a name anyone writes by
 /// accident, and it has to be one the lexer accepts.
-const ENTRY: &str = "debug'entry'";
+pub(super) const ENTRY: &str = "debug'entry'";
 
 impl Session {
     /// Build `path` for debugging and stand it at its entry point, not yet run.
@@ -226,74 +227,9 @@ impl Session {
 
     /// [`Session::launch`], starting at `entry` rather than at `main`.
     pub fn launch_at(path: &Path, entry: Option<&Entry>) -> Result<Session, LaunchError> {
-        let path = std::fs::canonicalize(path)
-            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-        let mut options = Resolved::new(Profile::Debug).options;
-        options.debug_info = true;
-        // The entry below is run, like `main`, so it may perform effects.
-        options.entry_name = Some(ENTRY);
-
-        // The entry is a definition added to the end of the function's own
-        // module, so the expression sees exactly what that module sees --
-        // private functions, and whatever it `use`s.
-        let added = entry.map(|e| format!("def {ENTRY} =\n  {}", e.expression));
-        let original_len = entry
-            .and_then(|e| std::fs::read_to_string(&e.module).ok())
-            .map_or(usize::MAX, |t| t.len());
-        let addition = entry
-            .zip(added.as_deref())
-            .map(|(e, text)| pipeline::Addition {
-                file: &e.module,
-                text,
-            });
-        let out = pipeline::build_with(&path, options, addition);
-        if !out.diagnostics.is_empty() {
-            let shown: Vec<String> = out
-                .diagnostics
-                .iter()
-                .take(10)
-                .map(|d| {
-                    // Past the end of the file is the text we added.
-                    if d.label.1.start as usize >= original_len {
-                        format!(
-                            "in `{}`: {}",
-                            entry.map_or("", |e| e.expression.as_str()),
-                            d.msg
-                        )
-                    } else {
-                        format!("{}: {}", plain_path(&d.filename), d.msg)
-                    }
-                })
-                .collect();
-            return Err(format!(
-                "{} did not compile:\n{}",
-                path_display(&path),
-                shown.join("\n")
-            ));
-        }
-        let mut linked = out.linked.ok_or("the build produced no program")?;
-        if entry.is_some() {
-            let var = linked
-                .program
-                .defs
-                .iter()
-                .find(|d| &*d.name == ENTRY)
-                .map(|d| d.var)
-                .ok_or("the entry definition went missing in the build")?;
-            linked.program.entry = Some(var);
-        }
-        if linked.program.entry.is_none() {
-            return Err(format!("{} has no `main` to run", path_display(&path)));
-        }
-        let lowered = meadow_seq::lower_program(&linked.program, options.opt);
-        if !lowered.unsupported.is_empty() {
-            return Err(format!(
-                "the back end cannot compile this program: {:?}",
-                lowered.unsupported
-            ));
-        }
-        let image = meadow_codegen::compile_with_debug_info(&lowered.program).map_err(|e| e.msg)?;
-        Session::new(image, &linked.packages)
+        let (program, packages) = build(path, entry)?;
+        let image = meadow_codegen::compile_with_debug_info(&program).map_err(|e| e.msg)?;
+        Session::new(image, &packages)
     }
 
     /// A session over an image that was compiled with debug information, with
@@ -312,33 +248,7 @@ impl Session {
             .ok_or("the program was compiled without debug information")?;
         let entry = image.entry.ok_or("the program has no entry point")?;
 
-        let std_root = crate::stdlib::extract_sources();
-        let mut files = HashMap::new();
-        let mut vars = HashMap::new();
-        for pkg in packages {
-            for m in &pkg.modules {
-                let name = match m.source.kind {
-                    SourceKind::File(n) => n.to_string(),
-                    SourceKind::Interactive => "<interactive>".to_string(),
-                };
-                let path = {
-                    let p = Path::new(&name);
-                    if p.is_absolute() {
-                        Some(PathBuf::from(plain_path(&name)))
-                    } else {
-                        std_root.as_ref().map(|r| r.join(p)).filter(|p| p.is_file())
-                    }
-                };
-                files.insert(m.source.id, SourceFile::new(path, name, m.source.content));
-                collect_names(&m.hir, &m.source.content, &pkg.types, &mut vars);
-            }
-        }
-        // A specialized copy's variables go by the names of the originals.
-        for (copy, original) in &debug.origins {
-            if let Some(info) = vars.get(original).cloned() {
-                vars.insert(*copy, info);
-            }
-        }
+        let (files, vars) = sources(packages, debug.origins.iter().map(|(c, o)| (*c, *o)));
 
         let n = image.code.len();
         let mut boundary = vec![false; n];
@@ -1206,6 +1116,119 @@ impl Session {
     }
 }
 
+/// `path` built for debugging, starting at `entry` if there is one: the
+/// program as AxCut, with where everything was written kept, and the packages
+/// it was built from -- what either engine's session starts from.
+pub(super) fn build(
+    path: &Path,
+    entry: Option<&Entry>,
+) -> Result<(meadow_seq::Program, Vec<meadow_compiler::CompiledPackage>), LaunchError> {
+    let path =
+        std::fs::canonicalize(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let mut options = Resolved::new(Profile::Debug).options;
+    options.debug_info = true;
+    // The entry below is run, like `main`, so it may perform effects.
+    options.entry_name = Some(ENTRY);
+
+    // The entry is a definition added to the end of the function's own
+    // module, so the expression sees exactly what that module sees --
+    // private functions, and whatever it `use`s.
+    let added = entry.map(|e| format!("def {ENTRY} =\n  {}", e.expression));
+    let original_len = entry
+        .and_then(|e| std::fs::read_to_string(&e.module).ok())
+        .map_or(usize::MAX, |t| t.len());
+    let addition = entry
+        .zip(added.as_deref())
+        .map(|(e, text)| pipeline::Addition {
+            file: &e.module,
+            text,
+        });
+    let out = pipeline::build_with(&path, options, addition);
+    if !out.diagnostics.is_empty() {
+        let shown: Vec<String> = out
+            .diagnostics
+            .iter()
+            .take(10)
+            .map(|d| {
+                // Past the end of the file is the text we added.
+                if d.label.1.start as usize >= original_len {
+                    format!(
+                        "in `{}`: {}",
+                        entry.map_or("", |e| e.expression.as_str()),
+                        d.msg
+                    )
+                } else {
+                    format!("{}: {}", plain_path(&d.filename), d.msg)
+                }
+            })
+            .collect();
+        return Err(format!(
+            "{} did not compile:\n{}",
+            path_display(&path),
+            shown.join("\n")
+        ));
+    }
+    let mut linked = out.linked.ok_or("the build produced no program")?;
+    if entry.is_some() {
+        let var = linked
+            .program
+            .defs
+            .iter()
+            .find(|d| &*d.name == ENTRY)
+            .map(|d| d.var)
+            .ok_or("the entry definition went missing in the build")?;
+        linked.program.entry = Some(var);
+    }
+    if linked.program.entry.is_none() {
+        return Err(format!("{} has no `main` to run", path_display(&path)));
+    }
+    let lowered = meadow_seq::lower_program(&linked.program, options.opt);
+    if !lowered.unsupported.is_empty() {
+        return Err(format!(
+            "the back end cannot compile this program: {:?}",
+            lowered.unsupported
+        ));
+    }
+    Ok((lowered.program, linked.packages))
+}
+
+/// Where each of `packages`' sources is, and what each name it binds is
+/// called and typed: the debug information a program's own does not hold.
+/// `origins` maps a specialized copy's variables to the originals'.
+pub(super) fn sources(
+    packages: &[meadow_compiler::CompiledPackage],
+    origins: impl IntoIterator<Item = (u32, u32)>,
+) -> (HashMap<u32, SourceFile>, HashMap<u32, VarInfo>) {
+    let std_root = crate::stdlib::extract_sources();
+    let mut files = HashMap::new();
+    let mut vars = HashMap::new();
+    for pkg in packages {
+        for m in &pkg.modules {
+            let name = match m.source.kind {
+                SourceKind::File(n) => n.to_string(),
+                SourceKind::Interactive => "<interactive>".to_string(),
+            };
+            let path = {
+                let p = Path::new(&name);
+                if p.is_absolute() {
+                    Some(PathBuf::from(plain_path(&name)))
+                } else {
+                    std_root.as_ref().map(|r| r.join(p)).filter(|p| p.is_file())
+                }
+            };
+            files.insert(m.source.id, SourceFile::new(path, name, m.source.content));
+            collect_names(&m.hir, &m.source.content, &pkg.types, &mut vars);
+        }
+    }
+    // A specialized copy's variables go by the names of the originals.
+    for (copy, original) in origins {
+        if let Some(info) = vars.get(&original).cloned() {
+            vars.insert(copy, info);
+        }
+    }
+    (files, vars)
+}
+
 /// Every name a module binds: its spelling, from the source, and its type.
 fn collect_names(
     module: &hir::LModule,
@@ -1363,7 +1386,7 @@ impl Names<'_> {
 }
 
 /// A definition's name as a stack frame shows it.
-fn display_name(name: &str) -> String {
+pub(super) fn display_name(name: &str) -> String {
     if name == ENTRY {
         "(debug entry)".to_string()
     } else {
@@ -1383,12 +1406,12 @@ pub fn plain_path(p: &str) -> String {
     }
 }
 
-fn path_display(p: &Path) -> String {
+pub(super) fn path_display(p: &Path) -> String {
     plain_path(&p.display().to_string())
 }
 
 /// `a`, `n1`: a type that is only a variable.
-fn is_type_variable(ty: &str) -> bool {
+pub(super) fn is_type_variable(ty: &str) -> bool {
     let mut chars = ty.chars();
     chars.next().is_some_and(|c| c.is_ascii_lowercase()) && chars.all(|c| c.is_ascii_alphanumeric())
 }

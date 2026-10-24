@@ -20,23 +20,9 @@ use crate::Error;
 use crate::heap::Kind;
 use crate::value::Value;
 use crate::vm::Vm;
-use meadow_rt::roles::{Role, TUPLE};
+use meadow_rt::roles::Role;
 
 use num_bigint::{BigInt, Sign};
-use std::fmt::Write;
-
-/// A constructor as a reader wants to see it.
-///
-/// The name a value carries is canonical -- `Maybe.Just` -- because two types
-/// may each have a `Leaf` and something has to tell them apart. A person
-/// reading output has the context the qualifier supplies, so printing it would
-/// be noise: `Just(3)`, not `Maybe.Just(3)`.
-fn bare_ctor(name: &str) -> &str {
-    match name.rsplit_once('.') {
-        Some((_, c)) => c,
-        None => name,
-    }
-}
 
 impl Vm<'_> {
     /// The constructor playing `role` in this program, if it declares one --
@@ -182,159 +168,14 @@ impl Vm<'_> {
     }
 
     /// How `print` and `println` render a value: a `String` as its text,
-    /// everything else as [`Vm::show`] gives it.
-    ///
-    /// `println "hello"` used to write `"hello"`, quotes and all, because these
-    /// are polymorphic and fell through to the display used for data.
+    /// everything else as [`Vm::show`] gives it (`meadow_rt::look`).
     pub fn displayed(&self, v: Value) -> String {
-        match self.text_of(v) {
-            Some(text) => text,
-            None => self.show(v),
-        }
+        meadow_rt::look::displayed(self, v)
     }
 
-    /// Render a value the way the REPL prints it.
+    /// Render a value the way the REPL prints it (`meadow_rt::look`).
     pub fn show(&self, v: Value) -> String {
-        let mut out = String::new();
-        self.render(&mut out, v, 0);
-        out
-    }
-
-    fn render(&self, out: &mut String, v: Value, depth: usize) {
-        // `render` recurses once per level of nesting, so a value deep enough
-        // -- a long chain of a user data type, or a cycle through a `Ref` --
-        // would overflow the native stack and abort the process. Past a bound
-        // it prints an ellipsis instead. Lists and vectors are flattened
-        // below and do not count against it, so an ordinary long list still
-        // prints in full.
-        const MAX_DEPTH: usize = 1000;
-        if depth > MAX_DEPTH {
-            out.push('…');
-            return;
-        }
-        match v {
-            Value::Int(n) => {
-                let _ = write!(out, "{n}");
-            }
-            Value::Float(x) => out.push_str(&meadow_rt::fmt_float(x)),
-            Value::Word(w, b) => {
-                let _ = write!(out, "{}", w.value(b));
-            }
-            Value::Float32(x) => out.push_str(&meadow_rt::num::fmt_float32(x)),
-            // Printed as the constructors a program names them by.
-            Value::Bool(b) => out.push_str(if b { "True" } else { "False" }),
-            Value::Str(s) => {
-                let _ = write!(out, "{:?}", &*s);
-            }
-            Value::Char(c) => {
-                let _ = write!(out, "{c:?}");
-            }
-            Value::Unit => out.push_str("()"),
-            Value::Obj(a) => match self.heap.kind(a) {
-                Kind::BigInt => {
-                    let _ = write!(out, "{}", self.bigint_at(v).expect("a bigint"));
-                }
-                Kind::Array | Kind::Bytes => {
-                    out.push_str("#[");
-                    self.join(out, &self.heap.array_values(a), ", ", depth);
-                    out.push(']');
-                }
-                Kind::MutArray => {
-                    out.push_str("mut #[");
-                    self.join(out, &self.heap.fields(a), ", ", depth);
-                    out.push(']');
-                }
-                Kind::Record => {
-                    out.push_str("{ ");
-                    for j in 0..self.heap.len(a) / 2 {
-                        if j > 0 {
-                            out.push_str(", ");
-                        }
-                        if let Value::Str(l) = self.heap.field(a, 2 * j) {
-                            let _ = write!(out, "{l} = ");
-                        }
-                        self.render(out, self.heap.field(a, 2 * j + 1), depth + 1);
-                    }
-                    out.push_str(" }");
-                }
-                // The contents, not the address: what a person debugging one
-                // wants to see.
-                Kind::Ref => {
-                    out.push_str("ref ");
-                    self.render(out, self.heap.field(a, 0), depth + 1);
-                }
-                Kind::Closure => out.push_str("<closure>"),
-                Kind::Resume | Kind::Frame | Kind::Stack => out.push_str("<continuation>"),
-                Kind::Compact => {
-                    out.push_str("compact ");
-                    self.render(out, self.heap.field(a, 0), depth + 1);
-                }
-                Kind::Channel => out.push_str("<channel>"),
-                Kind::Task => out.push_str("<thread>"),
-                Kind::TVar => out.push_str("<tvar>"),
-                Kind::Str => {
-                    let text = String::from_utf8_lossy(&self.heap.packed_bytes(a)).into_owned();
-                    let _ = write!(out, "{text:?}");
-                }
-                Kind::Data => self.render_data(out, v, a, depth),
-            },
-        }
-    }
-
-    fn render_data(&self, out: &mut String, v: Value, a: crate::value::Addr, depth: usize) {
-        let name = match self.program.ctor(self.heap.meta(a)) {
-            Some(n) => n,
-            None => {
-                let _ = write!(out, "#{}(..)", self.heap.meta(a));
-                return;
-            }
-        };
-        match &*name {
-            TUPLE => {
-                out.push('(');
-                self.join(out, &self.heap.fields(a), ", ", depth);
-                out.push(')');
-            }
-            n if matches!(self.role_of(n), Some(Role::Nil | Role::Cons)) => {
-                match self.list_items(v) {
-                    Some(xs) => {
-                        out.push('[');
-                        self.join(out, &xs, "; ", depth);
-                        out.push(']');
-                    }
-                    None => {
-                        let _ = write!(out, "{}(..)", bare_ctor(&name));
-                    }
-                }
-            }
-            n if self.is_vector_ctor(n) => match self.vector_elems(v) {
-                Some(xs) => {
-                    out.push('[');
-                    self.join(out, &xs, ", ", depth);
-                    out.push(']');
-                }
-                None => {
-                    let _ = write!(out, "{}(..)", bare_ctor(&name));
-                }
-            },
-            _ if self.heap.len(a) == 0 => {
-                let _ = write!(out, "{}", bare_ctor(&name));
-            }
-            _ => {
-                let _ = write!(out, "{}(", bare_ctor(&name));
-                self.join(out, &self.heap.fields(a), ", ", depth);
-                out.push(')');
-            }
-        }
-    }
-
-    fn join(&self, out: &mut String, vs: &[Value], sep: &str, depth: usize) {
-        for (i, v) in vs.iter().enumerate() {
-            if i > 0 {
-                out.push_str(sep);
-            }
-            self.render(out, *v, depth + 1);
-        }
+        meadow_rt::look::show(self, v)
     }
 
     /// Structural equality.
@@ -677,4 +518,58 @@ fn is_number(v: Value) -> bool {
         v,
         Value::Int(_) | Value::Word(..) | Value::Float(_) | Value::Float32(_)
     )
+}
+
+/// What a value is, for the printer every runtime shares.
+impl meadow_rt::look::Look for Vm<'_> {
+    type Value = Value;
+
+    fn shape(&self, v: Value) -> meadow_rt::look::Shape<Value> {
+        use meadow_rt::look::Shape;
+        match v {
+            Value::Int(n) => Shape::Int(n),
+            Value::Float(x) => Shape::Float(x),
+            Value::Word(w, b) => Shape::Word(w, b),
+            Value::Float32(x) => Shape::Float32(x),
+            Value::Bool(b) => Shape::Bool(b),
+            Value::Char(c) => Shape::Char(Some(c)),
+            Value::Str(s) => Shape::Sym(s.to_string()),
+            Value::Unit => Shape::Unit,
+            Value::Obj(a) => match self.heap.kind(a) {
+                Kind::BigInt => Shape::BigInt(self.bigint_at(v).expect("a bigint")),
+                Kind::Array | Kind::Bytes => Shape::Array(self.heap.array_values(a)),
+                Kind::MutArray => Shape::MutArray(self.heap.fields(a)),
+                Kind::Record => Shape::Record(
+                    (0..self.heap.len(a) / 2)
+                        .map(|j| {
+                            let label = match self.heap.field(a, 2 * j) {
+                                Value::Str(l) => l.to_string(),
+                                _ => String::new(),
+                            };
+                            (label, self.heap.field(a, 2 * j + 1))
+                        })
+                        .collect(),
+                ),
+                Kind::Ref => Shape::Ref(self.heap.field(a, 0)),
+                Kind::Closure => Shape::Closure,
+                Kind::Resume | Kind::Frame | Kind::Stack => Shape::Continuation,
+                Kind::Compact => Shape::Compact(self.heap.field(a, 0)),
+                Kind::Channel => Shape::Channel,
+                Kind::Task => Shape::Task,
+                Kind::TVar => Shape::TVar,
+                Kind::Str => {
+                    Shape::Str(String::from_utf8_lossy(&self.heap.packed_bytes(a)).into_owned())
+                }
+                Kind::Data => Shape::Data(
+                    self.program.ctor(self.heap.meta(a)).map(|n| n.to_string()),
+                    u64::from(self.heap.meta(a)),
+                    self.heap.fields(a),
+                ),
+            },
+        }
+    }
+
+    fn role_of(&self, name: &str) -> Option<Role> {
+        Vm::role_of(self, name)
+    }
 }

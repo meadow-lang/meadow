@@ -181,8 +181,7 @@ impl Parcel {
                     heap::set_word(v, i, *w);
                 }
                 // The count is the references besides one.
-                let len = b.words[0] & 0xFFFF_FFFF_0000_0000;
-                heap::set_word(v, 0, len | u64::from(b.incoming - 1));
+                heap::set_count(v, b.incoming - 1);
                 // What the sending thread's cycle collector thought of the
                 // block it copied is about that heap's candidate list, not
                 // this one's: a fresh block here has never been a candidate.
@@ -239,7 +238,8 @@ fn lift(v: Word) -> Result<Lifted, String> {
     }
     let n = heap::size(v);
     let mut words: Vec<Word> = (0..n).map(|i| heap::word(v, i)).collect();
-    words[0] &= 0xFFFF_FFFF_0000_0000;
+    let at = heap::LAYOUT.count.word;
+    words[at] = heap::LAYOUT.count.set(words[at], 0);
     Ok(Lifted {
         words,
         refs: Vec::new(),

@@ -1004,6 +1004,7 @@ dependencies = [
  "meadow-rt",
  "num-bigint",
  "num-traits",
+ "postcard",
  "serde",
 ]
 

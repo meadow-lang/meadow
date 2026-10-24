@@ -1773,6 +1773,8 @@ mod tests {
             results: Default::default(),
             threads: Default::default(),
             pure: Default::default(),
+            types: Default::default(),
+            ctor_types: Default::default(),
             defs: vec![Def {
                 label: Label(0),
                 name: InternedString::from("main"),

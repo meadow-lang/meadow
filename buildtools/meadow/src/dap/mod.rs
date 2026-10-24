@@ -22,9 +22,75 @@
 //! of input.
 
 pub mod session;
+pub mod silo;
 
 use serde_json::{Value as Json, json};
 use session::{Mode, Session, Stop};
+
+/// What is being debugged: a program on Glade's VM, in this process, or on
+/// Silo's interpreter, in its own (`silo::SiloSession`). The adapter asks
+/// both the same things.
+pub enum Debuggee {
+    Glade(Session),
+    Silo(silo::SiloSession),
+}
+
+/// `Debuggee::$name`, of whichever it is.
+macro_rules! either {
+    ($self:ident, $s:ident => $e:expr) => {
+        match $self {
+            Debuggee::Glade($s) => $e,
+            Debuggee::Silo($s) => $e,
+        }
+    };
+}
+
+impl Debuggee {
+    fn run(&mut self, budget: u64) -> Option<Stop> {
+        either!(self, s => s.run(budget))
+    }
+    fn take_output(&mut self) -> String {
+        either!(self, s => s.take_output())
+    }
+    fn is_finished(&self) -> bool {
+        either!(self, s => s.is_finished())
+    }
+    fn set_breakpoints(&mut self, path: &std::path::Path, lines: &[u32]) -> Vec<Option<u32>> {
+        either!(self, s => s.set_breakpoints(path, lines))
+    }
+    fn resume(&mut self, mode: Mode) {
+        either!(self, s => s.resume(mode))
+    }
+    fn resume_until_in(&mut self, name: &str, module: &std::path::Path) -> bool {
+        either!(self, s => s.resume_until_in(name, module))
+    }
+    fn stop_at_entry(&mut self) -> Option<Stop> {
+        either!(self, s => s.stop_at_entry())
+    }
+    fn frames(&mut self, max: usize) -> Vec<session::Frame> {
+        either!(self, s => s.frames(max))
+    }
+    fn file(&self, loc: meadow_compiler::core::Loc) -> Option<&session::SourceFile> {
+        either!(self, s => s.file(loc))
+    }
+    fn scopes(&mut self, frame: usize) -> Vec<session::Scope> {
+        either!(self, s => s.scopes(frame))
+    }
+    fn variables(&mut self, reference: u32) -> Vec<session::Variable> {
+        either!(self, s => s.variables(reference))
+    }
+    fn evaluate(&mut self, frame: usize, expr: &str) -> Option<session::Variable> {
+        either!(self, s => s.evaluate(frame, expr))
+    }
+    /// Stop the running program. Glade's is run a slice at a time, and is
+    /// stopped by not running another; Silo's runs on its own, and is told.
+    fn pause(&mut self) -> Option<Stop> {
+        match self {
+            Debuggee::Glade(_) => Some(Stop::Pause),
+            Debuggee::Silo(s) => s.pause(),
+        }
+    }
+}
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -78,7 +144,7 @@ pub fn read_message(input: &mut impl BufRead) -> Option<Json> {
 pub struct Adapter {
     out: Box<dyn Write>,
     seq: i64,
-    session: Option<Session>,
+    session: Option<Debuggee>,
     /// Breakpoints the editor set before the program was built, by file.
     pending_breakpoints: Vec<(PathBuf, Vec<u32>)>,
     stop_on_entry: bool,
@@ -276,7 +342,29 @@ impl Adapter {
                     (Some(f), Some(e)) => Some((f.to_string(), e.module.clone())),
                     _ => None,
                 };
-                match Session::launch_at(std::path::Path::new(program), entry.as_ref()) {
+                // Silo's interpreter, when the launch or the package's debug
+                // profile asks for Silo; Glade's VM otherwise.
+                let path = std::path::Path::new(program);
+                let silo = match args["runtime"].as_str() {
+                    Some(r) => r == "silo",
+                    None => {
+                        crate::profile::Resolved::resolve(
+                            crate::profile::Profile::Debug,
+                            path,
+                            Default::default(),
+                        )
+                        .runtime
+                            == crate::aot::Runtime::Silo
+                    }
+                };
+                let launched = if silo {
+                    // `stack`: `heap` for frames on the heap, as Glade's are.
+                    let stack = args["stack"].as_str().and_then(meadow_llvm::Stack::named);
+                    silo::SiloSession::launch_with(path, entry.as_ref(), stack).map(Debuggee::Silo)
+                } else {
+                    Session::launch_at(path, entry.as_ref()).map(Debuggee::Glade)
+                };
+                match launched {
                     Ok(s) => {
                         self.session = Some(s);
                         for (path, lines) in std::mem::take(&mut self.pending_breakpoints) {
@@ -362,7 +450,10 @@ impl Adapter {
                     Some(0) | None => 1000,
                     Some(n) => n as usize,
                 };
-                let Some(s) = &self.session else {
+                let (lines_from_1, columns_from_1) = (self.lines_from_1, self.columns_from_1);
+                let line_out = |l: u32| if lines_from_1 { l } else { l - 1 };
+                let column_out = |c: u32| if columns_from_1 { c } else { c - 1 };
+                let Some(s) = &mut self.session else {
                     return self.respond(&req, json!({ "stackFrames": [], "totalFrames": 0 }));
                 };
                 let frames = s.frames(start + levels);
@@ -377,11 +468,11 @@ impl Adapter {
                             f.loc.and_then(|l| s.file(l).map(|file| (file, l)))
                         {
                             let (line, col) = file.position(loc.span.start);
-                            row["line"] = json!(self.line_out(line));
-                            row["column"] = json!(self.column_out(col));
+                            row["line"] = json!(line_out(line));
+                            row["column"] = json!(column_out(col));
                             let (end_line, end_col) = file.position(loc.span.end);
-                            row["endLine"] = json!(self.line_out(end_line));
-                            row["endColumn"] = json!(self.column_out(end_col));
+                            row["endLine"] = json!(line_out(end_line));
+                            row["endColumn"] = json!(column_out(end_col));
                             row["source"] = source_json(file);
                         }
                         row
@@ -479,8 +570,11 @@ impl Adapter {
                 self.respond(&req, json!({}));
                 if self.running {
                     self.running = false;
+                    let stop = self.session.as_mut().and_then(Debuggee::pause);
                     self.flush_output();
-                    self.report(Stop::Pause);
+                    if let Some(stop) = stop {
+                        self.report(stop);
+                    }
                 }
             }
 
@@ -503,10 +597,6 @@ impl Adapter {
 
     fn line_out(&self, line: u32) -> u32 {
         if self.lines_from_1 { line } else { line - 1 }
-    }
-
-    fn column_out(&self, col: u32) -> u32 {
-        if self.columns_from_1 { col } else { col - 1 }
     }
 }
 

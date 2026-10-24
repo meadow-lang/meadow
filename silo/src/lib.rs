@@ -18,8 +18,10 @@
 //! answers words: references are counted as `docs/SILO.md` says, a primitive
 //! borrows its arguments, and what one answers is owned by the caller.
 
+pub mod coverage;
 pub mod ctx;
 pub mod cycles;
+pub mod frames;
 pub mod heap;
 pub mod memory;
 pub mod native;
@@ -31,6 +33,9 @@ pub mod sched;
 pub mod segments;
 pub mod shadow;
 pub mod show;
+pub mod stack;
+pub mod stats;
+pub mod trace;
 pub mod value;
 
 use ctx::Ctx;
@@ -56,6 +61,12 @@ unsafe extern "C" {
 #[unsafe(no_mangle)]
 pub extern "C" fn meadow_acquire(c: *mut ctx::Ctx, words: i64) -> Word {
     heap::acquire_in(ctx::given(c), words as usize)
+}
+
+/// [`meadow_acquire`], in a traced program: see `crate::trace`.
+#[unsafe(no_mangle)]
+pub extern "C" fn meadow_acquire_traced(c: *mut ctx::Ctx, words: i64) -> Word {
+    heap::acquire_traced(ctx::given(c), words as usize)
 }
 
 /// The last reference to the block at `v` was erased: it is block `v` and its
@@ -86,9 +97,22 @@ pub unsafe extern "C" fn meadow_fail(msg: *const u8, len: i64) -> ! {
     fail(&String::from_utf8_lossy(text))
 }
 
+/// What runs first when the program fails, if anything was set to: a
+/// debugger's, which stops there to be looked at. See [`on_failure`].
+static FAILING: std::sync::OnceLock<fn(&str)> = std::sync::OnceLock::new();
+
+/// Have `hook` told of a failure, before anything else happens: on the
+/// thread that failed, with its frames still in place.
+pub fn on_failure(hook: fn(&str)) {
+    let _ = FAILING.set(hook);
+}
+
 /// Stop the program with `msg` on stderr and a failing status -- or, in a
 /// thread other than `main`, just that thread: see [`sched::fail_thread`].
 pub fn fail(msg: &str) -> ! {
+    if let Some(hook) = FAILING.get() {
+        hook(msg);
+    }
     sched::fail_thread(msg);
     use std::io::Write;
     let _ = std::io::stdout().flush();
@@ -157,6 +181,10 @@ pub extern "C" fn meadow_bigint(n: i64) -> Word {
 /// A program that never spawns needs none of the scheduler: it runs here, on
 /// this thread's stack, with one context and no thread-locals at all. See
 /// `ctx::threaded`.
+/// The stack of the OS thread `main` runs on: non-tail recursion over a long
+/// list is ordinary Meadow. Reserved, and committed only as it is touched.
+const MAIN_STACK: usize = 1 << 30;
+
 fn run_main(entry: extern "C" fn() -> Word) -> (Box<Ctx>, Word) {
     if ctx::threaded() {
         let (mut c, v) = sched::main(move || entry());
@@ -165,6 +193,8 @@ fn run_main(entry: extern "C" fn() -> Word) -> (Box<Ctx>, Word) {
     }
     let mut c = Ctx::new(0);
     ctx::set(&mut *c);
+    // The thread `meadow_run` started for it, of `MAIN_STACK` bytes.
+    stack::set_limit(stack::below_here(MAIN_STACK));
     let v = entry();
     (c, v)
 }
@@ -236,10 +266,16 @@ pub unsafe extern "C" fn meadow_run_test(
         return 2;
     };
     // Safety: the caller's.
-    let entry = unsafe { *tests.add(i) };
+    run_one_test(unsafe { *tests.add(i) })
+}
+
+/// Run `entry` as a test: on a stack of its own, status 0 if it returns and 1
+/// if it fails. What a test executable does with the test it was asked for,
+/// and what Silo's interpreter does with one of an image's tests.
+pub fn run_one_test(entry: extern "C" fn() -> Word) -> i32 {
     let ran = std::thread::Builder::new()
         .name("main".into())
-        .stack_size(1 << 30)
+        .stack_size(MAIN_STACK)
         .spawn(move || {
             allocator();
             let (c, _) = run_main(entry);
@@ -297,6 +333,7 @@ pub unsafe extern "C" fn meadow_run(
     // Safety: the emitted module defines it.
     let d = unsafe { meadow_result_desc };
     let run = move || {
+        let began = std::time::Instant::now();
         // What `main` answers is in its heap, which stays current here.
         allocator();
         memory::start();
@@ -307,6 +344,7 @@ pub unsafe extern "C" fn meadow_run(
         let text = show::show(v, d);
         prims::report();
         cycles::report();
+        stats::report(began.elapsed());
         heap::quarantined();
         heap::erase(v, d);
         if std::env::var_os("MEADOW_SILO_LEAKS").is_some() {
@@ -367,7 +405,7 @@ pub unsafe extern "C" fn meadow_run(
     // committed only as it is touched.
     let answer = std::thread::Builder::new()
         .name("main".into())
-        .stack_size(1 << 30)
+        .stack_size(MAIN_STACK)
         .spawn(run)
         .expect("the main thread starts")
         .join();

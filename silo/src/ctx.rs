@@ -75,7 +75,7 @@ impl std::hash::Hasher for AddressHasher {
     }
 }
 
-/// Laid out as C would, for the first two words' sake: emitted code reads
+/// Laid out as C would, for the first three words' sake: emitted code reads
 /// them off the context it is handed (`meadow_llvm::emit`'s `CTX`), so they
 /// must be where it looks.
 #[repr(C)]
@@ -86,6 +86,10 @@ pub struct Ctx {
     /// Word 1: the running segment's shadow chain: see `crate::shadow`.
     /// Here for a program with threads; one without keeps it in a global.
     pub shadow: Word,
+    /// Word 2: the running stack's limit, where a growable program moves to a
+    /// new piece of stack: see `crate::stack`. Here for a program with
+    /// threads; one without keeps it in a global.
+    pub stack_limit: usize,
     pub heap: Heap,
     /// This thread's own counts of references into the regions it last
     /// touched: see `crate::region::Tallies`.
@@ -98,6 +102,11 @@ pub struct Ctx {
     /// Segments suspended for a handler further out than their own, while
     /// that suspension lasts, innermost first: see `crate::segments::drive`.
     pub(crate) parked: Vec<Parked>,
+    /// Under tracing, the shadow chains of the segments running further out
+    /// than the running one, which each `drive` frame holds while the segment
+    /// it drives runs: roots the collector would not find otherwise. See
+    /// `crate::trace`.
+    pub outer_chains: Vec<Word>,
     pub next_handler: u32,
     /// String literals, made once per thread, by their bytes' address.
     pub literals: ByAddress<Word>,
@@ -121,6 +130,20 @@ pub struct Ctx {
     /// Inside a call C made into a library, on a segment of its own: a
     /// failure ends the call, not the process. See `crate::sched::export_run`.
     pub guarded: bool,
+    /// What the engine running this thread keeps for it, if it is not
+    /// compiled code: Silo's interpreter keeps the frames it reuses. Here
+    /// rather than in a thread-local, because a thread moves between OS
+    /// threads with its context -- mid-call, when it waits.
+    pub engine: Option<Box<dyn std::any::Any>>,
+    /// Pieces of stack a growable program has moved to and come back from,
+    /// to move to again: see `crate::stack`.
+    pub chunks: Vec<corosensei::stack::DefaultStack>,
+    /// The head of the frame records an engine keeps for a debugger: see
+    /// `crate::frames`.
+    pub frames: Word,
+    /// What of the program this thread has reached, once it has asked: see
+    /// `crate::coverage`.
+    pub reached: Option<Box<crate::coverage::Reached>>,
 }
 
 // Safety: a context is used by one OS thread at a time -- the one running its
@@ -132,11 +155,13 @@ impl Ctx {
         let mut c = Box::new(Ctx {
             spill_at: std::ptr::null_mut(),
             shadow: 0,
+            stack_limit: 0,
             heap: Heap::new(),
             regions: crate::region::Tallies::new(),
             running: Vec::new(),
             suspended: Vec::new(),
             parked: Vec::new(),
+            outer_chains: Vec::new(),
             next_handler: 1,
             literals: ByAddress::default(),
             globals: Vec::new(),
@@ -149,6 +174,10 @@ impl Ctx {
             spill: vec![0; unsafe { meadow_spill_words }.max(0) as usize],
             tid,
             guarded: false,
+            engine: None,
+            chunks: Vec::new(),
+            frames: 0,
+            reached: None,
         });
         c.spill_at = c.spill.as_mut_ptr();
         c
