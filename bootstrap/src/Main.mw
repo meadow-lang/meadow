@@ -82,7 +82,7 @@ cli! {
     "meadowboot"
     "Meadow's compiler, written in Meadow"
     version
-    "0.3.0-dev"
+    "0.4.0-dev"
     default
     repl
     unnamed
