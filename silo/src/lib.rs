@@ -169,6 +169,14 @@ fn run_main(entry: extern "C" fn() -> Word) -> (Box<Ctx>, Word) {
     (c, v)
 }
 
+/// A row of a library's `@meadow_exports`: a C function's name, and the
+/// function. A null name is an export that was not made.
+#[repr(C)]
+pub struct ExportRow {
+    name: *const std::ffi::c_char,
+    at: *const std::ffi::c_void,
+}
+
 /// Make the runtime ready for a call from C into a library of Meadow's: what
 /// every exported function does first (`meadow_llvm::emit`'s `export_fn`).
 /// The first call sets the runtime up, as a program's start does, and the
@@ -180,11 +188,29 @@ fn run_main(entry: extern "C" fn() -> Word) -> (Box<Ctx>, Word) {
 /// A library whose code spawns threads is not ready this way yet: its
 /// scheduler is not started.
 #[unsafe(no_mangle)]
-pub extern "C" fn meadow_export_enter() {
+pub extern "C" fn meadow_export_enter(exports: *const ExportRow, count: i64) {
     static READY: std::sync::Once = std::sync::Once::new();
     READY.call_once(|| {
         allocator();
         memory::start();
+        // The library's C functions by name, for `Std.Ffi.own ()`: see
+        // `meadow_rt::ffi::set_exports`.
+        let rows: &[ExportRow] = if exports.is_null() {
+            &[]
+        } else {
+            // Safety: the table the emitted library holds, of `count` rows.
+            unsafe { std::slice::from_raw_parts(exports, count.max(0) as usize) }
+        };
+        let named = rows
+            .iter()
+            .filter(|r| !r.name.is_null())
+            .map(|r| {
+                // Safety: a NUL-terminated constant of the library's.
+                let name = unsafe { std::ffi::CStr::from_ptr(r.name) };
+                (name.to_string_lossy().into_owned(), r.at as i64)
+            })
+            .collect();
+        meadow_rt::ffi::set_exports(named);
     });
     thread_local! {
         static HAS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

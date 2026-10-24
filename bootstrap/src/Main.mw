@@ -565,6 +565,7 @@ fun targetOf (given : Maybe String) : Goal =
   in
   let os =
     if S.contains "android" t then "android"
+    else if S.contains "apple-ios" t then "ios"
     else if S.contains "apple-darwin" t then "macos"
     else if S.contains "windows" t then "windows"
     else if S.contains "linux" t then "linux"
@@ -572,10 +573,15 @@ fun targetOf (given : Maybe String) : Goal =
   in
   let rest =
     if os == "android" then "linux-android"
+    else if os == "ios" then "apple-ios"
     else if os == "macos" then "apple-darwin"
     else if os == "windows" then "pc-windows-msvc"
     else "unknown-linux-gnu"
-  in Goal { os, arch, triple = "${arch}-${rest}", host = os == hostOs and arch == hostArch }
+  in
+  -- A triple given is kept as it is spelt, which is how `meadow` names the
+  -- directory it builds in: `aarch64-apple-ios-sim` says more than its system.
+  let triple = if S.contains "-" t then t else "${arch}-${rest}" in
+  Goal { os, arch, triple, host = os == hostOs and arch == hostArch }
 
 -- What the back end built natively for the package at `r` -- a library of
 -- what it exports, or a program -- named for the package and put where `meadow
@@ -593,6 +599,7 @@ fun placed (r : String) (profile : String) (library : Bool) (goal : Goal)
       if library then
         (if goal.os == "windows" then "${n}.dll"
          else if goal.os == "macos" then "lib${n}.dylib"
+         else if goal.os == "ios" then "lib${n}.a"
          else "lib${n}.so")
       else if goal.os == "windows" then "${n}.exe"
       else n
