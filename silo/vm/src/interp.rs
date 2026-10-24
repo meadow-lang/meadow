@@ -664,6 +664,10 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
         growable,
         shadow: tracing || c.detaches,
     };
+    // Its records kept from the start: see `meadow_silo::coverage::recording`.
+    if vm.debugging {
+        meadow_silo::coverage::record();
+    }
     // Safety: set before the runtime starts, which reads them.
     unsafe {
         crate::meadow_threaded = u8::from(c.threads);
@@ -1800,7 +1804,9 @@ impl Vm {
         if self.growable && meadow_silo::stack::low() {
             return meadow_silo::stack::grow(move || self.exec(p, env));
         }
-        if self.debugging {
+        // Under a debugger, a profile, or once the program has asked what it
+        // reached: the loop that keeps records, and notes what it runs.
+        if meadow_silo::coverage::recording() {
             self.run::<true>(p, env)
         } else {
             self.run::<false>(p, env)
@@ -1834,6 +1840,11 @@ impl Vm {
                 match watching {
                     Some(w) => w.at(&act),
                     None => profile::tick(&act),
+                }
+                if meadow_silo::coverage::asked() {
+                    // A place is a pc of a segment: the first load's are
+                    // numbered from nought.
+                    meadow_silo::coverage::note((u64::from(p >> SEG) << 32) | pc as u64);
                 }
             }
             // Safety: every pc is a procedure's entry, an instruction's

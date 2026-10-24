@@ -136,6 +136,12 @@ struct Here;
 impl World for Here {
     type Value = Val;
 
+    /// What the engine has noted, which native code never does: see
+    /// `crate::coverage`.
+    fn covered(&mut self, reset: bool) -> i64 {
+        crate::coverage::covered(reset)
+    }
+
     fn int_of(&self, v: Val) -> Option<i64> {
         match v {
             Val::Int(n) => Some(n),

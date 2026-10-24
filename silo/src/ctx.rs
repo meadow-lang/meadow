@@ -141,6 +141,9 @@ pub struct Ctx {
     /// The head of the frame records an engine keeps for a debugger: see
     /// `crate::frames`.
     pub frames: Word,
+    /// What of the program this thread has reached, once it has asked: see
+    /// `crate::coverage`.
+    pub reached: Option<Box<crate::coverage::Reached>>,
 }
 
 // Safety: a context is used by one OS thread at a time -- the one running its
@@ -174,6 +177,7 @@ impl Ctx {
             engine: None,
             chunks: Vec::new(),
             frames: 0,
+            reached: None,
         });
         c.spill_at = c.spill.as_mut_ptr();
         c

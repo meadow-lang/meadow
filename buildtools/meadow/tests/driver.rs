@@ -720,3 +720,47 @@ fn a_profile_of_a_program_on_the_merged_runtime_s_vm_names_its_functions() {
     b.sort();
     assert_eq!(a, b);
 }
+
+#[test]
+fn the_merged_runtime_s_vm_says_what_a_program_reached_as_glade_does() {
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("meadow-vm-covered-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("Cov/src")).unwrap();
+    std::fs::write(
+        dir.join("Cov/Meadow.toml"),
+        "[package]\nname = \"Cov\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("Cov/src/Main.mw"),
+        "use Std.Process as P\nuse Std.String as S\n\n\
+         fun pick (n : Int) : Int = if n > 10 then n * 2 else if n > 5 then n + 1 else 0\n\n\
+         fun main () =\n  let a = P.covered True in\n  let _ = pick 1 in\n  \
+         let b = P.covered False in\n  let _ = pick 20 in\n  let c = P.covered False in\n  \
+         println (S.concatAll [show a, \" \", show (b > a), \" \", show (c > b)])\n",
+    )
+    .unwrap();
+    let said = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
+            .arg("run")
+            .args(args)
+            .arg(dir.join("Cov"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    // Glade's VM, and the merged runtime's: from nothing, and more as the
+    // program gets somewhere new. Native code notes nothing.
+    assert_eq!(said(&["--backend", "vm"]), "0 True True");
+    assert_eq!(said(&["--runtime", "silo", "--interpret"]), "0 True True");
+    assert_eq!(said(&["--runtime", "silo"]), "0 False False");
+}

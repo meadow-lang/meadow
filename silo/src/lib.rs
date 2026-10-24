@@ -18,6 +18,7 @@
 //! answers words: references are counted as `docs/SILO.md` says, a primitive
 //! borrows its arguments, and what one answers is owned by the caller.
 
+pub mod coverage;
 pub mod ctx;
 pub mod cycles;
 pub mod frames;
