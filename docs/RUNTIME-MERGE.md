@@ -238,7 +238,8 @@ its method table varies from one build to the next, as it did before this.
 **The second layout, Glade's** (Chris: "something like glade's", with more
 of the layout to be configurable later). What sets it apart, and so what it
 needs, in the order it can be built:
-1. **No count in the header, and blocks that move.** A young generation
+1. **No count in the header, and blocks that move.** (Begun 2026-10-24: a
+   young generation on the VM, below.) A young generation
    copied as Glade's nursery is, and an old one evacuated from sparse blocks.
    The header gives the count's place to the collector: a mark and an age,
    and a forwarding address in the header of a block that has moved.
@@ -503,7 +504,7 @@ choices:
 
 | choice | options | default |
 |---|---|---|
-| memory | `--gc rc` (counting, with reuse) or `tracing` | rc |
+| memory | `--gc rc` (counting, with reuse), `tracing`, or `generational` (a nursery, on the VM) | rc |
 | stack | `--stack fixed` (Silo's) or `growable` (Glade's) | growable in a debug build, fixed in a release one; `stack = "…"` in a profile |
 
 `--gc` is one option for both runtimes. Glade's names for its two collectors,
@@ -683,6 +684,37 @@ versioned, so its IR is what it was.
 Tests: `buildtools/meadow/tests/hot_reload.rs`, among them a changed type
 with old and new values alive at once, and a build that opted out.
 
+### A young generation (2026-10-24)
+
+`--gc generational` makes small blocks in a nursery of each heap's own, from
+the front. When it fills, the next safe point copies what is still reached
+out of it into the pages the tracing collector keeps (`silo/src/trace.rs`,
+`minor`), and a full collection empties it first and then marks and sweeps
+as before. Under tracing nothing counts, so a block's count is free to say
+that it moved, and the header word its kind was in says where.
+
+Blocks move, so everything that points at the nursery must be where the copy
+can rewrite it:
+- the records on every chain;
+- the context's top-level values, literals and kept values;
+- a transaction's writes;
+- the older blocks a young one was stored into.
+
+A store through `heap::set_field`, or into a mutable array, notes the block
+stored into (`trace::remember`, the write barrier). A block made while the
+nursery is full counts as one, since it may be given young fields as it is
+built.
+
+The VM reads back what its records held, after a safe point and after a call
+it waited on, and records a frame's borrowed values too. Native code cannot
+yet, since its SSA values hold addresses across calls, so under
+`generational` it traces without moving.
+
+Every example prints the same with the smallest nursery (32K words). On the
+VM, binarytrees spends 7.7% of its run collecting, against 10.6% traced. The
+run itself is about the same, since interpreting it costs most. A larger
+nursery (`MEADOW_GC_NURSERY`, in words) spends less: 4.8% at 16M words.
+
 ### Replacing Glade in full (2026-10-24)
 
 The merged runtime is to be Glade's next release, so it has to do all that
@@ -697,7 +729,7 @@ Glade's VM does. Where it stands:
 | GC statistics (`--gc-stats`) | yes, on both engines, under both strategies |
 | `meadow exec` of an image | yes, of an image of AxCut |
 | growable stacks, heap frames | yes, on both engines |
-| a generational, moving collector | not yet: it comes with a Glade-like layout |
+| a generational, moving collector | on the VM: `--gc generational`; native code traces without moving |
 | a JIT of hot blocks | not planned: the LLVM path compiles a whole program |
 
 A block no person wrote -- a join point, a group of local functions, a
