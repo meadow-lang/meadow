@@ -232,8 +232,8 @@ segments, parcels, regions and collectors read headers only through those
 accessors. The LLVM back end writes its IR from the description too
 (`Module::layout`), and asks of it only what that IR's shape assumes
 (`suits`). The IR of nine programs, counted and traced, is byte for byte
-what it was. One build of `concurrency` in four is not: the method table's
-order varies from one build to the next, which it did before this as well.
+what it was -- for `concurrency` in one build of four, since the order of
+its method table varies from one build to the next, as it did before this.
 
 **The second layout, Glade's** (Chris: "something like glade's", with more
 of the layout to be configurable later). What sets it apart, and so what it
