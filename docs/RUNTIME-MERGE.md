@@ -710,8 +710,10 @@ it waited on, and records a frame's borrowed values too. Native code cannot
 yet, since its SSA values hold addresses across calls, so under
 `generational` it traces without moving.
 
-Every example prints the same with the smallest nursery (32K words). On the
-VM, binarytrees spends 7.7% of its run collecting, against 10.6% traced. The
+Every example prints the same with the smallest nursery (32K words), and the
+standard library's 350 tests pass on the VM under `generational` with the
+default nursery, with the smallest, and with heap frames, as they do natively
+(Linux, 2026-10-24, with the full suite). On the VM, binarytrees spends 7.7% of its run collecting, against 10.6% traced. The
 run itself is about the same, since interpreting it costs most. A larger
 nursery (`MEADOW_GC_NURSERY`, in words) spends less: 4.8% at 16M words.
 
