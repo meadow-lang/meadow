@@ -229,8 +229,8 @@ describes a layout as data:
 `SILO` is its one instance. Silo's heap takes its constants and accessors
 from it. The interpreter and the runtime's printing, arrays, big integers,
 segments, parcels, regions and collectors read headers only through those
-accessors. The LLVM back end writes its IR from the description too, and
-the IR is byte for byte what it was.
+accessors. The LLVM back end is next: it is to write its IR from the
+description too, with the IR byte for byte what it was.
 
 **The second layout, Glade's** (Chris: "something like glade's", with more
 of the layout to be configurable later). What sets it apart, and so what it
