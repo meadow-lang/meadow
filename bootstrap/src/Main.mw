@@ -45,7 +45,7 @@ use MeadowBoot.Unit (packageOf, absolute, packageName)
 use Std.Result as Res
 use MeadowBoot.Compiler (
   unitDatabase, buildUnits, givenUnits, setCompilerSource, compilerGrouped, compilerRenamed,
-  compilerInferred, compilerCore, compilerWhole, Interface, hostOs
+  compilerInferred, compilerCore, compilerWhole, Interface, hostOs, hostArch
 )
 use Lingua.Make (linkDirIn)
 use Std.Path as Path
@@ -128,9 +128,9 @@ cli! {
       target
         : Option
           String
-          "The architecture a native build compiles for: `aarch64` or `x86_64`"
+          "What a native build compiles for: `aarch64` or `x86_64`, or a target triple such as `aarch64-linux-android`"
           value
-          "ARCH"
+          "TARGET"
       threads : Option Int "How many OS threads run the program's green threads" short "j" value "N"
       nursery
         : Option
@@ -294,6 +294,12 @@ cli! {
         optLevel : Option Int =
           2 "How hard an executable is optimised: 0, 1 or 2" short "O" value "LEVEL"
         noRun : Flag "Build what would be run -- the bytecode image, or the executable -- and stop"
+        target
+          : Option
+            String
+            "What a Silo build compiles for: `aarch64` or `x86_64`, or a target triple such as `aarch64-linux-android`"
+            value
+            "TARGET"
       }
     | clean
       "Remove what a build wrote: the package's `target` directory, with the images, executables and incremental cache in it"
@@ -453,7 +459,6 @@ fun handedOn () =
 fun unheeded (b : CliBuild) : [String] =
   V.concatMap (\x -> if fst x then [snd x] else []) [
     (b.noPrune, "--no-prune"),
-    (M.isSome b.target, "--target"),
     (M.isSome b.nursery, "--nursery"),
     (b.leaks, "--leaks"),
     (M.isSome b.features, "--features"),
@@ -478,9 +483,11 @@ fun driven (path : Maybe String) (b : CliBuild) (args : Maybe [String]) =
      | Just r ->
          let profile = if b.release then "release" else "debug" in
          let level = M.unwrapOr (if b.release then 2 else 1) b.optLevel in
+         let goal = targetOf b.target in
          let pairs =
            V.concat [
              [("opt", "O${show (if level > 2 then 2 else level)}"), ("macros", "Glade")],
+             (if M.isSome b.target then [("os", goal.os), ("arch", goal.arch)] else []),
              (if V.isEmpty b.cfg then [] else [("flags", S.join "," b.cfg)]),
              (if b.strict then [("strict", "true")]
               else if b.lenient then [("strict", "false")]
@@ -508,19 +515,25 @@ fun driven (path : Maybe String) (b : CliBuild) (args : Maybe [String]) =
                  | Ok text -> S.contains "\nexport " text
                  | Err _ -> False
                in
+               let aimed = match b.target with | Just t -> ["--target", t] | None -> [] in
                let back =
-                 if library then ["cut", program, "--runtime", "silo", "-O", show level, "--no-run"]
+                 if library then
+                   V.concat [
+                     ["cut", program, "--runtime", "silo", "-O", show level, "--no-run"],
+                     aimed
+                   ]
                  else
                    V.concat [
                      ["cut", program, "--runtime", M.unwrapOr "glade" b.runtime, "-O", show level],
                      (if ahead and b.runtime != Just "silo" then ["--aot"] else []),
+                     aimed,
                      (if M.isNone args then ["--no-run"] else V.pushFront theirs "--")
                    ]
                in match Proc.runInherit (meadow ()) back with
                   | Ok 0 ->
                       if not library then exit 0
                       else
-                        (match placed r profile library with
+                        (match placed r profile library goal with
                          | Ok at -> (let u = writeError "      Copied ${at}\n" in exit 0)
                          | Err why ->
                              (let u =
@@ -532,11 +545,44 @@ fun driven (path : Maybe String) (b : CliBuild) (args : Maybe [String]) =
                       (let u = writeError "meadowboot: the back end could not be run: ${why}\n" in
                        exit 1))
 
+-- What a native build is for: the system and the processor `@cfg` answers
+-- for, the Rust target triple `meadow` knows them by, and whether that is
+-- this machine.
+record Goal = {
+  os : String,
+  arch : String,
+  triple : String,
+  host : Bool
+}
+
+-- `--target`'s: an architecture alone, for this system, or a target triple.
+fun targetOf (given : Maybe String) : Goal =
+  let t = M.unwrapOr "" given in
+  let arch =
+    if M.isNone given then hostArch
+    else if S.startsWith "aarch64" t or S.startsWith "arm64" t then "aarch64"
+    else "x86_64"
+  in
+  let os =
+    if S.contains "android" t then "android"
+    else if S.contains "apple-darwin" t then "macos"
+    else if S.contains "windows" t then "windows"
+    else if S.contains "linux" t then "linux"
+    else hostOs
+  in
+  let rest =
+    if os == "android" then "linux-android"
+    else if os == "macos" then "apple-darwin"
+    else if os == "windows" then "pc-windows-msvc"
+    else "unknown-linux-gnu"
+  in Goal { os, arch, triple = "${arch}-${rest}", host = os == hostOs and arch == hostArch }
+
 -- What the back end built natively for the package at `r` -- a library of
 -- what it exports, or a program -- named for the package and put where `meadow
 -- build` puts a native program, `target/<profile>/native/silo`, so that two
 -- packages' do not share a name. A library is put there; a program is not yet.
-fun placed (r : String) (profile : String) (library : Bool) : Result String String ! { Fs | e } =
+fun placed (r : String) (profile : String) (library : Bool) (goal : Goal)
+    : Result String String ! { Fs | e } =
   let name =
     match readToString (Path.join r "Meadow.toml") with
     | Ok text -> packageName text
@@ -545,16 +591,20 @@ fun placed (r : String) (profile : String) (library : Bool) : Result String Stri
   let fileOf =
     \n ->
       if library then
-        (if hostOs == "windows" then "${n}.dll"
-         else if hostOs == "macos" then "lib${n}.dylib"
+        (if goal.os == "windows" then "${n}.dll"
+         else if goal.os == "macos" then "lib${n}.dylib"
          else "lib${n}.so")
-      else if hostOs == "windows" then "${n}.exe"
+      else if goal.os == "windows" then "${n}.exe"
       else n
   in
+  -- A build for another system is under its triple, as `meadow`'s is.
+  let under = if goal.host then "" else "/${goal.triple}" in
   let built =
-    Path.join (Path.join (linkDirIn r profile) "target/release/native/silo") (fileOf "program")
+    Path.join
+      (Path.join (linkDirIn r profile) "target/release/native${under}/silo")
+      (fileOf "program")
   in
-  let dir = Path.join r "target/${profile}/native/silo" in
+  let dir = Path.join r "target/${profile}/native${under}/silo" in
   let dest = Path.join dir (fileOf name) in
   match createDirAll dir with
   | Err why -> Err why

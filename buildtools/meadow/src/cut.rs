@@ -151,8 +151,13 @@ pub fn build_for_glade(path: &Path, opt: meadow_compiler::OptLevel) -> Result<Pa
 }
 
 /// Build it for Silo -- LLVM's code, linked with the `meadow_silo` runtime
-/// -- beside the file, under `target`, and answer where the executable is.
-pub fn build_for_silo(path: &Path, opt: meadow_compiler::OptLevel) -> Result<PathBuf, String> {
+/// -- beside the file, under `target`, and answer where the executable is:
+/// for `on`, or this machine.
+pub fn build_for_silo(
+    path: &Path,
+    opt: meadow_compiler::OptLevel,
+    on: Option<aot::Target>,
+) -> Result<PathBuf, String> {
     let root = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -161,10 +166,11 @@ pub fn build_for_silo(path: &Path, opt: meadow_compiler::OptLevel) -> Result<Pat
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or("a file with a name")?;
-    let target = aot::Target {
-        runtime: aot::Runtime::Silo,
-        ..aot::Target::host()?
-    };
+    let target = match on {
+        Some(t) => t,
+        None => aot::Target::host()?,
+    }
+    .with_runtime(aot::Runtime::Silo);
     aot::build_native_of(root, Profile::Release, opt, name, target, None, || {
         lowered(path)
     })

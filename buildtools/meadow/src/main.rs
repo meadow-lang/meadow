@@ -306,6 +306,11 @@ enum Cmd {
         /// -- and stop: what a front end's `build` asks for.
         #[arg(long)]
         no_run: bool,
+        /// On Silo, what to build for: an architecture of this system, or a
+        /// target triple for another, such as `aarch64-linux-android`. A
+        /// build for another system is built and not run.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
         /// What the program is given, after `--`: what its `argv` answers.
         #[arg(last = true, value_name = "ARGS")]
         args: Vec<String>,
@@ -410,10 +415,12 @@ fn select(selection: &Selection, path: &std::path::Path) -> Selected {
 /// `--target` -- what a native build compiles for -- and how the runtime runs.
 #[derive(clap::Args, Clone)]
 struct TargetArgs {
-    /// The architecture a native build compiles for: `aarch64` or `x86_64`.
-    /// The host's by default; `target = "…"` in a `[profile.<name>]` of
-    /// `Meadow.toml` sets it for a package.
-    #[arg(long, value_name = "ARCH")]
+    /// What a native build compiles for: an architecture of this system --
+    /// `aarch64` or `x86_64` -- or a target triple for another, such as
+    /// `aarch64-linux-android` (which needs the Android NDK: see
+    /// `ANDROID_NDK_HOME`). The host by default; `target = "…"` in a
+    /// `[profile.<name>]` of `Meadow.toml` sets it for a package.
+    #[arg(long, value_name = "TARGET")]
     target: Option<String>,
     /// The runtime system, from the profile: see `--runtime`.
     #[arg(skip)]
@@ -1013,8 +1020,18 @@ fn command() {
             aot: ahead,
             opt,
             no_run,
+            target,
             args,
         }) => {
+            let target = match target.as_deref().map(aot::Target::named).transpose() {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            // What is built for another system cannot be run here.
+            let no_run = no_run || target.is_some_and(|t| !t.is_host());
             let opt = match opt {
                 0 => meadow_compiler::OptLevel::O0,
                 1 => meadow_compiler::OptLevel::O1,
@@ -1028,8 +1045,15 @@ fn command() {
                     meadow::cut::kept_for_glade(&file).map(|()| 0)
                 }
                 Some(aot::Runtime::Silo) if no_run => {
-                    meadow::cut::build_for_silo(&file, opt).map(|_| 0)
+                    meadow::cut::build_for_silo(&file, opt, target).map(|exe| {
+                        meadow::status::status("Built", exe.display().to_string());
+                        0
+                    })
                 }
+                Some(aot::Runtime::Glade) if target.is_some_and(|t| !t.is_host()) => Err(
+                    "Glade builds for this system only: build for another with `--runtime silo`"
+                        .to_string(),
+                ),
                 Some(aot::Runtime::Glade) if ahead => meadow::cut::build_for_glade(&file, opt)
                     .and_then(|exe| {
                         std::process::Command::new(&exe)
@@ -1045,7 +1069,7 @@ fn command() {
                     meadow::cut::run_on_glade(&file).map(|()| 0)
                 }
                 Some(aot::Runtime::Silo) => {
-                    meadow::cut::build_for_silo(&file, opt).and_then(|exe| {
+                    meadow::cut::build_for_silo(&file, opt, target).and_then(|exe| {
                         // A library is built, and there is nothing to run.
                         if matches!(
                             exe.extension().and_then(|e| e.to_str()),
@@ -1397,6 +1421,7 @@ fn for_target(mut profile: Resolved, target: &TargetArgs) -> Resolved {
             meadow_glade::codegen::Arch::Aarch64 => "aarch64",
             meadow_glade::codegen::Arch::X86_64 => "x86_64",
         };
+        profile.options.cfg.os = t.os.cfg_name();
     }
     profile
 }

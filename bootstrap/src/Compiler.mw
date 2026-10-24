@@ -1383,7 +1383,7 @@ make! {
         True
           "from O1, copy a function for the dictionaries a call names, and read a known dictionary's method out of it"
       kind : Debug | Release = Debug "what `@cfg(debug)` and `@cfg(release)` hold of"
-      os : String = hostOs "the system `@cfg` answers for: windows, linux or macos"
+      os : String = hostOs "the system `@cfg` answers for: windows, linux, macos or android"
       arch : String = hostArch "the processor `@cfg` answers for: x86_64 or aarch64"
       backend : String = "aot" "what `@cfg(backend = …)` holds of: vm, jit, aot, silo or cek"
       test : Bool = False "whether `@cfg(test)` holds in the unit that was asked for"
@@ -1425,11 +1425,14 @@ make! {
 @cfg(os = "windows")
 @pub def hostOs : String = "windows"
 
+@cfg(os = "android")
+@pub def hostOs : String = "android"
+
 @cfg(arch = "x86_64")
-def hostArch : String = "x86_64"
+@pub def hostArch : String = "x86_64"
 
 @cfg(arch = "aarch64")
-def hostArch : String = "aarch64"
+@pub def hostArch : String = "aarch64"
 
 -- What a build at these options decides a `@cfg` by.
 fun cfgOf (o : UnitsOptions) : Cfg =

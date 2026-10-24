@@ -84,11 +84,56 @@ impl Runtime {
     }
 }
 
+/// The system a native build is for. The object format follows from it,
+/// but not the other way round: Android's is ELF, as Linux's is, and its C
+/// library, loader and linker are not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Os {
+    Linux,
+    Android,
+    MacOs,
+    Windows,
+}
+
+impl Os {
+    /// The system this `meadow` runs on.
+    pub fn host() -> Os {
+        if cfg!(target_os = "android") {
+            Os::Android
+        } else if cfg!(target_os = "macos") {
+            Os::MacOs
+        } else if cfg!(windows) {
+            Os::Windows
+        } else {
+            Os::Linux
+        }
+    }
+
+    pub fn format(self) -> Format {
+        match self {
+            Os::Linux | Os::Android => Format::Elf,
+            Os::MacOs => Format::MachO,
+            Os::Windows => Format::Coff,
+        }
+    }
+
+    /// As `@cfg(os = "…")` names it.
+    pub fn cfg_name(self) -> &'static str {
+        match self {
+            Os::Linux => "linux",
+            Os::Android => "android",
+            Os::MacOs => "macos",
+            Os::Windows => "windows",
+        }
+    }
+}
+
 /// What to compile for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Target {
     pub arch: Arch,
     pub format: Format,
+    pub os: Os,
     /// Which runtime library the program links: see [`Runtime`].
     pub runtime: Runtime,
 }
@@ -100,25 +145,44 @@ impl Target {
         Ok(Target {
             arch,
             format: Format::host(),
+            os: Os::host(),
             runtime: Runtime::Glade,
         })
     }
 
-    /// An architecture by name, for this platform's object format:
-    /// `aarch64` (or `arm64`), `x86_64` (or `x86-64`).
+    /// A target by name: an architecture alone -- `aarch64` (or `arm64`),
+    /// `x86_64` (or `x86-64`) -- for this system, or a Rust target triple
+    /// for another: `aarch64-linux-android`, `x86_64-apple-darwin`.
     pub fn named(name: &str) -> Result<Target, String> {
-        let arch = match name {
-            "aarch64" | "arm64" => Arch::Aarch64,
-            "x86_64" | "x86-64" | "amd64" => Arch::X86_64,
-            other => {
-                return Err(format!(
-                    "no native target `{other}` -- there is `aarch64` and `x86_64`"
-                ));
-            }
+        let arch_named = |a: &str| match a {
+            "aarch64" | "arm64" => Some(Arch::Aarch64),
+            "x86_64" | "x86-64" | "amd64" => Some(Arch::X86_64),
+            _ => None,
         };
+        if let Some(arch) = arch_named(name) {
+            return Ok(Target {
+                arch,
+                format: Format::host(),
+                os: Os::host(),
+                runtime: Runtime::Glade,
+            });
+        }
+        let os = match name.split_once('-').map(|(_, rest)| rest) {
+            Some("linux-android") => Os::Android,
+            Some("unknown-linux-gnu") => Os::Linux,
+            Some("apple-darwin") => Os::MacOs,
+            Some("pc-windows-msvc") => Os::Windows,
+            _ => None.ok_or_else(|| unknown_target(name))?,
+        };
+        let arch = name
+            .split('-')
+            .next()
+            .and_then(arch_named)
+            .ok_or_else(|| unknown_target(name))?;
         Ok(Target {
             arch,
-            format: Format::host(),
+            format: os.format(),
+            os,
             runtime: Runtime::Glade,
         })
     }
@@ -130,7 +194,7 @@ impl Target {
 
     /// Is this the machine this is running on, whichever runtime it links?
     pub fn is_host(self) -> bool {
-        Target::host().is_ok_and(|h| (h.arch, h.format) == (self.arch, self.format))
+        Target::host().is_ok_and(|h| (h.arch, h.os) == (self.arch, self.os))
     }
 
     /// The calling convention Silo's functions are in on this target: see
@@ -144,19 +208,95 @@ impl Target {
 
     /// The Rust target the runtime library for this is built for.
     pub fn triple(self) -> &'static str {
-        match (self.arch, self.format) {
-            // An ELF target on Android is Android: a native executable is for
-            // the machine this runs on, and on a phone that is not glibc Linux.
-            (Arch::Aarch64, Format::Elf) if cfg!(target_os = "android") => "aarch64-linux-android",
-            (Arch::X86_64, Format::Elf) if cfg!(target_os = "android") => "x86_64-linux-android",
-            (Arch::Aarch64, Format::MachO) => "aarch64-apple-darwin",
-            (Arch::X86_64, Format::MachO) => "x86_64-apple-darwin",
-            (Arch::Aarch64, Format::Elf) => "aarch64-unknown-linux-gnu",
-            (Arch::X86_64, Format::Elf) => "x86_64-unknown-linux-gnu",
-            (Arch::Aarch64, Format::Coff) => "aarch64-pc-windows-msvc",
-            (Arch::X86_64, Format::Coff) => "x86_64-pc-windows-msvc",
+        match (self.arch, self.os) {
+            (Arch::Aarch64, Os::Android) => "aarch64-linux-android",
+            (Arch::X86_64, Os::Android) => "x86_64-linux-android",
+            (Arch::Aarch64, Os::MacOs) => "aarch64-apple-darwin",
+            (Arch::X86_64, Os::MacOs) => "x86_64-apple-darwin",
+            (Arch::Aarch64, Os::Linux) => "aarch64-unknown-linux-gnu",
+            (Arch::X86_64, Os::Linux) => "x86_64-unknown-linux-gnu",
+            (Arch::Aarch64, Os::Windows) => "aarch64-pc-windows-msvc",
+            (Arch::X86_64, Os::Windows) => "x86_64-pc-windows-msvc",
         }
     }
+}
+
+fn unknown_target(name: &str) -> String {
+    format!(
+        "no native target `{name}` -- there is `aarch64` and `x86_64` for this system, and \
+         the triples `aarch64-linux-android`, `x86_64-linux-android`, \
+         `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, \
+         `x86_64-apple-darwin`, `aarch64-pc-windows-msvc` and `x86_64-pc-windows-msvc`"
+    )
+}
+
+/// The Android API level a build for Android is for: `MEADOW_ANDROID_API`, or
+/// 24 -- Android 7, the oldest the release's own Android build runs on.
+fn android_api() -> String {
+    std::env::var("MEADOW_ANDROID_API")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "24".to_string())
+}
+
+/// The NDK's clang, which knows where Android's headers and libraries are:
+/// from `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`, `ANDROID_NDK_LATEST_HOME`
+/// (a GitHub runner's) or `ANDROID_NDK`, whichever is set first.
+fn ndk_clang() -> Result<String, String> {
+    let ndk = [
+        "ANDROID_NDK_HOME",
+        "ANDROID_NDK_ROOT",
+        "ANDROID_NDK_LATEST_HOME",
+        "ANDROID_NDK",
+    ]
+    .iter()
+    .find_map(|v| std::env::var_os(v).filter(|p| !p.is_empty()))
+    .ok_or(
+        "a build for Android needs its NDK: set ANDROID_NDK_HOME to where it is, \
+             or MEADOW_CLANG to its clang",
+    )?;
+    let host = if cfg!(windows) {
+        "windows-x86_64"
+    } else if cfg!(target_os = "macos") {
+        // The NDK's macOS tools are universal, under this name.
+        "darwin-x86_64"
+    } else {
+        "linux-x86_64"
+    };
+    let exe = if cfg!(windows) { "clang.exe" } else { "clang" };
+    let clang = PathBuf::from(ndk)
+        .join("toolchains/llvm/prebuilt")
+        .join(host)
+        .join("bin")
+        .join(exe);
+    if !clang.is_file() {
+        return Err(format!(
+            "the Android NDK has no clang at {}: is ANDROID_NDK_HOME the NDK itself?",
+            clang.display()
+        ));
+    }
+    Ok(clang.to_string_lossy().into_owned())
+}
+
+/// The clang a native build for `target` runs, and the `--target` it gives
+/// it: `MEADOW_CLANG` or the `clang` on `PATH`, except that a build for
+/// Android takes the NDK's, and names the API level in the triple.
+fn clang_for(target: Target) -> Result<(String, String), String> {
+    let set = std::env::var("MEADOW_CLANG").ok().filter(|c| !c.is_empty());
+    if target.os == Os::Android {
+        let clang = match set {
+            Some(c) => c,
+            None => ndk_clang()?,
+        };
+        return Ok((
+            clang,
+            format!("--target={}{}", target.triple(), android_api()),
+        ));
+    }
+    Ok((
+        set.unwrap_or_else(|| "clang".into()),
+        format!("--target={}", target.triple()),
+    ))
 }
 
 /// Compile `image` for `target` at `opt`, and link it into package `name`'s executable,
@@ -483,7 +623,7 @@ pub fn clang_link(
         meadow_compiler::OptLevel::O1 => "-O1",
         meadow_compiler::OptLevel::O2 => "-O2",
     };
-    let clang = std::env::var("MEADOW_CLANG").unwrap_or_else(|_| "clang".into());
+    let (clang, triple) = clang_for(target)?;
     let run = |cmd: &mut Command, what: &Path| -> Result<(), String> {
         let out = cmd.output().map_err(|e| {
             format!("could not run {clang}: {e} -- the native backend needs clang, or MEADOW_CLANG")
@@ -499,7 +639,6 @@ pub fn clang_link(
         }
         Ok(())
     };
-    let triple = format!("--target={}", target.triple());
     // One module compiles and links in one step; several are compiled apart
     // first, as many at once as there are cores.
     let inputs: Vec<PathBuf> = if modules.len() == 1 {
@@ -591,7 +730,7 @@ pub fn clang_link(
         }
     }
     cmd.arg(runtime);
-    for lib in native_system_libs(target.format) {
+    for lib in native_system_libs(target) {
         cmd.arg(lib);
     }
     let linked = run(&mut cmd, &modules[0]);
@@ -602,8 +741,14 @@ pub fn clang_link(
 }
 
 /// What clang links a program against besides the runtime library.
-fn native_system_libs(format: Format) -> &'static [&'static str] {
-    match format {
+fn native_system_libs(target: Target) -> &'static [&'static str] {
+    // Bionic is its own C library: its threads are in it, and what Rust's
+    // runtime needs besides is the loader's, the system log's, and the
+    // unwinder the NDK carries -- what Glade's runtime links on Android too.
+    if target.os == Os::Android {
+        return &["-ldl", "-llog", "-lunwind", "-lm"];
+    }
+    match target.format {
         Format::Coff => &[
             "-lkernel32",
             "-lntdll",
@@ -705,6 +850,15 @@ pub fn link_image(
     calls: &codegen::Calls,
     exe: &Path,
 ) -> Result<(), String> {
+    // Glade's executables are linked by this system's C compiler, for this
+    // system: another one is Silo's, through clang.
+    if target.os != Os::host() {
+        return Err(format!(
+            "Glade builds ahead of time for {} only; for `{}`, build with `--runtime silo`",
+            Os::host().cfg_name(),
+            target.triple()
+        ));
+    }
     let runtimes = runtimes(target)?;
     let dir = match exe.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
@@ -921,10 +1075,22 @@ pub fn runtimes(target: Target) -> Result<Vec<PathBuf>, String> {
     if !found.is_empty() {
         return Ok(found);
     }
+    // Android's needs the NDK's C compiler for the C its crates build, which
+    // the script sets up.
+    let how = if target.os == Os::Android {
+        format!(
+            "`scripts/silo-runtime.sh {}` in a checkout",
+            target.triple()
+        )
+    } else {
+        format!(
+            "`cargo build --release --target {}` in `{crate_dir}`",
+            target.triple()
+        )
+    };
     Err(format!(
-        "no `{crate_dir}` runtime library for {} -- build one with \
-         `cargo build --release --target {}` in `{crate_dir}`, or name it with MEADOW_RUNTIME",
-        target.triple(),
+        "no `{crate_dir}` runtime library for {} -- build one with {how}, or name it with \
+         MEADOW_RUNTIME",
         target.triple()
     ))
 }
