@@ -29,18 +29,40 @@ unsafe extern "C" {
 }
 
 /// Tables given by whatever runs the program when there is no emitted module
-/// to read them from: an interpreter (`silo/vm`), before the program starts.
-static INSTALLED: std::sync::OnceLock<Names> = std::sync::OnceLock::new();
+/// to read them from: an interpreter (`silo/vm`), before the program starts,
+/// and again when it loads a new build of the program. Each is kept for as
+/// long as the program runs -- what read one may still be reading it -- and
+/// each extends the one before: what the old numbered, it numbers alike.
+static INSTALLED: std::sync::atomic::AtomicPtr<Names> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 /// Give the program's tables to the runtime, before anything asks for them.
 pub fn install(names: Names) {
-    let _ = INSTALLED.set(names);
+    INSTALLED.store(
+        Box::into_raw(Box::new(names)),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+/// Replace the tables, as loading a new build of the running program does.
+/// `make` is given the labels the runtime numbered after the program's own
+/// (see [`sym_named`]), and answers tables whose symbols number those as they
+/// were -- after which they are the program's, and not numbered again. Until
+/// it answers, nothing numbers another.
+pub fn reinstall<E>(make: impl FnOnce(&[String]) -> Result<Names, E>) -> Result<(), E> {
+    let mut extra = EXTRA.lock().unwrap_or_else(|p| p.into_inner());
+    let names = make(&extra)?;
+    install(names);
+    extra.clear();
+    Ok(())
 }
 
 /// The program's tables: those installed, or the emitted module's, read once.
 pub fn names() -> &'static Names {
-    if let Some(n) = INSTALLED.get() {
-        return n;
+    let installed = INSTALLED.load(std::sync::atomic::Ordering::Acquire);
+    if !installed.is_null() {
+        // Safety: installed tables are never freed.
+        return unsafe { &*installed };
     }
     static NAMES: std::sync::OnceLock<Names> = std::sync::OnceLock::new();
     NAMES.get_or_init(|| {
@@ -89,23 +111,23 @@ static EXTRA: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// The name of symbol `i`.
 pub fn sym_name(i: usize) -> String {
+    // The tables read with the labels held, which a reload moves into them.
+    let extra = EXTRA.lock().unwrap_or_else(|p| p.into_inner());
     let n = names();
     match n.syms.get(i) {
         Some(s) => s.clone(),
-        None => EXTRA
-            .lock()
-            .map(|e| e.get(i - n.syms.len()).cloned().unwrap_or_default())
-            .unwrap_or_default(),
+        None => extra.get(i - n.syms.len()).cloned().unwrap_or_default(),
     }
 }
 
 /// The symbol called `name`.
 pub fn sym_named(name: &str) -> usize {
+    // As in `sym_name`.
+    let mut extra = EXTRA.lock().unwrap_or_else(|p| p.into_inner());
     let n = names();
     if let Some(i) = n.syms.iter().position(|s| s == name) {
         return i;
     }
-    let mut extra = EXTRA.lock().unwrap_or_else(|p| p.into_inner());
     let at = match extra.iter().position(|s| s == name) {
         Some(at) => at,
         None => {

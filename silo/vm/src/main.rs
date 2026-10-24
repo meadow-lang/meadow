@@ -6,9 +6,14 @@
 //! meadow-silo-vm TESTS.image N
 //! meadow-silo-vm --dis PROGRAM.image
 //! meadow-silo-vm --debug PORT PROGRAM.image
+//! meadow-silo-vm --watch PROGRAM.image [ARGS...]
 //! ```
 //!
 //! An image of tests runs the one numbered `N`, as a test executable does.
+//! `--watch` runs the program and, whenever the image is written anew, loads
+//! the new one into it as it runs (`interp::Vm::reload`): what `meadow run
+//! --watch` writes. Each new build says on stderr what it replaced, or why it
+//! was refused.
 //!
 //! `meadow` writes the image (`meadow_axcut::image`): the program made linear
 //! (`meadow_axcut::linear`, the same pass Silo's compiler runs, done once when
@@ -100,33 +105,69 @@ extern "C" fn entry_debugged() -> Word {
     v
 }
 
+/// Load the image at `path` into the running program whenever it is written
+/// anew, from a thread of its own.
+fn watch(path: std::path::PathBuf) {
+    let written = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut seen = written(&path);
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let now = written(&path);
+            if now.is_none() || now == seen {
+                continue;
+            }
+            seen = now;
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            // What the new code is made of, for as long as it may run.
+            let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+            match meadow_axcut::image::decode(bytes).and_then(|i| interp::vm().reload(i)) {
+                Ok(what) => eprintln!("reloaded {}: {what}", path.display()),
+                Err(e) => eprintln!("not reloaded: {e}"),
+            }
+        }
+    });
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().collect();
     // `--dis`: the program's code, as the VM runs it, and nothing run.
-    let dis = args.get(1).is_some_and(|a| a == "--dis");
-    if dis {
-        args.remove(1);
-    }
+    let mut dis = false;
     // `--debug PORT`: run under the debugger listening there.
-    let debug = match args.get(1).map(String::as_str) {
-        Some("--debug") => {
-            let port = args.get(2).and_then(|p| p.parse::<u16>().ok());
-            args.drain(1..3.min(args.len()));
-            match port {
-                Some(p) => Some(p),
-                None => {
-                    eprintln!("usage: meadow-silo-vm --debug PORT PROGRAM.image");
-                    std::process::exit(2);
+    let mut debug = None;
+    // `--watch`: load the image again whenever it is written anew.
+    let mut watching = false;
+    loop {
+        match args.get(1).map(String::as_str) {
+            Some("--dis") => {
+                dis = true;
+                args.remove(1);
+            }
+            Some("--watch") => {
+                watching = true;
+                args.remove(1);
+            }
+            Some("--debug") => {
+                let port = args.get(2).and_then(|p| p.parse::<u16>().ok());
+                args.drain(1..3.min(args.len()));
+                match port {
+                    Some(p) => debug = Some(p),
+                    None => {
+                        eprintln!("usage: meadow-silo-vm --debug PORT PROGRAM.image");
+                        std::process::exit(2);
+                    }
                 }
             }
+            _ => break,
         }
-        _ => None,
-    };
+    }
     if debug.is_some() {
         interp::debugging();
     }
     let Some(path) = args.get(1) else {
-        eprintln!("usage: meadow-silo-vm [--dis | --debug PORT] PROGRAM.image [ARGS...]");
+        eprintln!("usage: meadow-silo-vm [--dis | --debug PORT | --watch] PROGRAM.image [ARGS...]");
         std::process::exit(2);
     };
     let bytes = match std::fs::read(path) {
@@ -159,6 +200,9 @@ fn main() {
     if dis {
         print!("{}", interp::vm().disassemble());
         return;
+    }
+    if watching {
+        watch(std::path::PathBuf::from(path));
     }
     if let Some(port) = debug {
         // Safety: before the runtime starts, which reads it.

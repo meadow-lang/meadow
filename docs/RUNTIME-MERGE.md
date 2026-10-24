@@ -421,7 +421,9 @@ debugging and introspection, and hot loading, which Glade does not have.
   - Nothing already running changes. An activation finishes in the version it
     began in. A closure or continuation already made keeps its version, since
     its captures are laid out for that version's code.
-  - A top-level value is kept unless its definition changed.
+  - A top-level value is computed again by the new code. The design said
+    "kept unless its definition changed"; see "Hot loading, as built" for
+    why it is not.
 - **Order of work:**
   1. the register VM on the native stack, at least as fast as the tree it
      replaces;
@@ -499,6 +501,87 @@ What it costs and allows, on this machine:
 
 One thing is lost: a piece in use by a continuation that is abandoned, rather
 than finished, is not given back.
+
+### Hot loading, as built (2026-10-23)
+
+`meadow run --watch` runs a program on the VM. Whenever the package's
+sources change, it builds the package again and loads the new build into the
+program while it runs.
+- The VM does the loading: `meadow-silo-vm --watch IMAGE` reloads the image
+  whenever it is written anew.
+- `meadow` writes an image whole, by renaming it into place, so the VM never
+  reads half of one.
+- Each reload prints on stderr what it replaced, or why it was refused.
+- A build that fails to compile leaves the program running as it was.
+
+**Segments.** Each load's code is a segment of its own: its procedures, its
+instructions and its method table.
+- A procedure's or a method's number carries its segment in its top bits.
+  So the header of a closure, or the return of a frame, says which version it
+  belongs to.
+- Nothing in a segment changes once it is in place.
+- A program takes up to 1,024 loads.
+
+**Slots.** A call by name goes through a slot, one per definition. This
+covers a jump, a direct call and the program's entry. Each reads its slot's
+procedure when it is made.
+- A reload points each slot it has a new version for at that version, with a
+  release store.
+- A call already under way runs the code it began in. So does a closure or a
+  continuation already made.
+- Whatever any of them calls by name next is the newest version.
+
+The first load numbers its slots as its procedures, so a program that is
+never reloaded runs as before: fib takes 337 ms and matmul 2.12 s, against
+333 ms and 2.11 s before the change.
+
+**What a definition is.** A slot is found by a key with four parts:
+- the module;
+- the name;
+- the type, as the type checker gave it, written the same in every build
+  (`meadow_core::signature`, carried in AxCut's `Program::types`);
+- how its parameters and its answer are represented.
+
+A definition whose type changed is therefore a new definition. Old code that
+calls it by name still reaches the old version, with arguments laid out as
+that version expects.
+
+Some definitions have no key, so each build has its own:
+- **What no person wrote**, such as join points.
+- **Local functions the compiler lifted** out of the definition they were
+  written in (`meadow_core::lift::is_lifted`). Such a function is part of
+  that definition's code, so a closure made of it keeps its version.
+- **Definitions alike in all four parts.**
+
+**Constructors.** Tags are renumbered by constructor name to the running
+program's, and new constructors get new tags. A reload is refused, and
+nothing changes, when:
+- a constructor's field types or labels changed (`Program::ctor_types`, from
+  the variant environment), since values already made of it have the old
+  shape;
+- the built-in roles are played by other constructors;
+- it was built to manage memory or the stack another way;
+- it starts threads, or detaches continuations, and the running program was
+  not set up for that.
+
+**Tables.** The runtime's names tables are replaced whole
+(`show::reinstall`), and each new table extends the one before. Labels the
+runtime numbered for itself become the program's, at the numbers they
+already had.
+
+**Top-level values.** A reload's caches are numbered after the running
+program's. So the new code computes each value again the first time it reads
+it, and the old code goes on reading its own. Keeping the values whose
+definitions did not change would mean knowing what each value depends on.
+Values are pure, so computing them again only costs time.
+
+**Not yet:**
+- The debugger knows only the first load's code, and does not stop in
+  reloaded code.
+- A watching run only reloads. It does not offer a restart when a reload is
+  refused.
+
+Tests: `buildtools/meadow/tests/hot_reload.rs`.
 
 ### Silo's speed, kept (measured 2026-10-23)
 

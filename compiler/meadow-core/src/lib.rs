@@ -506,6 +506,28 @@ impl Program {
     }
 }
 
+/// `p` as text that is the same in every build of a program: its variables
+/// named in the order they appear, as [`Program::pretty`] names them, rather
+/// than by ids that come from the inference arena.
+pub fn signature(p: &Poly) -> String {
+    Printer::default().poly(p)
+}
+
+/// What constructor `v`'s fields are, written as [`signature`] writes a
+/// type: `(Int, String)`, or with their labels, `(x : Int, y : Int)`.
+pub fn variant_signature(v: &meadow_infer::VariantSig) -> String {
+    let mut p = Printer::default();
+    let fields: Vec<String> = match &v.labels {
+        Some(ls) => ls
+            .iter()
+            .zip(&v.fields)
+            .map(|(l, t)| format!("{l} : {}", p.ty(t)))
+            .collect(),
+        None => v.fields.iter().map(|t| p.ty(t)).collect(),
+    };
+    format!("({})", fields.join(", "))
+}
+
 #[derive(Default)]
 struct Printer {
     names: HashMap<Var, String>,

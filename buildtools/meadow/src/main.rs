@@ -95,6 +95,13 @@ enum Cmd {
         /// program to guard its calls on: profile-guided optimization.
         #[arg(long)]
         train: bool,
+        /// Run on Silo's interpreter and, whenever the package's sources
+        /// change, build it again and load the new build into the program as
+        /// it runs: from then on a call by name runs the new version, and
+        /// what is running already finishes as it was. A build that changes a
+        /// constructor's fields is refused, and the program goes on as it was.
+        #[arg(long)]
+        watch: bool,
         #[command(flatten)]
         target: TargetArgs,
         /// Arguments for the program, after `--`: what `Process.argv` gives
@@ -802,10 +809,19 @@ fn command() {
             sample_every,
             sample_hz,
             train,
+            watch,
             target,
             args,
         }) => {
             meadow_compiler::core::args::set(args);
+            // Reloading is the interpreter's, on Silo.
+            let mut profile = profile;
+            let mut target = target;
+            if watch {
+                profile.runtime = Some("silo".into());
+                target.interpret = true;
+                meadow::watch::set_watching();
+            }
             let resolved = profile.resolve(&path);
             let target = target.with(&resolved);
             target.configure();
@@ -1617,25 +1633,34 @@ fn finish(
                 status::note("Executable", shown(&exe));
             }
             Ok(exe) => {
+                // The program a watching run rebuilt this for is running.
+                if meadow::watch::rebuilding() {
+                    std::process::exit(0);
+                }
                 status::status("Running", format!("`{}`", shown(&exe)));
+                let watching = meadow::watch::watching() && aot::is_image(&exe);
                 let mut command = if aot::is_image(&exe) {
                     let vm = aot::interpreter().unwrap_or_else(|e| {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     });
                     let mut c = std::process::Command::new(vm);
+                    if watching {
+                        c.arg("--watch");
+                    }
                     c.arg(&exe);
                     c
                 } else {
                     std::process::Command::new(&exe)
                 };
-                let status = command
-                    .args(meadow_compiler::core::args::get())
-                    .status()
-                    .unwrap_or_else(|e| {
-                        eprintln!("error: could not run {}: {e}", exe.display());
-                        std::process::exit(1);
-                    });
+                command.args(meadow_compiler::core::args::get());
+                if let (true, Some((root, _))) = (watching, package) {
+                    std::process::exit(meadow::watch::run(command, root));
+                }
+                let status = command.status().unwrap_or_else(|e| {
+                    eprintln!("error: could not run {}: {e}", exe.display());
+                    std::process::exit(1);
+                });
                 std::process::exit(status.code().unwrap_or(1));
             }
             // A release build of a lone file, or on a machine that cannot link

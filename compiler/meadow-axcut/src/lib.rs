@@ -445,6 +445,17 @@ pub struct Program {
     /// block's caller goes on, and so may borrow what the block borrowed: see
     /// `meadow_llvm::linear`.
     pub pure: std::collections::HashSet<Label>,
+    /// The type of each definition made from one a person wrote, as
+    /// `meadow_core::signature` writes it: what tells one build's version of
+    /// a definition from another's where how it is represented does not --
+    /// for Silo's interpreter, loading a new build into a running program.
+    /// Empty where a front end does not say.
+    #[serde(default)]
+    pub types: std::collections::HashMap<Label, InternedString>,
+    /// What each constructor's fields are, as `meadow_core::variant_signature`
+    /// writes it: what a reload refuses to change under values already made.
+    #[serde(default)]
+    pub ctor_types: std::collections::HashMap<InternedString, InternedString>,
 }
 
 impl Program {

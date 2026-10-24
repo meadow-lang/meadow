@@ -40,6 +40,7 @@ pub mod stdlib;
 pub mod test;
 pub mod tour;
 pub mod update;
+pub mod watch;
 pub mod workspace;
 
 pub use meadow_compiler::{OptLevel, Options, Strictness};

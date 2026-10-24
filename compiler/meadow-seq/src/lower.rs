@@ -544,6 +544,32 @@ pub fn lower_program(program: &core::Program, opt: OptLevel) -> Lowered {
         "definitions needing descriptors they are not passed: {unmet:?}"
     );
 
+    // Each definition's type, which its direct entry point has too -- but a
+    // local function's, lifted out of the definition it was written in: it
+    // is that definition's code, and has no version of its own.
+    let mut types = HashMap::new();
+    for (i, d) in program.defs.iter().enumerate() {
+        if core::lift::is_lifted(program, d) {
+            continue;
+        }
+        let sig = InternedString::from(core::signature(&d.poly).as_str());
+        types.insert(Label(i as u32), sig);
+        if let Some(&(worker, _)) = lower.workers.get(&d.var) {
+            types.insert(worker, sig);
+        }
+    }
+    let ctor_types = program
+        .variants
+        .iter()
+        .flat_map(|(_, vs)| vs)
+        .map(|v| {
+            (
+                v.name,
+                InternedString::from(core::variant_signature(v).as_str()),
+            )
+        })
+        .collect();
+
     timing.since("lower", lowering);
     Lowered {
         program: Program {
@@ -568,6 +594,8 @@ pub fn lower_program(program: &core::Program, opt: OptLevel) -> Lowered {
             results: lower.results,
             threads: lower.threads,
             pure: lower.pure,
+            types,
+            ctor_types,
         },
         unsupported: lower.unsupported,
     }

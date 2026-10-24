@@ -140,6 +140,9 @@ enum PK {
     Spawn(D),
     /// Through `meadow_prim`.
     Generic,
+    /// A top-level value's cache, by a reload's number for it: what the
+    /// code says, after those numbered before it.
+    Global(u32),
 }
 
 enum Op {
@@ -423,14 +426,100 @@ struct Segment {
     methods: Vec<(u32, usize)>,
 }
 
-/// What loading keeps from one load to the next.
+/// What loading keeps from one load to the next: how the program running
+/// numbers what a new build of it must number alike.
+#[derive(Clone, Default)]
 struct LoadState {
     /// The interned names, numbered once for every load.
     syms: HashMap<InternedString, usize>,
-    /// Each definition's slot, by what it is: see [`def_key`].
+    /// The slot of each definition a new build may have a new version of, by
+    /// what it is: see [`def_keys`].
     slots: HashMap<String, u32>,
     segments: usize,
+    /// How many slots are in use.
     defs: usize,
+    /// Every constructor's tag, numbered once for every load, and the next.
+    tags: HashMap<InternedString, u32>,
+    next_tag: u32,
+    ctor_fields: HashMap<InternedString, Vec<InternedString>>,
+    ctor_types: HashMap<InternedString, InternedString>,
+    roles: HashMap<meadow_axcut::Role, InternedString>,
+    /// How many top-level values' caches are numbered: each load's are
+    /// numbered after those before it, so that its code computes its own.
+    globals: u32,
+    /// Whether some load numbered a cache by other than a literal, which
+    /// leaves how many there are unknown, and a reload unable to number its
+    /// own clear of them.
+    opaque_globals: bool,
+    config: meadow_axcut::config::Config,
+}
+
+impl LoadState {
+    fn fresh_slot(&mut self) -> Result<u32, String> {
+        if self.defs >= DEFS {
+            return Err("more definitions than the program can hold".into());
+        }
+        self.defs += 1;
+        Ok(self.defs as u32 - 1)
+    }
+
+    /// Each of `program`'s tags, by its own number, as the program running
+    /// numbers the constructor: the first load's as they are, a reload's by
+    /// name, and those new to it after the rest. A reload is refused whose
+    /// constructor has fields other than it had -- values already made of it
+    /// are the old shape -- or whose roles are other constructors'.
+    fn tags_of(&mut self, program: &Program) -> Result<Vec<u32>, String> {
+        let size = program.tags.values().max().map_or(0, |t| *t as usize + 1);
+        if self.segments == 0 {
+            self.tags = program.tags.iter().map(|(n, t)| (*n, *t)).collect();
+            self.next_tag = size as u32;
+            self.ctor_fields = program.ctor_fields.clone();
+            self.ctor_types = program.ctor_types.clone();
+            self.roles = program.roles.clone();
+            return Ok((0..size as u32).collect());
+        }
+        if program.roles != self.roles {
+            return Err("its built-in types are other constructors than they were".into());
+        }
+        for (n, ty) in &program.ctor_types {
+            if let Some(had) = self.ctor_types.get(n)
+                && had != ty
+            {
+                return Err(format!(
+                    "constructor `{}` changed: its fields were {had}, and are {ty}",
+                    meadow_rt::ctor_spelling(n)
+                ));
+            }
+        }
+        for (n, fs) in &program.ctor_fields {
+            if let Some(had) = self.ctor_fields.get(n)
+                && had != fs
+            {
+                return Err(format!(
+                    "constructor `{}`'s fields changed",
+                    meadow_rt::ctor_spelling(n)
+                ));
+            }
+        }
+        let mut by: Vec<(u32, InternedString)> =
+            program.tags.iter().map(|(n, t)| (*t, *n)).collect();
+        by.sort();
+        let mut retag = vec![u32::MAX; size];
+        for (t, n) in by {
+            let next = &mut self.next_tag;
+            retag[t as usize] = *self.tags.entry(n).or_insert_with(|| {
+                *next += 1;
+                *next - 1
+            });
+        }
+        for (n, fs) in &program.ctor_fields {
+            self.ctor_fields.entry(*n).or_insert_with(|| fs.clone());
+        }
+        for (n, ty) in &program.ctor_types {
+            self.ctor_types.entry(*n).or_insert(*ty);
+        }
+        Ok(retag)
+    }
 }
 
 /// The program, ready to run.
@@ -493,7 +582,6 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
     } else {
         vec![program.entry.ok_or("the program has no entry point")?]
     };
-    let lin = image.linear;
     // What a test answers is not printed; what the program does is.
     let result = match (is_tests, program.entry) {
         (false, Some(e)) => program
@@ -503,15 +591,183 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
             .unwrap_or(desc::ANY),
         _ => desc::ANY,
     };
+    let mut state = LoadState {
+        config: image.config,
+        ..LoadState::default()
+    };
+    let c = compile(program, image.linear, 0, &mut state)?;
+    let entries = entries
+        .iter()
+        .map(|l| {
+            c.slots
+                .get(l)
+                .copied()
+                .ok_or("an entry the program does not have")
+        })
+        .collect::<Result<Vec<u32>, _>>()?;
+    let tracing = image.config.memory == meadow_axcut::config::Memory::Trace;
+    let growable = image.config.stack == meadow_axcut::config::Stack::Growable;
+    // What loading made of the program, for whoever is making it faster.
+    if std::env::var_os("MEADOW_VM_STATS").is_some() {
+        let seg = &c.segment;
+        eprintln!(
+            "vm: loaded in {:?}; {} procedures, {} methods, {} instructions; {:?}",
+            began.elapsed(),
+            seg.procs.len(),
+            seg.methods.len(),
+            seg.code.ins.len(),
+            seg.code.census()
+        );
+        let slots: Vec<usize> = seg.procs.iter().map(|p| p.slots).collect();
+        let over = slots.iter().filter(|n| **n > 16).count();
+        eprintln!(
+            "vm: {over} of {} procedures have over 16 slots; the most is {}",
+            slots.len(),
+            slots.iter().max().unwrap_or(&0)
+        );
+    }
+    let defs: Box<[std::sync::atomic::AtomicU32]> = (0..DEFS)
+        .map(|_| std::sync::atomic::AtomicU32::new(u32::MAX))
+        .collect();
+    for (slot, proc) in &c.defs {
+        defs[*slot as usize].store(*proc, Ordering::Relaxed);
+    }
+    let segs: Box<[OnceLock<Segment>]> = (0..SEGMENTS).map(|_| OnceLock::new()).collect();
+    let _ = segs[0].set(c.segment);
+    state.segments = 1;
+    let names = names_of(&state);
+    let vm = Vm {
+        segs,
+        defs,
+        entries,
+        is_tests,
+        state: std::sync::Mutex::new(state),
+        tracing,
+        debugging: DEBUGGING.load(Ordering::Relaxed),
+        growable,
+        shadow: tracing || c.detaches,
+    };
+    // Safety: set before the runtime starts, which reads them.
+    unsafe {
+        crate::meadow_threaded = u8::from(c.threads);
+        crate::meadow_cycles = u8::from(!tracing);
+        crate::meadow_gc = u8::from(tracing);
+        crate::meadow_result_desc = result;
+    }
+    meadow_silo::show::install(names);
+    VM.set(vm)
+        .map_err(|_| "a program was loaded twice".to_string())
+}
+
+impl Vm {
+    /// Load `image`, a new build of the program running, beside it, while it
+    /// runs (`docs/RUNTIME-MERGE.md`, "Hot loading"): its code goes in a
+    /// segment of its own, and each definition it has a new version of is
+    /// called by that from now on. What is running already goes on as it
+    /// was -- a call under way, a closure or a continuation already made,
+    /// runs the code it was made of -- and only what calls a definition by
+    /// name after this finds the new version. Its constructors are numbered
+    /// as the running program numbers them, and its top-level values are
+    /// computed again, by its own code, the first time it asks for them.
+    ///
+    /// Refused, and nothing changed, when what is already made cannot be
+    /// what the new code expects: a constructor whose fields changed, or a
+    /// program built to run otherwise. Answers what it replaced and added.
+    pub fn reload(&self, image: meadow_axcut::image::Image) -> Result<String, String> {
+        let mut held = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if image.config != held.config {
+            return Err("it was built to manage memory or the stack otherwise".into());
+        }
+        if !image.tests.is_empty() {
+            return Err("it is a program of tests".into());
+        }
+        let seg = held.segments;
+        if seg >= SEGMENTS {
+            return Err("the program has been reloaded as often as it can be".into());
+        }
+        let program: &'static Program = Box::leak(Box::new(image.program));
+        let mut state = held.clone();
+        let mut made = None;
+        meadow_silo::show::reinstall(|extra| -> Result<_, String> {
+            // The labels the runtime numbered after the program's own are
+            // the program's from now on, numbered as they were.
+            let base = state.syms.len();
+            for (j, s) in extra.iter().enumerate() {
+                state
+                    .syms
+                    .insert(InternedString::from(s.as_str()), base + j);
+            }
+            let c = compile(program, image.linear, seg as u32, &mut state)?;
+            // Safety: read only; the runtime set it when it started.
+            if c.threads && unsafe { crate::meadow_threaded } == 0 {
+                return Err(
+                    "it starts threads, which the program running was not set up for".into(),
+                );
+            }
+            if c.detaches && !self.shadow {
+                return Err(
+                    "it detaches continuations, which the program running was not set up for"
+                        .into(),
+                );
+            }
+            let names = names_of(&state);
+            made = Some(c);
+            Ok(names)
+        })?;
+        let c = made.expect("compiled");
+        let _ = self.segs[seg].set(c.segment);
+        // The segment in place first: a slot is read by whatever calls it.
+        for (slot, proc) in &c.defs {
+            self.defs[*slot as usize].store(*proc, Ordering::Release);
+        }
+        state.segments = seg + 1;
+        *held = state;
+        Ok(format!(
+            "{} definitions replaced, {} added",
+            c.replaced,
+            c.defs.len() - c.replaced
+        ))
+    }
+}
+
+/// One image's code, compiled for segment `seg`.
+struct Compiled {
+    segment: Segment,
+    /// Each definition's slot, by its label.
+    slots: HashMap<Label, u32>,
+    /// What each of those slots holds now: the definition's procedure.
+    defs: Vec<(u32, u32)>,
+    /// How many of those slots the program running had already.
+    replaced: usize,
+    threads: bool,
+    detaches: bool,
+}
+
+/// Compile `program`, whose linear blocks are `lin`, into segment `seg`,
+/// numbering what it shares with the program running -- its definitions'
+/// slots, its constructors, its names -- as `state` says, and adding to
+/// `state` what it numbers anew.
+fn compile(
+    program: &'static Program,
+    lin: Vec<(usize, Label, LBlock)>,
+    seg: u32,
+    state: &mut LoadState,
+) -> Result<Compiled, String> {
+    let retag = state.tags_of(program)?;
     let mut c = Compiler {
         program,
-        seg: 0,
+        seg,
+        retag,
+        globals: state.globals,
+        lits: HashMap::new(),
+        global_count: 0,
+        opaque_globals: false,
         news: HashMap::new(),
         codes: HashMap::new(),
         labels: HashMap::new(),
         procs: Vec::new(),
         methods: Vec::new(),
-        syms: HashMap::new(),
+        syms: std::mem::take(&mut state.syms),
         threads: false,
         detaches: false,
         code: Code::default(),
@@ -530,89 +786,64 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
             )
         })
         .collect();
-    // A slot for each definition, and in it, to begin with, its procedure:
-    // the first load's are numbered alike.
+    // A slot for each definition: the one it is a new version of, if the
+    // program running has one, or one of its own. A first load's are
+    // numbered as its procedures are.
     let keys = def_keys(program);
     let mut slots = HashMap::new();
+    let mut defs = Vec::new();
+    let mut replaced = 0;
     for (i, (label, ..)) in blocks.iter().enumerate() {
-        c.labels.insert(*label, i as u32);
-        if let Some(k) = keys.get(label) {
-            slots.insert(k.clone(), i as u32);
-        }
+        let slot = match keys.get(label) {
+            Some(k) => match state.slots.get(k) {
+                Some(s) => {
+                    replaced += 1;
+                    *s
+                }
+                None => {
+                    let s = state.fresh_slot()?;
+                    state.slots.insert(k.clone(), s);
+                    s
+                }
+            },
+            None => state.fresh_slot()?,
+        };
+        c.labels.insert(*label, slot);
+        slots.insert(*label, slot);
+        defs.push((slot, c.global(i)));
         c.procs.push(None);
     }
     for (i, (_, name, b)) in blocks.iter().enumerate() {
         let p = c.proc(b, name.clone());
         c.procs[i] = Some(p);
     }
-    let entries = entries
-        .iter()
-        .map(|l| {
-            c.labels
-                .get(l)
-                .copied()
-                .ok_or("an entry the program does not have")
-        })
-        .collect::<Result<Vec<u32>, _>>()?;
-    let tracing = image.config.memory == meadow_axcut::config::Memory::Trace;
-    let growable = image.config.stack == meadow_axcut::config::Stack::Growable;
-    // What loading made of the program, for whoever is making it faster.
-    if std::env::var_os("MEADOW_VM_STATS").is_some() {
-        eprintln!(
-            "vm: loaded in {:?}; {} procedures, {} methods, {} instructions; {:?}",
-            began.elapsed(),
-            c.procs.len(),
-            c.methods.len(),
-            c.code.ins.len(),
-            c.code.census()
-        );
-        let slots: Vec<usize> = c.procs.iter().flatten().map(|p| p.slots).collect();
-        let over = slots.iter().filter(|n| **n > 16).count();
-        eprintln!(
-            "vm: {over} of {} procedures have over 16 slots; the most is {}",
-            slots.len(),
-            slots.iter().max().unwrap_or(&0)
+    // A reload's caches numbered clear of the running program's: which
+    // they cannot be, where how many it has is not known.
+    let caches = c.global_count > 0 || c.opaque_globals;
+    if seg != 0 && caches && (state.opaque_globals || c.opaque_globals) {
+        return Err(
+            "its top-level values cannot be numbered apart from the running program's".into(),
         );
     }
-    let threads = c.threads;
-    let ndefs = blocks.len();
-    let defs = (0..DEFS)
-        .map(|i| std::sync::atomic::AtomicU32::new(if i < ndefs { i as u32 } else { u32::MAX }))
-        .collect();
-    let segs: Box<[OnceLock<Segment>]> = (0..SEGMENTS).map(|_| OnceLock::new()).collect();
-    let names = names_of(program, &c.syms);
-    let _ = segs[0].set(Segment {
-        program,
-        procs: c.procs.into_iter().map(|p| p.expect("compiled")).collect(),
-        code: c.code,
-        methods: c.methods,
-    });
-    let vm = Vm {
-        segs,
+    if c.procs.len() > LOCAL as usize || c.methods.len() > LOCAL as usize {
+        return Err("it has more procedures than a segment can hold".into());
+    }
+    state.syms = c.syms;
+    state.globals += c.global_count;
+    state.opaque_globals |= c.opaque_globals;
+    Ok(Compiled {
+        segment: Segment {
+            program,
+            procs: c.procs.into_iter().map(|p| p.expect("compiled")).collect(),
+            code: c.code,
+            methods: c.methods,
+        },
+        slots,
         defs,
-        entries,
-        is_tests,
-        state: std::sync::Mutex::new(LoadState {
-            syms: c.syms,
-            slots,
-            segments: 1,
-            defs: ndefs,
-        }),
-        tracing,
-        debugging: DEBUGGING.load(Ordering::Relaxed),
-        growable,
-        shadow: tracing || c.detaches,
-    };
-    // Safety: set before the runtime starts, which reads them.
-    unsafe {
-        crate::meadow_threaded = u8::from(threads);
-        crate::meadow_cycles = u8::from(!tracing);
-        crate::meadow_gc = u8::from(tracing);
-        crate::meadow_result_desc = result;
-    }
-    meadow_silo::show::install(names);
-    VM.set(vm)
-        .map_err(|_| "a program was loaded twice".to_string())
+        replaced,
+        threads: c.threads,
+        detaches: c.detaches,
+    })
 }
 
 // --- loading ------------------------------------------------------------------
@@ -622,6 +853,17 @@ struct Compiler {
     /// The segment this load's code goes in: the bits above [`LOCAL`] of
     /// every procedure and method it numbers.
     seg: u32,
+    /// Each of the program's tags, as the program running numbers it: see
+    /// [`LoadState::tags_of`].
+    retag: Vec<u32>,
+    /// Where this load's top-level values' caches are numbered from, and
+    /// how many it numbers: one more than the most a literal names.
+    globals: u32,
+    global_count: u32,
+    /// Whether one is numbered by other than a literal.
+    opaque_globals: bool,
+    /// The names bound to integer literals: what a cache is numbered by.
+    lits: HashMap<Name, i64>,
     /// Where each `new` statement's methods are in the table, by its address:
     /// compiled once however many times the code around it is (a frame's
     /// code is, once in its place and once where its call is).
@@ -729,6 +971,15 @@ impl Compiler {
         (self.seg << SEG) | local as u32
     }
 
+    /// Tag `t` of this load's program, as the program running numbers it.
+    fn tag(&self, t: u32) -> u32 {
+        self.retag
+            .get(t as usize)
+            .copied()
+            .filter(|t| *t != u32::MAX)
+            .unwrap_or(t)
+    }
+
     fn sym(&mut self, s: InternedString) -> i64 {
         let n = self.syms.len();
         *self.syms.entry(s).or_insert(n) as i64
@@ -811,7 +1062,7 @@ impl Compiler {
                 let dst = scope.at(*name);
                 I::Let {
                     dst,
-                    tag: *tag,
+                    tag: self.tag(*tag),
                     fields,
                     reuse,
                     rest: Box::new(self.stmt(rest, scope)),
@@ -854,7 +1105,7 @@ impl Compiler {
                     let fields = self.uses(&a.fields, scope);
                     let reuse = a.reuse.map(|t| scope.at(t));
                     out.push(Arm {
-                        tag: u64::from(a.tag),
+                        tag: u64::from(self.tag(a.tag)),
                         fields,
                         keep: a.keep,
                         reuse,
@@ -1151,7 +1402,25 @@ impl Compiler {
         }
         let result = results.first().copied();
         let op = match op {
-            Extern::Lit(l) => Op::Lit(self.literal(l)),
+            Extern::Lit(l) => {
+                if let (Lit::Int(n), Some(r)) = (l, result) {
+                    self.lits.insert(r, *n);
+                }
+                Op::Lit(self.literal(l))
+            }
+            // A top-level value's cache, numbered by a literal: by this
+            // load's own numbers, after the loads before it.
+            Extern::Prim(p @ (Prim::GlobalReady | Prim::GlobalGet | Prim::GlobalSet)) => {
+                match args.first().and_then(|a| self.lits.get(a)) {
+                    Some(i) => self.global_count = self.global_count.max(*i as u32 + 1),
+                    None => self.opaque_globals = true,
+                }
+                if self.globals == 0 {
+                    Op::Prim(*p, self.kind(*p, args, result, scope))
+                } else {
+                    Op::Prim(*p, PK::Global(self.globals))
+                }
+            }
             Extern::Prim(p) => {
                 if *p == Prim::ThreadSpawn {
                     self.threads = true;
@@ -2183,6 +2452,15 @@ impl Vm {
                 _ => unreachable!("direct"),
             },
             PK::Generic => generic(p, vals, descs),
+            PK::Global(base) => {
+                let mut ws: Words = vals.into();
+                ws[0] = ws[0].wrapping_add(Word::from(base));
+                match p {
+                    Prim::GlobalReady => rt::meadow_global_ready(ws[0]),
+                    Prim::GlobalGet => rt::meadow_global_get(ws[0]),
+                    _ => generic(p, &ws, descs),
+                }
+            }
         }
     }
 
@@ -2202,14 +2480,20 @@ impl Vm {
             }
         }
     }
-
 }
 
-/// What each definition is, across builds of the program: its module, its
-/// name, how its parameters and its answer are represented, and which of the
-/// definitions alike in all that it is -- a function's copies specialized at
-/// different types are told apart by their representations, and those alike
-/// in them too by their order. A reload finds a definition's slot by this.
+/// What each definition is, across builds of the program, for those a new
+/// build may have a new version of: its module, its name, its type, and how
+/// its parameters and its answer are represented -- a function's copies
+/// specialized at different types, and its direct entry point, are told
+/// apart by their representations. A reload finds a definition's slot by
+/// this, and calls by name that went to the old version go to the new.
+///
+/// A definition has none, and each build's version is its own, where that
+/// could call a version of something else: one no person wrote (a join
+/// point, a group of local functions, which only their own definition's
+/// code calls), one whose type the front end does not say, and those alike
+/// in all of it.
 fn def_keys(program: &Program) -> HashMap<Label, String> {
     fn rep(r: Option<&Rep>) -> String {
         match r {
@@ -2225,28 +2509,36 @@ fn def_keys(program: &Program) -> HashMap<Label, String> {
         }
     }
     let mut seen: HashMap<String, usize> = HashMap::new();
-    let mut out = HashMap::new();
+    let mut keys = Vec::new();
     for d in &program.defs {
-        let params: Vec<String> = d.block.params.iter().map(|p| rep(program.reps.get(p))).collect();
-        let base = format!(
-            "{}.{}({})->{}",
+        let Some(ty) = program.types.get(&d.label) else {
+            continue;
+        };
+        let params: Vec<String> = d
+            .block
+            .params
+            .iter()
+            .map(|p| rep(program.reps.get(p)))
+            .collect();
+        let key = format!(
+            "{}.{} : {ty} ({})->{}",
             d.module,
             d.name,
             params.join(","),
             rep(program.results.get(&d.label))
         );
-        let n = seen.entry(base.clone()).or_insert(0);
-        out.insert(d.label, format!("{base}#{n}"));
-        *n += 1;
+        *seen.entry(key.clone()).or_insert(0) += 1;
+        keys.push((d.label, key));
     }
-    out
+    keys.into_iter().filter(|(_, k)| seen[k] == 1).collect()
 }
 
 /// The tables the runtime prints and takes records apart by, as the compiler
 /// writes them (`meadow_llvm::emit`'s `header`).
-fn names_of(program: &Program, syms: &HashMap<InternedString, usize>) -> meadow_silo::show::Names {
+fn names_of(state: &LoadState) -> meadow_silo::show::Names {
+    let syms = &state.syms;
     {
-        let mut ctors: Vec<(u32, String)> = program
+        let mut ctors: Vec<(u32, String)> = state
             .tags
             .iter()
             .map(|(n, t)| (*t, n.to_string()))
@@ -2257,19 +2549,15 @@ fn names_of(program: &Program, syms: &HashMap<InternedString, usize>) -> meadow_
         let mut fields = vec![None; count];
         for (t, name) in &ctors {
             names[*t as usize] = Some(name.clone());
-            if let Some(fs) = program
-                .ctor_fields
-                .get(&InternedString::from(name.as_str()))
-            {
+            if let Some(fs) = state.ctor_fields.get(&InternedString::from(name.as_str())) {
                 fields[*t as usize] = Some(fs.iter().map(|f| f.to_string()).collect());
             }
         }
         let roles = meadow_rt::roles::Role::ALL
             .into_iter()
-            .map(|r| program.role(r).map(|c| c.to_string()))
+            .map(|r| state.roles.get(&r).map(|c| c.to_string()))
             .collect();
-        let mut syms: Vec<(usize, InternedString)> =
-            syms.iter().map(|(s, i)| (*i, *s)).collect();
+        let mut syms: Vec<(usize, InternedString)> = syms.iter().map(|(s, i)| (*i, *s)).collect();
         syms.sort_by_key(|(i, _)| *i);
         // Where each goes among a record's labels: the interned names' order.
         let mut by: Vec<usize> = (0..syms.len()).collect();

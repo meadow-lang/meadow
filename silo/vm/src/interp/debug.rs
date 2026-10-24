@@ -378,7 +378,8 @@ impl Debugger {
             // native stack: under `--stack heap` every caller is one.
             let k = p.slot_vars.iter().enumerate().find_map(|(slot, var)| {
                 let var = (*var)?;
-                v.seg(a.proc).program
+                v.seg(a.proc)
+                    .program
                     .returns
                     .contains(&meadow_axcut::VarId(var))
                     .then_some(())?;
@@ -671,8 +672,9 @@ impl Vm {
         let mut origin = vec![Json::Null; first.procs.len()];
         for (pc, i) in first.code.ins.iter().enumerate() {
             if let super::code::Ins::New(n) = i
-                && let Some(&(proc, _)) =
-                    first.methods.get(first.code.news[*n as usize].base as usize)
+                && let Some(&(proc, _)) = first
+                    .methods
+                    .get(first.code.news[*n as usize].base as usize)
                 && origin[proc as usize].is_null()
             {
                 origin[proc as usize] = json!(pc);

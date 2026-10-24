@@ -14,7 +14,7 @@ use crate::linear::LBlock;
 use crate::{Label, Program};
 
 /// What a file of this kind starts with.
-const MAGIC: &[u8] = b"meadow axcut image 3\n";
+const MAGIC: &[u8] = b"meadow axcut image 4\n";
 
 /// A program to run, and how.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]

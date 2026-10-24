@@ -184,7 +184,11 @@ pub fn write_image_with(
         tests,
         linear,
     };
-    write(path, &meadow_seq::image::encode(&image)?)
+    // Whole or not at all: an interpreter watching the image (`meadow run
+    // --watch`) reads it as soon as it changes.
+    let partial = path.with_extension("image.part");
+    write(&partial, &meadow_seq::image::encode(&image)?)?;
+    std::fs::rename(&partial, path).map_err(|e| format!("could not write {}: {e}", path.display()))
 }
 
 /// Is `path` an image, which [`interpreter`] runs, rather than an executable?
