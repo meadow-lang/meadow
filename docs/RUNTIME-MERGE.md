@@ -215,6 +215,50 @@ LIR lowering's description of a block (header size, where the length and
 kind are, how a field is addressed), and converting values that cross
 between two layouts in a compact region or a parcel.
 
+**The layout is a description now** (2026-10-24). `meadow_rt::layout`
+describes a layout as data:
+- the word that is nothing, and how a value with no block is encoded and
+  told from an address;
+- each header field as a word, a shift and a width: the count, the length,
+  the kind, the element descriptor, the uniform bit, the colour, the mutable
+  bit and `meta`;
+- how descriptors are packed, and where fields begin;
+- the region floor;
+- the number of each kind.
+
+`SILO` is its one instance. Silo's heap takes its constants and accessors
+from it. The interpreter and the runtime's printing, arrays, big integers,
+segments, parcels, regions and collectors read headers only through those
+accessors. The LLVM back end writes its IR from the description too, and
+the IR is byte for byte what it was.
+
+**The second layout, Glade's** (Chris: "something like glade's", with more
+of the layout to be configurable later). What sets it apart, and so what it
+needs, in the order it can be built:
+1. **No count in the header, and blocks that move.** A young generation
+   copied as Glade's nursery is, and an old one evacuated from sparse blocks.
+   The header gives the count's place to the collector: a mark and an age,
+   and a forwarding address in the header of a block that has moved.
+2. **Precise roots that are read back.** Everything that holds a reference
+   across a safe point must hold it where the collector can rewrite it:
+   - The interpreter's registers, which its activation records already
+     reach.
+   - The runtime's code, which may hold no address across an allocation.
+     This is Glade's rule, `Vm::ensure`.
+   - The native code's shadow records. Today they are written and never
+     read back: every reference held across a call is to be reloaded from
+     its record after it.
+3. **Regions told by address range, not by count.** A region's blocks lie in
+   memory of their own, as Glade's do above `REGION_BASE`.
+4. **Values with no block kept.** Odd words survive moving as they are, so
+   the Glade-like layout keeps Silo's encoding of them, which Glade itself
+   does not have.
+
+The interpreter comes first, since its roots are already precise. Native
+code comes second: its frames need reloading after every safe point, which
+costs a load per live reference across a call, so it is the strategy's
+choice and not paid under counting.
+
 ### Debugging native code
 
 The interpreter remains the debugger's engine: debug builds use it, and it
