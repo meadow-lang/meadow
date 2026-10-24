@@ -808,3 +808,46 @@ fn gc_stats_say_what_memory_did_on_the_merged_runtime_s_vm() {
         );
     }
 }
+
+#[test]
+fn exec_runs_an_image_of_axcut_on_the_merged_runtime_s_vm() {
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("meadow-vm-exec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("Ex/src")).unwrap();
+    std::fs::write(
+        dir.join("Ex/Meadow.toml"),
+        "[package]\nname = \"Ex\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("Ex/src/Main.mw"),
+        "use Std.Process as P\n\nfun main () = println (P.argv ())\n",
+    )
+    .unwrap();
+    let built = Command::new(env!("CARGO_BIN_EXE_meadow"))
+        .args(["build", "--runtime", "silo", "--interpret"])
+        .arg(dir.join("Ex"))
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
+        .arg("exec")
+        .arg(dir.join("Ex/target/debug/native/silo/Ex.image"))
+        .args(["--", "a", "b"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "[a, b]");
+}

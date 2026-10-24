@@ -115,9 +115,10 @@ enum Cmd {
     },
     /// Run a bytecode image: what `meadow build` writes under
     /// `target/<profile>/bytecode/`, or what a compiler written in Meadow
-    /// emits.
+    /// emits -- or an image of AxCut, what `--runtime silo --interpret`
+    /// writes, which Silo's interpreter runs.
     Exec {
-        /// The `.mbc` file.
+        /// The `.mbc` file, or the `.image`.
         image: PathBuf,
         /// `vm` (the interpreter alone) or `jit` (the default). For an
         /// executable, `meadow link` the image.
@@ -1359,6 +1360,23 @@ fn could_not_compile(name: &str, errors: usize) {
 
 /// `meadow exec`: run the image at `path` on `backend`.
 fn exec(path: &std::path::Path, backend: Backend, opt: OptLevel) {
+    // An image of AxCut, which the merged runtime's VM runs: what a build
+    // that interprets for Silo writes.
+    if aot::is_image(path) {
+        let vm = aot::interpreter().unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        });
+        let status = std::process::Command::new(vm)
+            .arg(path)
+            .args(meadow_compiler::core::args::get())
+            .status()
+            .unwrap_or_else(|e| {
+                eprintln!("error: could not run {}: {e}", path.display());
+                std::process::exit(1);
+            });
+        std::process::exit(status.code().unwrap_or(1));
+    }
     let image = read_image(path);
     let engine = match backend {
         Backend::Vm => Engine::Vm,
