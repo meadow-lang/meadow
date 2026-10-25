@@ -366,7 +366,7 @@ fun member =
 
 -- --- lexical -----------------------------------------------------------------
 
-fun float negative = P.map (\x -> Float (if negative then 0.0 -. x else x)) L.float
+fun float negative = P.map (\x -> Float (if negative then 0.0 - x else x)) L.float
 
 fun integer negative = P.map (\n -> Int (if negative then 0 - n else n)) L.decimal
 
@@ -558,8 +558,8 @@ fun hexDigit (d : Int) : String = stringSlice "0123456789abcdef" d (d + 1)
 -- parser produces, and honest about being a placeholder.
 fun showFloat x =
   let whole = floor x in
-  let frac = x -. toFloat whole in
-  let scaled = floor ((if frac <. 0.0 then 0.0 -. frac else frac) *. 1000000.0) in
+  let frac = x - toFloat whole in
+  let scaled = floor ((if frac < 0.0 then 0.0 - frac else frac) * 1000000.0) in
   S.concatAll [S.fromInt whole, ".", padLeft 6 (S.fromInt scaled)]
 
 fun padLeft width s = if S.byteLength s >= width then s else padLeft width (S.concat "0" s)
@@ -587,7 +587,7 @@ fun parsed text =
   -- float would lose precision no one asked to lose.
   let a = assertEq (parsed "1") (Int 1) "no fraction means Int" in
   let b = assertEq (parsed "2e3") (Float 2000.0) "an exponent means Float" in
-  let c = assertEq (parsed "-2.5E-1") (Float (0.0 -. 0.25)) "a signed exponent" in
+  let c = assertEq (parsed "-2.5E-1") (Float (0.0 - 0.25)) "a signed exponent" in
   assertTrue (isFloat (parsed "1.5")) "a fraction means Float"
 
 fun isFloat v = match v with | Float x -> True | _ -> False

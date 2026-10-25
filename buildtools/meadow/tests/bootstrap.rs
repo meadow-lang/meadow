@@ -2319,7 +2319,7 @@ impl Double Int {
 }
 
 impl Double Float {
-  fun double x = x *. 2.0
+  fun double x = _primMulF x 2.0
 }
 
 impl Double (Pair a b) where Double a, Double b {
@@ -2618,7 +2618,7 @@ fun next n = n + 1
 
 fun twiceNext n = next n + next 10
 
-fun half x = x *. 0.5
+fun half x = x * 0.5
 
 fun bumped xs = V.map (\x -> x + 300) xs
 
@@ -3350,7 +3350,7 @@ fn a_function_meadowboot_exports_is_called_from_c() {
         lib.join("src").join("Main.mw"),
         "use Std.Ffi as Ffi\nuse Std.Ffi (Arg)\n\n\
          @export\nfun twice (x : Int32) : Int32 = x * 2\n\n\
-         @export(lib_half)\nfun half (x : Float) : Float = x *. 0.5\n\n\
+         @export(lib_half)\nfun half (x : Float) : Float = x * 0.5\n\n\
          @export\nfun same32 (x : Float32) : Float32 = x\n\n\
          @export\nfun add (a : Int) (b : Int) : Int = a + b\n\n\
          @export\nfun broken (x : Int) : Int = x / (x - x)\n\n\

@@ -216,7 +216,7 @@ fn agrees(name: &str, src: &str) -> String {
 #[test]
 fn typed_arithmetic_and_branches_run_natively() {
     let src = "fun fib (n : Int) = if n < 2 then n else fib (n - 1) + fib (n - 2)
-               fun loop (n : Int) (acc : Float) = if n == 0 then acc else loop (n - 1) (acc +. 1.5)
+               fun loop (n : Int) (acc : Float) = if n == 0 then acc else loop (n - 1) (_primAddF acc 1.5)
                fun g (a : Int) (b : Int) = (a / b, a % b, a * b - 7, a >= b, a != b)
                def result = (fib 20, loop 1000 0.0, g 17 5, g (0 - 9223372036854775807 - 1) (0 - 1))";
     assert_eq!(
@@ -231,7 +231,7 @@ fn everything_else_goes_through_the_interpreter() {
                fun build (n : Int) = if n == 0 then Nil else Cons n (build (n - 1))
                fun total xs = match xs with | Nil -> 0 | Cons x r -> x + total r
                fun twice f x = f (f x)
-               def result = (total (build 1000), twice (\\x -> x * 3) 7, \"hi\", 1.5 <. 2.5)";
+               def result = (total (build 1000), twice (\\x -> x * 3) 7, \"hi\", _primLtF 1.5 2.5)";
     assert_eq!(agrees("mixed", src), "(500500, 63, \"hi\", True)");
 }
 

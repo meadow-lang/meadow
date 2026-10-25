@@ -66,12 +66,8 @@ def builtin : [(String, Fixity)] =
     ("*", fx Left 7),
     ("/", fx Left 7),
     ("%", fx Left 7),
-    ("*.", fx Left 7),
-    ("/.", fx Left 7),
     ("+", fx Left 6),
     ("-", fx Left 6),
-    ("+.", fx Left 6),
-    ("-.", fx Left 6),
     ("<<", fx Left 6),
     (">>", fx Left 6),
     (">>>", fx Left 6),
@@ -82,11 +78,7 @@ def builtin : [(String, Fixity)] =
     ("<", fx Neither 4),
     (">", fx Neither 4),
     ("<=", fx Neither 4),
-    (">=", fx Neither 4),
-    ("<.", fx Neither 4),
-    (">.", fx Neither 4),
-    ("<=.", fx Neither 4),
-    (">=.", fx Neither 4)
+    (">=", fx Neither 4)
   ]
 
 fun builtinOf (op : String) : Maybe Fixity = M.map snd (V.find (\b -> fst b == op) builtin)

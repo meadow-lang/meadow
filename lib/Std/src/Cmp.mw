@@ -410,8 +410,8 @@ use Std.Test (assertEq, assertTrue, assertFalse)
   assertEq (compare #[1, 2] #[1, 2, 0]) Less "a prefix first"
 
 @test fun floatsArePartial () =
-  let nan = 0.0 /. 0.0 in
+  let nan = 0.0 / 0.0 in
   let a = assertFalse (nan == nan) "NaN is not equal to itself" in
   let b = assertEq (partialCmp nan 1.0) None "and is ordered against nothing" in
-  let c = assertTrue (0.0 == (0.0 -. 0.0)) "-0.0 equals 0.0" in
+  let c = assertTrue (0.0 == (0.0 - 0.0)) "-0.0 equals 0.0" in
   assertTrue (1.5 < 2.5 and 2.5 >= 2.5) "the rest are ordered"

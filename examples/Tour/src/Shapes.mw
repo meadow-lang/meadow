@@ -21,21 +21,21 @@ use Shape.*
 
 fun area' s =
   match s with
-  | Circle r -> 3.14159 *. r *. r
-  | Rect w h -> w *. h
+  | Circle r -> 3.14159 * r * r
+  | Rect w h -> w * h
   | Triangle a b c ->
       -- Heron's formula.
-      let p = (a +. b +. c) /. 2.0 in
-      sqrt (p *. (p -. a) *. (p -. b) *. (p -. c))
+      let p = (a + b + c) / 2.0 in
+      sqrt (p * (p - a) * (p - b) * (p - c))
 
 -- Newton's method, since there is no `sqrt` primitive to reach for.
 fun sqrt x =
   let rec go (guess : Float) (n : Int) =
-    if n == 0 then guess else go ((guess +. x /. guess) /. 2.0) (n - 1)
-  in if x <=. 0.0 then 0.0 else go x 30
+    if n == 0 then guess else go ((guess + x / guess) / 2.0) (n - 1)
+  in if x <= 0.0 then 0.0 else go x 30
 
 -- `Just` the name of a shape with no area, if it is one.
-@pub fun degenerate s = if area s <=. 0.0 then Just (describe s) else None
+@pub fun degenerate s = if area s <= 0.0 then Just (describe s) else None
 
 @pub fun describe s =
   match s with
@@ -44,6 +44,6 @@ fun sqrt x =
   | Triangle a b c -> "a triangle"
 
 @pub fun distance p q =
-  let dx = p.x -. q.x in
-  let dy = p.y -. q.y in
-  sqrt (dx *. dx +. dy *. dy)
+  let dx = p.x - q.x in
+  let dy = p.y - q.y in
+  sqrt (dx * dx + dy * dy)

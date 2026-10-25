@@ -10,9 +10,9 @@
 -- and so does every package that depends on `Std`.
 
 infixr 8 ^
-infixl 7 *, /, %, *., /.
-infixl 6 +, -, +., -., <<, >>, >>>
-infix 4 ==, !=, <, >, <=, >=, <., >., <=., >=.
+infixl 7 *, /, %
+infixl 6 +, -, <<, >>, >>>
+infix 4 ==, !=, <, >, <=, >=
 
 -- Arithmetic, one trait per operator, so that a type may have `+` without `/`.
 
@@ -52,40 +52,40 @@ infix 4 ==, !=, <, >, <=, >=, <., >., <=., >=.
   fun (>>>) : a -> Int -> a
 }
 
--- The float operators: `1.5 +. x`. Separate from `+` so that a literal says by
--- its operator which kind of number it is.
+-- Both float types have the arithmetic operators, from the float primitives,
+-- as the integer types have them from the integer ones; `Std.Cmp` gives them
+-- `==` and `<`.
 
-@pub trait Floating a {
-  fun (+.) : a -> a -> a
-  fun (-.) : a -> a -> a
-  fun (*.) : a -> a -> a
-  fun (/.) : a -> a -> a
-  fun (<.) : a -> a -> Bool
-  fun (>.) : a -> a -> Bool
-  fun (<=.) : a -> a -> Bool
-  fun (>=.) : a -> a -> Bool
+impl Add Float {
+  fun (+) x y = _primAddF x y
 }
 
-impl Floating Float {
-  fun (+.) x y = _primAddF x y
-  fun (-.) x y = _primSubF x y
-  fun (*.) x y = _primMulF x y
-  fun (/.) x y = _primDivF x y
-  fun (<.) x y = _primLtF x y
-  fun (>.) x y = _primGtF x y
-  fun (<=.) x y = _primLeF x y
-  fun (>=.) x y = _primGeF x y
+impl Sub Float {
+  fun (-) x y = _primSubF x y
 }
 
-impl Floating Float32 {
-  fun (+.) x y = _primAddF x y
-  fun (-.) x y = _primSubF x y
-  fun (*.) x y = _primMulF x y
-  fun (/.) x y = _primDivF x y
-  fun (<.) x y = _primLtF x y
-  fun (>.) x y = _primGtF x y
-  fun (<=.) x y = _primLeF x y
-  fun (>=.) x y = _primGeF x y
+impl Mul Float {
+  fun (*) x y = _primMulF x y
+}
+
+impl Div Float {
+  fun (/) x y = _primDivF x y
+}
+
+impl Add Float32 {
+  fun (+) x y = _primAddF x y
+}
+
+impl Sub Float32 {
+  fun (-) x y = _primSubF x y
+}
+
+impl Mul Float32 {
+  fun (*) x y = _primMulF x y
+}
+
+impl Div Float32 {
+  fun (/) x y = _primDivF x y
 }
 
 -- Every integer type has all of the integer operators, from the same

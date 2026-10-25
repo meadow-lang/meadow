@@ -635,20 +635,20 @@ fun f64Of (bits : Int) : Float =
   let exponent = bitAnd (bits >>> 52) 2047 in
   let fraction = bitAnd bits 4503599627370495 in
   let magnitude =
-    if exponent == 2047 then (if fraction == 0 then 1.0 /. 0.0 else 0.0 /. 0.0)
+    if exponent == 2047 then (if fraction == 0 then 1.0 / 0.0 else 0.0 / 0.0)
     else if exponent == 0 then scaled (toFloat fraction) (0 - 1074)
     else scaled (toFloat (fraction + 4503599627370496)) (exponent - 1075)
-  in if bits < 0 then magnitude *. (0.0 -. 1.0) else magnitude
+  in if bits < 0 then magnitude * (0.0 - 1.0) else magnitude
 
 -- The `Float32` whose bits are `bits`, as a `Float`, which holds it exactly.
 fun f32Of (bits : Int) : Float =
   let exponent = bitAnd (bits >>> 23) 255 in
   let fraction = bitAnd bits 8388607 in
   let magnitude =
-    if exponent == 255 then (if fraction == 0 then 1.0 /. 0.0 else 0.0 /. 0.0)
+    if exponent == 255 then (if fraction == 0 then 1.0 / 0.0 else 0.0 / 0.0)
     else if exponent == 0 then scaled (toFloat fraction) (0 - 149)
     else scaled (toFloat (fraction + 8388608)) (exponent - 150)
-  in if bitAnd bits 2147483648 != 0 then magnitude *. (0.0 -. 1.0) else magnitude
+  in if bitAnd bits 2147483648 != 0 then magnitude * (0.0 - 1.0) else magnitude
 
 fun scaled (x : Float) (e : Int) : Float =
-  if e > 0 then scaled (x *. 2.0) (e - 1) else if e < 0 then scaled (x *. 0.5) (e + 1) else x
+  if e > 0 then scaled (x * 2.0) (e - 1) else if e < 0 then scaled (x * 0.5) (e + 1) else x

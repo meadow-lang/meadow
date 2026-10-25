@@ -15,7 +15,7 @@ fn numeric_literals_coerce_by_context() {
     // A literal takes the type of what it meets; one nothing pins down is an
     // `Int`. A `def` keeps the one type it gets rather than generalizing.
     insta::assert_snapshot!(schemes(
-        "def a = 1 + 2\ndef b = toUInt8 1 + 2\ndef c = 1 + toInt 2\ndef d = 5\ndef e = 1.5 +. 2.0\n"
+        "def a = 1 + 2\ndef b = toUInt8 1 + 2\ndef c = 1 + toInt 2\ndef d = 5\ndef e = _primAddF 1.5 2.0\n"
     ));
 }
 

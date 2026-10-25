@@ -498,9 +498,9 @@ fn float_pair(what: &str, a: Num, b: Num) -> Result<FloatPair, String> {
     })
 }
 
-/// `+. -. *. /.`.
+/// `+ - * /` on floats: the float primitives.
 pub fn float_arith(op: Arith, a: Num, b: Num) -> Result<Num, String> {
-    let what = format!("{}.", op.symbol());
+    let what = op.symbol().to_string();
     Ok(match float_pair(&what, a, b)? {
         FloatPair::F64(x, y) => Num::Float(match op {
             Arith::Add => x + y,
@@ -517,9 +517,10 @@ pub fn float_arith(op: Arith, a: Num, b: Num) -> Result<Num, String> {
     })
 }
 
-/// `<. >. <=. >=.` -- IEEE comparisons, so anything against NaN is false.
+/// `< > <= >=` on floats -- IEEE comparisons, so anything against NaN is
+/// false.
 pub fn float_cmp(op: Cmp, a: Num, b: Num) -> Result<bool, String> {
-    let what = format!("{}.", op.symbol());
+    let what = op.symbol().to_string();
     Ok(match float_pair(&what, a, b)? {
         FloatPair::F64(x, y) => match op {
             Cmp::Lt => x < y,

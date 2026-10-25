@@ -63,7 +63,7 @@ fn json_round_trip() {
 fn a_user_type_and_a_record() {
     same_pruned(
         "data Shape = Circle Float | Square Float
-         fun area s = match s with | Shape.Circle r -> 3.0 *. r *. r | Shape.Square a -> a *. a
+         fun area s = match s with | Shape.Circle r -> 3.0 * r * r | Shape.Square a -> a * a
          def result = (area (Shape.Circle 2.0), { name = \"sq\", area = area (Shape.Square 3.0) })",
     );
 }

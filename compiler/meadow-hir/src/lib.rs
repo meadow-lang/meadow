@@ -56,18 +56,16 @@ pub fn type_package(name: &str) -> Option<&str> {
 /// as methods of traits, over these same primitives.
 ///
 /// `::` is the list constructor's and nothing else's, and `++` has no
-/// primitive: it is `Std.String`'s.
+/// primitive: it is `Std.String`'s. The primitives are the integer ones:
+/// `Std.Ops` gives the float types the same operators, and without it float
+/// arithmetic names its primitives (`_primAddF x y`).
 pub const OPERATORS: &[(&str, Fixity, Option<&str>)] = &[
     ("^", Fixity::right(8), Some("_primPow")),
     ("*", Fixity::left(7), Some("_primMul")),
     ("/", Fixity::left(7), Some("_primDiv")),
     ("%", Fixity::left(7), Some("_primMod")),
-    ("*.", Fixity::left(7), Some("_primMulF")),
-    ("/.", Fixity::left(7), Some("_primDivF")),
     ("+", Fixity::left(6), Some("_primAdd")),
     ("-", Fixity::left(6), Some("_primSub")),
-    ("+.", Fixity::left(6), Some("_primAddF")),
-    ("-.", Fixity::left(6), Some("_primSubF")),
     ("<<", Fixity::left(6), Some("_primShl")),
     (">>", Fixity::left(6), Some("_primShr")),
     (">>>", Fixity::left(6), Some("_primUshr")),
@@ -79,10 +77,6 @@ pub const OPERATORS: &[(&str, Fixity, Option<&str>)] = &[
     (">", Fixity::none(4), Some("_primGt")),
     ("<=", Fixity::none(4), Some("_primLe")),
     (">=", Fixity::none(4), Some("_primGe")),
-    ("<.", Fixity::none(4), Some("_primLtF")),
-    (">.", Fixity::none(4), Some("_primGtF")),
-    ("<=.", Fixity::none(4), Some("_primLeF")),
-    (">=.", Fixity::none(4), Some("_primGeF")),
 ];
 
 /// Which way an operator groups: `a - b - c` is `(a - b) - c` (left), `a ^ b ^

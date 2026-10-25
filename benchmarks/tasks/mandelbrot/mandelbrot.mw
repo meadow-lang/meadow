@@ -15,19 +15,19 @@ def workers : Int = 8
 
 fun escape (cx : Float) (cy : Float) (i : Int) (x : Float) (y : Float) : Int =
   if i >= limit then limit
-  else if x *. x +. y *. y >. 4.0 then i
-  else escape cx cy (i + 1) (x *. x -. y *. y +. cx) (2.0 *. x *. y +. cy)
+  else if x * x + y * y > 4.0 then i
+  else escape cx cy (i + 1) (x * x - y * y + cx) (2.0 * x * y + cy)
 
 fun row (cy : Float) (i : Int) (acc : Int) : Int =
   if i >= side then acc
   else
-    let cx = toFloat i /. toFloat side *. 3.0 -. 2.0 in
+    let cx = toFloat i / toFloat side * 3.0 - 2.0 in
     row cy (i + 1) (acc + escape cx cy 0 0.0 0.0)
 
 fun band (j : Int) (acc : Int) : Int =
   if j >= side then acc
   else
-    band (j + workers) (acc + row (toFloat j /. toFloat side *. 3.0 -. 1.5) 0 0)
+    band (j + workers) (acc + row (toFloat j / toFloat side * 3.0 - 1.5) 0 0)
 
 fun main () =
   println
