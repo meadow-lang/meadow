@@ -1086,10 +1086,15 @@ VM.
   loop head in it is passed more than a threshold of times. Both thresholds
   are options.
 - **JIT-2.** Tier 1 is a baseline compiler. Each VM procedure becomes one
-  native function, instruction for instruction, over the same registers, from
-  the old Glade's code generator (`glade/src/codegen`, x86-64 and AArch64).
+  native function, instruction for instruction, over the same registers.
   An instruction it does not compile is run by the interpreter, and the
   native code carries on.
+  - *Status:* begun, x86-64 only (`silo/vm/src/interp/jit.rs`), with
+    `MEADOW_JIT` and `MEADOW_JIT_THRESHOLD` and no driver flag yet. The
+    integer arithmetic and comparisons are inline; every other instruction
+    goes through the interpreter's `step`. Glade's code generator did not
+    fit, so tier 1 has a small encoder of its own; Glade's executable memory
+    is shared (`compiler/meadow-exec`).
 - **JIT-3.** Tier 2 is an optimizing compiler from the lower-level IR (R3),
   in process (LLVM's ORC, or Cranelift; §19). `--jit-tiers 1|2` chooses
   how far to go.
@@ -1099,15 +1104,28 @@ VM.
 - **JIT-5.** A procedure goes back to the interpreter at a safe point when a
   debugger attaches or sets a breakpoint in it, when a reload replaces it,
   and when profiling or coverage begins.
+  - *Status:* done for recording: the loop that records (a debugger, a
+    profile, coverage) never enters compiled code. A reload's procedures are
+    a new segment's, compiled anew.
 - **JIT-6.** Hot code can enter its compiled form at a loop head, without
   waiting for the procedure to be entered again (on-stack replacement).
 - **JIT-7.** Under every memory strategy, compiled code meets the VM's
   obligations: MEM-GEN-8 under `generational`, and records around waited
   calls under tracing.
+  - *Status:* done by construction. Compiled code keeps no value in a
+    machine register across a call of `step`, and reads the slots' address
+    again after each one.
 - **JIT-8.** DIFF-1 and DIFF-2 hold under `jit` in every configuration, with
   the thresholds at 0 (compile everything) and at their defaults.
+  - *Status:* DIFF-1 holds with the threshold at 0 under `rc`, `tracing` and
+    `generational`, and DIFF-2 under `rc` and `generational` (Windows). The
+    script is `scratchpad/jitdiff.sh`.
 - **JIT-9.** (should) A long-running loop under `jit` runs within a factor of
   the AOT build's speed, to be set once tier 1 is measured.
+- **JIT-11.** The VM without the JIT is no slower for its being there
+  (PERF-3).
+  - *Status:* done; measured with code layout held still (functions and
+    blocks aligned to 64 bytes).
 - **JIT-10.** Mixed engines are options:
   - an AOT executable that carries the VM and the JIT, for code loaded into
     it by a reload (hot loading native programs);

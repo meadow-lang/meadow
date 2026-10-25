@@ -228,6 +228,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "meadow-exec"
+version = "0.3.0"
+
+[[package]]
 name = "meadow-intern"
 version = "0.3.0"
 dependencies = [
@@ -265,6 +269,7 @@ name = "meadow-silo-vm"
 version = "0.3.0"
 dependencies = [
  "meadow-axcut",
+ "meadow-exec",
  "meadow-intern",
  "meadow-rt",
  "meadow-silo",

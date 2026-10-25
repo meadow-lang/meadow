@@ -813,6 +813,101 @@ rbtree under generational is the exception:
 
 It is yet to be profiled.
 
+### A JIT: the design (2026-10-25)
+
+The engine becomes a choice of three, as Chris asked ("I want aot and jit to
+be options. the idea is maximum configurability"):
+- `interpret`, the VM as it is;
+- `jit`, the VM compiling what runs often;
+- `aot`, LLVM ahead of time.
+
+`docs/RUNTIME-SPEC.md` has the requirements (JIT-1 to JIT-10). This is how
+the first tier meets them.
+
+**Where it starts: the VM's own registers.** A procedure the VM runs keeps
+its slots in an `Env`, a vector of `V`s (a word, a frame not yet built, or
+nothing) in the native frame of the call that runs it. Tier 1 compiles a
+procedure to a native function over that same `Env`, so that compiled and
+interpreted code see one state:
+- `V` gets a fixed layout (`repr(u64)`: a tag word, then the word or the
+  frame's pointer), which compiled code reads and writes.
+- Any instruction can be left to the interpreter. One that tier 1 does not
+  compile becomes a call to `step`, which runs that one instruction as the
+  interpreter's loop does and answers where to go next: another pc of the
+  procedure, which compiled code jumps to through a table of its labels, or
+  a transfer out of it (a `Jump` or `Invoke` to another procedure, a return).
+  That is JIT-2's "an instruction it does not compile is run by the
+  interpreter, and the native code carries on", and it lets tier 1 begin
+  with very little compiled and grow an instruction at a time, checked
+  against the interpreter at each step.
+- What leaves a procedure goes back to the driver loop (`run`), which enters
+  the next procedure compiled if it is, and interpreted if not. Calls by name
+  go through the slots hot loading uses, so a reload replaces compiled code
+  as it replaces interpreted code (JIT-4): compiled code is per segment and
+  procedure, and a new segment's procedures start interpreted.
+
+**What is compiled first:**
+- the arithmetic and comparisons (`Bin`, `BinK`, `BinI`, `IfBin`,
+  `IfBinI`), on words, with the tag checked inline and `step` taking any
+  other case;
+- branches and jumps within the procedure, so that a loop is native;
+- moves (`Rename`).
+
+The rest calls `step`, through which the procedure stays whole. A `Switch` on
+a tag, allocation, and calls come next, measured one at a time.
+
+**Memory.** Compiled code keeps no value in a machine register across
+anything that may collect: every helper it calls may, and it reads its
+operands from `Env` again after each one. So the VM's records, which already
+reach `Env`, stay all the roots there are, and the young generation needs
+nothing new (JIT-7).
+
+**When.** A procedure is compiled once it has been entered `--jit-threshold`
+times (1000 by default; 0 compiles each one when it is first entered), or
+once a backward jump in it has been taken as often. A loop entered once is
+compiled at its head, and the running activation carries on in the compiled
+code at that pc (JIT-6), which the label table makes a lookup.
+
+**Not compiled.** While a debugger, a profile or coverage records, the VM
+runs the loop that records, and compiled code is not entered: a procedure
+goes back to the interpreter at its next entry (JIT-5).
+
+**The machine code.**
+- Executable memory is Glade's JIT's `Arena`, moved into a crate both use
+  (`compiler/meadow-exec`): never writable and executable at once, `MAP_JIT`
+  on macOS, two views of one mapping elsewhere.
+- The instructions are x86-64 first, then AArch64. Glade's encoders did not
+  fit, being written for its own machine state (pinned registers, its
+  "thin" steps), so tier 1 has a small encoder of its own
+  (`silo/vm/src/interp/jit/x64.rs`).
+
+**Tier 2** is the open question in the spec (§19): LLVM's ORC or Cranelift,
+from the lower-level IR (R3). Tier 1 does not wait for it.
+
+**Built: the first step** (2026-10-25). `MEADOW_JIT=1` on the VM, and
+`MEADOW_JIT_THRESHOLD`:
+- **What is compiled.** Every procedure is compiled once entered often
+  enough. `Bin`, `BinK`, `BinI`, `IfBin` and `IfBinI` are compiled inline,
+  for the integer operations and comparisons; everything else calls `step`.
+- **One source for the semantics.** `step` and the interpreter's loop are
+  one macro (`instruction!`), each giving it its own way of going on, so
+  that what the interpreter does is written once. A first try, the loop
+  calling `step` as a function, cost fib 15% even with `#[inline(always)]`,
+  and was taken back.
+- **The interpreter pays nothing for it.** `exec` and `call` carry whether
+  the JIT is on as a constant, so the interpreter without the JIT calls only
+  code without it. Measured with functions and blocks aligned, fib takes
+  335 ms against 336 to 342 ms before, and matmul 2,127 ms against 2,144 to
+  2,160 ms. Unaligned, fib reads 3% slower, which is code layout.
+- **Checked.** With everything compiled at first entry, the six examples
+  print as without it, under counting, tracing and `generational` with the
+  smallest nursery; Std's tests pass under counting and `generational`
+  (Windows).
+- **Not faster yet.** fib takes 445 ms, against 355 ms interpreted, since a
+  call goes through `step` and then the driver, and the arithmetic it saves
+  is little. matmul is level. Calls and returns compiled natively come next,
+  and they are what will make it pay.
+
 ### Replacing Glade in full (2026-10-24)
 
 The merged runtime is to be Glade's next release, so it has to do all that
