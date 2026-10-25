@@ -25,7 +25,8 @@
 //! to be told.
 //!
 //! So it is told, by the same counting every reference already does. A block
-//! inside a region carries [`heap::STICKY`] references more than it has, which
+//! inside a region carries [`heap::STICKY`] references more than it has (its
+//! mark, under a layout with no count, is [`heap::REGION_FLOOR`]), which
 //! puts its count far above anything an ordinary block reaches; sharing or
 //! erasing one therefore knows, from the count it has already loaded, that it
 //! is touching a region -- see [`heap::REGION_FLOOR`], and
@@ -549,10 +550,9 @@ fn copy(inside: &mut Inside, r: *const Region, v: Word, d: i64) -> Result<Word, 
             unsafe { *to.add(i) = heap::word(b, i) };
         }
         let new = to as Word;
-        // Never counted again: see the module docs.
-        heap::set_word(new, 0, heap::word(b, 0));
-        heap::set_word(new, 1, heap::word(b, 1) & !heap::MARKS);
-        heap::set_count(new, heap::STICKY);
+        // Never counted or marked again: see the module docs.
+        heap::copy_header(b, new);
+        heap::set_in_region(new);
         // A compact inside this one keeps its own region, which this copy of
         // the block now names as well.
         if heap::kind(new) == heap::COMPACT {

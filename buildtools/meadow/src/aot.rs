@@ -69,7 +69,7 @@ impl Runtime {
     pub fn symbol(self) -> String {
         match self {
             Runtime::Glade => codegen::object::runtime_symbol(),
-            Runtime::Silo => meadow_llvm::runtime_symbol(),
+            Runtime::Silo => meadow_llvm::runtime_symbol_for(layout()),
         }
     }
 
@@ -121,11 +121,41 @@ pub fn stack() -> meadow_llvm::Stack {
     })
 }
 
+/// How a block of a program for Silo is laid out: what `--layout` said, or
+/// `MEADOW_LAYOUT`, or Silo's.
+static LAYOUT: std::sync::OnceLock<meadow_llvm::Layout> = std::sync::OnceLock::new();
+
+/// Say how blocks are laid out, before anything is built: `--layout`.
+pub fn set_layout(layout: meadow_llvm::Layout) {
+    let _ = LAYOUT.set(layout);
+}
+
+pub fn layout() -> meadow_llvm::Layout {
+    *LAYOUT.get_or_init(|| {
+        std::env::var("MEADOW_LAYOUT")
+            .ok()
+            .and_then(|l| meadow_llvm::Layout::named(&l))
+            .unwrap_or_default()
+    })
+}
+
 /// How a program for Silo is run, by either engine.
 pub fn config() -> meadow_llvm::Config {
     meadow_llvm::Config {
         memory: gc(),
         stack: stack(),
+        layout: layout(),
+    }
+}
+
+/// Where in a directory of runtimes the ones built for `layout` are: Silo's
+/// in it, and another's in a directory of the layout's name, as a checkout's
+/// `cargo build --features glade-layout --target-dir target/glade-layout`
+/// leaves them.
+fn layout_dir(dir: PathBuf, layout: meadow_llvm::Layout) -> PathBuf {
+    match layout {
+        meadow_llvm::Layout::Silo => dir,
+        other => dir.join(format!("{}-layout", other.name())),
     }
 }
 
@@ -228,30 +258,45 @@ pub fn is_image(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "image")
 }
 
-/// Silo's interpreter: `MEADOW_SILO_VM`, or beside this executable, or where
-/// a checkout builds it.
+/// Silo's interpreter, for the layout [`layout`] says: `MEADOW_SILO_VM`, or
+/// beside this executable, or where a checkout builds it -- for another
+/// layout than Silo's, in a directory of the layout's name in each (see
+/// [`layout_dir`]). One built for another layout than an image's refuses it.
 pub fn interpreter() -> Result<PathBuf, String> {
     let exe = format!("meadow-silo-vm{}", std::env::consts::EXE_SUFFIX);
     if let Some(path) = std::env::var_os("MEADOW_SILO_VM") {
         return Ok(PathBuf::from(path));
     }
+    let layout = layout();
     let mut candidates = Vec::new();
     if let Some(dir) = std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(Path::to_path_buf))
     {
-        candidates.push(dir.join(&exe));
+        candidates.push(layout_dir(dir, layout).join(&exe));
     }
-    let built = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../silo/target");
+    let built = layout_dir(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../silo/target"),
+        layout,
+    );
     for profile in ["release", "debug"] {
         candidates.push(built.join(profile).join(&exe));
     }
     candidates
         .into_iter()
         .find(|p| p.is_file())
-        .ok_or_else(|| {
-            "Silo's interpreter is not built: `cargo build --release --manifest-path              silo/Cargo.toml -p meadow-silo-vm`, or say where it is with MEADOW_SILO_VM"
-                .to_string()
+        .ok_or_else(|| match layout {
+            meadow_llvm::Layout::Silo => "Silo's interpreter is not built: `cargo build --release \
+                 --manifest-path silo/Cargo.toml -p meadow-silo-vm`, or say where it is with \
+                 MEADOW_SILO_VM"
+                .to_string(),
+            other => format!(
+                "Silo's interpreter for the `{name}` layout is not built: `cargo build --release \
+                 --manifest-path silo/Cargo.toml -p meadow-silo-vm --features \
+                 meadow-silo/{name}-layout --target-dir silo/target/{name}-layout`, or say where \
+                 it is with MEADOW_SILO_VM",
+                name = other.name()
+            ),
         })
 }
 
@@ -441,8 +486,9 @@ pub fn build_native_of(
             .chain(target.triple().bytes())
             .chain(linked_with.iter().copied())
             // Traced and counted, the same program is two executables;
-            // with a fixed stack and a growable one, two more.
-            .chain([gc() as u8, stack() as u8])
+            // with a fixed stack and a growable one, two more; and so on
+            // for each layout.
+            .chain([gc() as u8, stack() as u8, layout() as u8])
         {
             h ^= u64::from(b);
             h = h.wrapping_mul(0x0100_0000_01b3);
@@ -1090,24 +1136,37 @@ pub fn runtimes(target: Target) -> Result<Vec<PathBuf>, String> {
         };
     }
     let host = target.is_host();
+    // Silo's runtime is built for one layout: another's is in a directory of
+    // its own, beside this `meadow` and in a checkout, and none is embedded.
+    let layout = match target.runtime {
+        Runtime::Silo => layout(),
+        Runtime::Glade => meadow_llvm::Layout::Silo,
+    };
+    let other_layout = layout != meadow_llvm::Layout::Silo;
     let mut candidates = Vec::new();
-    if host && let Some(path) = embedded(target.runtime, lib) {
+    if host
+        && !other_layout
+        && let Some(path) = embedded(target.runtime, lib)
+    {
         candidates.push(path);
     }
     if let Some(dir) = std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(Path::to_path_buf))
     {
-        candidates.push(dir.join("lib").join(target.triple()).join(lib));
+        candidates.push(layout_dir(dir.join("lib").join(target.triple()), layout).join(lib));
         if host {
-            candidates.push(dir.join(lib));
+            candidates.push(layout_dir(dir, layout).join(lib));
         }
     }
     // A checkout: the runtime crate's own target directory.
-    let built = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(crate_dir)
-        .join("target");
+    let built = layout_dir(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(crate_dir)
+            .join("target"),
+        layout,
+    );
     for profile in ["release", "debug"] {
         candidates.push(built.join(target.triple()).join(profile).join(lib));
         if host {
@@ -1117,6 +1176,16 @@ pub fn runtimes(target: Target) -> Result<Vec<PathBuf>, String> {
     let found: Vec<PathBuf> = candidates.into_iter().filter(|p| p.is_file()).collect();
     if !found.is_empty() {
         return Ok(found);
+    }
+    if other_layout {
+        return Err(format!(
+            "no `{crate_dir}` runtime library for {} and the `{name}` layout -- build one with \
+             `cargo build --release --target {} --features {name}-layout --target-dir \
+             target/{name}-layout` in `{crate_dir}`, or name it with MEADOW_RUNTIME",
+            target.triple(),
+            target.triple(),
+            name = layout.name()
+        ));
     }
     Err(format!(
         "no `{crate_dir}` runtime library for {} -- build one with \

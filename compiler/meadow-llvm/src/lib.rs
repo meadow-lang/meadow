@@ -39,9 +39,25 @@ impl From<emit::Error> for Error {
 
 /// The symbol a runtime library built from the sources this compiler was
 /// defines, and that the emitted module refers to: so that a program links
-/// with that runtime and no other. See `build.rs`.
+/// with that runtime and no other. See `build.rs`. A library built for
+/// another object layout than Silo's names it too (`meadow-silo`'s
+/// `glade-layout` feature).
 pub fn runtime_symbol() -> String {
-    format!("meadow_silo_{}", fingerprint())
+    runtime_symbol_for(Layout::Silo)
+}
+
+/// [`runtime_symbol`], of a library built for `layout`.
+pub fn runtime_symbol_for(layout: Layout) -> String {
+    symbol_of(fingerprint(), layout.description())
+}
+
+/// The runtime's symbol, for its fingerprint and layout.
+pub(crate) fn symbol_of(fingerprint: &str, layout: meadow_rt::layout::Layout) -> String {
+    if layout == meadow_rt::layout::SILO {
+        format!("meadow_silo_{fingerprint}")
+    } else {
+        format!("meadow_silo_{fingerprint}_{}", layout.name)
+    }
 }
 
 /// The fingerprint of the sources that decide the ABI between the emitted
@@ -51,7 +67,7 @@ pub fn fingerprint() -> &'static str {
 }
 
 pub use emit::CallConv;
-pub use meadow_axcut::config::{Config, Memory, Stack};
+pub use meadow_axcut::config::{Config, Layout, Memory, Stack};
 
 /// `program` as an LLVM module, as text, its functions in `conv`.
 pub fn compile(program: &Program, conv: CallConv) -> Result<String, Error> {

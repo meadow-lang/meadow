@@ -14,14 +14,14 @@ use crate::linear::LBlock;
 use crate::{Label, Program};
 
 /// What a file of this kind starts with.
-const MAGIC: &[u8] = b"meadow axcut image 4\n";
+const MAGIC: &[u8] = b"meadow axcut image 5\n";
 
 /// A program to run, and how.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(bound(deserialize = "'de: 'static"))]
 pub struct Image {
     pub program: Program,
-    /// How it is run: its memory, its stack.
+    /// How it is run: its memory, its stack, its layout.
     pub config: Config,
     /// For a program of tests, where each begins: the one run is the one
     /// numbered by the first argument, as a test executable's is. Empty for

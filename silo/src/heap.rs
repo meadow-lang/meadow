@@ -2,15 +2,9 @@
 //!
 //! A reference is a word: `0` is nothing, an odd word is an object with no
 //! block (a nullary constructor, a closure with no captures), and any other
-//! word is the address of a block:
-//!
-//! ```text
-//! word 0   extra references: u32 (0: the only one) | length: u32
-//! word 1   kind: u8 | element descriptor: u4 | uniform: u1 | … | meta: u32
-//! words    field descriptors, four bits each, sixteen to a word
-//!          (absent for a uniform block, whose one descriptor is in word 1)
-//! fields
-//! ```
+//! word is the address of a block, laid out as [`LAYOUT`] says: Silo's
+//! layout, or with the `glade-layout` feature Glade's, which has no count and
+//! is only traced (`meadow_rt::layout`).
 //!
 //! What the paper does, and so what this does:
 //!
@@ -27,10 +21,17 @@
 //! field; Meadow has arrays and strings, which want indexing, so blocks come in
 //! a size class per word count, with anything bigger allocated on its own.
 
-/// The layout all of this is: `meadow_rt::layout::SILO`, which the emitted
-/// code and the interpreter read too. The constants below are its, by the
-/// names this module has always given them.
+/// The layout all of this is: `meadow_rt::layout::SILO`, or with the
+/// `glade-layout` feature `meadow_rt::layout::GLADE`, which the emitted code
+/// and the interpreter read too. The constants below are its, by the names
+/// this module has always given them.
+#[cfg(not(feature = "glade-layout"))]
 pub const LAYOUT: meadow_rt::layout::Layout = meadow_rt::layout::SILO;
+#[cfg(feature = "glade-layout")]
+pub const LAYOUT: meadow_rt::layout::Layout = meadow_rt::layout::GLADE;
+
+/// The header word the cycle collector's bits are in: the kind's.
+pub const FLAGS: usize = LAYOUT.flags_word();
 
 /// What word 1's low byte says a block is.
 pub const DATA: u64 = LAYOUT.kinds.data;
@@ -55,7 +56,8 @@ pub const REGION: u64 = LAYOUT.kinds.region;
 pub const DESC_SHIFT: u32 = LAYOUT.elem_desc.shift;
 pub const UNIFORM: u64 = LAYOUT.uniform.bits_in_place();
 
-/// What the cycle collector keeps in word 1, where a fresh block has zeroes:
+/// What the cycle collector keeps in the kind's word ([`FLAGS`]), where a
+/// fresh block has zeroes:
 /// a colour, whether the block is waiting in the candidate buffer, and
 /// whether it died while it was waiting. See [`crate::cycles`].
 pub const COLOUR_SHIFT: u32 = LAYOUT.colour.shift;
@@ -63,13 +65,13 @@ pub const BLACK: u64 = 0;
 pub const GRAY: u64 = 1;
 pub const WHITE: u64 = 2;
 pub const PURPLE: u64 = 3;
-const BUFFERED: u64 = 1 << 15;
+const BUFFERED: u64 = LAYOUT.buffered.bits_in_place();
 /// Its count reached zero while it was a candidate: the memory is held back
 /// until the collector has finished with it.
-const DEAD: u64 = 1 << 16;
+const DEAD: u64 = LAYOUT.dead.bits_in_place();
 /// Its fields were moved out before it died, so there is nothing in it to
 /// erase -- see [`clean`].
-const MOVED: u64 = 1 << 17;
+const MOVED: u64 = LAYOUT.moved.bits_in_place();
 /// The count a block inside a compact region is given on top of the
 /// references it has. It does two things at once, and [`crate::region`] has
 /// both: it puts the count out of reach of zero, so such a block is never
@@ -79,17 +81,23 @@ const MOVED: u64 = 1 << 17;
 /// anyway.
 pub const STICKY: u32 = LAYOUT.sticky as u32;
 
-/// A count this big is a block inside a compact region and nothing else: half
-/// the bias, so no amount of drift in either direction is mistaken either
-/// way. `meadow_llvm::emit`'s helpers test the same number inline.
+/// A mark this big is a block inside a compact region and nothing else. Under
+/// counting the mark is the count, and this is half the bias, so no amount of
+/// drift in either direction is mistaken either way; `meadow_llvm::emit`'s
+/// helpers test the same number inline. A layout with no count gives a
+/// region's block this mark, and nothing else has it.
 pub const REGION_FLOOR: u32 = LAYOUT.region_floor as u32;
 
 /// Is `v` a block inside a compact region? Ask only of a word a descriptor
 /// says is a reference: an `Int` that happens to be even is not an address.
 #[inline]
 pub fn in_region(v: Word) -> bool {
-    // Safety: a live block's count.
-    is_block(v) && unsafe { *(v as *const u32) } >= REGION_FLOOR
+    is_block(v) && mark(v) >= REGION_FLOOR
+}
+
+/// Make the block at `v`, a copy just made in a region, a region's block.
+pub fn set_in_region(v: Word) {
+    set_mark(v, LAYOUT.sticky as u32);
 }
 
 /// Its kind is one a cycle can contain: a `Ref` or a mutable array, which is
@@ -112,10 +120,10 @@ pub const MARKS: u64 = (3 << COLOUR_SHIFT) | BUFFERED | DEAD | MOVED | DEFERRED;
 /// off freeing a cycle through it, never free what is not garbage. Without
 /// this, one big table a program reads over and over is walked in part at
 /// every run, from whatever candidate reaches it.
-pub const DEFERRED: u64 = 1 << 20;
+pub const DEFERRED: u64 = LAYOUT.deferred.bits_in_place();
 
 pub fn deferred(v: Word) -> bool {
-    word(v, 1) & DEFERRED != 0
+    word(v, FLAGS) & DEFERRED != 0
 }
 
 /// The [`MUTABLE`] bit, for a block of this kind.
@@ -146,7 +154,7 @@ fn mutable_holding(kind: u64, d: i64) -> u64 {
 /// for the cycle collector to walk, however long it is; which is what a
 /// program's column of ten thousand names is, taken and let go of at every
 /// read of it and so a candidate again after every run.
-pub const CYCLABLE: u64 = 1 << 19;
+pub const CYCLABLE: u64 = LAYOUT.cyclable.bits_in_place();
 
 /// `x`, described by `d`, is being stored in the mutable array at `arr`.
 #[inline]
@@ -156,7 +164,7 @@ pub fn note_stored(arr: Word, x: Word, d: i64) {
         && is_block(x)
         && crate::cycles::may_cycle(x)
     {
-        set_word(arr, 1, word(arr, 1) | CYCLABLE);
+        set_word(arr, FLAGS, word(arr, FLAGS) | CYCLABLE);
     }
 }
 
@@ -164,7 +172,7 @@ pub fn note_stored(arr: Word, x: Word, d: i64) {
 /// a mutable array only if something that could ever was stored in it.
 pub fn may_hold_cycles(v: Word) -> bool {
     if kind(v) == MUT_ARRAY && uniform(v) {
-        word(v, 1) & CYCLABLE != 0
+        word(v, FLAGS) & CYCLABLE != 0
     } else {
         holds_refs(v)
     }
@@ -174,31 +182,31 @@ pub fn may_hold_cycles(v: Word) -> bool {
 /// whose words are all described as something else.
 pub fn holds_refs(v: Word) -> bool {
     !uniform(v) || {
-        let d = ((word(v, 1) >> DESC_SHIFT) & 15) as i64;
+        let d = LAYOUT.elem_desc.get(word(v, LAYOUT.elem_desc.word)) as i64;
         d == meadow_rt::desc::REF || d == meadow_rt::desc::ANY
     }
 }
 
 pub fn colour(v: Word) -> u64 {
-    (word(v, 1) >> COLOUR_SHIFT) & 3
+    (word(v, FLAGS) >> COLOUR_SHIFT) & 3
 }
 
 pub fn set_colour(v: Word, c: u64) {
-    let w = word(v, 1) & !(3 << COLOUR_SHIFT);
-    set_word(v, 1, w | (c << COLOUR_SHIFT));
+    let w = word(v, FLAGS) & !(3 << COLOUR_SHIFT);
+    set_word(v, FLAGS, w | (c << COLOUR_SHIFT));
 }
 
 pub fn buffered(v: Word) -> bool {
-    word(v, 1) & BUFFERED != 0
+    word(v, FLAGS) & BUFFERED != 0
 }
 
 pub fn set_buffered(v: Word, yes: bool) {
-    let w = word(v, 1) & !BUFFERED;
-    set_word(v, 1, if yes { w | BUFFERED } else { w });
+    let w = word(v, FLAGS) & !BUFFERED;
+    set_word(v, FLAGS, if yes { w | BUFFERED } else { w });
 }
 
 pub fn dead(v: Word) -> bool {
-    word(v, 1) & DEAD != 0
+    word(v, FLAGS) & DEAD != 0
 }
 
 /// Keep `v` for the cycle collector: see [`Heap::candidate`].
@@ -568,9 +576,10 @@ pub(crate) fn uniform(v: Word) -> bool {
     LAYOUT.uniform.get(word(v, LAYOUT.uniform.word)) != 0
 }
 
-/// The references to `v` besides one.
+/// The references to `v` besides one. Only a layout that counts has them.
 #[inline]
 pub fn count(v: Word) -> u32 {
+    debug_assert!(LAYOUT.counted, "the count of a block of a layout with none");
     LAYOUT.count.get(word(v, LAYOUT.count.word)) as u32
 }
 
@@ -578,6 +587,48 @@ pub fn count(v: Word) -> u32 {
 pub fn set_count(v: Word, rc: u32) {
     let at = LAYOUT.count.word;
     set_word(v, at, LAYOUT.count.set(word(v, at), u64::from(rc)));
+}
+
+/// The number of the collection that last marked `v` (see
+/// [`crate::trace`]): its count, under a layout that has one.
+#[inline]
+pub fn mark(v: Word) -> u32 {
+    LAYOUT.mark.get(word(v, LAYOUT.mark.word)) as u32
+}
+
+#[inline]
+pub fn set_mark(v: Word, m: u32) {
+    let at = LAYOUT.mark.word;
+    set_word(v, at, LAYOUT.mark.set(word(v, at), u64::from(m)));
+}
+
+/// Where the block at `v` went, if it moved (see [`crate::trace`]).
+#[inline]
+pub fn forwarded(v: Word) -> Option<Word> {
+    let f = LAYOUT.forward;
+    (f.get(word(v, f.word)) == LAYOUT.forwarded).then(|| word(v, LAYOUT.forward_to))
+}
+
+/// Say that the block at `v` moved to `to`.
+#[inline]
+pub fn set_forwarded(v: Word, to: Word) {
+    let f = LAYOUT.forward;
+    set_word(v, f.word, f.set(word(v, f.word), LAYOUT.forwarded));
+    set_word(v, LAYOUT.forward_to, to);
+}
+
+/// Copy the header of the block at `from` into the new block at `to`, of
+/// another heap or a region: its length, kind, `meta` and what else its
+/// header words hold, but none of what one heap's collectors keep -- no
+/// count beyond the one, no mark, none of the cycle collector's bits
+/// ([`MARKS`]).
+pub fn copy_header(from: Word, to: Word) {
+    for i in 0..LAYOUT.header_words {
+        set_word(to, i, word(from, i));
+    }
+    set_word(to, FLAGS, word(to, FLAGS) & !MARKS);
+    set_count(to, 0);
+    set_mark(to, 0);
 }
 
 /// Where a uniform block's elements begin -- an array's, a big integer's
@@ -740,7 +791,7 @@ pub fn died_in(c: *mut crate::ctx::Ctx, v: Word) {
         // Black and dead: what the collector must not mistake for a
         // candidate with a reference left, since the count it reads is the
         // references besides one.
-        set_word(v, 1, (word(v, 1) | DEAD) & !(3 << COLOUR_SHIFT));
+        set_word(v, FLAGS, (word(v, FLAGS) | DEAD) & !(3 << COLOUR_SHIFT));
         return;
     }
     with_in(c, |h| h.pending.push((ptr(v), 0)));
@@ -1007,7 +1058,11 @@ pub fn clean_in(c: *mut crate::ctx::Ctx, v: Word) {
     if crate::cycles::possible() && buffered(v) {
         // Waiting in the candidate buffer: hold the memory back, and
         // remember that there is nothing left inside to erase.
-        set_word(v, 1, (word(v, 1) | DEAD | MOVED) & !(3 << COLOUR_SHIFT));
+        set_word(
+            v,
+            FLAGS,
+            (word(v, FLAGS) | DEAD | MOVED) & !(3 << COLOUR_SHIFT),
+        );
         return;
     }
     let words = size(v);
@@ -1109,7 +1164,7 @@ impl Heap {
     /// the heap may get before walking it anyway -- a doubling, so that the
     /// one long pause it costs is paid over as much allocation as it saves.
     pub(crate) fn set_oversized(&mut self, v: Word) {
-        set_word(v, 1, word(v, 1) | DEFERRED);
+        set_word(v, FLAGS, word(v, FLAGS) | DEFERRED);
         self.oversized.push(v);
         if self.oversized_mark == usize::MAX {
             self.oversized_mark = (2 * self.live.max(0) as usize).max(FLOOR);
@@ -1127,7 +1182,7 @@ impl Heap {
         self.oversized_mark = usize::MAX;
         let waiting = std::mem::take(&mut self.oversized);
         for &v in &waiting {
-            set_word(v, 1, word(v, 1) & !DEFERRED);
+            set_word(v, FLAGS, word(v, FLAGS) & !DEFERRED);
         }
         self.candidates.extend_from_slice(&waiting);
         waiting.len()
@@ -1137,8 +1192,8 @@ impl Heap {
     /// finished with it: erase what is in it, if anything, and take the
     /// memory back.
     pub(crate) fn free_dead(&mut self, v: Word) {
-        let moved = word(v, 1) & MOVED != 0;
-        set_word(v, 1, word(v, 1) & !(DEAD | MOVED));
+        let moved = word(v, FLAGS) & MOVED != 0;
+        set_word(v, FLAGS, word(v, FLAGS) & !(DEAD | MOVED));
         if moved {
             let words = size(v);
             self.clean_block(ptr(v), words);
@@ -1180,7 +1235,11 @@ impl Heap {
     /// erase. See `cycles::collect_white`.
     pub(crate) fn hold_collected(&mut self, v: Word) {
         self.freed += 1;
-        set_word(v, 1, (word(v, 1) | DEAD | MOVED) & !(3 << COLOUR_SHIFT));
+        set_word(
+            v,
+            FLAGS,
+            (word(v, FLAGS) | DEAD | MOVED) & !(3 << COLOUR_SHIFT),
+        );
     }
 
     /// Under `MEADOW_SILO_LEAKS`, after a run of the collector: no candidate
@@ -1246,7 +1305,7 @@ impl Heap {
                     let rc = unsafe { &mut *(x as *mut u32) };
                     if *rc == 0 {
                         if cycles && buffered(x) {
-                            set_word(x, 1, word(x, 1) | DEAD);
+                            set_word(x, FLAGS, word(x, FLAGS) | DEAD);
                         } else {
                             self.pending.push((ptr(x), 0));
                         }
@@ -1348,21 +1407,24 @@ pub fn live() -> isize {
 pub fn build(kind: u64, meta: u32, fields: &[Word], descs: &[i64]) -> Word {
     let n = fields.len();
     if n == 0 {
-        return (u64::from(meta) << 1) | 1;
+        return immediate(u64::from(meta));
     }
-    let dw = n.div_ceil(16);
-    let v = acquire(2 + dw + n);
-    set_word(v, 0, (n as u64) << 32);
-    set_word(v, 1, kind | mutable(kind) | (u64::from(meta) << 32));
-    for w in 0..dw {
-        let mut bits = 0u64;
-        for (j, d) in descs.iter().enumerate().skip(16 * w).take(16) {
-            bits |= ((*d as u64) & 15) << (4 * (j - 16 * w));
+    let first = LAYOUT.first_field(n, false);
+    let v = acquire(first + n);
+    let mut head = LAYOUT.header(kind, n as u64, u64::from(meta));
+    head[FLAGS] |= mutable(kind);
+    LAYOUT.pack_descs(descs, |w, bits| {
+        if w < LAYOUT.header_words {
+            head[w] |= bits;
+        } else {
+            set_word(v, w, bits);
         }
-        set_word(v, 2 + w, bits);
+    });
+    for (i, h) in head.iter().enumerate() {
+        set_word(v, i, *h);
     }
     for (i, x) in fields.iter().enumerate() {
-        set_word(v, 2 + dw + i, *x);
+        set_word(v, first + i, *x);
     }
     v
 }
@@ -1373,16 +1435,15 @@ pub fn build_uniform(kind: u64, meta: u32, n: usize, d: i64) -> Word {
     if kind == ARRAY && crate::prims::counting() {
         made(n);
     }
-    let v = acquire(2 + if kind == ARRAY { array_room(n) } else { n });
-    set_word(v, 0, (n as u64) << 32);
-    set_word(
-        v,
-        1,
-        kind | mutable_holding(kind, d)
-            | ((d as u64 & 15) << DESC_SHIFT)
-            | UNIFORM
-            | (u64::from(meta) << 32),
-    );
+    let v = acquire(ELEMS + if kind == ARRAY { array_room(n) } else { n });
+    let mut head = LAYOUT.header(kind, n as u64, u64::from(meta));
+    head[FLAGS] |= mutable_holding(kind, d);
+    let e = LAYOUT.elem_desc;
+    head[e.word] |= e.put(d as u64);
+    head[LAYOUT.uniform.word] |= UNIFORM;
+    for (i, h) in head.iter().enumerate() {
+        set_word(v, i, *h);
+    }
     v
 }
 
@@ -1394,7 +1455,7 @@ pub fn string(bytes: &[u8]) -> Word {
         let chunk = &bytes[8 * i..bytes.len().min(8 * i + 8)];
         let mut w = [0u8; 8];
         w[..chunk.len()].copy_from_slice(chunk);
-        set_word(v, 2 + i, Word::from_le_bytes(w));
+        set_word(v, ELEMS + i, Word::from_le_bytes(w));
     }
     v
 }

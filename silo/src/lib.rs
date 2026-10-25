@@ -43,8 +43,16 @@ use heap::Word;
 use std::ffi::c_char;
 
 /// Defined only by a library of this runtime built from the sources the
-/// compiler was: see `build.rs`, and `meadow_llvm::runtime_symbol`.
-#[unsafe(export_name = concat!("meadow_silo_", env!("MEADOW_SILO_FINGERPRINT")))]
+/// compiler was, for the layout it was: see `build.rs`, and
+/// `meadow_llvm::runtime_symbol_for`.
+#[cfg_attr(
+    not(feature = "glade-layout"),
+    unsafe(export_name = concat!("meadow_silo_", env!("MEADOW_SILO_FINGERPRINT")))
+)]
+#[cfg_attr(
+    feature = "glade-layout",
+    unsafe(export_name = concat!("meadow_silo_", env!("MEADOW_SILO_FINGERPRINT"), "_glade"))
+)]
 pub static FINGERPRINT: u8 = 0;
 
 unsafe extern "C" {
@@ -269,10 +277,26 @@ pub unsafe extern "C" fn meadow_run_test(
     run_one_test(unsafe { *tests.add(i) })
 }
 
+/// Stop, unless the program is one this runtime's layout can run: a layout
+/// with no count runs only a program whose memory is traced. `meadow`
+/// refuses to build any other, so this is for a program built some other
+/// way.
+fn suits_layout() {
+    if !heap::LAYOUT.counted && !trace::on() {
+        eprintln!(
+            "error: this runtime is for the `{}` layout, which has no count, and the program \
+             counts its memory: build it with `--gc tracing` or `--gc generational`",
+            heap::LAYOUT.name
+        );
+        std::process::exit(2);
+    }
+}
+
 /// Run `entry` as a test: on a stack of its own, status 0 if it returns and 1
 /// if it fails. What a test executable does with the test it was asked for,
 /// and what Silo's interpreter does with one of an image's tests.
 pub fn run_one_test(entry: extern "C" fn() -> Word) -> i32 {
+    suits_layout();
     let ran = std::thread::Builder::new()
         .name("main".into())
         .stack_size(MAIN_STACK)
@@ -330,6 +354,7 @@ pub unsafe extern "C" fn meadow_run(
     _argc: i32,
     _argv: *const *const c_char,
 ) -> i32 {
+    suits_layout();
     // Safety: the emitted module defines it.
     let d = unsafe { meadow_result_desc };
     let run = move || {

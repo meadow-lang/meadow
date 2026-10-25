@@ -726,6 +726,93 @@ traced, and 0.91 s with an 8 MB nursery (`--nursery 8M`). On the VM, binarytrees
 run itself is about the same, since interpreting it costs most. A larger
 nursery (`MEADOW_GC_NURSERY`, in words) spends less: 4.8% at 16M words.
 
+### The second layout (2026-10-25)
+
+`--layout glade` lays blocks out as Glade does, as near as machine pointers
+allow (`meadow_rt::layout::GLADE`).
+- **The header.** It has no count, so word 0 holds the kind, the uniform
+  descriptor, the cycle collector's bits, the collector's mark and the
+  length. Word 1 holds the `meta` and the first eight fields' descriptors.
+  A block of up to eight fields has two words of header, where Silo's layout
+  gives it three: a cons cell is four words rather than five.
+- **Memory.** It is traced only: counting has nothing to count, and
+  `--layout glade --gc rc` is refused.
+
+The description grew what a collector keeps, so that one runtime serves
+both:
+- **the mark**: Silo's count, or a field of its own;
+- **a region's blocks**, told by a mark no collection reaches: Silo's sticky
+  count, or the mark's top value;
+- **a moved block**: Silo's count of `u32::MAX - 1`, or Glade's kind `0xFF`;
+- **a free block's link word**;
+- **descriptors kept in a header word.**
+
+Everything that read Silo's numbers now reads these instead:
+- the heap's accessors and its builders (`heap::build` had its offsets
+  written in);
+- the collectors' mark, sweep, copy and walk;
+- copies into a region, another heap or a record updated by copy
+  (`heap::copy_header`);
+- the VM's `New`.
+
+The runtime and the VM are built for one layout, by the `glade-layout`
+feature, so that reading a header costs no more than it did. A library built
+for it exports a symbol of its own (`meadow_silo_{hash}_glade`), so a program
+links only with the library made for its layout. The VM refuses an image of
+the other layout. The image's configuration carries the layout, and so its
+format is version 5.
+
+The LLVM back end takes the layout from the configuration. Each place it
+assumed Silo's shape now asks the description:
+- a field is read with a shift only if it is not at the bottom of its word,
+  and a mask only if it is not at the top;
+- a block's header and descriptors are written word by word, in Silo's
+  order;
+- a closure's method index is or-ed in with the descriptors that share its
+  word;
+- `setRef`'s descriptor goes where `desc_at` says;
+- `setField`, the hole tail recursion modulo cons fills, finds its field
+  past only the descriptors the header does not hold.
+
+That last was the one bug the work found: lists came back with their first
+element only. `suits` asks Silo's shape only of a layout that counts.
+
+**A bug, found on the way.** Under tracing, `@mw.field` (a field read by
+number, or a record's by label) shared the value it read. That added to a
+count which, under Silo's layout, is the collector's mark. A block marked by
+one collection and read once before the next looked marked by it, so its
+fields were never scanned, and could be freed while it was live. A traced
+program now has no counting helpers at all. Its IR differs from before only
+in what was removed. Counted IR is the same byte for byte, for the nine
+programs that are checked (`concurrency` up to its method table's order).
+
+**Checked** (Windows, 2026-10-25):
+- **The examples.** All six print the same, on both engines, under tracing
+  and generational, with the smallest nursery, as under counting with Silo's
+  layout.
+- **Std.** All 354 tests pass under generational with the smallest nursery,
+  on the VM and natively. The 354 are Std's 350 and the test package's own
+  four.
+
+**Measured** natively, best of five:
+
+| benchmark | strategy | silo | glade |
+|---|---|---|---|
+| binarytrees | tracing | 1600 ms | 1495 ms |
+| binarytrees | generational | 1154 ms | 1100 ms |
+| rbtree | tracing | 10343 ms | 9727 ms |
+| rbtree | generational | 2033 ms | 2157 ms |
+
+rbtree under generational is the exception:
+- it runs fewer minor collections with the smaller blocks (4,872 against
+  5,577), but spends longer in them (870 ms against 803);
+- that leaves about 50 ms of the gap in the program's own code. One
+  explanation is the mask the bottom-of-word `meta` now needs at every
+  `switch`; another is code layout, which has moved these benchmarks by as
+  much before.
+
+It is yet to be profiled.
+
 ### Replacing Glade in full (2026-10-24)
 
 The merged runtime is to be Glade's next release, so it has to do all that
@@ -741,7 +828,7 @@ Glade's VM does. Where it stands:
 | `meadow exec` of an image | yes, of an image of AxCut |
 | growable stacks, heap frames | yes, on both engines |
 | a generational, moving collector | `--gc generational`, on both engines |
-| a JIT of hot blocks | not planned: the LLVM path compiles a whole program |
+| a JIT of hot blocks | planned: R2 in `docs/RUNTIME-SPEC.md`, beside the VM and AOT |
 
 A block no person wrote -- a join point, a group of local functions, a
 `perform`'s search -- is named at load after the definition that jumps to

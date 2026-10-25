@@ -122,11 +122,11 @@ impl SiloSession {
                 .and_then(|s| meadow_llvm::Stack::named(&s))
         });
         let config = meadow_llvm::Config {
-            memory: crate::aot::gc(),
             stack: match asked {
                 Some(meadow_llvm::Stack::Heap) => meadow_llvm::Stack::Heap,
                 _ => meadow_llvm::Stack::Growable,
             },
+            ..crate::aot::config()
         };
         crate::aot::write_image_with(&image, program, Vec::new(), config)?;
         say("image written");

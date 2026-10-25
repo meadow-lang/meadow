@@ -29,43 +29,60 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::rc::Rc;
 
-/// The object layout the emitted code reads and writes blocks by: Silo's,
-/// which the runtime it is linked with has too (`meadow_rt::layout`). Every
-/// word, shift, mask and kind of a block the code names is taken from it, by
-/// way of [`Module::layout`], so another layout is a change here.
-const LAYOUT: Layout = meadow_rt::layout::SILO;
-
 /// What the shape of the emitted code takes for granted of a layout, beyond
-/// the numbers it reads from it: that a block's count is the integer its
-/// address points at; that a small value is one whose single tag bit is set;
-/// that one store writes a new block's count and length, and one its kind and
-/// `meta`, with the uniform bit and the one descriptor beside them, as the
-/// cycle collector's bits are; that a shift alone reads the length and the
-/// `meta`; and that descriptors are packed so that a shift finds one.
+/// the numbers it reads from it: that a small value is one whose single tag
+/// bit is set; that a uniform block's bit and its one descriptor are in one
+/// word; and that descriptors are packed so that a shift finds one. And of a
+/// layout that counts, what counting's code takes for granted: that a block's
+/// count is the integer its address points at; that one store writes a new
+/// block's count and length, and one its kind and `meta`, as the cycle
+/// collector's bits are; that a reused block's descriptors are words of their
+/// own; and that a shift alone reads the length and the `meta`.
 fn suits(l: &Layout) {
-    assert!(
-        l.count.word == 0 && l.count.shift == 0 && [8, 16, 32, 64].contains(&l.count.bits),
-        "the count is the integer at a block's address"
-    );
     assert!(
         l.imm_mask.is_power_of_two() && l.imm_tag == l.imm_mask,
         "a small value is told by one bit"
+    );
+    assert_eq!(
+        l.uniform.word, l.elem_desc.word,
+        "a uniform block's descriptor is beside the bit"
+    );
+    assert!(
+        l.descs_per_word.is_power_of_two() && l.desc_bits.is_power_of_two(),
+        "descriptors are found by shifting"
+    );
+    if !l.counted {
+        return;
+    }
+    assert!(
+        l.count.word == 0 && l.count.shift == 0 && [8, 16, 32, 64].contains(&l.count.bits),
+        "the count is the integer at a block's address"
     );
     assert_eq!(l.len.word, l.count.word, "the length is beside the count");
     for f in [l.meta, l.elem_desc, l.uniform, l.colour, l.mutable] {
         assert_eq!(f.word, l.kind.word, "the kind's word holds the rest");
     }
+    assert_eq!(l.inline_descs, 0, "descriptors are words of their own");
     for f in [l.len, l.meta] {
-        assert_eq!(
-            f.shift + f.bits,
-            64,
-            "the length and `meta` top their words"
-        );
+        assert!(f.tops(), "the length and `meta` top their words");
     }
-    assert!(
-        l.descs_per_word.is_power_of_two() && l.desc_bits.is_power_of_two(),
-        "descriptors are found by shifting"
-    );
+}
+
+/// The instructions that read `field` out of its word `w`, in `f`: a shift
+/// unless it is at the bottom, and a mask unless it is at the top. Its value.
+fn read_field(f: &mut Fun, w: &str, field: Field) -> String {
+    let mut x = w.to_string();
+    if field.shift > 0 {
+        let s = f.t();
+        f.i(format!("{s} = lshr i64 {x}, {}", field.shift));
+        x = s;
+    }
+    if !field.tops() {
+        let m = f.t();
+        f.i(format!("{m} = and i64 {x}, {}", field.mask()));
+        x = m;
+    }
+    x
 }
 
 /// The LLVM type of a block's count, as it is loaded and stored: `i32` for
@@ -303,7 +320,9 @@ pub struct Module<'p> {
     /// The trampoline of the function being written, which goes with it:
     /// see [`Module::stack_point`].
     trampoline: Option<String>,
-    /// How a block is laid out: see [`LAYOUT`].
+    /// How a block is laid out: the configuration's layout, which the
+    /// runtime it is linked with has too (`meadow_rt::layout`). Every word,
+    /// shift, mask and kind of a block the code names is taken from it.
     layout: Layout,
 }
 
@@ -316,7 +335,7 @@ impl<'p> Module<'p> {
     pub fn with(program: &'p Program, conv: CallConv, config: Config) -> Module<'p> {
         let tracing = config.memory.traced();
         let moving = config.memory == Memory::Generational;
-        let layout = LAYOUT;
+        let layout = config.layout.description();
         suits(&layout);
         Module {
             program,
@@ -1285,9 +1304,15 @@ impl<'p> Module<'p> {
             self.cx(),
             l.first_field(n, false) + n
         ));
+        let closure = l.kinds.closure;
+        if l.desc_at(0).0 == l.meta.word {
+            // The method's index shares its word with descriptors: or-ed in
+            // as the word is written.
+            self.write_block_with(f, &b, closure, 0, Some(&m), vals, descs, None);
+            return b;
+        }
         // Written as method 0 -- the number itself must not be in the text --
         // and then again with what was read: LLVM drops the first store.
-        let closure = l.kinds.closure;
         self.write_block(f, &b, closure, 0, vals, descs, None);
         let p = f.ptr(&b);
         let w1 = f.t();
@@ -1394,6 +1419,30 @@ impl<'p> Module<'p> {
         descs: &[D],
         reused: Option<Option<&Origin>>,
     ) {
+        self.write_block_with(f, b, kind, meta, None, vals, descs, reused)
+    }
+
+    /// [`Self::write_block`], with a `meta` read at run time, `dyn_meta`,
+    /// or-ed into its word if there is one.
+    ///
+    /// Each word of the header and the descriptors is written once, in
+    /// order: what is known of it as one number, and what is read at run
+    /// time (a type variable's descriptor, the `meta`) or-ed in. A reused
+    /// block's first word already says zero references and as many fields;
+    /// its kind's word, and its descriptors' words, are left when they would
+    /// be written as they are.
+    #[allow(clippy::too_many_arguments)]
+    fn write_block_with(
+        &self,
+        f: &mut Fun,
+        b: &str,
+        kind: u64,
+        meta: u64,
+        dyn_meta: Option<&str>,
+        vals: &[String],
+        descs: &[D],
+        reused: Option<Option<&Origin>>,
+    ) {
         let l = self.layout;
         let n = vals.len();
         let same = match reused {
@@ -1402,56 +1451,58 @@ impl<'p> Module<'p> {
             }
             _ => None,
         };
-        let p = f.ptr(b);
-        if reused.is_none() {
-            // Its count, zero, and its length: the word the block's address
-            // points at.
-            f.i(format!("store i64 {}, ptr {p}", l.len.put(n as u64)));
-        }
-        if same.is_none() {
-            let w1 = f.t();
-            f.i(format!(
-                "{w1} = getelementptr i64, ptr {p}, i64 {}",
-                l.kind.word
-            ));
-            f.i(format!(
-                "store i64 {}, ptr {w1}",
-                l.kind.put(kind) | l.meta.put(meta)
-            ));
-        }
         let same_descs = same.is_some_and(|o| {
             o.descs.as_slice() == descs && descs.iter().all(|d| matches!(d, D::Known(_)))
         });
-        let per = l.descs_per_word;
-        for w in 0..l.desc_words(n) {
-            if same_descs {
-                break;
+        let p = f.ptr(b);
+        let first = l.first_field(n, false);
+        let mut known = vec![0u64; first];
+        let mut dynamic: Vec<Vec<(u32, u64, String)>> = vec![Vec::new(); first];
+        let mut described = vec![false; first];
+        for (w, h) in l.header(kind, n as u64, meta).iter().enumerate() {
+            known[w] |= h;
+        }
+        if let Some(m) = dyn_meta {
+            dynamic[l.meta.word].push((l.meta.shift, l.meta.mask(), m.to_string()));
+        }
+        for (j, d) in descs.iter().enumerate() {
+            let (w, shift) = l.desc_at(j);
+            described[w] = true;
+            match d {
+                D::Known(k) => known[w] |= ((*k as u64) & l.desc_mask()) << shift,
+                D::Dyn(r) => dynamic[w].push((shift, l.desc_mask(), r.clone())),
             }
-            let mut known: u64 = 0;
-            let mut dynamic: Vec<(u32, String)> = Vec::new();
-            for (j, d) in descs.iter().enumerate().skip(per * w).take(per) {
-                let (_, shift) = l.desc_at(j);
-                match d {
-                    D::Known(k) => known |= ((*k as u64) & l.desc_mask()) << shift,
-                    D::Dyn(r) => dynamic.push((shift, r.clone())),
-                }
+        }
+        for w in 0..first {
+            let header = w < l.header_words;
+            let kept = if header && w == l.len.word && w != l.kind.word && !described[w] {
+                // The count and the length.
+                reused.is_some()
+            } else if header {
+                same.is_some() && (!described[w] || same_descs)
+            } else {
+                same_descs
+            };
+            if kept {
+                continue;
             }
-            let mut acc = format!("{known}");
-            for (shift, r) in dynamic {
+            let mut acc = format!("{}", known[w]);
+            for (shift, mask, r) in &dynamic[w] {
                 let m = f.t();
-                f.i(format!("{m} = and i64 {r}, {}", l.desc_mask()));
+                f.i(format!("{m} = and i64 {r}, {mask}"));
                 let s = f.t();
                 f.i(format!("{s} = shl i64 {m}, {shift}"));
                 let o = f.t();
                 f.i(format!("{o} = or i64 {acc}, {s}"));
                 acc = o;
             }
-            let q = f.t();
-            f.i(format!(
-                "{q} = getelementptr i64, ptr {p}, i64 {}",
-                l.desc_at(per * w).0
-            ));
-            f.i(format!("store i64 {acc}, ptr {q}"));
+            if w == 0 {
+                f.i(format!("store i64 {acc}, ptr {p}"));
+            } else {
+                let q = f.t();
+                f.i(format!("{q} = getelementptr i64, ptr {p}, i64 {w}"));
+                f.i(format!("store i64 {acc}, ptr {q}"));
+            }
         }
         let first = l.first_field(n, false);
         for (i, v) in vals.iter().enumerate() {
@@ -1892,8 +1943,7 @@ impl<'p> Module<'p> {
         ));
         let w1 = f.t();
         f.i(format!("{w1} = load i64, ptr {q}"));
-        let m2 = f.t();
-        f.i(format!("{m2} = lshr i64 {w1}, {}", l.meta.shift));
+        let m2 = read_field(f, &w1, l.meta);
         f.i(format!("br label %{join}"));
         f.label(&join);
         let m = f.t();
@@ -2479,19 +2529,26 @@ impl<'p> Module<'p> {
         self.erase(f, &old, d);
         if let D::Dyn(dv) = d {
             // A value of a type variable's type: the block says how to read
-            // it, so say it. The first field's descriptor is at the bottom of
-            // its word.
-            let (at, _) = l.desc_at(0);
+            // it, so say it.
+            let (at, shift) = l.desc_at(0);
             let w = f.t();
             f.i(format!("{w} = getelementptr i64, ptr {p}, i64 {at}"));
             let had = f.t();
             f.i(format!("{had} = load i64, ptr {w}"));
-            let (cleared, bits, now) = (f.t(), f.t(), f.t());
+            let (cleared, bits) = (f.t(), f.t());
             f.i(format!(
                 "{cleared} = and i64 {had}, {}",
-                !l.desc_mask() as i64
+                !(l.desc_mask() << shift) as i64
             ));
             f.i(format!("{bits} = and i64 {dv}, {}", l.desc_mask()));
+            let bits = if shift > 0 {
+                let s = f.t();
+                f.i(format!("{s} = shl i64 {bits}, {shift}"));
+                s
+            } else {
+                bits
+            };
+            let now = f.t();
             f.i(format!("{now} = or i64 {cleared}, {bits}"));
             f.i(format!("store i64 {now}, ptr {w}"));
         }
@@ -2519,9 +2576,7 @@ impl<'p> Module<'p> {
             ));
             let w = f.t();
             f.i(format!("{w} = load i64, ptr {q}"));
-            let x = f.t();
-            f.i(format!("{x} = lshr i64 {w}, {}", field.shift));
-            x
+            read_field(f, &w, field)
         };
         match (p, vals) {
             (ArrayLen | StArrayLen, [a]) => Some(header(f, a, l.len)),
@@ -2612,7 +2667,8 @@ impl<'p> Module<'p> {
             // What the hole held -- the placeholder, of the field's own type
             // -- is erased by the value's descriptor, and the descriptor bits
             // already say what the value is; one not known here is left to
-            // the runtime, which writes them.
+            // the runtime, which writes them. As `Layout::first_field` has it,
+            // descriptors a header holds take no word past it.
             (SetField, [o, i, v])
                 if self.rep(args[1]) == Some(Rep::Int)
                     && matches!(self.desc(args[2], env), D::Known(_)) =>
@@ -2622,9 +2678,19 @@ impl<'p> Module<'p> {
                 // The length is in the word the block's address points at.
                 let w0 = f.t();
                 f.i(format!("{w0} = load i64, ptr {p}"));
-                let (n, up, dw, at, idx) = (f.t(), f.t(), f.t(), f.t(), f.t());
+                let n = read_field(f, &w0, l.len);
+                let n = if l.inline_descs > 0 {
+                    let (over, less, past) = (f.t(), f.t(), f.t());
+                    let k = l.inline_descs;
+                    f.i(format!("{over} = icmp ugt i64 {n}, {k}"));
+                    f.i(format!("{less} = sub i64 {n}, {k}"));
+                    f.i(format!("{past} = select i1 {over}, i64 {less}, i64 0"));
+                    past
+                } else {
+                    n
+                };
+                let (up, dw, at, idx) = (f.t(), f.t(), f.t(), f.t());
                 let per = l.descs_per_word;
-                f.i(format!("{n} = lshr i64 {w0}, {}", l.len.shift));
                 f.i(format!("{up} = add i64 {n}, {}", per - 1));
                 f.i(format!("{dw} = lshr i64 {up}, {}", per.trailing_zeros()));
                 f.i(format!("{at} = add i64 {dw}, {}", l.header_words));
@@ -3011,7 +3077,12 @@ impl<'p> Module<'p> {
                     );
                     out.push_str(RUNTIME);
                     out.push_str(self.remembering());
-                    out.push_str(&helpers(&self.layout, self.cycles, self.regions));
+                    out.push_str(&helpers(
+                        &self.layout,
+                        self.tracing,
+                        self.cycles,
+                        self.regions,
+                    ));
                     // Of no stated length: how many methods the program has
                     // is not this unit's to say, and would be one more thing
                     // that changed its text when another unit changed.
@@ -3114,13 +3185,16 @@ impl<'p> Module<'p> {
         let _ = writeln!(out, "; A Meadow program, compiled by meadow-llvm.\n");
         out.push_str(RUNTIME);
         out.push_str(self.remembering());
-        out.push_str(&helpers(&self.layout, self.cycles, self.regions));
+        out.push_str(&helpers(
+            &self.layout,
+            self.tracing,
+            self.cycles,
+            self.regions,
+        ));
         out.push_str(&invokers(&self.layout, self.cc, self.threaded));
-        let _ = writeln!(out, "@meadow_silo_{fingerprint} = external global i8");
-        let _ = writeln!(
-            out,
-            "@meadow_runtime = constant ptr @meadow_silo_{fingerprint}\n"
-        );
+        let symbol = crate::symbol_of(fingerprint, self.layout);
+        let _ = writeln!(out, "@{symbol} = external global i8");
+        let _ = writeln!(out, "@meadow_runtime = constant ptr @{symbol}\n");
         let methods: Vec<String> = self.methods.iter().map(|m| format!("ptr {m}")).collect();
         let _ = writeln!(
             out,
@@ -3839,7 +3913,14 @@ fn export_fn(
 /// that can tie a knot hands every block whose count went down without
 /// reaching zero to the collector, which is where a cycle is noticed
 /// (`silo/src/cycles.rs`); one that cannot has no such call anywhere in it.
-fn helpers(l: &Layout, cycles: bool, regions: bool) -> String {
+///
+/// A traced program counts nothing, so it has no sharing or erasing to do,
+/// and its `@mw.field` shares nothing: under Silo's layout the count is the
+/// mark a collection leaves, which a share would move.
+fn helpers(l: &Layout, tracing: bool, cycles: bool, regions: bool) -> String {
+    if tracing {
+        return field_text(l, false);
+    }
     let c = count_ty(l);
     // The test before the call is inline, and on a program that makes no
     // cycles it is the whole cost, so it is one mask and one compare against
@@ -3920,11 +4001,10 @@ noreg:
 /// small functions: skip the null word and a small value (no block), and a
 /// value whose descriptor says it is no reference; add to the count, or take
 /// from it -- handing the block to the runtime when it was the last. And
-/// `@mw.field`, a field read from a block whose shape is not known here.
+/// `@mw.field` ([`field_text`]).
 fn helpers_text(l: &Layout) -> String {
     let c = count_ty(l);
     let (tag, null, r) = (l.imm_mask, l.null, desc::REF);
-    let per = l.descs_per_word;
     format!(
         "\
 define internal void @mw.share(i64 %v, {c} %n) alwaysinline {{
@@ -3989,6 +4069,86 @@ done:
   ret void
 }}
 
+{field}",
+        field = field_text(l, true),
+    )
+}
+
+/// `@mw.field`, a field read from a block whose shape is not known here:
+/// shared, when `shares`. Where its descriptor is depends on the layout:
+/// sixteen to a word after the header, or the first few in a header word.
+fn field_text(l: &Layout, shares: bool) -> String {
+    let per = l.descs_per_word;
+    let c = count_ty(l);
+    // Where field %i's descriptor is, and where a mixed block's fields
+    // begin: as `Layout::desc_at` and `Layout::first_field` say.
+    let mixed = if l.inline_descs == 0 {
+        format!(
+            "  %w0 = load i64, ptr %p
+  %len = lshr i64 %w0, {len_shift}
+  %len15 = add i64 %len, {per_less}
+  %dws = lshr i64 %len15, {per_log}
+  %mfirst = add i64 %dws, {header}
+  %slot0 = lshr i64 %i, {per_log}
+  %slot = add i64 %slot0, {header}
+  %dwp = getelementptr i64, ptr %p, i64 %slot
+  %dw = load i64, ptr %dwp
+  %nib = and i64 %i, {per_less}
+  %shift = shl i64 %nib, {bits_log}
+",
+            len_shift = l.len.shift,
+            per_less = per - 1,
+            per_log = per.trailing_zeros(),
+            header = l.header_words,
+            bits_log = l.desc_bits.trailing_zeros(),
+        )
+    } else {
+        format!(
+            "  %w0p = getelementptr i64, ptr %p, i64 {len_word}
+  %w0 = load i64, ptr %w0p
+  %len0 = lshr i64 %w0, {len_shift}
+  %len = and i64 %len0, {len_mask}
+  %over = icmp ugt i64 %len, {inline}
+  %past0 = sub i64 %len, {inline}
+  %past = select i1 %over, i64 %past0, i64 0
+  %len15 = add i64 %past, {per_less}
+  %dws = lshr i64 %len15, {per_log}
+  %mfirst = add i64 %dws, {header}
+  %out = icmp uge i64 %i, {inline}
+  %j = sub i64 %i, {inline}
+  %oslot0 = lshr i64 %j, {per_log}
+  %oslot = add i64 %oslot0, {header}
+  %slot = select i1 %out, i64 %oslot, i64 {inline_word}
+  %dwp = getelementptr i64, ptr %p, i64 %slot
+  %dw = load i64, ptr %dwp
+  %onib = and i64 %j, {per_less}
+  %oshift = shl i64 %onib, {bits_log}
+  %ishift0 = shl i64 %i, {bits_log}
+  %ishift = add i64 %ishift0, {inline_shift}
+  %shift = select i1 %out, i64 %oshift, i64 %ishift
+",
+            len_word = l.len.word,
+            len_shift = l.len.shift,
+            len_mask = l.len.mask(),
+            inline = l.inline_descs,
+            inline_word = l.inline_word,
+            inline_shift = l.inline_shift,
+            per_less = per - 1,
+            per_log = per.trailing_zeros(),
+            header = l.header_words,
+            bits_log = l.desc_bits.trailing_zeros(),
+        )
+    };
+    let share = if shares {
+        format!(
+            "  call void @mw.share_d(i64 %x, i64 %d, {c} 1)
+"
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "\
 ; Field %i of the block at %v, shared: `meadow_field` without the call. A
 ; uniform block's fields start at word 2 and share word 1's descriptor; any
 ; other's start past its descriptor words, sixteen four-bit descriptors to a
@@ -4006,18 +4166,7 @@ uniform:
   %ud = and i64 %ud0, {ud_mask}
   br label %load
 mixed:
-  %w0 = load i64, ptr %p
-  %len = lshr i64 %w0, {len_shift}
-  %len15 = add i64 %len, {per_less}
-  %dws = lshr i64 %len15, {per_log}
-  %mfirst = add i64 %dws, {header}
-  %slot0 = lshr i64 %i, {per_log}
-  %slot = add i64 %slot0, {header}
-  %dwp = getelementptr i64, ptr %p, i64 %slot
-  %dw = load i64, ptr %dwp
-  %nib = and i64 %i, {per_less}
-  %shift = shl i64 %nib, {bits_log}
-  %md0 = lshr i64 %dw, %shift
+{mixed}  %md0 = lshr i64 %dw, %shift
   %md = and i64 %md0, {desc_mask}
   br label %load
 load:
@@ -4026,8 +4175,7 @@ load:
   %at = add i64 %first, %i
   %xp = getelementptr i64, ptr %p, i64 %at
   %x = load i64, ptr %xp
-  call void @mw.share_d(i64 %x, i64 %d, {c} 1)
-  ret i64 %x
+{share}  ret i64 %x
 }}
 
 ",
@@ -4035,11 +4183,6 @@ load:
         uniform = l.uniform.bits_in_place(),
         ud_shift = l.elem_desc.shift,
         ud_mask = l.elem_desc.mask(),
-        len_shift = l.len.shift,
-        per_less = per - 1,
-        per_log = per.trailing_zeros(),
-        header = l.header_words,
-        bits_log = l.desc_bits.trailing_zeros(),
         desc_mask = l.desc_mask(),
         uniform_first = l.first_field(0, true),
     )
@@ -4075,15 +4218,22 @@ blk:
   %p = inttoptr i64 %obj to ptr
   %q = getelementptr i64, ptr %p, i64 {word}
   %w = load i64, ptr %q
-  %m2 = lshr i64 %w, {shift}
-  br label %go
+{read}  br label %go
 go:
   %m = phi i64 [ %m1, %imm ], [ %m2, %blk ]
 ",
         tag = l.imm_mask,
         imm_shift = l.imm_shift,
         word = l.meta.word,
-        shift = l.meta.shift,
+        read = if l.meta.tops() {
+            format!("  %m2 = lshr i64 %w, {}\n", l.meta.shift)
+        } else {
+            format!(
+                "  %m2s = lshr i64 %w, {}\n  %m2 = and i64 %m2s, {}\n",
+                l.meta.shift,
+                l.meta.mask()
+            )
+        },
     );
     format!(
         "\

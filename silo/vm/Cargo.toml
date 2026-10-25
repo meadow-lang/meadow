@@ -8,6 +8,11 @@ edition = "2024"
 name = "meadow-silo-vm"
 path = "src/main.rs"
 
+[features]
+# The interpreter for programs built for Glade's object layout: see
+# `meadow-silo`'s feature of the same name.
+glade-layout = ["meadow-silo/glade-layout"]
+
 [dependencies]
 meadow-silo = { path = ".." }
 meadow-axcut = { path = "../../compiler/meadow-axcut" }

@@ -109,8 +109,8 @@ pub fn run_on_vm(program: &core::Program, opt: OptLevel) -> (Result<String, Stri
             .and_then(|()| {
                 // A stack that grows, as an edit-run loop's should.
                 let config = meadow_llvm::Config {
-                    memory: crate::aot::gc(),
                     stack: meadow_llvm::Stack::Growable,
+                    ..crate::aot::config()
                 };
                 crate::aot::write_image_with(&image, lowered.program, Vec::new(), config)
             })

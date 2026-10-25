@@ -180,12 +180,12 @@ impl Parcel {
                 for (i, w) in b.words.iter().enumerate() {
                     heap::set_word(v, i, *w);
                 }
-                // The count is the references besides one.
-                heap::set_count(v, b.incoming - 1);
                 // What the sending thread's cycle collector thought of the
                 // block it copied is about that heap's candidate list, not
                 // this one's: a fresh block here has never been a candidate.
-                heap::set_word(v, 1, b.words[1] & !heap::MARKS);
+                heap::set_word(v, heap::FLAGS, b.words[heap::FLAGS] & !heap::MARKS);
+                // The count is the references besides one.
+                heap::set_count(v, b.incoming - 1);
                 // A compact arrives naming the region it always named, and
                 // that block holds two references into it: its own, given up
                 // when the block dies, and the one its field holds, given up
@@ -240,6 +240,8 @@ fn lift(v: Word) -> Result<Lifted, String> {
     let mut words: Vec<Word> = (0..n).map(|i| heap::word(v, i)).collect();
     let at = heap::LAYOUT.count.word;
     words[at] = heap::LAYOUT.count.set(words[at], 0);
+    let at = heap::LAYOUT.mark.word;
+    words[at] = heap::LAYOUT.mark.set(words[at], 0);
     Ok(Lifted {
         words,
         refs: Vec::new(),

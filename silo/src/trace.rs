@@ -10,18 +10,19 @@
 //!
 //! # The blocks
 //!
-//! The same blocks as counting's (`crate::heap`), with the same header. The
-//! count, which nothing reads under tracing, holds the number of the
-//! collection that last marked the block, so marking needs no clearing pass
-//! and a block is live in this collection when its number is this one's.
-//! A block inside a compact region keeps its count, which is far above any
+//! The same blocks as counting's (`crate::heap`), with the same header. Its
+//! mark (`heap::mark`) holds the number of the collection that last marked
+//! the block, so marking needs no clearing pass and a block is live in this
+//! collection when its number is this one's. Under Silo's layout the mark is
+//! the count, which nothing reads under tracing; Glade's has a field of its
+//! own. A block inside a compact region has a mark far above any
 //! collection's number (`heap::REGION_FLOOR`), and so is told from a heap's
 //! block by the same test counting uses.
 //!
 //! Blocks come from pages of one size class each, so that a sweep can walk a
-//! page from end to end; a free block has a zero second word, which no block
-//! in use has, and its first word links it into its class's free list. A
-//! block too big for a class is allocated alone.
+//! page from end to end; a free block has a zero kind's word, which no block
+//! in use has, and its link word (`LAYOUT.link_word`) links it into its
+//! class's free list. A block too big for a class is allocated alone.
 //!
 //! # Where a collection happens
 //!
@@ -65,9 +66,10 @@
 //! field. The engine reads back what its records held once the safe point,
 //! or the call it waited on, is over.
 //!
-//! A young block that moved is marked as moved in its count, which nothing
-//! else reads under tracing, and keeps where it went in the header word its
-//! kind was in: its copy has its header whole. A walk over the nursery then
+//! A young block that moved says so in its header (`heap::set_forwarded`):
+//! Silo's layout marks it in the count, which nothing else reads under
+//! tracing, and Glade's in its kind, as Glade does. It keeps where it went in
+//! another header word, since its copy has its header whole. A walk over the nursery then
 //! steps over a block that moved by its copy's size, and finds the young
 //! blocks that died still whole, letting go of what one of them held outside
 //! the heap -- a segment, a thread's task, a region.
@@ -121,8 +123,12 @@ const LEAST: usize = 1 << 20;
 /// times over rather than once for each of its size it allocates.
 const GROWTH: usize = 2;
 /// A collection's number never reaches this, so it is never mistaken for a
-/// region block's count (`heap::REGION_FLOOR` is above it).
-const EPOCHS: u32 = 1 << 27;
+/// region block's mark (`heap::REGION_FLOOR` is above it), and it fits the
+/// layout's mark.
+const EPOCHS: u32 = heap::LAYOUT.epochs() as u32;
+
+/// The word of a free block that links it to the next.
+const LINK: usize = heap::LAYOUT.link_word;
 
 /// One heap's traced memory.
 pub struct Space {
@@ -235,9 +241,6 @@ pub fn moving() -> bool {
     unsafe { meadow_gc == 2 }
 }
 
-/// A count no block of a heap's has while it is young but one that moved.
-const MOVED_OUT: u32 = u32::MAX - 1;
-
 /// [`remember`], for emitted code: what a store into a block written inline
 /// calls, where blocks move.
 #[unsafe(no_mangle)]
@@ -334,10 +337,11 @@ impl Space {
         }
         let head = self.free[words];
         if !head.is_null() {
-            // Safety: a free block of this class, whose first word is the next.
-            self.free[words] = unsafe { *head } as *mut Word;
-            // Safety: likewise; its second word is already zero.
-            unsafe { *head = 0 };
+            // Safety: a free block of this class, whose link word is the
+            // next.
+            self.free[words] = unsafe { *head.add(LINK) } as *mut Word;
+            // Safety: likewise; its kind's word is already zero.
+            unsafe { *head.add(LINK) = 0 };
             return head as Word;
         }
         let (at, left) = self.fresh[words];
@@ -517,7 +521,7 @@ pub fn collect(cx: &mut Ctx) {
                 if free(v) {
                     continue;
                 }
-                if heap::count(v) == epoch {
+                if heap::mark(v) == epoch {
                     kept_words += class;
                 } else {
                     dying.push((v, class));
@@ -528,7 +532,7 @@ pub fn collect(cx: &mut Ctx) {
     let mut large_dying = Vec::new();
     for (&p, &words) in &space.large {
         let v = p as Word;
-        if heap::count(v) == epoch {
+        if heap::mark(v) == epoch {
             kept_words += words;
         } else {
             large_dying.push((v, words));
@@ -544,11 +548,11 @@ pub fn collect(cx: &mut Ctx) {
     };
     for (v, class) in dying {
         let b = v as *mut Word;
-        // Safety: a dead block of this class: its second word zero says it
-        // is free, its first links it in.
+        // Safety: a dead block of this class: its kind's word zero says it
+        // is free, its link word links it in.
         unsafe {
-            *b.add(1) = 0;
-            *b = space.free[class] as Word;
+            *b.add(heap::LAYOUT.kind.word) = 0;
+            *b.add(LINK) = space.free[class] as Word;
         }
         space.free[class] = b;
     }
@@ -652,8 +656,8 @@ pub fn minor(cx: &mut Ctx) {
     // heap is let go of, as a sweep does.
     let mut at = lo;
     while at < top as Word {
-        let size = if heap::count(at) == MOVED_OUT {
-            heap::size(heap::word(at, MOVED_TO))
+        let size = if let Some(to) = heap::forwarded(at) {
+            heap::size(to)
         } else {
             finalize(at);
             heap::size(at)
@@ -680,10 +684,6 @@ pub fn minor(cx: &mut Ctx) {
     }
 }
 
-/// Where a young block that moved keeps the address it moved to: the word
-/// its kind was in, which its copy has.
-const MOVED_TO: usize = heap::LAYOUT.kind.word;
-
 /// What copies the nursery's survivors out: the nursery's bounds, how many
 /// were copied, and those whose fields are still to be looked at.
 struct Copier {
@@ -706,17 +706,16 @@ impl Copier {
         if !self.young(v) {
             return v;
         }
-        if heap::count(v) == MOVED_OUT {
-            return heap::word(v, MOVED_TO);
+        if let Some(to) = heap::forwarded(v) {
+            return to;
         }
         let words = heap::size(v);
         // Safety: the heap's space, which nothing else touches meanwhile.
         let to = unsafe { (*self.space).take_old(words) };
         // Safety: both blocks have `words` words.
         unsafe { std::ptr::copy_nonoverlapping(v as *const Word, to as *mut Word, words) };
-        heap::set_count(to, 0);
-        heap::set_count(v, MOVED_OUT);
-        heap::set_word(v, MOVED_TO, to);
+        heap::set_mark(to, 0);
+        heap::set_forwarded(v, to);
         self.copied += 1;
         self.scan.push(to);
         to
@@ -745,7 +744,7 @@ impl Copier {
 
     /// The fields of the block at `v` that are references, rewritten.
     fn fields(&mut self, v: Word) {
-        if !heap::is_block(v) || heap::count(v) >= heap::REGION_FLOOR {
+        if !heap::is_block(v) || heap::in_region(v) {
             return;
         }
         match heap::kind(v) {
@@ -787,7 +786,7 @@ fn finalize(v: Word) {
 }
 
 /// Number the collections from the start again, before the numbers reach a
-/// region block's count: every block a collection marked is unmarked.
+/// region block's mark: every block a collection marked is unmarked.
 fn renumber(space: &mut Space) {
     for class in 1..CLASSES {
         for &(p, blocks) in &space.pages[class] {
@@ -795,13 +794,13 @@ fn renumber(space: &mut Space) {
                 // Safety: block `k` of the page.
                 let v = unsafe { p.add(k * class) } as Word;
                 if !free(v) {
-                    heap::set_count(v, 0);
+                    heap::set_mark(v, 0);
                 }
             }
         }
     }
     for &p in space.large.keys() {
-        heap::set_count(p as Word, 0);
+        heap::set_mark(p as Word, 0);
     }
     space.epoch = 1;
 }
@@ -840,19 +839,19 @@ impl Marker {
 
     /// Mark the block at `v`, and queue what it holds.
     fn visit(&mut self, v: Word, cx: &Ctx) {
-        let count = heap::count(v);
-        if count >= heap::REGION_FLOOR {
+        let mark = heap::mark(v);
+        if mark >= heap::REGION_FLOOR {
             // Inside a compact region, which is never looked inside: what is
             // noted is that the heap still points into it.
-            // Safety: the count says it is a region's block.
+            // Safety: the mark says it is a region's block.
             self.regions
                 .insert(unsafe { crate::region::owner(v) } as usize);
             return;
         }
-        if count == self.epoch {
+        if mark == self.epoch {
             return;
         }
-        heap::set_count(v, self.epoch);
+        heap::set_mark(v, self.epoch);
         match heap::kind(v) {
             heap::STRING | heap::BIGINT => {}
             // A suspended continuation: what its segments' frames hold.

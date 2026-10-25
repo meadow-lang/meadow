@@ -14,6 +14,13 @@ path = "src/lib.rs"
 # The static library is what a program links against; the rlib is for tests.
 crate-type = ["rlib", "staticlib"]
 
+[features]
+# Glade's object layout instead of Silo's: no count, a header of two words up
+# to eight fields, only ever traced (`meadow_rt::layout::GLADE`). A library
+# built with it exports a runtime symbol of its own, so a program emitted for
+# the other layout does not link with it.
+glade-layout = []
+
 [dependencies]
 # Descriptors, number formatting and the numeric tower's rules, which this
 # runtime must agree with the others about.

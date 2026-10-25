@@ -110,7 +110,7 @@ front ends ──► Cut ──► AxCut ──► (versions, when reloadable)
 | engine | interpret, `jit` ([R2](#r2-a-jit)), aot | aot; `--interpret` chooses the VM | debug: interpret or jit; release: aot |
 | memory | `rc`, `tracing`, `generational` | `rc` | `rc` |
 | stack | `fixed`, `growable`, `heap` | debug: `growable`; release: `fixed` | the same |
-| layout | `silo`; Glade-like ([R1](#r1-the-glade-like-layout)) | `silo` | `silo` |
+| layout | `silo`, `glade` ([§5](#5-the-object-layout)) | `silo` | `silo` |
 | reloading | on, off | on (the VM) | on |
 | nursery | a size | 2 MB (2^18 words) | the same |
 
@@ -170,10 +170,17 @@ version number is `meadow`'s.
 run as another combination silently. One exception is allowed while native
 code is the case: none at present, since `generational` moves blocks on both
 engines.
-- *Status:* done; must hold for every option added later.
+- The one refused today is the `glade` layout with `rc`. `meadow` exits with
+  status 2 and `error: the `glade` layout has no count, so its memory is
+  traced: build with `--gc tracing` or `--gc generational``.
+- *Status:* done, no test for the refusal; must hold for every option added
+  later.
 
-**CFG-10.** (planned, R1) `--layout silo|glade` chooses the object layout, and
-the image's configuration carries it.
+**CFG-10.** `--layout silo|glade`, or `MEADOW_LAYOUT`, chooses the object
+layout ([§5](#5-the-object-layout)). The image's configuration carries it.
+Building again with the other layout builds anew (CFG-7).
+- *Check:* DIFF-1 with `--layout glade`.
+- *Status:* done; no profile key yet.
 
 **CFG-11.** (planned, R2) `--engine interpret|jit|aot`, or `backend = "…"` in
 a profile, chooses the engine for Silo, and `--jit-tiers` and the JIT's
@@ -192,9 +199,10 @@ in every configuration.
   - `rc`, `tracing` and `generational`;
   - `fixed`, `growable` and `heap`;
   - debug and release;
-  - the default nursery and the smallest.
+  - the default nursery and the smallest;
+  - the `silo` and `glade` layouts.
 - *Status:* done as a manual check, no test. A test is to be written over
-  these examples.
+  these examples. The script is `scratchpad/laydiff.sh`.
 
 **DIFF-2.** Std's 350 tests pass in every configuration of [§17](#17-the-test-matrix).
 - *Status:* done; run on Jarvis at 09a91d0.
@@ -214,7 +222,13 @@ on the merged runtime as on the old Glade.
 ### 5.1 The description
 
 The layout is a value, `meadow_rt::layout::Layout`. Every reader and writer of
-a block takes its facts from it.
+a block takes its facts from it. There are two:
+- `SILO`, Silo's, with a count;
+- `GLADE`, Glade's as near as machine pointers allow, with no count.
+
+The runtime library and the VM are each built for one, by `meadow-silo`'s
+`glade-layout` feature (LAY-20). The LLVM back end takes it from the
+configuration.
 
 **LAY-1.** `meadow_rt::layout::SILO` describes Silo's layout exactly:
 
@@ -238,15 +252,21 @@ It also fixes:
   record 7, mutable array 8, once 9, compact 10, channel 11, task 12, `TVar`
   13, stack 14 and region 15.
 
+Under tracing, the count is the mark. A moved block has a count of
+`u32::MAX - 1`, with where it went in word 1. A free block's word 1 is zero,
+and word 0 links it.
 - *Status:* done; `meadow_rt::layout::tests::silo_s_header_is_where_its_heap_says`.
 
 **LAY-2.** `first_field(n, uniform)` answers `header_words` for a uniform
-block, and otherwise `header_words + ceil(n / descs_per_word)`.
-`desc_at(i)` answers `(header_words + i / descs_per_word, (i %
-descs_per_word) * desc_bits)`.
-- *Check:* `first_field(3, false) == 3`, `first_field(17, false) == 4`,
-  `first_field(17, true) == 2`, and `desc_at(17) == (3, 4)`.
-- *Status:* done; the same test.
+block, and otherwise `header_words + ceil(max(n - inline_descs, 0) /
+descs_per_word)`. `desc_at(i)` answers `(inline_word, inline_shift + i *
+desc_bits)` for `i < inline_descs`. Otherwise, with `j = i - inline_descs`, it
+answers `(header_words + j / descs_per_word, (j % descs_per_word) *
+desc_bits)`.
+- *Check:* for `SILO`, `first_field(3, false) == 3`,
+  `first_field(17, false) == 4`, `first_field(17, true) == 2`, and
+  `desc_at(17) == (3, 4)`.
+- *Status:* done; the same test, and LAY-6's for `GLADE`.
 
 **LAY-3.** No code in the runtime, the VM or the LLVM back end writes a header
 word index, shift, mask or kind number as a literal. Each comes from the
@@ -263,18 +283,87 @@ identical byte for byte (PERF-1).
 - *Status:* done.
 
 **LAY-5.** The LLVM back end refuses at start a description its IR cannot
-serve. `emit::suits` requires:
-- the count at word 0, shift 0, 8, 16, 32 or 64 bits wide;
+serve. `emit::suits` requires of every layout:
 - a one-bit immediate tag equal to its mask;
+- the uniform bit and the element descriptor in one word;
+- descriptors per word and descriptor bits that are powers of two.
+
+And of a layout that counts, what counting's code assumes:
+- the count at word 0, shift 0, 8, 16, 32 or 64 bits wide;
 - the length and the count in one word;
 - the meta, uniform bit, element descriptor, colour and mutable bit in the
   kind's word;
-- the length and the meta at the top of their words;
-- descriptors per word and descriptor bits that are powers of two.
+- no descriptors in the header;
+- the length and the meta at the top of their words.
 
+A field is read with a shift unless it is at the bottom of its word, and a
+mask unless it is at the top (`emit::read_field`).
 - *Status:* done, no test.
 
-### 5.2 Descriptors
+**LAY-6.** `meadow_rt::layout::GLADE` describes the Glade-like layout:
+
+| field | word | shift | bits |
+|---|---|---|---|
+| kind | 0 | 0 | 8 |
+| element descriptor | 0 | 8 | 4 |
+| uniform | 0 | 12 | 1 |
+| colour, buffered, dead, moved, mutable, cyclable, deferred | 0 | 13 to 20 | 8 in all |
+| mark | 0 | 21 | 11 |
+| length | 0 | 32 | 32 |
+| meta | 1 | 0 | 32 |
+| descriptors of fields 0 to 7 | 1 | 32 | 4 each |
+
+It also fixes:
+- no count;
+- 2 header words, and descriptors of fields 8 and up in the words after
+  the header, 16 to a word;
+- immediates as Silo's;
+- a region's block has the mark 2047 (the region floor), which no collection
+  reaches, since collections are numbered below 2047;
+- a moved block has kind `0xFF`, with where it went in word 1;
+- a free block's word 0 is zero, and word 1 links it;
+- the kinds as Silo's.
+
+Every bit of word 0 belongs to exactly one field.
+- *Check:* `first_field(n, false)` is 2 for `n <= 8`, 3 for `9 <= n <= 24`
+  and 4 for `n = 25`. `desc_at(0) == (1, 32)`, `desc_at(8) == (2, 0)` and
+  `desc_at(24) == (3, 0)`.
+- *Status:* done;
+  `meadow_rt::layout::tests::glade_s_header_is_two_words_up_to_eight_fields`.
+
+**LAY-7.** A block of 1 to 8 fields takes one word fewer under `GLADE` than
+under `SILO`: a cons cell is 4 words rather than 5.
+- *Status:* done.
+
+### 5.2 One layout per runtime
+
+**LAY-20.** The runtime library and the VM are built for one layout:
+`SILO`, or `GLADE` with the `glade-layout` feature. A checkout builds the
+second with `--features meadow-silo/glade-layout --target-dir
+silo/target/glade-layout` (the VM), or `--features glade-layout` (the
+library). `meadow` looks for a `glade` layout's VM and library in
+`glade-layout` directories:
+- in a checkout, under `silo/target`;
+- beside `meadow`, both in `lib/{TRIPLE}/` and where the binary is.
+
+No `glade` library is embedded in `meadow`.
+- *Status:* done.
+
+**LAY-21.** A library built for `GLADE` exports `meadow_silo_{hash}_glade`,
+and a program emitted for it refers to that symbol. So a program links only
+with a library built for its layout.
+- *Status:* done.
+
+**LAY-22.** The VM refuses an image built for another layout than its own,
+with exit status 1 and
+`error: the program is built for the `{a}` layout, and this interpreter for the `{b}` one: run it with the interpreter built for its layout`.
+- *Status:* done, no test.
+
+**LAY-23.** A runtime built for a layout with no count stops a counted
+program at start with exit status 2.
+- *Status:* done, no test. `meadow` never builds one (CFG-9).
+
+### 5.3 Descriptors
 
 **LAY-10.** A descriptor is a small integer: `REF` 0, `INT` 1, `FLOAT` 2,
 `STR` 3 (an interned name, not a `String`), `UNIT` 4, `BOOL` 5, `CHAR` 6,
@@ -350,6 +439,13 @@ blocks still held and what held them.
 last collection kept, and never before 2^20 words.
 - *Check:* `MEADOW_SILO_GC=1` lines are spaced so.
 - *Status:* done, no test.
+
+**MEM-TR-5.** Nothing a traced program runs changes a block's count. In
+particular, `@mw.field`, which reads a field by number or a record's by
+label, shares nothing under tracing. Under Silo's layout the count is the
+mark, and a share would make a block look marked in the next collection, so
+that its fields were never scanned.
+- *Status:* done, since the second layout's work; no focused test.
 
 **MEM-TR-4.** A block in a compact region is never marked or swept. The heap
 holds one reference to each region its last collection found a pointer into.
@@ -838,7 +934,7 @@ On Glade's engines it prints Glade's own statistics.
 
 ## 15. Images and running them
 
-**IMG-1.** An image begins with the bytes `meadow axcut image 4\n`, followed by
+**IMG-1.** An image begins with the bytes `meadow axcut image 5\n`, followed by
 an `Image` in postcard: `program`, `config`, `tests` and `linear`. An image
 with any other beginning is refused.
 - *Status:* done.
@@ -938,20 +1034,42 @@ meet, numbered now so that tests can be planned.
 
 ### R1. The Glade-like layout
 
+Begun 2026-10-25: `GLADE` and `--layout` (LAY-6 to LAY-23).
+
 - **LAYG-1.** A second instance of the layout description, with no count in
-  the header. The count's word holds the collector's mark, age and
-  forwarding.
-- **LAYG-2.** Region blocks are told apart by address range, not by count:
-  `in_region` is a range test, under every layout.
-- **LAYG-3.** `--layout silo|glade` (CFG-10). Every reader takes the layout
-  from the configuration, not from a constant.
+  the header. Its first word holds the collector's mark, and a moved block
+  says so in its kind.
+  - *Status:* done (LAY-6).
+- **LAYG-2.** Region blocks are told apart without a count. Changed from "by
+  address range": they are told by a mark no collection gives, the same test
+  under both layouts (`heap::in_region`). An address range would need memory
+  reserved for regions, which a phone limits.
+  - *Status:* done.
+- **LAYG-3.** `--layout silo|glade` (CFG-10). The LLVM back end takes the
+  layout from the configuration. The runtime and the VM are each built for
+  one, rather than reading the layout from a variable, so that a header read
+  costs what it did (LAY-20).
+  - *Status:* done.
 - **LAYG-4.** The Glade-like layout with `rc` is refused, since it has no
   count, with a message (CFG-9).
+  - *Status:* done.
 - **LAYG-5.** Std and the suite pass with the Glade-like layout on both
   engines under `tracing` and `generational`.
+  - *Status:* Std passes under `generational` with the smallest nursery on
+    both engines (Windows). The full matrix is to run on Jarvis.
 - **LAYG-6.** Silo's layout's native counted IR is unchanged (PERF-1).
-- **LAYG-7.** A value crossing between two layouts (a compact region, a
-  parcel, the FFI) is converted.
+  - *Status:* done, checked by snapshot.
+- **LAYG-7.** A value crossing between two layouts is converted. Dropped:
+  one runtime holds one layout, so no value meets the other. Compact regions
+  and parcels copy within it.
+- **LAYG-8.** (should) The Glade-like layout is no slower than Silo's under
+  tracing or `generational`.
+  - *Status:* faster on binarytrees under both and on rbtree under tracing,
+    by 5 to 7%; rbtree under `generational` is 6% slower, yet to be
+    profiled.
+- **LAYG-9.** A profile key, `layout = "glade"`, and the release archives
+  ship the second layout's runtime and VM.
+  - *Status:* planned.
 
 ### R2. A JIT
 
@@ -1095,5 +1213,5 @@ VM.
 | a growable stack's piece | 64 MB; up to 4 kept | `stack::CHUNK`, `stack::POOL` |
 | `main`'s fixed stack | 1 GB | `lib::MAIN_STACK` |
 | VM instruction | 8 bytes | `interp/code.rs` |
-| image magic | `meadow axcut image 4\n` | `meadow_axcut::image` |
+| image magic | `meadow axcut image 5\n` | `meadow_axcut::image` |
 | watching interval | 100 ms (VM); 250 ms (sources) | `silo/vm/src/main.rs`, `watch.rs` |

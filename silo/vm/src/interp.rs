@@ -594,6 +594,16 @@ pub fn choose(i: usize) {
 /// runtime what it needs to know of it.
 pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
     let began = std::time::Instant::now();
+    // An interpreter is built for one layout, as its runtime is.
+    if image.config.layout.description() != heap::LAYOUT {
+        return Err(format!(
+            "the program is built for the `{}` layout, and this interpreter for the `{}` one: \
+             run it with the interpreter built for its layout",
+            image.config.layout.name(),
+            heap::LAYOUT.name
+        ));
+    }
+    image.config.check()?;
     let program: &'static Program = Box::leak(Box::new(image.program));
     let is_tests = !image.tests.is_empty();
     let entries = if is_tests {
@@ -2917,20 +2927,16 @@ fn set_count(v: Word, rc: u32) {
 fn write_block(b: Word, kind: u64, meta: u32, vals: &[Word], descs: &[i64]) {
     let l = heap::LAYOUT;
     let n = vals.len();
-    let mut header = [0u64; 4];
-    header[l.len.word] |= l.len.put(n as u64);
-    header[l.kind.word] |= l.kind.put(kind);
-    header[l.meta.word] |= l.meta.put(u64::from(meta));
-    for (i, h) in header.iter().enumerate().take(l.header_words) {
-        heap::set_word(b, i, *h);
-    }
-    let per = l.descs_per_word;
-    for w in 0..l.desc_words(n) {
-        let mut bits = 0u64;
-        for (j, d) in descs.iter().enumerate().skip(per * w).take(per) {
-            bits |= ((*d as u64) & l.desc_mask()) << ((j - per * w) as u32 * l.desc_bits);
+    let mut header = l.header(kind, n as u64, u64::from(meta));
+    l.pack_descs(descs, |w, bits| {
+        if w < l.header_words {
+            header[w] |= bits;
+        } else {
+            heap::set_word(b, w, bits);
         }
-        heap::set_word(b, l.header_words + w, bits);
+    });
+    for (i, h) in header.iter().enumerate() {
+        heap::set_word(b, i, *h);
     }
     let first = l.first_field(n, false);
     for (i, x) in vals.iter().enumerate() {

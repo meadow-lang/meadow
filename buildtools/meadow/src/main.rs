@@ -455,6 +455,13 @@ struct TargetArgs {
     /// `MEADOW_STACK` says the same.
     #[arg(long, value_name = "STACK", value_parser = stack_kind)]
     stack: Option<meadow_llvm::Stack>,
+    /// How a block is laid out in memory on Silo: `silo`, with a count in
+    /// every header, or `glade`, with none, so that a block of up to eight
+    /// fields has a header of two words rather than three -- which is only
+    /// ever traced (`--gc tracing` or `generational`). Each is a runtime
+    /// library and an interpreter of its own. `MEADOW_LAYOUT` says the same.
+    #[arg(long, value_name = "LAYOUT", value_parser = ["silo", "glade"])]
+    layout: Option<String>,
     /// Build what is interpreted so that no new build of it can be loaded
     /// into it while it runs (`meadow run --watch`): its definitions,
     /// constructors and effects are not written with the versions of the
@@ -517,6 +524,7 @@ impl TargetArgs {
             gc: self.gc.clone(),
             interpret: self.interpret,
             stack: self.stack.or(Some(profile.stack)),
+            layout: self.layout.clone(),
             no_reload: self.no_reload || !profile.reload,
             nursery: self.nursery.or(profile.nursery),
             leaks: self.leaks || profile.leaks,
@@ -539,6 +547,12 @@ impl TargetArgs {
         if self.no_reload {
             meadow::aot::set_no_reload();
         }
+        if let Some(l) = self.layout.as_deref().and_then(meadow_llvm::Layout::named) {
+            meadow::aot::set_layout(l);
+            // What a program run in a process of its own builds for, and
+            // which interpreter runs it. Safety: as below.
+            unsafe { std::env::set_var("MEADOW_LAYOUT", l.name()) };
+        }
         if let Some(g) = &self.gc {
             meadow::aot::set_gc(meadow::aot::strategy(g));
             if g == "rc" && self.runtime == aot::Runtime::Glade {
@@ -558,6 +572,13 @@ impl TargetArgs {
         if self.leaks {
             // Safety: as above.
             unsafe { std::env::set_var("MEADOW_SILO_LEAKS", "1") };
+        }
+        // A combination that cannot be met is refused, never run as another.
+        if self.runtime == aot::Runtime::Silo
+            && let Err(e) = meadow::aot::config().check()
+        {
+            status::error(e);
+            std::process::exit(2);
         }
     }
 

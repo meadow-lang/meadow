@@ -1299,9 +1299,7 @@ pub extern "C" fn meadow_update(r: Word, at: i64, of: i64, v: Word, vd: i64) -> 
     };
     // Its header as the record's, with a count of its own and none of the
     // collector's marks.
-    heap::set_word(c, 0, heap::word(r, 0));
-    heap::set_word(c, 1, heap::word(r, 1) & !heap::MARKS);
-    heap::set_count(c, 0);
+    heap::copy_header(r, c);
     for j in (1..heap::len(r)).step_by(2).filter(|j| *j != i) {
         heap::share(heap::field(r, j), heap::field_desc(r, j));
     }
