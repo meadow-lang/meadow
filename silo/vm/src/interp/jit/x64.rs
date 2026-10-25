@@ -258,6 +258,48 @@ impl Asm {
         self.byte(0xC0);
     }
 
+    /// `shr r, n`.
+    pub(super) fn shr_imm(&mut self, r: Reg, n: u8) {
+        self.rex(true, 0, r);
+        self.byte(0xC1);
+        self.modrm(0b11, 5, r);
+        self.byte(n);
+    }
+
+    /// `test r, imm`, an immediate of 32 bits sign-extended.
+    pub(super) fn test_imm(&mut self, r: Reg, imm: i32) {
+        self.rex(true, 0, r);
+        self.byte(0xF7);
+        self.modrm(0b11, 0, r);
+        self.u32(imm as u32);
+    }
+
+    /// `[base + index * 8 + disp]` as the operand of `reg`.
+    fn indexed(&mut self, reg: Reg, base: Reg, index: Reg, disp: i32) {
+        debug_assert!(index & 7 != RSP || index >= 8, "rsp is no index");
+        self.modrm(0b10, reg, 0b100);
+        self.byte((0b11 << 6) | ((index & 7) << 3) | (base & 7));
+        self.u32(disp as u32);
+    }
+
+    fn rex_indexed(&mut self, reg: Reg, base: Reg, index: Reg) {
+        self.byte(0x48 | ((reg >> 3) << 2) | ((index >> 3) << 1) | (base >> 3));
+    }
+
+    /// `mov dst, [base + index * 8 + disp]`.
+    pub(super) fn load_indexed(&mut self, dst: Reg, base: Reg, index: Reg, disp: i32) {
+        self.rex_indexed(dst, base, index);
+        self.byte(0x8B);
+        self.indexed(dst, base, index, disp);
+    }
+
+    /// `mov [base + index * 8 + disp], src`.
+    pub(super) fn store_indexed(&mut self, base: Reg, index: Reg, disp: i32, src: Reg) {
+        self.rex_indexed(src, base, index);
+        self.byte(0x89);
+        self.indexed(src, base, index, disp);
+    }
+
     /// `test a, b`.
     pub(super) fn test(&mut self, a: Reg, b: Reg) {
         self.rex(true, b, a);
@@ -403,6 +445,10 @@ mod tests {
         a.store_f64(RBX, 16, 0);
         a.movq_to_xmm(1, RAX);
         a.sse_op(Sse::Mul, 0, 1);
+        a.shr_imm(RDX, 32);
+        a.test_imm(RAX, 1);
+        a.load_indexed(RAX, RAX, RCX, 16);
+        a.store_indexed(RAX, RCX, 16, RDX);
         let code = a.finish();
         assert_eq!(
             code,
@@ -423,6 +469,10 @@ mod tests {
                 0xF2, 0x0F, 0x11, 0x83, 16, 0, 0, 0, // movsd [rbx+16], xmm0
                 0x66, 0x48, 0x0F, 0x6E, 0xC8, // movq xmm1, rax
                 0xF2, 0x0F, 0x59, 0xC1, // mulsd xmm0, xmm1
+                0x48, 0xC1, 0xEA, 32, // shr rdx, 32
+                0x48, 0xF7, 0xC0, 1, 0, 0, 0, // test rax, 1
+                0x48, 0x8B, 0x84, 0xC8, 16, 0, 0, 0, // mov rax, [rax+rcx*8+16]
+                0x48, 0x89, 0x94, 0xC8, 16, 0, 0, 0, // mov [rax+rcx*8+16], rdx
             ]
         );
     }

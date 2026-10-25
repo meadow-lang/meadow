@@ -924,6 +924,22 @@ from the lower-level IR (R3). Tier 1 does not wait for it.
 - **What is left.** The rest goes through the interpreter's `step` still:
   the array primitives, calls, switches, sharing and erasing.
 
+**The third step: arrays and returns** (2026-10-25).
+- **Array elements.** `stGetArray` and `stSetArray` on a mutable array whose
+  elements are no references are inline. The fast path checks that the
+  value is a block, that it is a mutable array, its elements' descriptor,
+  and the bounds, as an unsigned compare. It reads the header through the
+  layout's fields, so it serves Glade's layout too. Anything else, an index
+  out of bounds included, is the interpreter's, which fails with the same
+  message.
+- **Returns.** An answer to the null continuation, which is how a call
+  returns, is inline too.
+- **Measured.** matmul takes 904 ms with the JIT, against 2,107 ms
+  interpreted: 2.3 times as fast. fib is level, at 355 ms against 346 ms.
+- **Checked.** The differential, Std under all three strategies, the deep
+  recursions, and an index out of bounds: the same message and exit status
+  with the JIT as without.
+
 ### Replacing Glade in full (2026-10-24)
 
 The merged runtime is to be Glade's next release, so it has to do all that

@@ -15,7 +15,10 @@
 //! What is compiled inline is the integer arithmetic and comparisons and the
 //! floating-point arithmetic, on slots holding words, with anything else -- a
 //! slot holding a frame not built, a division -- left to [`step`] at the
-//! same pc. A tail call (`Jump`, `Invoke`) is made by [`transfer`], and when
+//! same pc. So are reading and writing a mutable array's element of a type
+//! that is no reference (`stGetArray`, `stSetArray`), with the bounds and the
+//! array checked, and the return of an answer to the null continuation. A
+//! tail call (`Jump`, `Invoke`) is made by [`transfer`], and when
 //! the procedure it enters is compiled too, the function jumps into that
 //! one's body, past its prologue, with the same `Cx` and native frame: a loop
 //! of tail calls stays in compiled code, and in one native frame.
@@ -33,8 +36,8 @@
 #[cfg(target_arch = "x86_64")]
 mod x64;
 
-use super::code::Ins;
-use super::{B, Code, Env, LOCAL, Next, Proc, V, Vm, Word};
+use super::code::{Ins, PrimI};
+use super::{B, Code, D, Env, LOCAL, Next, Op, Proc, V, Vm, Word};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
@@ -357,6 +360,26 @@ fn translate(code: &Code, entry: usize, end: usize) -> Option<(Vec<u8>, usize)> 
     };
     for pc in entry..end {
         a.bind(at(pc));
+        if let Ins::Invoke(i) = code.ins[pc] {
+            // The answer, to the null continuation: what returning is.
+            let iv = &code.invokes[i as usize];
+            if let (0, [arg]) = (iv.tag, iv.args.as_slice())
+                && let (Ok(t), Ok(arg)) = (u8::try_from(iv.target), u8::try_from(*arg))
+            {
+                let not = a.label();
+                a.cmp_mem_imm8(R12, tag_of(t), VAL);
+                a.jcc(Cc::Ne, not);
+                a.cmp_mem_imm8(R12, word_of(t), 0);
+                a.jcc(Cc::Ne, not);
+                a.cmp_mem_imm8(R12, tag_of(arg), VAL);
+                a.jcc(Cc::Ne, not);
+                a.load(RAX, R12, word_of(arg));
+                a.store(RBX, result, RAX);
+                a.mov_imm(RAX, DONE);
+                a.jmp(out);
+                a.bind(not);
+            }
+        }
         if matches!(code.ins[pc], Ins::Jump(_) | Ins::Invoke(_)) {
             call_transfer(&mut a, pc);
             continue;
@@ -573,7 +596,97 @@ fn inline(
         true
     };
     let is_float = |op: B| matches!(op, B::FAdd | B::FSub | B::FMul | B::FDiv);
+    // A mutable array's element, read or written, of a type that is no
+    // reference: nothing to count, erase or remember.
+    let element = |a: &mut Asm, x: &PrimI| -> bool {
+        use meadow_rt::desc;
+        use meadow_silo::heap;
+        let Some(next) = next else { return false };
+        let Op::Prim(p, _) = x.op else { return false };
+        let slot = |s: u32| u8::try_from(s).ok();
+        let (arr, idx, val, result) = match (p, x.args.as_slice()) {
+            (meadow_rt::Prim::StGetArray, [arr, idx]) => (arr.s, idx.s, None, x.result),
+            (meadow_rt::Prim::StSetArray, [arr, idx, v]) => match v.d {
+                D::K(k) if k != desc::REF && k != desc::ANY => (arr.s, idx.s, Some(v.s), x.result),
+                _ => return false,
+            },
+            _ => return false,
+        };
+        let (Some(arr), Some(idx)) = (slot(arr), slot(idx)) else {
+            return false;
+        };
+        let val = match val.map(slot) {
+            Some(None) => return false,
+            Some(Some(v)) => Some(v),
+            None => None,
+        };
+        let result = match result.map(slot) {
+            Some(None) => return false,
+            Some(Some(r)) => Some(r),
+            None => None,
+        };
+        if val.is_none() && result.is_none() {
+            return false;
+        }
+        // A header field of the block at `rax`, into `rdx`.
+        let header = |a: &mut Asm, f: meadow_rt::layout::Field| {
+            a.load(RDX, RAX, 8 * f.word as i32);
+            if f.shift > 0 {
+                a.shr_imm(RDX, f.shift as u8);
+            }
+            if !f.tops() {
+                a.alu_imm(Alu::And, RDX, f.mask() as i32);
+            }
+        };
+        let l = heap::LAYOUT;
+        want_word(a, arr);
+        want_word(a, idx);
+        if let Some(v) = val {
+            want_word(a, v);
+        }
+        if let Some(r) = result {
+            a.cmp_mem_imm8(R12, tag_of(r), FRAME);
+            a.jcc(Cc::E, slow);
+        }
+        // A mutable array's block, whose elements are no references.
+        a.load(RAX, R12, word_of(arr));
+        a.test_imm(RAX, l.imm_mask as i32);
+        a.jcc(Cc::Ne, slow);
+        a.test(RAX, RAX);
+        a.jcc(Cc::E, slow);
+        header(a, l.kind);
+        a.alu_imm(Alu::Cmp, RDX, heap::MUT_ARRAY as i32);
+        a.jcc(Cc::Ne, slow);
+        header(a, l.elem_desc);
+        a.alu_imm(Alu::Cmp, RDX, desc::REF as i32);
+        a.jcc(Cc::E, slow);
+        a.alu_imm(Alu::Cmp, RDX, desc::ANY as i32);
+        a.jcc(Cc::E, slow);
+        // In bounds: an index below the length, as an unsigned number.
+        a.load(RCX, R12, word_of(idx));
+        header(a, l.len);
+        a.alu(Alu::Cmp, RCX, RDX);
+        a.jcc(Cc::Ae, slow);
+        let elems = 8 * heap::ELEMS as i32;
+        match val {
+            None => {
+                a.load_indexed(RAX, RAX, RCX, elems);
+            }
+            Some(v) => {
+                a.load(RDX, R12, word_of(v));
+                a.store_indexed(RAX, RCX, elems, RDX);
+                a.mov_imm(RAX, 0);
+            }
+        }
+        if let Some(r) = result {
+            a.store_imm(R12, tag_of(r), i32::from(VAL));
+            a.store(R12, word_of(r), RAX);
+        }
+        a.jmp(next);
+        true
+    };
     match ins {
+        Ins::Prim(i) => element(a, &code.prims[i as usize]),
         Ins::Bin { op, a: x, b, dst } if is_float(op) => float(a, op, x, Src::Slot(b), dst),
         Ins::BinK { op, a: x, dst, k } if is_float(op) => {
             float(a, op, x, Src::K(code.consts[k as usize]), dst)

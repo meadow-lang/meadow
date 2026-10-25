@@ -1090,9 +1090,14 @@ VM.
   An instruction it does not compile is run by the interpreter, and the
   native code carries on.
   - *Status:* begun, x86-64 only (`silo/vm/src/interp/jit.rs`), with
-    `MEADOW_JIT` and `MEADOW_JIT_THRESHOLD` and no driver flag yet. The
-    integer arithmetic and comparisons are inline; every other instruction
-    goes through the interpreter's `step`. Glade's code generator did not
+    `MEADOW_JIT` and `MEADOW_JIT_THRESHOLD` and no driver flag yet. Inline:
+    - the integer arithmetic and comparisons, and the double arithmetic;
+    - reading and writing elements of mutable arrays that are no
+      references;
+    - returns to the null continuation;
+    - tail calls into compiled procedures.
+
+    Every other instruction goes through the interpreter's `step`. Glade's code generator did not
     fit, so tier 1 has a small encoder of its own; Glade's executable memory
     is shared (`compiler/meadow-exec`).
 - **JIT-3.** Tier 2 is an optimizing compiler from the lower-level IR (R3),
@@ -1122,6 +1127,8 @@ VM.
     script is `scratchpad/jitdiff.sh`.
 - **JIT-9.** (should) A long-running loop under `jit` runs within a factor of
   the AOT build's speed, to be set once tier 1 is measured.
+  - *Status:* matmul under `jit` takes 904 ms, against 2,107 ms
+    interpreted, on the Windows desktop.
 - **JIT-11.** The VM without the JIT is no slower for its being there
   (PERF-3).
   - *Status:* done; measured with code layout held still (functions and
