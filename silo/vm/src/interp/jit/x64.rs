@@ -34,7 +34,17 @@ pub(super) enum Cc {
     Le = 0xE,
     G = 0xF,
     S = 0x8,
+    B = 0x2,
     Ae = 0x3,
+}
+
+/// A scalar double arithmetic operation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Sse {
+    Add = 0x58,
+    Mul = 0x59,
+    Sub = 0x5C,
+    Div = 0x5E,
 }
 
 /// A place in the code, bound once.
@@ -319,6 +329,49 @@ impl Asm {
         self.u32(0);
     }
 
+    /// A scalar double operation, `F2 0F op`, between `xmm` and `[base +
+    /// disp]`.
+    fn sse_mem(&mut self, op: u8, xmm: u8, base: Reg, disp: i32) {
+        self.byte(0xF2);
+        self.rex(false, xmm, base);
+        self.byte(0x0F);
+        self.byte(op);
+        self.mem(xmm, base, disp);
+    }
+
+    /// `movsd xmm, [base + disp]`.
+    pub(super) fn load_f64(&mut self, xmm: u8, base: Reg, disp: i32) {
+        self.sse_mem(0x10, xmm, base, disp);
+    }
+
+    /// `movsd [base + disp], xmm`.
+    pub(super) fn store_f64(&mut self, base: Reg, disp: i32, xmm: u8) {
+        self.sse_mem(0x11, xmm, base, disp);
+    }
+
+    /// `op xmm, [base + disp]`, for `op` one of [`Sse`]'s.
+    pub(super) fn sse_op_mem(&mut self, op: Sse, xmm: u8, base: Reg, disp: i32) {
+        self.sse_mem(op as u8, xmm, base, disp);
+    }
+
+    /// `op dst, src`, between two `xmm` registers.
+    pub(super) fn sse_op(&mut self, op: Sse, dst: u8, src: u8) {
+        self.byte(0xF2);
+        self.rex(false, dst, src);
+        self.byte(0x0F);
+        self.byte(op as u8);
+        self.modrm(0b11, dst, src);
+    }
+
+    /// `movq xmm, r`.
+    pub(super) fn movq_to_xmm(&mut self, xmm: u8, r: Reg) {
+        self.byte(0x66);
+        self.rex(true, xmm, r);
+        self.byte(0x0F);
+        self.byte(0x6E);
+        self.modrm(0b11, xmm, r);
+    }
+
     /// Pad to a multiple of `n` bytes with `int3`.
     pub(super) fn align(&mut self, n: usize) {
         while self.code.len() % n != 0 {
@@ -345,6 +398,11 @@ mod tests {
         a.call(RAX);
         a.push(RBX);
         a.pop(R12);
+        a.load_f64(0, R12, 8);
+        a.sse_op_mem(Sse::Add, 0, R12, 24);
+        a.store_f64(RBX, 16, 0);
+        a.movq_to_xmm(1, RAX);
+        a.sse_op(Sse::Mul, 0, 1);
         let code = a.finish();
         assert_eq!(
             code,
@@ -360,6 +418,11 @@ mod tests {
                 0xFF, 0xD0, // call rax
                 0x53, // push rbx
                 0x41, 0x5C, // pop r12
+                0xF2, 0x41, 0x0F, 0x10, 0x84, 0x24, 8, 0, 0, 0, // movsd xmm0, [r12+8]
+                0xF2, 0x41, 0x0F, 0x58, 0x84, 0x24, 24, 0, 0, 0, // addsd xmm0, [r12+24]
+                0xF2, 0x0F, 0x11, 0x83, 16, 0, 0, 0, // movsd [rbx+16], xmm0
+                0x66, 0x48, 0x0F, 0x6E, 0xC8, // movq xmm1, rax
+                0xF2, 0x0F, 0x59, 0xC1, // mulsd xmm0, xmm1
             ]
         );
     }

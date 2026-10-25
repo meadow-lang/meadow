@@ -908,6 +908,22 @@ from the lower-level IR (R3). Tier 1 does not wait for it.
   is little. matmul is level. Calls and returns compiled natively come next,
   and they are what will make it pay.
 
+**The second step: tail calls stay native** (2026-10-25).
+- **Tail calls.** A `Jump` or `Invoke` is made by a helper, `transfer`. When
+  the procedure it enters is compiled, the function jumps into that
+  procedure's body, past the prologue every function shares, with the same
+  context and native frame. A loop of tail calls through compiled
+  procedures never goes back to the driver, and takes no native stack.
+- **Doubles.** Floating-point arithmetic is inline (`FAdd`, `FSub`, `FMul`,
+  `FDiv`).
+- **Measured.** matmul takes 2,047 ms against 2,132 ms interpreted; fib takes
+  406 ms against 346 ms.
+- **Checked.** The examples' differential holds, Std's tests pass under all
+  three strategies, and a recursion 20 million deep finishes on the growable
+  stack and on heap frames, everything compiled at first entry.
+- **What is left.** The rest goes through the interpreter's `step` still:
+  the array primitives, calls, switches, sharing and erasing.
+
 ### Replacing Glade in full (2026-10-24)
 
 The merged runtime is to be Glade's next release, so it has to do all that

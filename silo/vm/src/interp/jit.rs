@@ -12,9 +12,13 @@
 //! labels; anything else leaves the function, for the driver
 //! ([`Vm::jitted`]) to enter the next procedure, compiled or interpreted.
 //!
-//! What is compiled inline is the integer arithmetic and comparisons, on
-//! slots holding words, with anything else -- a slot holding a frame not
-//! built, a division -- left to [`step`] at the same pc.
+//! What is compiled inline is the integer arithmetic and comparisons and the
+//! floating-point arithmetic, on slots holding words, with anything else -- a
+//! slot holding a frame not built, a division -- left to [`step`] at the
+//! same pc. A tail call (`Jump`, `Invoke`) is made by [`transfer`], and when
+//! the procedure it enters is compiled too, the function jumps into that
+//! one's body, past its prologue, with the same `Cx` and native frame: a loop
+//! of tail calls stays in compiled code, and in one native frame.
 //!
 //! No value stays in a machine register across a call of [`step`], which may
 //! collect, move blocks and resize the slots: the slots' address is read
@@ -71,6 +75,9 @@ impl Jit {
 pub(super) struct Table {
     /// The native function, or null for none yet, or [`NEVER`].
     code: Box<[AtomicPtr<u8>]>,
+    /// Where its body begins, past the prologue: what a tail call from
+    /// another compiled procedure jumps to.
+    body: Box<[AtomicPtr<u8>]>,
     /// How many times it has been entered, uncompiled.
     entered: Box<[AtomicU32]>,
     /// Where each procedure's instructions end.
@@ -94,6 +101,7 @@ impl Table {
             .collect();
         Table {
             code: procs.iter().map(|_| AtomicPtr::default()).collect(),
+            body: procs.iter().map(|_| AtomicPtr::default()).collect(),
             entered: procs.iter().map(|_| AtomicU32::new(0)).collect(),
             ends,
         }
@@ -139,23 +147,11 @@ impl Vm {
     /// procedure it enters is compiled -- compiling one that has been
     /// entered often enough -- and say where the interpreter takes over.
     pub(super) fn jitted(&self, p: &mut u32, env: &mut Env) -> Jitted {
-        let Some(jit) = self.jit.as_ref() else {
-            return Jitted::Entry;
-        };
         loop {
-            let seg = self.seg(*p);
-            let local = (*p & LOCAL) as usize;
-            let mut f = seg.jit.code[local].load(Ordering::Acquire);
-            if f.is_null() {
-                let n = seg.jit.entered[local].fetch_add(1, Ordering::Relaxed);
-                if n < jit.threshold {
-                    return Jitted::Entry;
-                }
-                f = jit.compile(self, *p);
-            }
-            if f == NEVER {
+            let Some(f) = self.native(*p, &|t| &t.code) else {
                 return Jitted::Entry;
-            }
+            };
+            let seg = self.seg(*p);
             let mut cx = Cx {
                 slots: env.as_mut_ptr(),
                 vm: self,
@@ -174,6 +170,26 @@ impl Vm {
                 _ => return Jitted::At(cx.result as usize),
             }
         }
+    }
+
+    /// Procedure `p`'s function, or its body (as `which` picks the table),
+    /// compiling it if it has been entered often enough -- an entry it
+    /// counts -- or nothing, to interpret it.
+    #[inline]
+    fn native(&self, p: u32, which: &dyn Fn(&Table) -> &[AtomicPtr<u8>]) -> Option<*mut u8> {
+        let jit = self.jit.as_ref()?;
+        let seg = self.seg(p);
+        let local = (p & LOCAL) as usize;
+        let mut f = which(&seg.jit)[local].load(Ordering::Acquire);
+        if f.is_null() {
+            let n = seg.jit.entered[local].fetch_add(1, Ordering::Relaxed);
+            if n < jit.threshold {
+                return None;
+            }
+            jit.compile(self, p);
+            f = which(&seg.jit)[local].load(Ordering::Acquire);
+        }
+        (f != NEVER && !f.is_null()).then_some(f)
     }
 }
 
@@ -200,6 +216,39 @@ unsafe extern "C" fn step(cx: *mut Cx, pc: u32) -> i64 {
     next
 }
 
+/// Make the tail call at `pc` of the procedure `cx` is running, as the
+/// interpreter would: the body of the procedure it enters, if that is
+/// compiled -- with `cx` made that procedure's -- or [`ENTER`] for the driver
+/// to enter it, [`DONE`] when it answered (`cx.result`), or [`AT`].
+///
+/// # Safety
+///
+/// Called by compiled code, with the `Cx` it was given.
+unsafe extern "C" fn transfer(cx: *mut Cx, pc: u32) -> u64 {
+    // Safety: as in `step`.
+    let cx = unsafe { &mut *cx };
+    let (vm, env, code) = unsafe { (&*cx.vm, &mut *cx.env, &*cx.code) };
+    let how = vm.step(&mut cx.p, env, code, pc as usize);
+    cx.slots = env.as_mut_ptr();
+    match how {
+        Next::Enter => match vm.native(cx.p, &|t| &t.body) {
+            Some(body) => {
+                cx.code = &vm.seg(cx.p).code;
+                body as u64
+            }
+            None => ENTER,
+        },
+        Next::Done(w) => {
+            cx.result = w;
+            DONE
+        }
+        Next::At(n) => {
+            cx.result = n as Word;
+            AT
+        }
+    }
+}
+
 impl Jit {
     /// Compile procedure `p`, once however many threads get here: its
     /// function, or [`NEVER`].
@@ -213,9 +262,13 @@ impl Jit {
         }
         let entry = seg.procs[local].entry as usize;
         let end = seg.jit.ends[local] as usize;
-        let f = translate(&seg.code, entry, end)
-            .and_then(|bytes| arena.put(&bytes, 16))
-            .unwrap_or(NEVER);
+        let (f, body) = translate(&seg.code, entry, end)
+            .and_then(|(bytes, body)| {
+                let f = arena.put(&bytes, 16)?;
+                // Safety: within the function just put there.
+                Some((f, unsafe { f.add(body) }))
+            })
+            .unwrap_or((NEVER, NEVER));
         if std::env::var_os("MEADOW_JIT_LOG").is_some() {
             eprintln!(
                 "jit: {} ({} instructions){}",
@@ -224,13 +277,14 @@ impl Jit {
                 if f == NEVER { ": not compiled" } else { "" }
             );
         }
+        seg.jit.body[local].store(body, Ordering::Release);
         seg.jit.code[local].store(f, Ordering::Release);
         f
     }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn translate(_code: &Code, _entry: usize, _end: usize) -> Option<Vec<u8>> {
+fn translate(_code: &Code, _entry: usize, _end: usize) -> Option<(Vec<u8>, usize)> {
     None
 }
 
@@ -253,9 +307,11 @@ const VAL: i8 = 1;
 const FRAME: i8 = 2;
 
 /// The machine code of the procedure whose instructions are `entry..end` of
-/// `code`.
+/// `code`, and where in it the body begins: past the prologue, which every
+/// function has the same, so that a tail call from one jumps to another's
+/// body and leaves the same frame.
 #[cfg(target_arch = "x86_64")]
-fn translate(code: &Code, entry: usize, end: usize) -> Option<Vec<u8>> {
+fn translate(code: &Code, entry: usize, end: usize) -> Option<(Vec<u8>, usize)> {
     use std::mem::offset_of;
     use x64::*;
     let mut a = Asm::default();
@@ -270,6 +326,7 @@ fn translate(code: &Code, entry: usize, end: usize) -> Option<Vec<u8>> {
     a.push(R12);
     a.alu_imm(Alu::Sub, RSP, 40);
     a.mov(RBX, ARG[0]);
+    let body = a.code.len();
     a.load(R12, RBX, slots);
     // Hand the instruction at `pc` to the interpreter, and go where it says.
     let call_step = |a: &mut Asm, pc: usize| {
@@ -286,8 +343,24 @@ fn translate(code: &Code, entry: usize, end: usize) -> Option<Vec<u8>> {
         }
         a.jmp(dispatch);
     };
+    // Make the tail call at `pc`, and go into the next procedure's body if it
+    // is compiled; leave for the driver if not.
+    let out = a.label();
+    let call_transfer = |a: &mut Asm, pc: usize| {
+        a.mov(ARG[0], RBX);
+        a.mov_imm(ARG[1], pc as u64);
+        a.mov_imm(RAX, transfer as *const () as usize as u64);
+        a.call(RAX);
+        a.alu_imm(Alu::Cmp, RAX, AT as i32 + 1);
+        a.jcc(Cc::B, out);
+        a.jmp_reg(RAX);
+    };
     for pc in entry..end {
         a.bind(at(pc));
+        if matches!(code.ins[pc], Ins::Jump(_) | Ins::Invoke(_)) {
+            call_transfer(&mut a, pc);
+            continue;
+        }
         let next = (pc + 1 < end).then(|| at(pc + 1));
         let slow = a.label();
         if !inline(&mut a, code, code.ins[pc], next, &at, slow) {
@@ -301,7 +374,6 @@ fn translate(code: &Code, entry: usize, end: usize) -> Option<Vec<u8>> {
     // is what the driver is told.
     a.bind(leave);
     a.not(RAX);
-    let out = a.label();
     a.bind(out);
     a.alu_imm(Alu::Add, RSP, 40);
     a.pop(R12);
@@ -327,7 +399,7 @@ fn translate(code: &Code, entry: usize, end: usize) -> Option<Vec<u8>> {
     for pc in entry..end {
         a.offset(table, at(pc));
     }
-    Some(a.finish())
+    Some((a.finish(), body))
 }
 
 /// Write instruction `ins` inline, if this tier can: going on at `next` (the
@@ -470,7 +542,42 @@ fn inline(
         a.jmp(at(no as usize));
         true
     };
+    // `dst = a op src`, on doubles.
+    let float = |a: &mut Asm, op: B, x: u8, src: Src, dst: u8| -> bool {
+        let Some(next) = next else { return false };
+        let sse = match op {
+            B::FAdd => Sse::Add,
+            B::FSub => Sse::Sub,
+            B::FMul => Sse::Mul,
+            B::FDiv => Sse::Div,
+            _ => return false,
+        };
+        want_word(a, x);
+        if let Src::Slot(s) = src {
+            want_word(a, s);
+        }
+        a.cmp_mem_imm8(R12, tag_of(dst), FRAME);
+        a.jcc(Cc::E, slow);
+        a.load_f64(0, R12, word_of(x));
+        match src {
+            Src::Slot(s) => a.sse_op_mem(sse, 0, R12, word_of(s)),
+            Src::K(k) => {
+                a.mov_imm(RAX, k);
+                a.movq_to_xmm(1, RAX);
+                a.sse_op(sse, 0, 1);
+            }
+        }
+        a.store_imm(R12, tag_of(dst), i32::from(VAL));
+        a.store_f64(R12, word_of(dst), 0);
+        a.jmp(next);
+        true
+    };
+    let is_float = |op: B| matches!(op, B::FAdd | B::FSub | B::FMul | B::FDiv);
     match ins {
+        Ins::Bin { op, a: x, b, dst } if is_float(op) => float(a, op, x, Src::Slot(b), dst),
+        Ins::BinK { op, a: x, dst, k } if is_float(op) => {
+            float(a, op, x, Src::K(code.consts[k as usize]), dst)
+        }
         Ins::Bin { op, a: x, b, dst } => bin(a, op, x, Src::Slot(b), dst),
         Ins::BinI { op, a: x, dst, k } => bin(a, op, x, Src::K(k as i64 as u64), dst),
         Ins::BinK { op, a: x, dst, k } => bin(a, op, x, Src::K(code.consts[k as usize]), dst),
