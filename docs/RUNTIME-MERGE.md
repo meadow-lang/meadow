@@ -718,9 +718,10 @@ under `generational`, and only there:
 Counted and traced programs' IR is as it was.
 
 Every example prints the same with the smallest nursery (32K words), and the
-standard library's 350 tests pass on the VM under `generational` with the
-default nursery, with the smallest, and with heap frames (Linux, 2026-10-24,
-with the full suite). Natively, binarytrees takes 1.13 s against 1.57 s
+standard library's 350 tests pass under `generational` on both engines --
+the default nursery and the smallest, debug and release, and heap frames --
+as under counting and tracing (Linux, 2026-10-24, at 09a91d0, with the full
+suite). Natively, binarytrees takes 1.13 s against 1.57 s
 traced, and 0.91 s with an 8 MB nursery (`--nursery 8M`). On the VM, binarytrees spends 7.7% of its run collecting, against 10.6% traced. The
 run itself is about the same, since interpreting it costs most. A larger
 nursery (`MEADOW_GC_NURSERY`, in words) spends less: 4.8% at 16M words.
