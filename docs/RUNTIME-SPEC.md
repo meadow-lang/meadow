@@ -107,7 +107,7 @@ front ends ──► Cut ──► AxCut ──► (versions, when reloadable)
 
 | axis | options | default today | target default |
 |---|---|---|---|
-| engine | interpret, `jit` ([R2](#r2-a-jit)), aot | aot; `--interpret` chooses the VM | debug: interpret or jit; release: aot |
+| engine | interpret, `jit` ([R2](#r2-a-jit)), aot | aot; `--interpret` or `--backend vm` chooses the VM, `--jit` the VM with its JIT | debug: interpret or jit; release: aot |
 | memory | `rc`, `tracing`, `generational` | `rc` | `rc` |
 | stack | `fixed`, `growable`, `heap` | debug: `growable`; release: `fixed` | the same |
 | layout | `silo`, `glade` ([§5](#5-the-object-layout)) | `silo` | `silo` |
@@ -186,9 +186,15 @@ layout builds anew (CFG-7).
   `generational` (CFG-1).
 - *Status:* done, no test.
 
-**CFG-11.** (planned, R2) `--engine interpret|jit|aot`, or `backend = "…"` in
-a profile, chooses the engine for Silo, and `--jit-tiers` and the JIT's
-thresholds are options.
+**CFG-11.** `--backend vm|jit|aot` (or `--jit`, `--aot`), or `backend = "…"`
+in a profile, chooses the engine for Silo:
+- `vm` is its interpreter, as `--interpret` is;
+- `jit` is the interpreter with its JIT;
+- `aot` is LLVM ahead of time, which Silo is unless one is named.
+
+The JIT's threshold is `MEADOW_JIT_THRESHOLD`.
+- *Check:* `driver::the_merged_runtime_s_jit_runs_what_its_vm_runs`.
+- *Status:* done; `--jit-tiers` waits for a second tier (R2).
 
 ## 4. Behaviour across configurations
 
@@ -1081,10 +1087,13 @@ A third engine, interpreted first and compiled when hot, as configurable as
 the others. AOT and JIT are both options, and either may be mixed with the
 VM.
 
-- **JIT-1.** `--engine jit` runs a program on the VM, compiling a procedure to
+- **JIT-1.** `--jit` runs a program on the VM, compiling a procedure to
   machine code once it is entered more than a threshold of times, or once a
   loop head in it is passed more than a threshold of times. Both thresholds
   are options.
+  - *Status:* done for entries (`MEADOW_JIT_THRESHOLD`, 1000 by default).
+    A loop of tail calls counts each call as an entry. A loop within one
+    procedure is not counted yet.
 - **JIT-2.** Tier 1 is a baseline compiler. Each VM procedure becomes one
   native function, instruction for instruction, over the same registers.
   An instruction it does not compile is run by the interpreter, and the

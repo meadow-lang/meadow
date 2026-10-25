@@ -851,3 +851,62 @@ fn exec_runs_an_image_of_axcut_on_the_merged_runtime_s_vm() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "[a, b]");
 }
+
+/// `--jit` on Silo runs the program on the merged runtime's VM, compiling what
+/// runs often -- here everything, at first entry -- and the program prints
+/// what it prints interpreted.
+#[test]
+fn the_merged_runtime_s_jit_runs_what_its_vm_runs() {
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    if !cfg!(target_arch = "x86_64") {
+        eprintln!("skipped: the JIT compiles for x86-64 only yet");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("meadow-vm-jit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("Jit/src")).unwrap();
+    std::fs::write(
+        dir.join("Jit/Meadow.toml"),
+        "[package]\nname = \"Jit\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("Jit/src/Main.mw"),
+        "use Std.St as St\n\n\
+         fun fib (n : Int) : Int = if n < 2 then n else fib (n - 1) + fib (n - 2)\n\n\
+         fun main () =\n  \
+           let total = runSt (\\() ->\n    \
+             let a = St.newArray 100 0.5 in\n    \
+             let _ = St.forRange 0 100 (\\i -> St.set a i (toFloat i *. 2.0)) in\n    \
+             let rec sum i acc = if i >= 100 then acc else sum (i + 1) (acc +. St.get a i) in\n    \
+             sum 0 0.0) in\n  \
+           println (show (fib 20) ++ \" \" ++ show total)\n",
+    )
+    .unwrap();
+    let run = |engine: &str| {
+        let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
+            .args(["run", "--runtime", "silo", engine])
+            .arg(dir.join("Jit"))
+            .env("MEADOW_JIT_THRESHOLD", "0")
+            .env("MEADOW_JIT_LOG", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (vm, _) = run("--interpret");
+    let (jit, said) = run("--jit");
+    assert_eq!(vm.trim(), "6765 9900.0");
+    assert_eq!(jit, vm, "the JIT prints what the VM prints");
+    assert!(said.contains("jit: Jit.fib"), "fib was compiled:\n{said}");
+}

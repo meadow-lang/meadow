@@ -210,8 +210,8 @@ fn a_manifest_chooses_the_backend() {
 }
 
 /// A profile chooses the runtime -- Glade or Silo -- and the runtime's flags;
-/// Silo is compiled ahead of time by what it is, whatever a backend says, and
-/// does not give way to Glade's JIT.
+/// Silo is compiled ahead of time unless a backend names its interpreter or
+/// its JIT, and does not give way to Glade's JIT.
 #[test]
 fn a_manifest_chooses_the_runtime_and_its_flags() {
     use meadow::aot::Runtime;

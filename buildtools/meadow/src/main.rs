@@ -631,7 +631,9 @@ struct ProfileArgs {
     /// (machine code compiled ahead of time, into an executable). Debug builds
     /// default to `jit` and release builds to `aot`; `backend = "..."` in a
     /// `[profile.<name>]` of `Meadow.toml` overrides that, and this overrides
-    /// both. Silo is always compiled ahead of time.
+    /// both. On Silo it is the engine: `vm` its interpreter (as
+    /// `--interpret`), `jit` the interpreter with its JIT, or `aot`, LLVM
+    /// ahead of time, which Silo is unless one is named.
     #[arg(long, value_name = "BACKEND", value_parser = backend, conflicts_with_all = ["jit", "aot"])]
     backend: Option<Backend>,
     /// `--backend jit`.
@@ -711,14 +713,6 @@ impl ProfileArgs {
     /// The profile, the package's `Meadow.toml`, and these flags, in that order
     /// of increasing authority.
     fn resolve(&self, path: &std::path::Path) -> Resolved {
-        let silo = self.runtime.as_deref() == Some("silo");
-        if silo && (self.backend.is_some() || self.jit || self.aot) {
-            eprintln!(
-                "error: Silo is compiled ahead of time by what it is, and has no backend to \
-                 choose; `--backend`, `--jit` and `--aot` are Glade's"
-            );
-            std::process::exit(2);
-        }
         Resolved::resolve(self.profile(), path, self.overrides())
     }
 }

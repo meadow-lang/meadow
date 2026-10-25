@@ -194,16 +194,15 @@ impl Resolved {
             .map(|m| m.profile(profile.name()))
             .unwrap_or_default();
         let runtime = flags.runtime.or(from_manifest.runtime).unwrap_or_default();
-        // A backend is Glade's to choose. Silo has none: it is compiled ahead
-        // of time by what it is.
-        if runtime == crate::aot::Runtime::Silo && from_manifest.backend.is_some() {
-            crate::status::warning(format!(
-                "`[profile.{}]` picks Silo, which is always compiled ahead of time; \
-                 its `backend` is Glade's, and is ignored",
-                profile.name()
-            ));
-        }
         let named = flags.backend.or(from_manifest.backend);
+        // On Silo, a backend named is the engine: its interpreter, the
+        // interpreter with its JIT, or LLVM ahead of time, which it is unless
+        // one is named.
+        if runtime == crate::aot::Runtime::Silo
+            && let Some(b) = named
+        {
+            crate::aot::set_engine(b);
+        }
         let backend = named.unwrap_or(profile.backend());
         let mut options = flags.apply(from_manifest.apply(profile.options()));
         // What `@cfg(profile = …)` and `@cfg(backend = …)` see: this build's.

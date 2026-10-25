@@ -261,6 +261,23 @@ pub fn write_image_with(
     std::fs::rename(&partial, path).map_err(|e| format!("could not write {}: {e}", path.display()))
 }
 
+/// Run what is built for Silo on the engine `backend` names: `vm` its
+/// interpreter, `jit` the interpreter with its JIT (`MEADOW_JIT` in the
+/// interpreter's process), `aot` LLVM ahead of time, which it is by default.
+pub fn set_engine(backend: crate::profile::Backend) {
+    use crate::profile::Backend;
+    match backend {
+        Backend::Vm => set_interpret(),
+        Backend::Jit => {
+            set_interpret();
+            // Safety: before anything is built or run, so before any thread
+            // that reads the environment.
+            unsafe { std::env::set_var("MEADOW_JIT", "1") };
+        }
+        Backend::Aot => {}
+    }
+}
+
 /// Is `path` an image, which [`interpreter`] runs, rather than an executable?
 pub fn is_image(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "image")
