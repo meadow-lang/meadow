@@ -17,6 +17,8 @@ crate-type = ["rlib", "staticlib"]
 meadow-bytecode = { path = "../compiler/meadow-bytecode" }
 meadow-rt = { path = "../compiler/meadow-rt" }
 meadow-intern = { path = "../compiler/meadow-intern" }
+# Executable memory for the JIT.
+meadow-exec = { path = "../compiler/meadow-exec" }
 num-bigint = "0.4"
 num-traits = "0.2"
 

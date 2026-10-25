@@ -1089,6 +1089,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "meadow-exec"
+version = "0.3.0"
+
+[[package]]
 name = "meadow-exhaust"
 version = "0.3.0"
 dependencies = [
@@ -1118,6 +1122,7 @@ name = "meadow-glade"
 version = "0.3.0"
 dependencies = [
  "meadow-bytecode",
+ "meadow-exec",
  "meadow-intern",
  "meadow-rt",
  "num-bigint",

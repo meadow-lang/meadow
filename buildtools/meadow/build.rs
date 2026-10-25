@@ -68,6 +68,7 @@ fn main() {
                 root.join("glade/Cargo.toml"),
                 compiler.join("meadow-bytecode"),
                 compiler.join("meadow-rt"),
+                compiler.join("meadow-exec"),
                 compiler.join("meadow-intern"),
                 compiler.join("meadow-span"),
             ],

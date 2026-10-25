@@ -365,6 +365,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "meadow-exec"
+version = "0.3.0"
+
+[[package]]
 name = "meadow-exhaust"
 version = "0.3.0"
 dependencies = [
