@@ -94,12 +94,20 @@ pub fn set_gc(memory: meadow_llvm::Memory) {
     let _ = GC.set(memory);
 }
 
-/// How memory is managed: what `--gc` said, or `MEADOW_GC`, or counting.
+/// How memory is managed: what `--gc` said, or `MEADOW_GC`, or counting --
+/// or, for a layout with no count, Glade's default, the young generation.
 pub fn gc() -> meadow_llvm::Memory {
     *GC.get_or_init(|| {
-        std::env::var("MEADOW_GC")
-            .ok()
-            .map_or_else(Default::default, |g| strategy(&g))
+        std::env::var("MEADOW_GC").ok().map_or_else(
+            || {
+                if layout().description().counted {
+                    meadow_llvm::Memory::default()
+                } else {
+                    meadow_llvm::Memory::Generational
+                }
+            },
+            |g| strategy(&g),
+        )
     })
 }
 

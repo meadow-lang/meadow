@@ -118,7 +118,8 @@ front ends ──► Cut ──► AxCut ──► (versions, when reloadable)
 
 **CFG-1.** `--gc rc|tracing|generational|copying` chooses the memory strategy:
 `copying` means `generational`, and `MEADOW_GC` says the same when the flag is
-absent.
+absent. Without either, it is `rc`, or `generational` under a layout with no
+count (`--layout glade`), as Glade's default is.
 - *Check:* run a program with `--gc-stats` under each name; the first `gc:`
   line begins `gc: counted:` for `rc` and `gc: traced:` for the others.
 - *Status:* done; `driver::gc_stats_say_what_memory_did_on_the_merged_runtime_s_vm`.
@@ -176,11 +177,14 @@ engines.
 - *Status:* done, no test for the refusal; must hold for every option added
   later.
 
-**CFG-10.** `--layout silo|glade`, or `MEADOW_LAYOUT`, chooses the object
-layout ([§5](#5-the-object-layout)). The image's configuration carries it.
-Building again with the other layout builds anew (CFG-7).
-- *Check:* DIFF-1 with `--layout glade`.
-- *Status:* done; no profile key yet.
+**CFG-10.** `--layout silo|glade`, `MEADOW_LAYOUT`, or `layout = "…"` in a
+profile, chooses the object layout ([§5](#5-the-object-layout)), with the flag
+winning. The image's configuration carries it. Building again with the other
+layout builds anew (CFG-7).
+- *Check:* DIFF-1 with `--layout glade`. A package whose profile says
+  `runtime = "silo"` and `layout = "glade"`, run with no flags, runs under
+  `generational` (CFG-1).
+- *Status:* done, no test.
 
 **CFG-11.** (planned, R2) `--engine interpret|jit|aot`, or `backend = "…"` in
 a profile, chooses the engine for Silo, and `--jit-tiers` and the JIT's
@@ -1069,7 +1073,7 @@ Begun 2026-10-25: `GLADE` and `--layout` (LAY-6 to LAY-23).
     profiled.
 - **LAYG-9.** A profile key, `layout = "glade"`, and the release archives
   ship the second layout's runtime and VM.
-  - *Status:* planned.
+  - *Status:* the profile key is done (CFG-10); the archives are planned.
 
 ### R2. A JIT
 

@@ -140,6 +140,9 @@ pub struct Resolved {
     /// recursion too deep for a fixed stack should not stop the program; fixed
     /// for a release, where it costs nothing. `--stack` overrides it.
     pub stack: meadow_seq::config::Stack,
+    /// How a block is laid out on Silo: `layout` from the manifest, if it
+    /// says. `--layout` overrides it.
+    pub layout: Option<meadow_seq::config::Layout>,
     /// Whether an interpreted build may take a new build of itself while it
     /// runs: `reload` from the manifest, or yes. `--no-reload` says no.
     pub reload: bool,
@@ -166,6 +169,7 @@ impl Resolved {
             threads: None,
             nursery: None,
             stack: profile.stack(),
+            layout: None,
             reload: true,
             leaks: false,
             target: None,
@@ -219,6 +223,7 @@ impl Resolved {
             threads: flags.threads.or(from_manifest.threads),
             nursery: from_manifest.nursery,
             stack: from_manifest.stack.unwrap_or(profile.stack()),
+            layout: from_manifest.layout,
             reload: from_manifest.reload.unwrap_or(true),
             leaks: flags.leaks.or(from_manifest.leaks).unwrap_or(false),
             target: flags.target.or(from_manifest.target),

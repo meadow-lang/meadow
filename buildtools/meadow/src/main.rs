@@ -459,7 +459,8 @@ struct TargetArgs {
     /// every header, or `glade`, with none, so that a block of up to eight
     /// fields has a header of two words rather than three -- which is only
     /// ever traced (`--gc tracing` or `generational`). Each is a runtime
-    /// library and an interpreter of its own. `MEADOW_LAYOUT` says the same.
+    /// library and an interpreter of its own. `MEADOW_LAYOUT` says the same,
+    /// and `layout = "…"` in a profile.
     #[arg(long, value_name = "LAYOUT", value_parser = ["silo", "glade"])]
     layout: Option<String>,
     /// Build what is interpreted so that no new build of it can be loaded
@@ -524,7 +525,10 @@ impl TargetArgs {
             gc: self.gc.clone(),
             interpret: self.interpret,
             stack: self.stack.or(Some(profile.stack)),
-            layout: self.layout.clone(),
+            layout: self
+                .layout
+                .clone()
+                .or_else(|| profile.layout.map(|l| l.name().to_string())),
             no_reload: self.no_reload || !profile.reload,
             nursery: self.nursery.or(profile.nursery),
             leaks: self.leaks || profile.leaks,
@@ -695,6 +699,8 @@ impl ProfileArgs {
             nursery: None,
             // Asked for with `--stack`, likewise.
             stack: None,
+            // And with `--layout`.
+            layout: None,
             // And with `--no-reload`.
             reload: None,
             leaks: None,
