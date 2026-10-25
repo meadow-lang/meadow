@@ -36,6 +36,7 @@ pub(super) enum Cc {
     S = 0x8,
     B = 0x2,
     Ae = 0x3,
+    A = 0x7,
 }
 
 /// A scalar double arithmetic operation.
@@ -300,6 +301,44 @@ impl Asm {
         self.indexed(src, base, index, disp);
     }
 
+    /// The 32-bit word at `[base]`, as the operand of `reg`: for a block's
+    /// count, which is the integer its address points at. `base` is one the
+    /// encoding takes without a displacement or an index.
+    fn at32(&mut self, reg: Reg, base: Reg) {
+        debug_assert!(base & 7 != RSP && base & 7 != 5, "a base that needs more");
+        self.rex(false, reg, base);
+    }
+
+    /// `mov dst32, dword [base]`.
+    pub(super) fn load32(&mut self, dst: Reg, base: Reg) {
+        self.at32(dst, base);
+        self.byte(0x8B);
+        self.modrm(0b00, dst, base);
+    }
+
+    /// `cmp dword [base], imm`.
+    pub(super) fn cmp32_imm(&mut self, base: Reg, imm: u32) {
+        self.at32(0, base);
+        self.byte(0x81);
+        self.modrm(0b00, 7, base);
+        self.u32(imm);
+    }
+
+    /// `add dword [base], 1`, or `sub dword [base], 1` if `down`.
+    pub(super) fn step32(&mut self, base: Reg, down: bool) {
+        self.at32(0, base);
+        self.byte(0x83);
+        self.modrm(0b00, if down { 5 } else { 0 }, base);
+        self.byte(1);
+    }
+
+    /// `test a32, b32`.
+    pub(super) fn test32(&mut self, a: Reg, b: Reg) {
+        self.rex(false, b, a);
+        self.byte(0x85);
+        self.modrm(0b11, b, a);
+    }
+
     /// `test a, b`.
     pub(super) fn test(&mut self, a: Reg, b: Reg) {
         self.rex(true, b, a);
@@ -449,6 +488,11 @@ mod tests {
         a.test_imm(RAX, 1);
         a.load_indexed(RAX, RAX, RCX, 16);
         a.store_indexed(RAX, RCX, 16, RDX);
+        a.load32(RDX, RAX);
+        a.cmp32_imm(RAX, 1 << 29);
+        a.step32(RAX, false);
+        a.step32(RAX, true);
+        a.test32(RDX, RDX);
         let code = a.finish();
         assert_eq!(
             code,
@@ -473,6 +517,11 @@ mod tests {
                 0x48, 0xF7, 0xC0, 1, 0, 0, 0, // test rax, 1
                 0x48, 0x8B, 0x84, 0xC8, 16, 0, 0, 0, // mov rax, [rax+rcx*8+16]
                 0x48, 0x89, 0x94, 0xC8, 16, 0, 0, 0, // mov [rax+rcx*8+16], rdx
+                0x8B, 0x10, // mov edx, [rax]
+                0x81, 0x38, 0, 0, 0, 0x20, // cmp dword [rax], 1 << 29
+                0x83, 0x00, 1, // add dword [rax], 1
+                0x83, 0x28, 1, // sub dword [rax], 1
+                0x85, 0xD2, // test edx, edx
             ]
         );
     }

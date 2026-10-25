@@ -1028,8 +1028,9 @@ Also run:
 - `driver`;
 - the LLVM back end's native tests.
 
-The job script is `scratchpad/merge-job7.sh`. The last full run, at 09a91d0,
-passed everything.
+The job script is `scratchpad/merge-job8.sh`, which adds nine configurations
+with `--layout glade` and the examples' differential under it. The last full
+run, at 4011547 (the suite at 8da0687), passed everything.
 
 To add:
 - VM debug configurations;
@@ -1065,8 +1066,14 @@ Begun 2026-10-25: `GLADE` and `--layout` (LAY-6 to LAY-23).
   - *Status:* done.
 - **LAYG-5.** Std and the suite pass with the Glade-like layout on both
   engines under `tracing` and `generational`.
-  - *Status:* Std passes under `generational` with the smallest nursery on
-    both engines (Windows). The full matrix is to run on Jarvis.
+  - *Status:* done. On Linux at 4011547, Std passes in nine configurations
+    with the Glade-like layout:
+    - on the VM: `tracing`, `generational`, and `generational` with the
+      smallest nursery, with heap frames too;
+    - natively: the same, and in a debug build.
+
+    The six examples print the same in five configurations each, and the
+    suite passes at 8da0687.
 - **LAYG-6.** Silo's layout's native counted IR is unchanged (PERF-1).
   - *Status:* done, checked by snapshot.
 - **LAYG-7.** A value crossing between two layouts is converted. Dropped:
@@ -1136,8 +1143,12 @@ VM.
     script is `scratchpad/jitdiff.sh`.
 - **JIT-9.** (should) A long-running loop under `jit` runs within a factor of
   the AOT build's speed, to be set once tier 1 is measured.
-  - *Status:* matmul under `jit` takes 904 ms, against 2,107 ms
+  - *Status:* matmul under `jit` takes 912 ms, against 2,097 ms
     interpreted, on the Windows desktop.
+- **JIT-12.** (should) A program the JIT cannot speed up runs no slower
+  under `jit` than interpreted.
+  - *Status:* not met yet: fib, binarytrees and rbtree are 2 to 4% slower.
+    That is the driver's lookup at each procedure entry.
 - **JIT-11.** The VM without the JIT is no slower for its being there
   (PERF-3).
   - *Status:* done; measured with code layout held still (functions and

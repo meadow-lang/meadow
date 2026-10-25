@@ -17,7 +17,10 @@
 //! slot holding a frame not built, a division -- left to [`step`] at the
 //! same pc. So are reading and writing a mutable array's element of a type
 //! that is no reference (`stGetArray`, `stSetArray`), with the bounds and the
-//! array checked, and the return of an answer to the null continuation. A
+//! array checked, and the return of an answer to the null continuation.
+//! Under counting, so are sharing and erasing a reference: a count up or
+//! down, and the cycle collector's candidate, as the emitted code's helpers
+//! do it, with the last reference and a region's block the interpreter's. A
 //! tail call (`Jump`, `Invoke`) is made by [`transfer`], and when
 //! the procedure it enters is compiled too, the function jumps into that
 //! one's body, past its prologue, with the same `Cx` and native frame: a loop
@@ -151,7 +154,7 @@ impl Vm {
     /// entered often enough -- and say where the interpreter takes over.
     pub(super) fn jitted(&self, p: &mut u32, env: &mut Env) -> Jitted {
         loop {
-            let Some(f) = self.native(*p, &|t| &t.code) else {
+            let Some(f) = self.native(*p, false) else {
                 return Jitted::Entry;
             };
             let seg = self.seg(*p);
@@ -175,22 +178,27 @@ impl Vm {
         }
     }
 
-    /// Procedure `p`'s function, or its body (as `which` picks the table),
-    /// compiling it if it has been entered often enough -- an entry it
-    /// counts -- or nothing, to interpret it.
+    /// Procedure `p`'s function, or its body if `body`, compiling it if it
+    /// has been entered often enough -- an entry it counts -- or nothing, to
+    /// interpret it.
     #[inline]
-    fn native(&self, p: u32, which: &dyn Fn(&Table) -> &[AtomicPtr<u8>]) -> Option<*mut u8> {
+    fn native(&self, p: u32, body: bool) -> Option<*mut u8> {
         let jit = self.jit.as_ref()?;
         let seg = self.seg(p);
         let local = (p & LOCAL) as usize;
-        let mut f = which(&seg.jit)[local].load(Ordering::Acquire);
+        let which = if body { &seg.jit.body } else { &seg.jit.code };
+        let mut f = which[local].load(Ordering::Acquire);
         if f.is_null() {
-            let n = seg.jit.entered[local].fetch_add(1, Ordering::Relaxed);
+            // Counted without a locked instruction: two threads entering at
+            // once may count one entry, which only puts compiling off.
+            let counter = &seg.jit.entered[local];
+            let n = counter.load(Ordering::Relaxed);
+            counter.store(n + 1, Ordering::Relaxed);
             if n < jit.threshold {
                 return None;
             }
             jit.compile(self, p);
-            f = which(&seg.jit)[local].load(Ordering::Acquire);
+            f = which[local].load(Ordering::Acquire);
         }
         (f != NEVER && !f.is_null()).then_some(f)
     }
@@ -234,7 +242,7 @@ unsafe extern "C" fn transfer(cx: *mut Cx, pc: u32) -> u64 {
     let how = vm.step(&mut cx.p, env, code, pc as usize);
     cx.slots = env.as_mut_ptr();
     match how {
-        Next::Enter => match vm.native(cx.p, &|t| &t.body) {
+        Next::Enter => match vm.native(cx.p, true) {
             Some(body) => {
                 cx.code = &vm.seg(cx.p).code;
                 body as u64
@@ -265,7 +273,9 @@ impl Jit {
         }
         let entry = seg.procs[local].entry as usize;
         let end = seg.jit.ends[local] as usize;
-        let (f, body) = translate(&seg.code, entry, end)
+        // Counting's instructions are inline where blocks are counted.
+        let counted = !vm.tracing && meadow_silo::heap::LAYOUT.counted;
+        let (f, body) = translate(&seg.code, entry, end, counted)
             .and_then(|(bytes, body)| {
                 let f = arena.put(&bytes, 16)?;
                 // Safety: within the function just put there.
@@ -287,8 +297,21 @@ impl Jit {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn translate(_code: &Code, _entry: usize, _end: usize) -> Option<(Vec<u8>, usize)> {
+fn translate(_code: &Code, _entry: usize, _end: usize, _counted: bool) -> Option<(Vec<u8>, usize)> {
     None
+}
+
+/// The most of a procedure's instructions, in percent, that may be left to
+/// `step` for it to be compiled: `MEADOW_JIT_STEPPED`, or 30.
+#[cfg(target_arch = "x86_64")]
+fn stepped_at_most() -> usize {
+    static AT_MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *AT_MOST.get_or_init(|| {
+        std::env::var("MEADOW_JIT_STEPPED")
+            .ok()
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(30)
+    })
 }
 
 /// Where a slot's tag and word are, from the slots' address: a `V` is a tag
@@ -314,7 +337,7 @@ const FRAME: i8 = 2;
 /// function has the same, so that a tail call from one jumps to another's
 /// body and leaves the same frame.
 #[cfg(target_arch = "x86_64")]
-fn translate(code: &Code, entry: usize, end: usize) -> Option<(Vec<u8>, usize)> {
+fn translate(code: &Code, entry: usize, end: usize, counted: bool) -> Option<(Vec<u8>, usize)> {
     use std::mem::offset_of;
     use x64::*;
     let mut a = Asm::default();
@@ -358,6 +381,10 @@ fn translate(code: &Code, entry: usize, end: usize) -> Option<(Vec<u8>, usize)> 
         a.jcc(Cc::B, out);
         a.jmp_reg(RAX);
     };
+    // How many instructions are the interpreter's: each costs more through
+    // `step` than in the interpreter's own loop, so a procedure mostly of
+    // them is left interpreted.
+    let mut stepped = 0;
     for pc in entry..end {
         a.bind(at(pc));
         if let Ins::Invoke(i) = code.ins[pc] {
@@ -386,7 +413,8 @@ fn translate(code: &Code, entry: usize, end: usize) -> Option<(Vec<u8>, usize)> 
         }
         let next = (pc + 1 < end).then(|| at(pc + 1));
         let slow = a.label();
-        if !inline(&mut a, code, code.ins[pc], next, &at, slow) {
+        if !inline(&mut a, code, code.ins[pc], counted, next, &at, slow) {
+            stepped += 1;
             call_step(&mut a, pc);
             continue;
         }
@@ -417,6 +445,9 @@ fn translate(code: &Code, entry: usize, end: usize) -> Option<(Vec<u8>, usize)> 
     a.store(RBX, result, RAX);
     a.mov_imm(RAX, AT);
     a.jmp(out);
+    if stepped * 100 > (end - entry) * stepped_at_most() {
+        return None;
+    }
     a.align(4);
     a.bind(table);
     for pc in entry..end {
@@ -430,10 +461,12 @@ fn translate(code: &Code, entry: usize, end: usize) -> Option<(Vec<u8>, usize)> 
 /// `slow` -- the interpreter at the same pc -- whenever the case is not one
 /// it handles. Whether it wrote it.
 #[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
 fn inline(
     a: &mut x64::Asm,
     code: &Code,
     ins: Ins,
+    counted: bool,
     next: Option<x64::Label>,
     at: &dyn Fn(usize) -> x64::Label,
     slow: x64::Label,
@@ -685,7 +718,75 @@ fn inline(
         a.jmp(next);
         true
     };
+    // Share the value in slot `s`, described by `d`, or -- if `erase` --
+    // erase it and empty the slot, as the interpreter does.
+    let counting = |a: &mut Asm, s: u8, d: D, erase: bool| -> bool {
+        use meadow_rt::desc;
+        use meadow_silo::heap;
+        let Some(next) = next else { return false };
+        if !counted {
+            return false;
+        }
+        let refs = match d {
+            D::K(k) => k == desc::REF,
+            D::S(_) => return false,
+        };
+        want_word(a, s);
+        let emptied = |a: &mut Asm| {
+            if erase {
+                a.store_imm(R12, tag_of(s), 0);
+            }
+            a.jmp(next);
+        };
+        if !refs {
+            emptied(a);
+            return true;
+        }
+        let l = heap::LAYOUT;
+        let nothing = a.label();
+        a.load(RAX, R12, word_of(s));
+        a.test_imm(RAX, l.imm_mask as i32);
+        a.jcc(Cc::Ne, nothing);
+        a.test(RAX, RAX);
+        a.jcc(Cc::E, nothing);
+        if erase {
+            // The last reference, or one into a region: the interpreter's.
+            a.load32(RDX, RAX);
+            a.test32(RDX, RDX);
+            a.jcc(Cc::E, slow);
+            a.alu_imm(Alu::Cmp, RDX, heap::REGION_FLOOR as i32);
+            a.jcc(Cc::A, slow);
+            a.step32(RAX, true);
+            a.store_imm(R12, tag_of(s), 0);
+            // A candidate for the cycle collector: a block of a kind a cycle
+            // can run through, not yet coloured -- the emitted code's test.
+            let mask = l.mutable.bits_in_place() | l.colour.bits_in_place();
+            a.load(RDX, RAX, 8 * l.flags_word() as i32);
+            a.alu_imm(Alu::And, RDX, mask as i32);
+            a.alu_imm(Alu::Cmp, RDX, l.mutable.bits_in_place() as i32);
+            a.jcc(Cc::Ne, next);
+            a.mov(ARG[0], RAX);
+            a.mov_imm(
+                RAX,
+                meadow_silo::cycles::meadow_candidate as *const () as usize as u64,
+            );
+            a.call(RAX);
+            a.load(R12, RBX, std::mem::offset_of!(Cx, slots) as i32);
+            a.jmp(next);
+        } else {
+            // A share into a region tells the region: the interpreter's.
+            a.cmp32_imm(RAX, heap::REGION_FLOOR);
+            a.jcc(Cc::Ae, slow);
+            a.step32(RAX, false);
+            a.jmp(next);
+        }
+        a.bind(nothing);
+        emptied(a);
+        true
+    };
     match ins {
+        Ins::Share { s, d } => counting(a, s, d.get(), false),
+        Ins::Erase { s, d } => counting(a, s, d.get(), true),
         Ins::Prim(i) => element(a, &code.prims[i as usize]),
         Ins::Bin { op, a: x, b, dst } if is_float(op) => float(a, op, x, Src::Slot(b), dst),
         Ins::BinK { op, a: x, dst, k } if is_float(op) => {

@@ -940,6 +940,35 @@ from the lower-level IR (R3). Tier 1 does not wait for it.
   recursions, and an index out of bounds: the same message and exit status
   with the JIT as without.
 
+**The fourth step: counting, and what not to compile** (2026-10-25).
+- **Counting inline.** Under counting, sharing and erasing a reference are
+  inline: a count up or down, and the cycle collector's candidate tested as
+  the emitted code's helper tests it. The last reference and a region's
+  block are the interpreter's. With everything compiled, a leak check of
+  `tour` reports what it reports interpreted: 623 blocks acquired, none
+  live at exit.
+- **What not to compile.** binarytrees and rbtree ran 17% and 16% slower
+  with the JIT. Most of their instructions (allocation, switches, calls) go
+  through `step`, and through a call each costs more than in the
+  interpreter's own loop. So a procedure is compiled only if at most 30% of
+  its instructions would be left to `step` (`MEADOW_JIT_STEPPED`).
+- **The driver's overhead.** The driver's lookup at each procedure entry
+  went from a dynamic call to a flag, and its count from a locked increment
+  to a load and a store.
+
+Measured, best of two, on the Windows desktop:
+
+| program | interpreted | with the JIT |
+|---|---|---|
+| fib | 340 ms | 355 ms |
+| matmul | 2,097 ms | 912 ms |
+| binarytrees | 9,269 ms | 9,501 ms |
+| rbtree | 58,263 ms | 60,295 ms |
+
+What is left of the JIT's cost on code it does not compile is the lookup
+at each procedure entry, 2 to 4%. Compiling the switches, allocation and
+calls is what will turn that around.
+
 ### Replacing Glade in full (2026-10-24)
 
 The merged runtime is to be Glade's next release, so it has to do all that
