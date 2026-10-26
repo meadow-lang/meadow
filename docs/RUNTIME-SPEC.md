@@ -30,7 +30,7 @@ reference for how each requirement is met.
 - [15. Images and running them](#15-images-and-running-them) -- `IMG`
 - [16. Performance](#16-performance) -- `PERF`
 - [17. The test matrix](#17-the-test-matrix)
-- [18. Roadmap](#18-roadmap) -- `R1` to `R8`, with requirements to come
+- [18. Roadmap](#18-roadmap) -- `R1` to `R9`, with requirements to come
 - [19. Open questions](#19-open-questions)
 - [Appendix A. Where the code is](#appendix-a-where-the-code-is)
 - [Appendix B. Limits and constants](#appendix-b-limits-and-constants)
@@ -53,7 +53,7 @@ reference for how each requirement is met.
   - *done*, with the tests that cover it, if any;
   - *done, no test*: met, but nothing checks it yet, so a test is to be
     written;
-  - *planned* (`R1`…`R8`): not met, and the roadmap item that meets it.
+  - *planned* (`R1`…`R9`): not met, and the roadmap item that meets it.
 
 **Notation:**
 - `meadow` is the driver, and `vm` stands for `meadow-silo-vm`.
@@ -1209,6 +1209,58 @@ VM.
 
 - **REP-1.** A full account, for Chris, of what was done and how Silo's speed
   was kept, before the branch is offered for merging.
+
+### R9. The runtime in Idyll
+
+The runtime rewritten in Idyll's low-level fragment: C's memory model as the
+`Mem` effect (Idyll's `docs/LOW.md`), compiled to C, and proved memory-safe
+and then sound. It goes a module at a time, behind the C interface the Rust
+runtime already has. The plan, with the compiler's half and the order, is
+`docs/MEADOW-IN-IDYLL.md` on master (Chris, 2026-10-26). It waits on Idyll's
+`Mem`, its solver and its extraction, and it begins once R1 to R4 have
+settled the design here (MI-0).
+
+- **IDY-1.** The layout is an Idyll module. `SILO` and `GLADE` are values,
+  and these invariants are theorems: no two fields of a word overlap; every
+  kind's number is distinct; the region floor is above every collection's
+  mark; the epochs stay below the floor. The table the runtime and the LLVM
+  back end read is generated from it.
+  - *Check:* the generated table is byte for byte today's
+    `meadow_rt::layout` constants, and LAY-1 and LAY-6 hold.
+- **IDY-2.** A module in Idyll lands only with every proof obligation in it
+  discharged. The only trusted primitives are those listed in the one
+  module that names them, each with its specification: the stack switch,
+  the atomics, the system's calls, the instruction-cache flush.
+  - *Check:* the build fails on an undischarged obligation, and the list is
+    one file.
+- **IDY-3.** A module replaced in Idyll keeps everything this specification
+  already requires:
+  - DIFF-1 and DIFF-2 in every configuration of §17;
+  - the debugger's and hot loading's tests;
+  - PERF-1, since the emitted code does not change;
+  - PERF-2 and PERF-3 within noise, measured with code layout held still.
+- **IDY-4.** Each module in Idyll also runs on `Mem`'s model, a handler in
+  pure Idyll, and agrees with its C on the same tests.
+- **IDY-5.** The allocator (`heap::acquire`, `trace::Space::take`, the
+  nursery's bump) hands out blocks that are live, of the size asked for, and
+  disjoint from every other live block. *(Proved.)*
+- **IDY-6.** Tracing frees only what no root reaches. After each operation
+  the heap is well formed: every header agrees with the layout, and every
+  reference field of a live block is an immediate or the address of a live
+  block. *(Proved; MEM-TR-1 to MEM-TR-5.)*
+- **IDY-7.** The copier leaves no reference to a moved block's old place,
+  and the barrier's obligation is the store's precondition. *(Proved;
+  MEM-GEN-4 and MEM-GEN-6.)*
+- **IDY-8.** Given that the memory pass consumes each name once, share,
+  erase and reuse keep a block's count equal to the references it accounts
+  for, so nothing still held is freed. *(Proved; MEM-RC-1.)*
+- **IDY-9.** The rest of the runtime is in Idyll: segments, the scheduler,
+  regions, parcels, STM, the primitives, printing and big integers. The big
+  integers are proved against their arithmetic. Done when `silo/src` has no
+  Rust.
+- **IDY-10.** The VM's loop is in low-level Idyll, and the JIT's encoder is
+  in high-level Idyll, proved against a decoder of the same instructions,
+  with VM-11 and PERF-3 holding. Done when `silo/vm` has no Rust.
 
 ### Smaller items, any time
 
