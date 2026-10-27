@@ -3751,11 +3751,16 @@ impl Resolver {
                     // Without its hygiene mark: a name a macro wrote is
                     // `tmp#3` inside the compiler, and `tmp` is what was
                     // written and what the reader can look for.
-                    self.error(
-                        format!("undefined variable: {}", ast::hygiene::strip(*name.value())),
-                        "not found in this scope".to_string(),
-                        name.span,
-                    );
+                    let written = ast::hygiene::strip(*name.value());
+                    // The float operators that were, before the floats had
+                    // the integers' operators: say what to write instead.
+                    let label = match written.strip_suffix('.') {
+                        Some(op @ ("+" | "-" | "*" | "/" | "<" | ">" | "<=" | ">=")) => {
+                            format!("the float operators are gone: write `{op}`, as for integers")
+                        }
+                        _ => "not found in this scope".to_string(),
+                    };
+                    self.error(format!("undefined variable: {written}"), label, name.span);
                     self.node(hir::Expr::Error, expr.span)
                 }
             }

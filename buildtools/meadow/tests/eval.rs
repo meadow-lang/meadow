@@ -2,7 +2,7 @@
 //! the `Display` of the resulting `Value` (or the runtime error).
 
 mod common;
-use common::{eval_expr, eval_main};
+use common::{eval_expr, eval_expr_std, eval_main};
 
 #[test]
 fn arithmetic() {
@@ -157,16 +157,17 @@ fn radix_int_literals() {
 
 #[test]
 fn float_arithmetic_and_precedence() {
-    // `*.` binds tighter than `+.`; unary minus folds into the literal.
-    insta::assert_snapshot!(eval_expr("2.0 *. 3.0 +. -1.5 /. 3.0"));
+    // `*` binds tighter than `+` on floats as on integers; unary minus
+    // folds into the literal.
+    insta::assert_snapshot!(eval_expr_std("2.0 * 3.0 + -1.5 / 3.0"));
 }
 
 #[test]
 fn float_comparison_ops() {
-    insta::assert_snapshot!(eval_expr("(1.5 <. 2.0, 2.0 >=. 2.0, 3.0 <=. 1.0)"));
+    insta::assert_snapshot!(eval_expr_std("(1.5 < 2.0, 2.0 >= 2.0, 3.0 <= 1.0)"));
 }
 
 #[test]
 fn float_int_conversions() {
-    insta::assert_snapshot!(eval_expr("(toFloat 7 /. 2.0, floor 3.9, floor (-2.1))"));
+    insta::assert_snapshot!(eval_expr_std("(toFloat 7 / 2.0, floor 3.9, floor (-2.1))"));
 }

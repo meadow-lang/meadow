@@ -164,8 +164,8 @@ fn a_comparison_allocates_nothing() {
         // A sized integer is as immediate as an `Int`.
         ("", "a < b", "(toUInt8 3) (toUInt8 4)"),
         ("", "a == 3", "(toInt16 3) (toInt16 4)"),
-        ("", "a <. b", "1.5 2.5"),
-        ("", "a >=. b", "1.5 2.5"),
+        ("", "_primLtF a b", "1.5 2.5"),
+        ("", "_primGeF a b", "1.5 2.5"),
         ("", "a == b", "'x' 'y'"),
         ("", "a == 'x'", "'x' 'y'"),
         ("", "a != b", "\"ab\" \"ab\""),

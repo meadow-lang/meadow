@@ -166,13 +166,13 @@ fun exactly (literal : String) : String =
   halving x 0
 
 fun scaleTen (x : Float) (e : Int) : Float =
-  if e > 0 then scaleTen (x *. 10.0) (e - 1) else if e < 0 then scaleTen (x /. 10.0) (e + 1) else x
+  if e > 0 then scaleTen (x * 10.0) (e - 1) else if e < 0 then scaleTen (x / 10.0) (e + 1) else x
 
 -- `x` doubled until it is a whole number, and how many times.
 fun halving (x : Float) (e : Int) : String =
   let whole = floor x in
   if toFloat whole == x or e <= 0 - 1074 then "${show whole}e${show e}"
-  else halving (x *. 2.0) (e - 1)
+  else halving (x * 2.0) (e - 1)
 
 -- --- an answer ---------------------------------------------------------------
 

@@ -514,14 +514,14 @@ fun prim (op : String) (args : [Value]) : Result String Value ! { Mut | e } =
   | "Ge" -> ordered ">=" op a b
   | "Neg" -> negated a
   | "BitNot" -> inverted a
-  | "AddF" -> fractional "+." op a b
-  | "SubF" -> fractional "-." op a b
-  | "MulF" -> fractional "*." op a b
-  | "DivF" -> fractional "/." op a b
-  | "LtF" -> fractionalOrder "<." op a b
-  | "GtF" -> fractionalOrder ">." op a b
-  | "LeF" -> fractionalOrder "<=." op a b
-  | "GeF" -> fractionalOrder ">=." op a b
+  | "AddF" -> fractional "+" op a b
+  | "SubF" -> fractional "-" op a b
+  | "MulF" -> fractional "*" op a b
+  | "DivF" -> fractional "/" op a b
+  | "LtF" -> fractionalOrder "<" op a b
+  | "GtF" -> fractionalOrder ">" op a b
+  | "LeF" -> fractionalOrder "<=" op a b
+  | "GeF" -> fractionalOrder ">=" op a b
   | "Eq" -> Ok (Bool (equal a b))
   | "Ne" -> Ok (Bool (not (equal a b)))
   | "ToFloat" -> asFloat a
@@ -725,7 +725,7 @@ fun prim (op : String) (args : [Value]) : Result String Value ! { Mut | e } =
   | other -> Err "MeadowBoot's CEK machine does not have the primitive `${other}` yet"
 
 -- Toward zero, as Rust's `as i64` has it.
-fun truncated (x : Float) : Int = if x >=. 0.0 then floor x else 0 - floor (0.0 -. x)
+fun truncated (x : Float) : Int = if x >= 0.0 then floor x else 0 - floor (0.0 - x)
 
 fun clamp (x : Int) (lo : Int) (hi : Int) : Int = if x < lo then lo else if x > hi then hi else x
 
@@ -897,16 +897,16 @@ fun asFloat (a : Value) =
 
 -- `x op y` on two floats of one type.
 fun floatArith (op : String) (x : f) (y : f) : f =
-  if op == "AddF" then x +. y
-  else if op == "SubF" then x -. y
-  else if op == "MulF" then x *. y
-  else x /. y
+  if op == "AddF" then x + y
+  else if op == "SubF" then x - y
+  else if op == "MulF" then x * y
+  else x / y
 
 fun floatCompare (op : String) (x : f) (y : f) : Bool =
-  if op == "LtF" then x <. y
-  else if op == "GtF" then x >. y
-  else if op == "LeF" then x <=. y
-  else x >=. y
+  if op == "LtF" then x < y
+  else if op == "GtF" then x > y
+  else if op == "LeF" then x <= y
+  else x >= y
 
 fun fractional (what : String) (op : String) (a : Value) (b : Value) =
   let f = \x y -> floatArith op x y in
@@ -1053,22 +1053,22 @@ fun floatBits (x : Float) : Int =
   if x == 0.0 then 0
   else if x != x then 9221120237041090560
   else
-    let negative = x <. 0.0 in
-    let a = if negative then 0.0 -. x else x in
-    let magnitude = if a == 1.0 /. 0.0 then 9218868437227405312 else finiteBits a in
+    let negative = x < 0.0 in
+    let a = if negative then 0.0 - x else x in
+    let magnitude = if a == 1.0 / 0.0 then 9218868437227405312 else finiteBits a in
     if negative then bitOr magnitude (0 - 9223372036854775807 - 1) else magnitude
 
 fun finiteBits (a : Float) : Int =
   match normalised a 0 with
   | (m, e) ->
-      if m >=. 4503599627370496.0 then bitOr ((e + 1075) << 52) (floor m - 4503599627370496)
+      if m >= 4503599627370496.0 then bitOr ((e + 1075) << 52) (floor m - 4503599627370496)
       else floor m
 
 -- `a` as `m × 2^e` with `m` in [2^52, 2^53) -- or, below the smallest normal
 -- float, `e` at -1074 and `m` smaller.
 fun normalised (a : Float) (e : Int) : (Float, Int) =
-  if a >=. 9007199254740992.0 then normalised (a *. 0.5) (e + 1)
-  else if a <. 4503599627370496.0 and e > 0 - 1074 then normalised (a *. 2.0) (e - 1)
+  if a >= 9007199254740992.0 then normalised (a * 0.5) (e + 1)
+  else if a < 4503599627370496.0 and e > 0 - 1074 then normalised (a * 2.0) (e - 1)
   else (a, e)
 
 -- --- display -----------------------------------------------------------------

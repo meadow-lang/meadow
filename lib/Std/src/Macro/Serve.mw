@@ -125,7 +125,7 @@ fun numberIn (s : String) (from : Int) (to : Int) : Int =
 
 -- `x` times two to the `e`: exact, one doubling or halving at a time.
 fun scaled (x : Float) (e : Int) : Float =
-  if e > 0 then scaled (x *. 2.0) (e - 1) else if e < 0 then scaled (x *. 0.5) (e + 1) else x
+  if e > 0 then scaled (x * 2.0) (e - 1) else if e < 0 then scaled (x * 0.5) (e + 1) else x
 
 fun childrenOf (w : Wire) : #[Wire] = match w with | Node _ xs -> xs | _ -> V.toArray V.empty
 
@@ -201,5 +201,5 @@ use Std.Test (assertEq)
 -- A float comes in exactly, as an integer and a power of two, and goes out as
 -- `show` writes it -- which the compiler reads back exactly.
 @test fun aFloatCrossesExactlyEitherWay () =
-  let a = assertEq (fst (readWire "F-3e-1;" 0)) (Frac (0.0 -. 1.5)) "in" in
+  let a = assertEq (fst (readWire "F-3e-1;" 0)) (Frac (0.0 - 1.5)) "in" in
   assertEq (writeWire (Frac 1.5)) "F1.5;" "out"

@@ -197,12 +197,8 @@ def operatorPrims : [(String, String)] =
     ("*", "_primMul"),
     ("/", "_primDiv"),
     ("%", "_primMod"),
-    ("*.", "_primMulF"),
-    ("/.", "_primDivF"),
     ("+", "_primAdd"),
     ("-", "_primSub"),
-    ("+.", "_primAddF"),
-    ("-.", "_primSubF"),
     ("<<", "_primShl"),
     (">>", "_primShr"),
     (">>>", "_primUshr"),
@@ -211,11 +207,7 @@ def operatorPrims : [(String, String)] =
     ("<", "_primLt"),
     (">", "_primGt"),
     ("<=", "_primLe"),
-    (">=", "_primGe"),
-    ("<.", "_primLtF"),
-    (">.", "_primGtF"),
-    ("<=.", "_primLeF"),
-    (">=.", "_primGeF")
+    (">=", "_primGe")
   ]
 
 -- The value `name` means in the base alone: what an interpolated string

@@ -94,11 +94,11 @@ fun digits = P.takeWhile1P "a digit" Ch.isDigit
   let run = P.takeWhile1P "a hexadecimal digit" Ch.isHexDigit in
   run |> P.map (digitsIn 16) |> P.label "a hexadecimal integer"
 
-fun powTen n = if n <= 0 then 1.0 else 10.0 *. powTen (n - 1)
+fun powTen n = if n <= 0 then 1.0 else 10.0 * powTen (n - 1)
 
-fun scale x e = if e >= 0 then x *. powTen e else x /. powTen (0 - e)
+fun scale x e = if e >= 0 then x * powTen e else x / powTen (0 - e)
 
-fun fractionOf chunk = toFloat (digitsIn 10 chunk) /. powTen (P.chunkLength chunk)
+fun fractionOf chunk = toFloat (digitsIn 10 chunk) / powTen (P.chunkLength chunk)
 
 fun sign = P.option 1 (P.alt (P.mapTo 1 (C.char '+')) (P.mapTo (0 - 1) (C.char '-')))
 
@@ -109,7 +109,7 @@ fun exponent =
 
 fun floatOf whole frac e =
   let f = match frac with | Just ds -> fractionOf ds | None -> 0.0 in
-  scale (toFloat (digitsIn 10 whole) +. f) e
+  scale (toFloat (digitsIn 10 whole) + f) e
 
 -- An exponent is optional after a fraction, and required without one.
 fun exponentAfter frac =
@@ -137,7 +137,7 @@ fun signBy neg = P.alt (P.mapTo (\x -> x) (C.char '+')) (P.mapTo neg (C.char '-'
 
 -- `signed`, for a floating-point `p`.
 @pub fun signedFloat (sc : Parser s a) (p : Parser s f) : Parser s f =
-  signBy (\x -> 0.0 -. x) |> lexeme sc |> P.option (\x -> x) |> P.keep p
+  signBy (\x -> 0.0 - x) |> lexeme sc |> P.option (\x -> x) |> P.keep p
 
 -- --- characters --------------------------------------------------------------
 
@@ -345,7 +345,7 @@ fun ok p text = P.runParser (P.thenSkip p P.eof) text
   let a = assertEq (ok float "1.5") (Ok 1.5) "a fraction" in
   let b = assertEq (ok float "2e3") (Ok 2000.0) "an exponent" in
   let c = assertEq (ok float "2.5e-1") (Ok 0.25) "both" in
-  let d = assertEq (ok (signedFloat sc float) "-0.5") (Ok (0.0 -. 0.5)) "signed" in
+  let d = assertEq (ok (signedFloat sc float) "-0.5") (Ok (0.0 - 0.5)) "signed" in
   assertFalse (isOk (ok float "3")) "an integer is not a float"
 
 @test fun charLiteralsDecodeEscapes () =

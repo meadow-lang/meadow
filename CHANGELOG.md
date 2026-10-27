@@ -13,6 +13,16 @@ beyond the last release is under _Unreleased_.
 
 ## Unreleased
 
+### Breaking
+
+- The float operators `+.`, `-.`, `*.`, `/.`, `<.`, `>.`, `<=.` and `>=.`
+  are gone, and so is their trait, `Std.Ops.Floating`. `Float` and `Float32`
+  implement `Add`, `Sub`, `Mul` and `Div`, and were already `PartialOrd`, so
+  `x + y` and `x < y` are what float code writes now, at the same cost. Write
+  `+` for `+.`, `<` for `<.`, and so on. A program built without `Std` names
+  the float primitives (`_primAddF x y`), since there `+` is the integers'
+  primitive.
+
 ## 0.4.0 - 2026-10-24
 
 Meadow on phones: Silo builds a program, or a library an app loads, for
