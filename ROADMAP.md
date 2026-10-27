@@ -139,14 +139,14 @@ worth finding.
 
 ## Meadow in Idyll
 
-The plan is `docs/MEADOW-IN-IDYLL.md` (Chris, 2026-10-26). It waits on
-Idyll's low-level fragment (Idyll's `docs/LOW.md`), and on the extensions a
-runtime needs beyond it, which are asked of the Idyll session.
+The plan is `docs/MEADOW-IN-IDYLL.md`. It waits on Idyll's low-level
+fragment (Idyll's `docs/LOW.md`), and on the extensions a runtime needs
+beyond it, which Idyll's roadmap lists.
 
 | Task | State |
 | --- | --- |
 | Idyll's `Mem` effect, its solver and its extraction to C (Idyll's `LOW.md`, steps 1 to 5) | Planned, in Idyll's roadmap |
-| Idyll's extensions for a runtime: words and tagged values, blocks typed by their headers, offsets within an allocation, function pointers, C structs and globals, atomics, trusted primitives with specifications, static libraries with LTO, 128-bit arithmetic | Planned; to be asked of Idyll |
+| Idyll's extensions for a runtime: words and tagged values, blocks typed by their headers, offsets within an allocation, function pointers, C structs and globals, atomics, trusted primitives with specifications, static libraries with LTO, 128-bit arithmetic | Planned in Idyll's roadmap (Phase 7) |
 | MI-0: the runtime's design settles in Rust first (`docs/RUNTIME-SPEC.md`, R1 to R4) | In progress on `runtime-merge` |
 | MI-1: the object layout in Idyll, its invariants proved, the Rust and the LLVM back end reading a table generated from it | Planned |
 | MI-2: the allocator in Idyll, proved to hand out disjoint, live blocks | Planned |

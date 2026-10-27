@@ -1,10 +1,25 @@
 # Meadow in Idyll
 
-*A plan, not yet begun (Chris, 2026-10-26): "Eventually, I want meadow
-(including the runtime) written in Idyll so we can get maximum performance
-while also writing proofs for safety." It depends on work in Idyll's roadmap
-that is designed but not built (Idyll's `docs/LOW.md`), and it is ordered so
-that each step ships on its own.*
+*A plan, not yet begun. It depends on work in Idyll's roadmap that is
+designed but not built (Idyll's `docs/LOW.md`), and it is ordered so that
+each step ships on its own.*
+
+## Why
+
+Meadow's runtime is where its speed and its worst bugs both live. It is
+Rust, and much of it has to be `unsafe`: headers read at offsets, blocks
+moved under live pointers, counts that must never drop to zero early. Tests
+and differential runs catch many mistakes there. They cannot show that none
+are left.
+
+Idyll can give it both. Its low-level fragment, the `Mem`
+effect extracted to C, writes code as close to the machine as the runtime's
+Rust and as fast. Its proofs state what that code must keep true, such as
+"this is a live block of this layout" or "nothing reachable was freed",
+and check it before the code runs. Written in Idyll, the runtime can be at
+least as fast as today, faster where a proof removes a check, and known
+safe where today it is only tested. The compiler follows for the same
+reason, and so that Meadow is written in one language with one toolchain.
 
 ## What it means
 
@@ -103,8 +118,8 @@ ask of Idyll, in the order the plan below needs them:
    `num-bigint`. They become Idyll code, with the big-integer operations
    proved against their mathematical specification.
 
-The asks go to the Idyll session, which decides how they are designed;
-`ROADMAP.md`'s *Meadow in Idyll* section keeps track of which have landed.
+How each is designed is Idyll's to decide; Idyll's roadmap lists them under
+Phase 7, and `ROADMAP.md`'s *Meadow in Idyll* section keeps track of which have landed.
 
 ## The strangler: replacing the runtime a module at a time
 
@@ -185,8 +200,7 @@ What is trusted, and listed in one place:
 
 ## Performance
 
-"Maximum performance" means at least today's, and better where the proofs
-let it be.
+The aim is speed at least today's, and better where the proofs let it be.
 
 - **No check the proofs make unnecessary.** A bounds check is proved, not
   run; a header read is an offset, as now.
