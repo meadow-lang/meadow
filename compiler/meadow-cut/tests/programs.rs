@@ -15,7 +15,70 @@ fn runs(text: &str) -> Outcome {
     assert_eq!(p, again, "printed and read back:\n{printed}");
     let out = run(&p, &Options::default()).unwrap_or_else(|(e, out)| panic!("{e}\n{out:?}"));
     lowered_agrees(&p, &out);
+    inlined_agrees(&p, &out);
     out
+}
+
+/// `p` with its small definitions inlined (`meadow_cut::inline`) does what
+/// `p` does, run by the interpreter and lowered.
+#[track_caller]
+fn inlined_agrees(p: &meadow_cut::Program, out: &Outcome) {
+    let inlined = meadow_cut::inline::program(p);
+    let shown = print::program(&inlined);
+    let again = parse(&shown).unwrap_or_else(|e| panic!("inlined, read back: {e}\n{shown}"));
+    match run(&again, &Options::default()) {
+        Ok(o) => {
+            assert_eq!(o.output, out.output, "inlined:\n{shown}");
+            assert_eq!(o.errors, out.errors, "inlined:\n{shown}");
+            assert_eq!(o.status, out.status, "inlined:\n{shown}");
+        }
+        Err((e, _)) => panic!("inlined, it fails: {e}\n{shown}"),
+    }
+    lowered_agrees(&again, out);
+}
+
+/// A small definition is inlined where it is called, and what that leaves
+/// known -- a pair taken apart where it is made, an object called where it
+/// is made, a branch on a literal -- is taken: nothing is called, built or
+/// tested but the sum.
+#[test]
+fn a_small_definition_is_inlined_and_what_it_leaves_known_is_taken() {
+    let text = format!(
+        "cut 0\nentry t:Main/main\nanswer str\n{CONSOLE}\n\
+         data t:Main/Pair {{ P(i64, i64) }}\n\n\
+         def t:Main/pair (a: i64, b: i64; k: ptr) =\n  <t:Main/Pair.P(a, b) | k>\n\n\
+         def t:Main/first (p: ptr; k: ptr) =\n  <p | case {{ t:Main/Pair.P(x: i64, y: i64) => <x | k> }}>\n\n\
+         def t:Main/twice (f: ptr, x: i64; k: ptr) =\n  \
+         <f | apply(x; μ̃ y: i64. <f | apply(y; k)>)>\n\n\
+         def t:Main/main (; k: ptr) =\n  \
+         t:Main/pair(20, 1; μ̃ p: ptr.\n    \
+         t:Main/first(p; μ̃ a: i64.\n      \
+         prim if(true; μ̃ u: unit. <\"no\" | k>, μ̃ u: unit.\n        \
+         t:Main/twice(cocase {{ apply(n: i64; j: ptr) => prim add(n, a; j) }}, 2; μ̃ r: i64.\n          \
+         prim eq(r, 42; μ̃ w: unit. <\"wrong\" | k>, μ̃ w: unit. <\"42\" | k>)))))\n"
+    );
+    let out = runs(&text);
+    assert_eq!(out.output, "42");
+    let p = parse(&text).unwrap();
+    let inlined = meadow_cut::inline::program(&p);
+    let main = inlined
+        .defs
+        .iter()
+        .find(|d| d.symbol.last() == "main")
+        .unwrap();
+    let shown = print::program(&meadow_cut::Program {
+        defs: vec![main.clone()],
+        ..inlined.clone()
+    });
+    for gone in [
+        "t:Main/pair(",
+        "t:Main/first(",
+        "t:Main/twice(",
+        "| case",
+        "prim if",
+    ] {
+        assert!(!shown.contains(gone), "`{gone}` is left:\n{shown}");
+    }
 }
 
 /// Where `p` is one the lowering to AxCut takes and its answer is a string,

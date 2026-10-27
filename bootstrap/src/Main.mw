@@ -300,6 +300,12 @@ cli! {
             "What a Silo build compiles for: `aarch64` or `x86_64`, or a target triple such as `aarch64-linux-android`"
             value
             "TARGET"
+        emit
+          : Option
+            String
+            "Print what the program is made into, and run nothing: `inlined`, the Cut it is lowered from once its small definitions are inlined; `axcut`, the AxCut it is lowered to; or `llvm`, the LLVM IR a Silo build compiles"
+            value
+            "WHAT"
       }
     | clean
       "Remove what a build wrote: the package's `target` directory, with the images, executables and incremental cache in it"
