@@ -1216,7 +1216,7 @@ The runtime rewritten in Idyll's low-level fragment: C's memory model as the
 `Mem` effect (Idyll's `docs/LOW.md`), compiled to C, and proved memory-safe
 and then sound. It goes a module at a time, behind the C interface the Rust
 runtime already has. The plan, with the compiler's half and the order, is
-`docs/MEADOW-IN-IDYLL.md` on master (Chris, 2026-10-26). It waits on Idyll's
+`docs/MEADOW-IN-IDYLL.md` on master. It waits on Idyll's
 `Mem`, its solver and its extraction, and it begins once R1 to R4 have
 settled the design here (MI-0).
 
