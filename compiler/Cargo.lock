@@ -427,6 +427,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "meadow-lir"
+version = "0.3.0"
+
+[[package]]
 name = "meadow-llvm"
 version = "0.3.0"
 dependencies = [
@@ -435,6 +439,7 @@ dependencies = [
  "meadow-core",
  "meadow-hir",
  "meadow-intern",
+ "meadow-lir",
  "meadow-rt",
  "meadow-seq",
 ]

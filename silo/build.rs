@@ -1,6 +1,6 @@
 //! The fingerprint of the sources that decide the ABI between the code
 //! `meadow-llvm` emits and this runtime, as `MEADOW_SILO_FINGERPRINT`: that
-//! crate's, and this one's. The library exports a symbol named after it, and
+//! crate's, the LIR's it prints, and this one's. The library exports a symbol named after it, and
 //! the emitted module refers to that symbol, so a program links only with a
 //! runtime built from the sources its compiler was.
 //!
@@ -13,7 +13,11 @@ include!("../glade/fingerprint.rs");
 
 fn main() {
     let here = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let roots = [here.join("../compiler/meadow-llvm/src"), here.join("src")];
+    let roots = [
+        here.join("../compiler/meadow-llvm/src"),
+        here.join("../compiler/meadow-lir/src"),
+        here.join("src"),
+    ];
     println!(
         "cargo:rustc-env=MEADOW_SILO_FINGERPRINT={}",
         fingerprint(&roots)

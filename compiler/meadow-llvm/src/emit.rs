@@ -22,6 +22,7 @@
 use crate::linear::{L, LBlock, SwitchArm};
 use meadow_axcut::config::{Config, Memory, Stack};
 use meadow_axcut::{Extern, Name, Program, Rep, VarId};
+use meadow_lir::{BinOp, Cast, FCmp, Func, ICmp, Inst, Ty};
 use meadow_rt::desc;
 use meadow_rt::layout::{Field, Layout};
 use meadow_rt::{Lit, Prim};
@@ -74,12 +75,24 @@ fn read_field(f: &mut Fun, w: &str, field: Field) -> String {
     let mut x = w.to_string();
     if field.shift > 0 {
         let s = f.t();
-        f.i(format!("{s} = lshr i64 {x}, {}", field.shift));
+        f.push(Inst::Bin {
+            dst: s.to_string(),
+            op: BinOp::LShr,
+            ty: Ty::I64,
+            a: x.to_string(),
+            b: (field.shift).to_string(),
+        });
         x = s;
     }
     if !field.tops() {
         let m = f.t();
-        f.i(format!("{m} = and i64 {x}, {}", field.mask()));
+        f.push(Inst::Bin {
+            dst: m.to_string(),
+            op: BinOp::And,
+            ty: Ty::I64,
+            a: x.to_string(),
+            b: (field.mask()).to_string(),
+        });
         x = m;
     }
     x
@@ -454,12 +467,24 @@ impl<'p> Module<'p> {
     }
 
     /// The arguments of a call, the context first where there is one.
-    fn arg_list(&self, ops: &[String]) -> String {
-        let ctx = self.threaded.then(|| format!("i64 {CTX}"));
+    fn arg_list(&self, ops: &[String]) -> Vec<(Ty, String)> {
+        let ctx = self.threaded.then(|| (Ty::I64, CTX.to_string()));
         ctx.into_iter()
-            .chain(ops.iter().take(self.regs()).map(|o| format!("i64 {o}")))
-            .collect::<Vec<_>>()
-            .join(", ")
+            .chain(ops.iter().take(self.regs()).map(|o| (Ty::I64, o.clone())))
+            .collect()
+    }
+
+    /// A call in the convention of the functions the module defines, of
+    /// `callee` with `ops` (see [`Module::arg_list`]), answering into `r`.
+    fn call_cc(&self, f: &mut Fun, r: &str, tail: bool, callee: &str, ops: &[String]) {
+        f.push(Inst::Call {
+            dst: Some(r.to_string()),
+            tail,
+            cc: Some(self.cc.to_string()),
+            ret: Ty::I64,
+            callee: callee.to_string(),
+            args: self.arg_list(ops),
+        });
     }
 
     /// What does not fit in registers, stored in the spill area: see
@@ -481,31 +506,78 @@ impl<'p> Module<'p> {
         // The stack pointer itself: under `ghccc` the frame pointer's
         // register carries an argument, so `llvm.frameaddress` is not it.
         let sp = f.t();
-        f.i(format!("{sp} = call ptr @llvm.stacksave()"));
+        f.push(Inst::Call {
+            dst: Some(sp.to_string()),
+            tail: false,
+            cc: None,
+            ret: Ty::Ptr,
+            callee: "@llvm.stacksave".to_string(),
+            args: vec![],
+        });
         let at = f.t();
-        f.i(format!("{at} = ptrtoint ptr {sp} to i64"));
+        f.push(Inst::Cast {
+            dst: at.to_string(),
+            op: Cast::PtrToInt,
+            from: Ty::Ptr,
+            v: sp.to_string(),
+            to: Ty::I64,
+        });
         let slot = if self.threaded {
             let c = f.ptr(CTX);
             let s = f.t();
-            f.i(format!("{s} = getelementptr i64, ptr {c}, i64 2"));
+            f.push(Inst::Gep {
+                dst: s.to_string(),
+                elem: Ty::I64,
+                base: c.to_string(),
+                index: "2".to_string(),
+            });
             s
         } else {
             "@meadow_stack_limit_single".to_string()
         };
         let limit = f.t();
-        f.i(format!("{limit} = load i64, ptr {slot}"));
+        f.push(Inst::Load {
+            dst: limit.to_string(),
+            ty: Ty::I64,
+            ptr: slot.to_string(),
+            volatile: false,
+        });
         let low = f.t();
-        f.i(format!("{low} = icmp ult i64 {at}, {limit}"));
-        f.i(format!("br i1 {low}, label %{grow}, label %{on}, !prof !1"));
+        f.push(Inst::ICmp {
+            dst: low.to_string(),
+            cond: ICmp::Ult,
+            ty: Ty::I64,
+            a: at.to_string(),
+            b: limit.to_string(),
+        });
+        f.push(Inst::CondBr {
+            cond: low.to_string(),
+            yes: grow.to_string(),
+            no: on.to_string(),
+            unlikely: true,
+        });
         f.label(&grow);
         let ctx = usize::from(self.threaded);
         let words = ctx + f.params.len();
         let buf = f.t();
-        f.alloca(format!("{buf} = alloca [{} x i64]", words.max(1)));
+        f.push_alloca(Inst::Alloca {
+            dst: buf.to_string(),
+            words: words.max(1),
+        });
         let store = |f: &mut Fun, i: usize, v: &str| {
             let q = f.t();
-            f.i(format!("{q} = getelementptr i64, ptr {buf}, i64 {i}"));
-            f.i(format!("store i64 {v}, ptr {q}"));
+            f.push(Inst::Gep {
+                dst: q.to_string(),
+                elem: Ty::I64,
+                base: buf.to_string(),
+                index: i.to_string(),
+            });
+            f.push(Inst::Store {
+                ty: Ty::I64,
+                v: v.to_string(),
+                ptr: q.to_string(),
+                volatile: false,
+            });
         };
         if self.threaded {
             store(f, 0, CTX);
@@ -515,17 +587,35 @@ impl<'p> Module<'p> {
         }
         let tramp = format!("@grow.{}", &f.name[1..]);
         let r = f.t();
-        f.i(format!(
-            "{r} = call i64 @meadow_stack_grow(ptr {tramp}, ptr {buf})"
-        ));
-        f.i(format!("ret i64 {r}"));
+        f.push(Inst::Call {
+            dst: Some(r.to_string()),
+            tail: false,
+            cc: None,
+            ret: Ty::I64,
+            callee: "@meadow_stack_grow".to_string(),
+            args: vec![(Ty::Ptr, tramp.to_string()), (Ty::Ptr, buf.to_string())],
+        });
+        f.push(Inst::Ret {
+            ty: Ty::I64,
+            v: Some(r.to_string()),
+        });
         f.label(&on);
         // The trampoline: the arguments back out of the buffer, and the call.
         let mut t = Fun::new(tramp.clone(), Vec::new());
         let load = |t: &mut Fun, i: usize, into: &str| {
             let q = t.t();
-            t.i(format!("{q} = getelementptr i64, ptr %args, i64 {i}"));
-            t.i(format!("{into} = load i64, ptr {q}"));
+            t.push(Inst::Gep {
+                dst: q.to_string(),
+                elem: Ty::I64,
+                base: "%args".to_string(),
+                index: i.to_string(),
+            });
+            t.push(Inst::Load {
+                dst: into.to_string(),
+                ty: Ty::I64,
+                ptr: q.to_string(),
+                volatile: false,
+            });
         };
         if self.threaded {
             load(&mut t, 0, CTX);
@@ -537,17 +627,25 @@ impl<'p> Module<'p> {
         self.spill(&mut t, &args);
         self.spill_words = self.spill_words.max(t.spill);
         let r = t.t();
-        t.i(format!(
-            "{r} = call {} i64 {}({})",
-            self.cc,
-            f.name,
-            self.arg_list(&args)
-        ));
-        t.i(format!("ret i64 {r}"));
-        self.trampoline = Some(format!(
-            "define internal i64 {tramp}(ptr %args) noinline {{\nentry:\n{}{}}}\n\n",
-            t.allocas, t.body
-        ));
+        self.call_cc(&mut t, &r, false, &f.name, &args);
+        t.push(Inst::Ret {
+            ty: Ty::I64,
+            v: Some(r.to_string()),
+        });
+        self.trampoline = Some(
+            Func {
+                name: tramp,
+                linkage: "internal".into(),
+                cc: None,
+                ret: Some(Ty::I64),
+                params: vec![(Ty::Ptr, "%args".into())],
+                attrs: "noinline".into(),
+                entry: Vec::new(),
+                allocas: t.allocas,
+                body: t.body,
+            }
+            .to_string(),
+        );
     }
 
     /// The runtime's entry a block is allocated through: counting's own, as it
@@ -567,13 +665,36 @@ impl<'p> Module<'p> {
         }
         let (give, on) = (f.b(), f.b());
         let flag = f.t();
-        f.i(format!("{flag} = load volatile i8, ptr @meadow_preempt"));
+        f.push(Inst::Load {
+            dst: flag.to_string(),
+            ty: Ty::I8,
+            ptr: "@meadow_preempt".to_string(),
+            volatile: true,
+        });
         let c = f.t();
-        f.i(format!("{c} = icmp ne i8 {flag}, 0"));
-        f.i(format!("br i1 {c}, label %{give}, label %{on}"));
+        f.push(Inst::ICmp {
+            dst: c.to_string(),
+            cond: ICmp::Ne,
+            ty: Ty::I8,
+            a: flag.to_string(),
+            b: "0".to_string(),
+        });
+        f.push(Inst::CondBr {
+            cond: c.to_string(),
+            yes: give.to_string(),
+            no: on.to_string(),
+            unlikely: false,
+        });
         f.label(&give);
-        f.i("call void @meadow_preempted()".to_string());
-        f.i(format!("br label %{on}"));
+        f.push(Inst::Call {
+            dst: None,
+            tail: false,
+            cc: None,
+            ret: Ty::Void,
+            callee: "@meadow_preempted".to_string(),
+            args: vec![],
+        });
+        f.push(Inst::Br(on.to_string()));
         f.label(&on);
     }
 
@@ -593,11 +714,27 @@ impl<'p> Module<'p> {
         }
         let (run, on) = (f.b(), f.b());
         let flag = f.t();
-        f.i(format!("{flag} = load volatile i8, ptr @meadow_gc_due"));
+        f.push(Inst::Load {
+            dst: flag.to_string(),
+            ty: Ty::I8,
+            ptr: "@meadow_gc_due".to_string(),
+            volatile: true,
+        });
         let c = f.t();
-        f.i(format!("{c} = icmp ne i8 {flag}, 0"));
+        f.push(Inst::ICmp {
+            dst: c.to_string(),
+            cond: ICmp::Ne,
+            ty: Ty::I8,
+            a: flag.to_string(),
+            b: "0".to_string(),
+        });
         let from = f.cur.clone();
-        f.i(format!("br i1 {c}, label %{run}, label %{on}, !prof !1"));
+        f.push(Inst::CondBr {
+            cond: c.to_string(),
+            yes: run.to_string(),
+            no: on.to_string(),
+            unlikely: true,
+        });
         f.label(&run);
         let mut which = Vec::new();
         let refs: Vec<(String, String)> = held
@@ -615,21 +752,44 @@ impl<'p> Module<'p> {
             .collect();
         let words = 2 + 2 * refs.len();
         let rec = f.t();
-        f.alloca(format!("{rec} = alloca [{words} x i64]"));
+        f.push_alloca(Inst::Alloca {
+            dst: rec.to_string(),
+            words: words,
+        });
         let slot = if self.threaded {
             let c = f.ptr(CTX);
             let s = f.t();
-            f.i(format!("{s} = getelementptr i64, ptr {c}, i64 1"));
+            f.push(Inst::Gep {
+                dst: s.to_string(),
+                elem: Ty::I64,
+                base: c.to_string(),
+                index: "1".to_string(),
+            });
             s
         } else {
             "@meadow_shadow_single".to_string()
         };
         let prev = f.t();
-        f.i(format!("{prev} = load i64, ptr {slot}"));
+        f.push(Inst::Load {
+            dst: prev.to_string(),
+            ty: Ty::I64,
+            ptr: slot.to_string(),
+            volatile: false,
+        });
         let store = |f: &mut Fun, i: usize, v: &str| {
             let q = f.t();
-            f.i(format!("{q} = getelementptr i64, ptr {rec}, i64 {i}"));
-            f.i(format!("store i64 {v}, ptr {q}"));
+            f.push(Inst::Gep {
+                dst: q.to_string(),
+                elem: Ty::I64,
+                base: rec.to_string(),
+                index: i.to_string(),
+            });
+            f.push(Inst::Store {
+                ty: Ty::I64,
+                v: v.to_string(),
+                ptr: q.to_string(),
+                volatile: false,
+            });
         };
         store(f, 0, &prev);
         store(f, 1, &refs.len().to_string());
@@ -638,32 +798,66 @@ impl<'p> Module<'p> {
             store(f, 3 + 2 * i, d);
         }
         let at = f.t();
-        f.i(format!("{at} = ptrtoint ptr {rec} to i64"));
-        f.i(format!("store i64 {at}, ptr {slot}"));
-        f.i(format!("call void @meadow_gc_poll(i64 {})", self.cx()));
-        f.i(format!("store i64 {prev}, ptr {slot}"));
+        f.push(Inst::Cast {
+            dst: at.to_string(),
+            op: Cast::PtrToInt,
+            from: Ty::Ptr,
+            v: rec.to_string(),
+            to: Ty::I64,
+        });
+        f.push(Inst::Store {
+            ty: Ty::I64,
+            v: at.to_string(),
+            ptr: slot.to_string(),
+            volatile: false,
+        });
+        f.push(Inst::Call {
+            dst: None,
+            tail: false,
+            cc: None,
+            ret: Ty::Void,
+            callee: "@meadow_gc_poll".to_string(),
+            args: vec![(Ty::I64, (self.cx()).to_string())],
+        });
+        f.push(Inst::Store {
+            ty: Ty::I64,
+            v: prev.to_string(),
+            ptr: slot.to_string(),
+            volatile: false,
+        });
         // Where the collection left what the record held, if it moved it.
         let mut reloaded = Vec::new();
         if self.moving {
             for k in 0..which.len() {
                 let (q, x) = (f.t(), f.t());
-                f.i(format!(
-                    "{q} = getelementptr i64, ptr {rec}, i64 {}",
-                    2 + 2 * k
-                ));
-                f.i(format!("{x} = load i64, ptr {q}"));
+                f.push(Inst::Gep {
+                    dst: q.to_string(),
+                    elem: Ty::I64,
+                    base: rec.to_string(),
+                    index: (2 + 2 * k).to_string(),
+                });
+                f.push(Inst::Load {
+                    dst: x.to_string(),
+                    ty: Ty::I64,
+                    ptr: q.to_string(),
+                    volatile: false,
+                });
                 reloaded.push(x);
             }
         }
         let polled = f.cur.clone();
-        f.i(format!("br label %{on}"));
+        f.push(Inst::Br(on.to_string()));
         f.label(&on);
         for (k, i) in which.into_iter().enumerate().filter(|_| self.moving) {
             let x = f.t();
-            f.i(format!(
-                "{x} = phi i64 [ {}, %{from} ], [ {}, %{polled} ]",
-                now[i], reloaded[k]
-            ));
+            f.push(Inst::Phi {
+                dst: x.to_string(),
+                ty: Ty::I64,
+                incoming: vec![
+                    ((now[i]).to_string(), from.to_string()),
+                    ((reloaded[k]).to_string(), polled.to_string()),
+                ],
+            });
             now[i] = x;
         }
         now
@@ -690,9 +884,18 @@ impl<'p> Module<'p> {
             D::Known(_) => return,
             D::Dyn(d) => d.clone(),
         };
-        f.i(format!(
-            "call void @meadow_remember(i64 {into}, i64 {v}, i64 {d})"
-        ));
+        f.push(Inst::Call {
+            dst: None,
+            tail: false,
+            cc: None,
+            ret: Ty::Void,
+            callee: "@meadow_remember".to_string(),
+            args: vec![
+                (Ty::I64, into.to_string()),
+                (Ty::I64, v.to_string()),
+                (Ty::I64, d.to_string()),
+            ],
+        });
     }
 
     /// A definition: its function.
@@ -876,10 +1079,12 @@ impl<'p> Module<'p> {
         ops.extend(args);
         let callee = self.frame_fn(fr);
         self.spill(f, &ops);
-        let list = self.arg_list(&ops);
         let r = f.t();
-        f.i(format!("{r} = tail call {} i64 {callee}({list})", self.cc));
-        f.i(format!("ret i64 {r}"));
+        self.call_cc(f, &r, true, &callee, &ops);
+        f.push(Inst::Ret {
+            ty: Ty::I64,
+            v: Some(r.to_string()),
+        });
         Ok(())
     }
 
@@ -898,15 +1103,23 @@ impl<'p> Module<'p> {
             .spill_words
             .max(f.spill)
             .max(f.params.len().saturating_sub(regs));
-        let mut text = format!(
-            "define {linkage} {} i64 {}({}) noinline {{\nentry:\n{}{}{}}}\n\n",
-            self.cc,
-            f.name,
-            self.arg_list(&f.params),
-            spilled_params(&f.params, regs, self.threaded),
-            f.allocas,
-            f.body
-        );
+        let ctx = self.threaded.then(|| (Ty::I64, CTX.to_string()));
+        let params = ctx
+            .into_iter()
+            .chain(f.params.iter().take(regs).map(|p| (Ty::I64, p.clone())))
+            .collect();
+        let mut text = Func {
+            name: f.name.clone(),
+            linkage: linkage.into(),
+            cc: Some(self.cc.into()),
+            ret: Some(Ty::I64),
+            params,
+            attrs: "noinline".into(),
+            entry: spilled_params(&f.params, regs, self.threaded),
+            allocas: f.allocas,
+            body: f.body,
+        }
+        .to_string();
         // In the same text, so in the same unit: it is internal to it.
         if let Some(t) = self.trampoline.take() {
             text.push_str(&t);
@@ -1025,12 +1238,31 @@ impl<'p> Module<'p> {
         let c = count_ty(&self.layout);
         match d {
             D::Known(k) if *k == desc::REF => {
-                f.i(format!("call void @mw.share(i64 {v}, {c} {times})"));
+                f.push(Inst::Call {
+                    dst: None,
+                    tail: false,
+                    cc: None,
+                    ret: Ty::Void,
+                    callee: "@mw.share".to_string(),
+                    args: vec![
+                        (Ty::I64, v.to_string()),
+                        (Ty::named(&c).expect("a type"), times.to_string()),
+                    ],
+                });
             }
             D::Known(_) => {}
-            D::Dyn(r) => f.i(format!(
-                "call void @mw.share_d(i64 {v}, i64 {r}, {c} {times})"
-            )),
+            D::Dyn(r) => f.push(Inst::Call {
+                dst: None,
+                tail: false,
+                cc: None,
+                ret: Ty::Void,
+                callee: "@mw.share_d".to_string(),
+                args: vec![
+                    (Ty::I64, v.to_string()),
+                    (Ty::I64, r.to_string()),
+                    (Ty::named(&c).expect("a type"), times.to_string()),
+                ],
+            }),
         }
     }
 
@@ -1040,14 +1272,27 @@ impl<'p> Module<'p> {
             return;
         }
         match d {
-            D::Known(k) if *k == desc::REF => {
-                f.i(format!("call void @mw.erase(i64 {}, i64 {v})", self.cx()))
-            }
+            D::Known(k) if *k == desc::REF => f.push(Inst::Call {
+                dst: None,
+                tail: false,
+                cc: None,
+                ret: Ty::Void,
+                callee: "@mw.erase".to_string(),
+                args: vec![(Ty::I64, (self.cx()).to_string()), (Ty::I64, v.to_string())],
+            }),
             D::Known(_) => {}
-            D::Dyn(r) => f.i(format!(
-                "call void @mw.erase_d(i64 {}, i64 {v}, i64 {r})",
-                self.cx()
-            )),
+            D::Dyn(r) => f.push(Inst::Call {
+                dst: None,
+                tail: false,
+                cc: None,
+                ret: Ty::Void,
+                callee: "@mw.erase_d".to_string(),
+                args: vec![
+                    (Ty::I64, (self.cx()).to_string()),
+                    (Ty::I64, v.to_string()),
+                    (Ty::I64, r.to_string()),
+                ],
+            }),
         }
     }
 
@@ -1069,12 +1314,19 @@ impl<'p> Module<'p> {
         (0..n)
             .map(|i| {
                 let q = f.t();
-                f.i(format!(
-                    "{q} = getelementptr i64, ptr {p}, i64 {}",
-                    first + i
-                ));
+                f.push(Inst::Gep {
+                    dst: q.to_string(),
+                    elem: Ty::I64,
+                    base: p.to_string(),
+                    index: (first + i).to_string(),
+                });
                 let x = f.t();
-                f.i(format!("{x} = load i64, ptr {q}"));
+                f.push(Inst::Load {
+                    dst: x.to_string(),
+                    ty: Ty::I64,
+                    ptr: q.to_string(),
+                    volatile: false,
+                });
                 x
             })
             .collect()
@@ -1105,27 +1357,58 @@ impl<'p> Module<'p> {
         let c = count_ty(&self.layout);
         let p = f.ptr(v);
         let rc = f.t();
-        f.i(format!("{rc} = load {c}, ptr {p}"));
+        f.push(Inst::Load {
+            dst: rc.to_string(),
+            ty: Ty::named(&c).expect("a type"),
+            ptr: p.to_string(),
+            volatile: false,
+        });
         let (clean, shared, done) = (f.b(), f.b(), f.b());
         let last = f.t();
-        f.i(format!("{last} = icmp eq {c} {rc}, 0"));
-        f.i(format!("br i1 {last}, label %{clean}, label %{shared}"));
+        f.push(Inst::ICmp {
+            dst: last.to_string(),
+            cond: ICmp::Eq,
+            ty: Ty::named(&c).expect("a type"),
+            a: rc.to_string(),
+            b: "0".to_string(),
+        });
+        f.push(Inst::CondBr {
+            cond: last.to_string(),
+            yes: clean.to_string(),
+            no: shared.to_string(),
+            unlikely: false,
+        });
         f.label(&clean);
-        f.i(format!(
-            "call void @meadow_clean(i64 {}, i64 {v})",
-            self.cx()
-        ));
-        f.i(format!("br label %{done}"));
+        f.push(Inst::Call {
+            dst: None,
+            tail: false,
+            cc: None,
+            ret: Ty::Void,
+            callee: "@meadow_clean".to_string(),
+            args: vec![(Ty::I64, (self.cx()).to_string()), (Ty::I64, v.to_string())],
+        });
+        f.push(Inst::Br(done.to_string()));
         f.label(&shared);
         let rc2 = f.t();
-        f.i(format!("{rc2} = sub {c} {rc}, 1"));
-        f.i(format!("store {c} {rc2}, ptr {p}"));
+        f.push(Inst::Bin {
+            dst: rc2.to_string(),
+            op: BinOp::Sub,
+            ty: Ty::named(&c).expect("a type"),
+            a: rc.to_string(),
+            b: "1".to_string(),
+        });
+        f.push(Inst::Store {
+            ty: Ty::named(&c).expect("a type"),
+            v: rc2.to_string(),
+            ptr: p.to_string(),
+            volatile: false,
+        });
         for (n, x) in names.iter().zip(loaded) {
             let d = self.desc(*n, env);
             self.share(f, x, &d, 1);
         }
         self.region_released(f, v, &rc);
-        f.i(format!("br label %{done}"));
+        f.push(Inst::Br(done.to_string()));
         f.label(&done);
         Ok(())
     }
@@ -1144,15 +1427,29 @@ impl<'p> Module<'p> {
         }
         let inreg = f.t();
         let (gone, on) = (f.b(), f.b());
-        f.i(format!(
-            "{inreg} = icmp ugt {} {rc}, {}",
-            count_ty(&self.layout),
-            self.layout.region_floor
-        ));
-        f.i(format!("br i1 {inreg}, label %{gone}, label %{on}"));
+        f.push(Inst::ICmp {
+            dst: inreg.to_string(),
+            cond: ICmp::Ugt,
+            ty: Ty::named(&(count_ty(&self.layout))).expect("a type"),
+            a: rc.to_string(),
+            b: (self.layout.region_floor).to_string(),
+        });
+        f.push(Inst::CondBr {
+            cond: inreg.to_string(),
+            yes: gone.to_string(),
+            no: on.to_string(),
+            unlikely: false,
+        });
         f.label(&gone);
-        f.i(format!("call void @meadow_region_erased(i64 {v})"));
-        f.i(format!("br label %{on}"));
+        f.push(Inst::Call {
+            dst: None,
+            tail: false,
+            cc: None,
+            ret: Ty::Void,
+            callee: "@meadow_region_erased".to_string(),
+            args: vec![(Ty::I64, v.to_string())],
+        });
+        f.push(Inst::Br(on.to_string()));
         f.label(&on);
     }
 
@@ -1177,30 +1474,62 @@ impl<'p> Module<'p> {
         let c = count_ty(&self.layout);
         let p = f.ptr(v);
         let rc = f.t();
-        f.i(format!("{rc} = load {c}, ptr {p}"));
+        f.push(Inst::Load {
+            dst: rc.to_string(),
+            ty: Ty::named(&c).expect("a type"),
+            ptr: p.to_string(),
+            volatile: false,
+        });
         let (mine, shared, shared_end, done) = (f.b(), f.b(), f.b(), f.b());
         let last = f.t();
-        f.i(format!("{last} = icmp eq {c} {rc}, 0"));
-        f.i(format!("br i1 {last}, label %{mine}, label %{shared}"));
+        f.push(Inst::ICmp {
+            dst: last.to_string(),
+            cond: ICmp::Eq,
+            ty: Ty::named(&c).expect("a type"),
+            a: rc.to_string(),
+            b: "0".to_string(),
+        });
+        f.push(Inst::CondBr {
+            cond: last.to_string(),
+            yes: mine.to_string(),
+            no: shared.to_string(),
+            unlikely: false,
+        });
         f.label(&mine);
-        f.i(format!("br label %{done}"));
+        f.push(Inst::Br(done.to_string()));
         f.label(&shared);
         let rc2 = f.t();
-        f.i(format!("{rc2} = sub {c} {rc}, 1"));
-        f.i(format!("store {c} {rc2}, ptr {p}"));
+        f.push(Inst::Bin {
+            dst: rc2.to_string(),
+            op: BinOp::Sub,
+            ty: Ty::named(&c).expect("a type"),
+            a: rc.to_string(),
+            b: "1".to_string(),
+        });
+        f.push(Inst::Store {
+            ty: Ty::named(&c).expect("a type"),
+            v: rc2.to_string(),
+            ptr: p.to_string(),
+            volatile: false,
+        });
         for (n, x) in names.iter().zip(loaded) {
             let d = self.desc(*n, env);
             self.share(f, x, &d, 1);
         }
         self.region_released(f, v, &rc);
-        f.i(format!("br label %{shared_end}"));
+        f.push(Inst::Br(shared_end.to_string()));
         f.label(&shared_end);
-        f.i(format!("br label %{done}"));
+        f.push(Inst::Br(done.to_string()));
         f.label(&done);
         let token = f.t();
-        f.i(format!(
-            "{token} = phi i64 [ {v}, %{mine} ], [ 0, %{shared_end} ]"
-        ));
+        f.push(Inst::Phi {
+            dst: token.to_string(),
+            ty: Ty::I64,
+            incoming: vec![
+                (v.to_string(), mine.to_string()),
+                ("0".to_string(), shared_end.to_string()),
+            ],
+        });
         f.origins.insert(
             token.clone(),
             Origin {
@@ -1229,11 +1558,27 @@ impl<'p> Module<'p> {
         let c = count_ty(&self.layout);
         let p = f.ptr(v);
         let rc = f.t();
-        f.i(format!("{rc} = load {c}, ptr {p}"));
+        f.push(Inst::Load {
+            dst: rc.to_string(),
+            ty: Ty::named(&c).expect("a type"),
+            ptr: p.to_string(),
+            volatile: false,
+        });
         let (mine, shared, done) = (f.b(), f.b(), f.b());
         let last = f.t();
-        f.i(format!("{last} = icmp eq {c} {rc}, 0"));
-        f.i(format!("br i1 {last}, label %{mine}, label %{shared}"));
+        f.push(Inst::ICmp {
+            dst: last.to_string(),
+            cond: ICmp::Eq,
+            ty: Ty::named(&c).expect("a type"),
+            a: rc.to_string(),
+            b: "0".to_string(),
+        });
+        f.push(Inst::CondBr {
+            cond: last.to_string(),
+            yes: mine.to_string(),
+            no: shared.to_string(),
+            unlikely: false,
+        });
         f.label(&mine);
         let loaded = self.load_fields(f, v, names.len());
         for (n, x) in names.iter().zip(&loaded) {
@@ -1241,20 +1586,25 @@ impl<'p> Module<'p> {
             self.erase(f, x, &d);
         }
         let mine_end = f.b();
-        f.i(format!("br label %{mine_end}"));
+        f.push(Inst::Br(mine_end.to_string()));
         f.label(&mine_end);
-        f.i(format!("br label %{done}"));
+        f.push(Inst::Br(done.to_string()));
         f.label(&shared);
         self.erase(f, v, &D::Known(desc::REF));
         let shared_end = f.b();
-        f.i(format!("br label %{shared_end}"));
+        f.push(Inst::Br(shared_end.to_string()));
         f.label(&shared_end);
-        f.i(format!("br label %{done}"));
+        f.push(Inst::Br(done.to_string()));
         f.label(&done);
         let token = f.t();
-        f.i(format!(
-            "{token} = phi i64 [ {v}, %{mine_end} ], [ 0, %{shared_end} ]"
-        ));
+        f.push(Inst::Phi {
+            dst: token.to_string(),
+            ty: Ty::I64,
+            incoming: vec![
+                (v.to_string(), mine_end.to_string()),
+                ("0".to_string(), shared_end.to_string()),
+            ],
+        });
         Ok(token)
     }
 
@@ -1265,14 +1615,32 @@ impl<'p> Module<'p> {
         }
         let (give, on) = (f.b(), f.b());
         let has = f.t();
-        f.i(format!("{has} = icmp ne i64 {token}, 0"));
-        f.i(format!("br i1 {has}, label %{give}, label %{on}"));
+        f.push(Inst::ICmp {
+            dst: has.to_string(),
+            cond: ICmp::Ne,
+            ty: Ty::I64,
+            a: token.to_string(),
+            b: "0".to_string(),
+        });
+        f.push(Inst::CondBr {
+            cond: has.to_string(),
+            yes: give.to_string(),
+            no: on.to_string(),
+            unlikely: false,
+        });
         f.label(&give);
-        f.i(format!(
-            "call void @meadow_clean(i64 {}, i64 {token})",
-            self.cx()
-        ));
-        f.i(format!("br label %{on}"));
+        f.push(Inst::Call {
+            dst: None,
+            tail: false,
+            cc: None,
+            ret: Ty::Void,
+            callee: "@meadow_clean".to_string(),
+            args: vec![
+                (Ty::I64, (self.cx()).to_string()),
+                (Ty::I64, token.to_string()),
+            ],
+        });
+        f.push(Inst::Br(on.to_string()));
         f.label(&on);
     }
 
@@ -1287,23 +1655,45 @@ impl<'p> Module<'p> {
         let l = self.layout;
         let index = Self::method_index(&self.methods[base]);
         let m = f.t();
-        f.i(format!("{m} = load i64, ptr {index}"));
+        f.push(Inst::Load {
+            dst: m.to_string(),
+            ty: Ty::I64,
+            ptr: index.to_string(),
+            volatile: false,
+        });
         if vals.is_empty() {
             // A small value: `l.immediate(m)`, of an `m` read at run time.
             let s = f.t();
-            f.i(format!("{s} = shl i64 {m}, {}", l.imm_shift));
+            f.push(Inst::Bin {
+                dst: s.to_string(),
+                op: BinOp::Shl,
+                ty: Ty::I64,
+                a: m.to_string(),
+                b: (l.imm_shift).to_string(),
+            });
             let v = f.t();
-            f.i(format!("{v} = or i64 {s}, {}", l.imm_tag));
+            f.push(Inst::Bin {
+                dst: v.to_string(),
+                op: BinOp::Or,
+                ty: Ty::I64,
+                a: s.to_string(),
+                b: (l.imm_tag).to_string(),
+            });
             return v;
         }
         let n = vals.len();
         let b = f.t();
-        f.i(format!(
-            "{b} = call i64 @{}(i64 {}, i64 {})",
-            self.acquire_fn(),
-            self.cx(),
-            l.first_field(n, false) + n
-        ));
+        f.push(Inst::Call {
+            dst: Some(b.to_string()),
+            tail: false,
+            cc: None,
+            ret: Ty::I64,
+            callee: format!("@{}", self.acquire_fn()),
+            args: vec![
+                (Ty::I64, (self.cx()).to_string()),
+                (Ty::I64, (l.first_field(n, false) + n).to_string()),
+            ],
+        });
         let closure = l.kinds.closure;
         if l.desc_at(0).0 == l.meta.word {
             // The method's index shares its word with descriptors: or-ed in
@@ -1316,15 +1706,34 @@ impl<'p> Module<'p> {
         self.write_block(f, &b, closure, 0, vals, descs, None);
         let p = f.ptr(&b);
         let w1 = f.t();
-        f.i(format!(
-            "{w1} = getelementptr i64, ptr {p}, i64 {}",
-            l.meta.word
-        ));
+        f.push(Inst::Gep {
+            dst: w1.to_string(),
+            elem: Ty::I64,
+            base: p.to_string(),
+            index: (l.meta.word).to_string(),
+        });
         let hi = f.t();
-        f.i(format!("{hi} = shl i64 {m}, {}", l.meta.shift));
+        f.push(Inst::Bin {
+            dst: hi.to_string(),
+            op: BinOp::Shl,
+            ty: Ty::I64,
+            a: m.to_string(),
+            b: (l.meta.shift).to_string(),
+        });
         let word = f.t();
-        f.i(format!("{word} = or i64 {hi}, {}", l.kind.put(closure)));
-        f.i(format!("store i64 {word}, ptr {w1}"));
+        f.push(Inst::Bin {
+            dst: word.to_string(),
+            op: BinOp::Or,
+            ty: Ty::I64,
+            a: hi.to_string(),
+            b: (l.kind.put(closure)).to_string(),
+        });
+        f.push(Inst::Store {
+            ty: Ty::I64,
+            v: word.to_string(),
+            ptr: w1.to_string(),
+            volatile: false,
+        });
         b
     }
 
@@ -1363,11 +1772,17 @@ impl<'p> Module<'p> {
         match reuse {
             None => {
                 let b = f.t();
-                f.i(format!(
-                    "{b} = call i64 @{}(i64 {}, i64 {words})",
-                    self.acquire_fn(),
-                    self.cx(),
-                ));
+                f.push(Inst::Call {
+                    dst: Some(b.to_string()),
+                    tail: false,
+                    cc: None,
+                    ret: Ty::I64,
+                    callee: format!("@{}", self.acquire_fn()),
+                    args: vec![
+                        (Ty::I64, (self.cx()).to_string()),
+                        (Ty::I64, words.to_string()),
+                    ],
+                });
                 self.write_block(f, &b, kind, meta, vals, descs, None);
                 b
             }
@@ -1375,31 +1790,53 @@ impl<'p> Module<'p> {
                 let origin = f.origins.get(token).cloned();
                 let (keep, fresh, join) = (f.b(), f.b(), f.b());
                 let has = f.t();
-                f.i(format!("{has} = icmp ne i64 {token}, 0"));
-                f.i(format!("br i1 {has}, label %{keep}, label %{fresh}"));
+                f.push(Inst::ICmp {
+                    dst: has.to_string(),
+                    cond: ICmp::Ne,
+                    ty: Ty::I64,
+                    a: token.to_string(),
+                    b: "0".to_string(),
+                });
+                f.push(Inst::CondBr {
+                    cond: has.to_string(),
+                    yes: keep.to_string(),
+                    no: fresh.to_string(),
+                    unlikely: false,
+                });
                 f.label(&keep);
                 self.write_block(f, token, kind, meta, vals, descs, Some(origin.as_ref()));
                 let keep_end = f.b();
-                f.i(format!("br label %{keep_end}"));
+                f.push(Inst::Br(keep_end.to_string()));
                 f.label(&keep_end);
-                f.i(format!("br label %{join}"));
+                f.push(Inst::Br(join.to_string()));
                 f.label(&fresh);
                 let a = f.t();
-                f.i(format!(
-                    "{a} = call i64 @{}(i64 {}, i64 {words})",
-                    self.acquire_fn(),
-                    self.cx(),
-                ));
+                f.push(Inst::Call {
+                    dst: Some(a.to_string()),
+                    tail: false,
+                    cc: None,
+                    ret: Ty::I64,
+                    callee: format!("@{}", self.acquire_fn()),
+                    args: vec![
+                        (Ty::I64, (self.cx()).to_string()),
+                        (Ty::I64, words.to_string()),
+                    ],
+                });
                 self.write_block(f, &a, kind, meta, vals, descs, None);
                 let fresh_end = f.b();
-                f.i(format!("br label %{fresh_end}"));
+                f.push(Inst::Br(fresh_end.to_string()));
                 f.label(&fresh_end);
-                f.i(format!("br label %{join}"));
+                f.push(Inst::Br(join.to_string()));
                 f.label(&join);
                 let b = f.t();
-                f.i(format!(
-                    "{b} = phi i64 [ {token}, %{keep_end} ], [ {a}, %{fresh_end} ]"
-                ));
+                f.push(Inst::Phi {
+                    dst: b.to_string(),
+                    ty: Ty::I64,
+                    incoming: vec![
+                        (token.to_string(), keep_end.to_string()),
+                        (a.to_string(), fresh_end.to_string()),
+                    ],
+                });
                 b
             }
         }
@@ -1489,19 +1926,52 @@ impl<'p> Module<'p> {
             let mut acc = format!("{}", known[w]);
             for (shift, mask, r) in &dynamic[w] {
                 let m = f.t();
-                f.i(format!("{m} = and i64 {r}, {mask}"));
+                f.push(Inst::Bin {
+                    dst: m.to_string(),
+                    op: BinOp::And,
+                    ty: Ty::I64,
+                    a: r.to_string(),
+                    b: mask.to_string(),
+                });
                 let s = f.t();
-                f.i(format!("{s} = shl i64 {m}, {shift}"));
+                f.push(Inst::Bin {
+                    dst: s.to_string(),
+                    op: BinOp::Shl,
+                    ty: Ty::I64,
+                    a: m.to_string(),
+                    b: shift.to_string(),
+                });
                 let o = f.t();
-                f.i(format!("{o} = or i64 {acc}, {s}"));
+                f.push(Inst::Bin {
+                    dst: o.to_string(),
+                    op: BinOp::Or,
+                    ty: Ty::I64,
+                    a: acc.to_string(),
+                    b: s.to_string(),
+                });
                 acc = o;
             }
             if w == 0 {
-                f.i(format!("store i64 {acc}, ptr {p}"));
+                f.push(Inst::Store {
+                    ty: Ty::I64,
+                    v: acc.to_string(),
+                    ptr: p.to_string(),
+                    volatile: false,
+                });
             } else {
                 let q = f.t();
-                f.i(format!("{q} = getelementptr i64, ptr {p}, i64 {w}"));
-                f.i(format!("store i64 {acc}, ptr {q}"));
+                f.push(Inst::Gep {
+                    dst: q.to_string(),
+                    elem: Ty::I64,
+                    base: p.to_string(),
+                    index: w.to_string(),
+                });
+                f.push(Inst::Store {
+                    ty: Ty::I64,
+                    v: acc.to_string(),
+                    ptr: q.to_string(),
+                    volatile: false,
+                });
             }
         }
         let first = l.first_field(n, false);
@@ -1510,11 +1980,18 @@ impl<'p> Module<'p> {
                 continue;
             }
             let q = f.t();
-            f.i(format!(
-                "{q} = getelementptr i64, ptr {p}, i64 {}",
-                first + i
-            ));
-            f.i(format!("store i64 {v}, ptr {q}"));
+            f.push(Inst::Gep {
+                dst: q.to_string(),
+                elem: Ty::I64,
+                base: p.to_string(),
+                index: (first + i).to_string(),
+            });
+            f.push(Inst::Store {
+                ty: Ty::I64,
+                v: v.to_string(),
+                ptr: q.to_string(),
+                volatile: false,
+            });
         }
     }
 
@@ -1716,10 +2193,24 @@ impl<'p> Module<'p> {
                     let a = self.val(args[0], env, f)?;
                     let (ret, call) = (f.b(), f.b());
                     let z = f.t();
-                    f.i(format!("{z} = icmp eq i64 {t}, 0"));
-                    f.i(format!("br i1 {z}, label %{ret}, label %{call}"));
+                    f.push(Inst::ICmp {
+                        dst: z.to_string(),
+                        cond: ICmp::Eq,
+                        ty: Ty::I64,
+                        a: t.to_string(),
+                        b: "0".to_string(),
+                    });
+                    f.push(Inst::CondBr {
+                        cond: z.to_string(),
+                        yes: ret.to_string(),
+                        no: call.to_string(),
+                        unlikely: false,
+                    });
                     f.label(&ret);
-                    f.i(format!("ret i64 {a}"));
+                    f.push(Inst::Ret {
+                        ty: Ty::I64,
+                        v: Some(a.to_string()),
+                    });
                     f.label(&call);
                 }
                 let fp = self.method_ptr(f, &t, *tag);
@@ -1728,8 +2219,15 @@ impl<'p> Module<'p> {
             L::Extern { op, args, blocks } => self.extern_op(op, args, blocks, env, f),
             L::Error(msg) => {
                 let (g, len) = self.cstr(msg);
-                f.i(format!("call void @meadow_fail(ptr {g}, i64 {len})"));
-                f.i("unreachable".to_string());
+                f.push(Inst::Call {
+                    dst: None,
+                    tail: false,
+                    cc: None,
+                    ret: Ty::Void,
+                    callee: "@meadow_fail".to_string(),
+                    args: vec![(Ty::Ptr, g.to_string()), (Ty::I64, len.to_string())],
+                });
+                f.push(Inst::Unreachable);
                 Ok(())
             }
         }
@@ -1756,22 +2254,45 @@ impl<'p> Module<'p> {
         }
         let words = 2 + 2 * held.len();
         let rec = f.t();
-        f.alloca(format!("{rec} = alloca [{words} x i64]"));
+        f.push_alloca(Inst::Alloca {
+            dst: rec.to_string(),
+            words: words,
+        });
         let slot = if self.threaded {
             // Word 1 of the context: see `silo/src/ctx.rs`.
             let c = f.ptr(CTX);
             let s = f.t();
-            f.i(format!("{s} = getelementptr i64, ptr {c}, i64 1"));
+            f.push(Inst::Gep {
+                dst: s.to_string(),
+                elem: Ty::I64,
+                base: c.to_string(),
+                index: "1".to_string(),
+            });
             s
         } else {
             "@meadow_shadow_single".to_string()
         };
         let prev = f.t();
-        f.i(format!("{prev} = load i64, ptr {slot}"));
+        f.push(Inst::Load {
+            dst: prev.to_string(),
+            ty: Ty::I64,
+            ptr: slot.to_string(),
+            volatile: false,
+        });
         let store = |f: &mut Fun, i: usize, v: &str| {
             let q = f.t();
-            f.i(format!("{q} = getelementptr i64, ptr {rec}, i64 {i}"));
-            f.i(format!("store i64 {v}, ptr {q}"));
+            f.push(Inst::Gep {
+                dst: q.to_string(),
+                elem: Ty::I64,
+                base: rec.to_string(),
+                index: i.to_string(),
+            });
+            f.push(Inst::Store {
+                ty: Ty::I64,
+                v: v.to_string(),
+                ptr: q.to_string(),
+                volatile: false,
+            });
         };
         store(f, 0, &prev);
         store(f, 1, &held.len().to_string());
@@ -1780,8 +2301,19 @@ impl<'p> Module<'p> {
             store(f, 3 + 2 * i, d);
         }
         let at = f.t();
-        f.i(format!("{at} = ptrtoint ptr {rec} to i64"));
-        f.i(format!("store i64 {at}, ptr {slot}"));
+        f.push(Inst::Cast {
+            dst: at.to_string(),
+            op: Cast::PtrToInt,
+            from: Ty::Ptr,
+            v: rec.to_string(),
+            to: Ty::I64,
+        });
+        f.push(Inst::Store {
+            ty: Ty::I64,
+            v: at.to_string(),
+            ptr: slot.to_string(),
+            volatile: false,
+        });
         Some((slot, prev, rec, held.len()))
     }
 
@@ -1910,13 +2442,27 @@ impl<'p> Module<'p> {
     fn method_ptr(&self, f: &mut Fun, t: &str, tag: u32) -> String {
         let m = self.meta_of(f, t);
         let idx = f.t();
-        f.i(format!("{idx} = add i64 {m}, {tag}"));
+        f.push(Inst::Bin {
+            dst: idx.to_string(),
+            op: BinOp::Add,
+            ty: Ty::I64,
+            a: m.to_string(),
+            b: tag.to_string(),
+        });
         let slot = f.t();
-        f.i(format!(
-            "{slot} = getelementptr ptr, ptr @meadow_methods, i64 {idx}"
-        ));
+        f.push(Inst::Gep {
+            dst: slot.to_string(),
+            elem: Ty::Ptr,
+            base: "@meadow_methods".to_string(),
+            index: idx.to_string(),
+        });
         let fp = f.t();
-        f.i(format!("{fp} = load ptr, ptr {slot}"));
+        f.push(Inst::Load {
+            dst: fp.to_string(),
+            ty: Ty::Ptr,
+            ptr: slot.to_string(),
+            volatile: false,
+        });
         fp
     }
 
@@ -1926,28 +2472,65 @@ impl<'p> Module<'p> {
         let l = self.layout;
         let (imm, blk, join) = (f.b(), f.b(), f.b());
         let low = f.t();
-        f.i(format!("{low} = and i64 {v}, {}", l.imm_mask));
+        f.push(Inst::Bin {
+            dst: low.to_string(),
+            op: BinOp::And,
+            ty: Ty::I64,
+            a: v.to_string(),
+            b: (l.imm_mask).to_string(),
+        });
         let small = f.t();
-        f.i(format!("{small} = icmp ne i64 {low}, 0"));
-        f.i(format!("br i1 {small}, label %{imm}, label %{blk}"));
+        f.push(Inst::ICmp {
+            dst: small.to_string(),
+            cond: ICmp::Ne,
+            ty: Ty::I64,
+            a: low.to_string(),
+            b: "0".to_string(),
+        });
+        f.push(Inst::CondBr {
+            cond: small.to_string(),
+            yes: imm.to_string(),
+            no: blk.to_string(),
+            unlikely: false,
+        });
         f.label(&imm);
         let m1 = f.t();
-        f.i(format!("{m1} = lshr i64 {v}, {}", l.imm_shift));
-        f.i(format!("br label %{join}"));
+        f.push(Inst::Bin {
+            dst: m1.to_string(),
+            op: BinOp::LShr,
+            ty: Ty::I64,
+            a: v.to_string(),
+            b: (l.imm_shift).to_string(),
+        });
+        f.push(Inst::Br(join.to_string()));
         f.label(&blk);
         let p = f.ptr(v);
         let q = f.t();
-        f.i(format!(
-            "{q} = getelementptr i64, ptr {p}, i64 {}",
-            l.meta.word
-        ));
+        f.push(Inst::Gep {
+            dst: q.to_string(),
+            elem: Ty::I64,
+            base: p.to_string(),
+            index: (l.meta.word).to_string(),
+        });
         let w1 = f.t();
-        f.i(format!("{w1} = load i64, ptr {q}"));
+        f.push(Inst::Load {
+            dst: w1.to_string(),
+            ty: Ty::I64,
+            ptr: q.to_string(),
+            volatile: false,
+        });
         let m2 = read_field(f, &w1, l.meta);
-        f.i(format!("br label %{join}"));
+        f.push(Inst::Br(join.to_string()));
         f.label(&join);
         let m = f.t();
-        f.i(format!("{m} = phi i64 [ {m1}, %{imm} ], [ {m2}, %{blk} ]"));
+        f.push(Inst::Phi {
+            dst: m.to_string(),
+            ty: Ty::I64,
+            incoming: vec![
+                (m1.to_string(), imm.to_string()),
+                (m2.to_string(), blk.to_string()),
+            ],
+        });
         m
     }
 
@@ -1981,32 +2564,46 @@ impl<'p> Module<'p> {
             }
         }
         self.spill(f, &ops);
-        let list = self.arg_list(&ops);
         match frame {
             None => {
                 let r = f.t();
-                f.i(format!("{r} = tail call {} i64 {callee}({list})", self.cc));
-                f.i(format!("ret i64 {r}"));
+                self.call_cc(f, &r, true, callee, &ops);
+                f.push(Inst::Ret {
+                    ty: Ty::I64,
+                    v: Some(r.to_string()),
+                });
                 Ok(())
             }
             Some(fr) => {
                 let pushed = self.shadow_push(&fr, env, f);
                 let r = f.t();
-                f.i(format!("{r} = call {} i64 {callee}({list})", self.cc));
+                self.call_cc(f, &r, false, callee, &ops);
                 let mut fr = fr;
                 if let Some((slot, prev, rec, n)) = pushed {
-                    f.i(format!("store i64 {prev}, ptr {slot}"));
+                    f.push(Inst::Store {
+                        ty: Ty::I64,
+                        v: prev.to_string(),
+                        ptr: slot.to_string(),
+                        volatile: false,
+                    });
                     // What the frame held, where a collection during the call
                     // left it.
                     if self.moving {
                         let mut vals = Vec::with_capacity(n);
                         for k in 0..n {
                             let (q, x) = (f.t(), f.t());
-                            f.i(format!(
-                                "{q} = getelementptr i64, ptr {rec}, i64 {}",
-                                2 + 2 * k
-                            ));
-                            f.i(format!("{x} = load i64, ptr {q}"));
+                            f.push(Inst::Gep {
+                                dst: q.to_string(),
+                                elem: Ty::I64,
+                                base: rec.to_string(),
+                                index: (2 + 2 * k).to_string(),
+                            });
+                            f.push(Inst::Load {
+                                dst: x.to_string(),
+                                ty: Ty::I64,
+                                ptr: q.to_string(),
+                                volatile: false,
+                            });
                             vals.push(x);
                         }
                         fr = Rc::new(self.reframe(&fr, env, &mut vals.into_iter()));
@@ -2030,15 +2627,19 @@ impl<'p> Module<'p> {
         let tag = self.meta_of(f, &s);
         let def = f.b();
         let labels: Vec<String> = arms.iter().map(|_| f.b()).collect();
-        let mut sw = format!("switch i64 {tag}, label %{def} [");
+        let mut cases = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for (a, l) in arms.iter().zip(&labels) {
             if seen.insert(a.tag) {
-                let _ = write!(sw, " i64 {}, label %{l}", a.tag);
+                cases.push((a.tag as i64, l.clone()));
             }
         }
-        sw.push_str(" ]");
-        f.i(sw);
+        f.push(Inst::Switch {
+            ty: Ty::I64,
+            v: tag.clone(),
+            default: def.clone(),
+            cases,
+        });
         for (a, l) in arms.iter().zip(&labels) {
             f.label(l);
             let mut inner = env.clone();
@@ -2082,14 +2683,26 @@ impl<'p> Module<'p> {
                 Extern::Branch => {
                     let v = self.val(args[0], env, f)?;
                     let c = f.t();
-                    f.i(format!("{c} = icmp ne i64 {v}, 0"));
+                    f.push(Inst::ICmp {
+                        dst: c.to_string(),
+                        cond: ICmp::Ne,
+                        ty: Ty::I64,
+                        a: v.to_string(),
+                        b: "0".to_string(),
+                    });
                     c
                 }
                 Extern::BranchPrim(p) => {
                     let (a, b) = (self.val(args[0], env, f)?, self.val(args[1], env, f)?);
                     let r = self.prim2(*p, &a, &b, args[0], env, f)?;
                     let c = f.t();
-                    f.i(format!("{c} = icmp ne i64 {r}, 0"));
+                    f.push(Inst::ICmp {
+                        dst: c.to_string(),
+                        cond: ICmp::Ne,
+                        ty: Ty::I64,
+                        a: r.to_string(),
+                        b: "0".to_string(),
+                    });
                     c
                 }
                 Extern::BranchPrimK(p, lit) => {
@@ -2098,7 +2711,13 @@ impl<'p> Module<'p> {
                     let r = self.prim2(*p, &a, &k, args[0], env, f)?;
                     self.erase_literal(f, &k, lit);
                     let c = f.t();
-                    f.i(format!("{c} = icmp ne i64 {r}, 0"));
+                    f.push(Inst::ICmp {
+                        dst: c.to_string(),
+                        cond: ICmp::Ne,
+                        ty: Ty::I64,
+                        a: r.to_string(),
+                        b: "0".to_string(),
+                    });
                     c
                 }
                 _ => unreachable!("is_branch"),
@@ -2107,7 +2726,12 @@ impl<'p> Module<'p> {
                 return err("a branch needs two continuations");
             };
             let (t, e) = (f.b(), f.b());
-            f.i(format!("br i1 {cond}, label %{t}, label %{e}"));
+            f.push(Inst::CondBr {
+                cond: cond.to_string(),
+                yes: t.to_string(),
+                no: e.to_string(),
+                unlikely: false,
+            });
             f.label(&t);
             self.stmt(on_true, &mut env.clone(), f)?;
             f.label(&e);
@@ -2149,8 +2773,18 @@ impl<'p> Module<'p> {
                 _ => "meadow_reattach",
             };
             let r = f.t();
-            f.i(format!("{r} = call i64 @{entry}(i64 {a}, i64 {code})"));
-            f.i(format!("ret i64 {r}"));
+            f.push(Inst::Call {
+                dst: Some(r.to_string()),
+                tail: false,
+                cc: None,
+                ret: Ty::I64,
+                callee: format!("@{}", entry),
+                args: vec![(Ty::I64, a.to_string()), (Ty::I64, code.to_string())],
+            });
+            f.push(Inst::Ret {
+                ty: Ty::I64,
+                v: Some(r.to_string()),
+            });
             return Ok(());
         }
         let v = match op {
@@ -2174,7 +2808,13 @@ impl<'p> Module<'p> {
                     }
                     [a] if *p == Prim::Neg && self.rep(args[0]) == Some(Rep::Int) => {
                         let r = f.t();
-                        f.i(format!("{r} = sub i64 0, {a}"));
+                        f.push(Inst::Bin {
+                            dst: r.to_string(),
+                            op: BinOp::Sub,
+                            ty: Ty::I64,
+                            a: "0".to_string(),
+                            b: a.to_string(),
+                        });
                         r
                     }
                     // The few a program does millions of times have an entry
@@ -2185,21 +2825,28 @@ impl<'p> Module<'p> {
                         let last = args.len() - 1;
                         let mut ops = Vec::new();
                         for (i, (a, v)) in args.iter().zip(&vals).enumerate() {
-                            ops.push(format!("i64 {v}"));
+                            ops.push((Ty::I64, v.clone()));
                             let wanted =
                                 descs == Descs::Each || (descs == Descs::Last && i == last);
                             if wanted {
-                                ops.push(format!(
-                                    "i64 {}",
+                                ops.push((
+                                    Ty::I64,
                                     match self.desc(*a, env) {
                                         D::Known(k) => k.to_string(),
                                         D::Dyn(x) => x,
-                                    }
+                                    },
                                 ));
                             }
                         }
                         let r = f.t();
-                        f.i(format!("{r} = call i64 @{name}({})", ops.join(", ")));
+                        f.push(Inst::Call {
+                            dst: Some(r.clone()),
+                            tail: false,
+                            cc: None,
+                            ret: Ty::I64,
+                            callee: format!("@{name}"),
+                            args: ops,
+                        });
                         r
                     }
                     // A thread's function answers what the thread does, and
@@ -2251,7 +2898,14 @@ impl<'p> Module<'p> {
             Extern::Field(i) => {
                 let a = self.val(args[0], env, f)?;
                 let r = f.t();
-                f.i(format!("{r} = call i64 @mw.field(i64 {a}, i64 {i})"));
+                f.push(Inst::Call {
+                    dst: Some(r.to_string()),
+                    tail: false,
+                    cc: None,
+                    ret: Ty::I64,
+                    callee: "@mw.field".to_string(),
+                    args: vec![(Ty::I64, a.to_string()), (Ty::I64, i.to_string())],
+                });
                 r
             }
             Extern::Array | Extern::Record(_) => {
@@ -2270,37 +2924,93 @@ impl<'p> Module<'p> {
                 }
                 let n = args.len().max(1);
                 let (av, dv) = (f.t(), f.t());
-                f.alloca(format!("{av} = alloca [{n} x i64]"));
-                f.alloca(format!("{dv} = alloca [{n} x i64]"));
+                f.push_alloca(Inst::Alloca {
+                    dst: av.to_string(),
+                    words: n,
+                });
+                f.push_alloca(Inst::Alloca {
+                    dst: dv.to_string(),
+                    words: n,
+                });
                 for (k, i) in order.iter().enumerate() {
                     let (q, r) = (f.t(), f.t());
-                    f.i(format!("{q} = getelementptr i64, ptr {av}, i64 {k}"));
-                    f.i(format!("store i64 {}, ptr {q}", vals[*i]));
-                    f.i(format!("{r} = getelementptr i64, ptr {dv}, i64 {k}"));
+                    f.push(Inst::Gep {
+                        dst: q.to_string(),
+                        elem: Ty::I64,
+                        base: av.to_string(),
+                        index: k.to_string(),
+                    });
+                    f.push(Inst::Store {
+                        ty: Ty::I64,
+                        v: (vals[*i]).to_string(),
+                        ptr: q.to_string(),
+                        volatile: false,
+                    });
+                    f.push(Inst::Gep {
+                        dst: r.to_string(),
+                        elem: Ty::I64,
+                        base: dv.to_string(),
+                        index: k.to_string(),
+                    });
                     let d = match self.desc(args[*i], env) {
                         D::Known(x) => x.to_string(),
                         D::Dyn(x) => x,
                     };
-                    f.i(format!("store i64 {d}, ptr {r}"));
+                    f.push(Inst::Store {
+                        ty: Ty::I64,
+                        v: d.to_string(),
+                        ptr: r.to_string(),
+                        volatile: false,
+                    });
                 }
                 let r = f.t();
                 if labels.is_empty() && matches!(op, Extern::Array) {
-                    f.i(format!(
-                        "{r} = call i64 @meadow_array(i64 {}, ptr {av}, ptr {dv})",
-                        args.len()
-                    ));
+                    f.push(Inst::Call {
+                        dst: Some(r.to_string()),
+                        tail: false,
+                        cc: None,
+                        ret: Ty::I64,
+                        callee: "@meadow_array".to_string(),
+                        args: vec![
+                            (Ty::I64, (args.len()).to_string()),
+                            (Ty::Ptr, av.to_string()),
+                            (Ty::Ptr, dv.to_string()),
+                        ],
+                    });
                 } else {
                     let lv = f.t();
-                    f.alloca(format!("{lv} = alloca [{n} x i64]"));
+                    f.push_alloca(Inst::Alloca {
+                        dst: lv.to_string(),
+                        words: n,
+                    });
                     for (k, l) in labels.iter().enumerate() {
                         let q = f.t();
-                        f.i(format!("{q} = getelementptr i64, ptr {lv}, i64 {k}"));
-                        f.i(format!("store i64 {l}, ptr {q}"));
+                        f.push(Inst::Gep {
+                            dst: q.to_string(),
+                            elem: Ty::I64,
+                            base: lv.to_string(),
+                            index: k.to_string(),
+                        });
+                        f.push(Inst::Store {
+                            ty: Ty::I64,
+                            v: l.to_string(),
+                            ptr: q.to_string(),
+                            volatile: false,
+                        });
                     }
-                    f.i(format!(
-                        "{r} = call i64 @meadow_record(i64 {}, ptr {av}, ptr {dv}, ptr {lv})",
-                        args.len()
-                    ));
+                    f.push(Inst::Call {
+                        dst: Some(r.to_string()),
+                        tail: false,
+                        cc: None,
+                        ret: Ty::I64,
+                        callee: "@meadow_record".to_string(),
+                        args: vec![
+                            (Ty::I64, (args.len()).to_string()),
+                            (Ty::Ptr, av.to_string()),
+                            (Ty::Ptr, dv.to_string()),
+                            (Ty::Ptr, lv.to_string()),
+                        ],
+                    });
                 }
                 r
             }
@@ -2310,14 +3020,28 @@ impl<'p> Module<'p> {
                 let a = self.val(args[0], env, f)?;
                 let r = f.t();
                 let i = 2 * place.at + 1;
-                f.i(format!("{r} = call i64 @mw.field(i64 {a}, i64 {i})"));
+                f.push(Inst::Call {
+                    dst: Some(r.to_string()),
+                    tail: false,
+                    cc: None,
+                    ret: Ty::I64,
+                    callee: "@mw.field".to_string(),
+                    args: vec![(Ty::I64, a.to_string()), (Ty::I64, i.to_string())],
+                });
                 r
             }
             Extern::Select(label, None) => {
                 let a = self.val(args[0], env, f)?;
                 let l = self.sym(*label);
                 let r = f.t();
-                f.i(format!("{r} = call i64 @meadow_select(i64 {a}, i64 {l})"));
+                f.push(Inst::Call {
+                    dst: Some(r.to_string()),
+                    tail: false,
+                    cc: None,
+                    ret: Ty::I64,
+                    callee: "@meadow_select".to_string(),
+                    args: vec![(Ty::I64, a.to_string()), (Ty::I64, l.to_string())],
+                });
                 r
             }
             Extern::Extend(label, place) => {
@@ -2329,15 +3053,35 @@ impl<'p> Module<'p> {
                 };
                 let r = f.t();
                 match place {
-                    Some(p) => f.i(format!(
-                        "{r} = call i64 @meadow_update(i64 {rec}, i64 {}, i64 {}, i64 {v}, i64 {d})",
-                        p.at, p.of
-                    )),
+                    Some(p) => f.push(Inst::Call {
+                        dst: Some(r.to_string()),
+                        tail: false,
+                        cc: None,
+                        ret: Ty::I64,
+                        callee: "@meadow_update".to_string(),
+                        args: vec![
+                            (Ty::I64, rec.to_string()),
+                            (Ty::I64, (p.at).to_string()),
+                            (Ty::I64, (p.of).to_string()),
+                            (Ty::I64, v.to_string()),
+                            (Ty::I64, d.to_string()),
+                        ],
+                    }),
                     None => {
                         let l = self.sym(*label);
-                        f.i(format!(
-                            "{r} = call i64 @meadow_extend(i64 {rec}, i64 {l}, i64 {v}, i64 {d})"
-                        ))
+                        f.push(Inst::Call {
+                            dst: Some(r.to_string()),
+                            tail: false,
+                            cc: None,
+                            ret: Ty::I64,
+                            callee: "@meadow_extend".to_string(),
+                            args: vec![
+                                (Ty::I64, rec.to_string()),
+                                (Ty::I64, l.to_string()),
+                                (Ty::I64, v.to_string()),
+                                (Ty::I64, d.to_string()),
+                            ],
+                        })
                     }
                 }
                 r
@@ -2351,15 +3095,32 @@ impl<'p> Module<'p> {
                 let (ge, _) = self.cstr(effect);
                 let (go, _) = self.cstr(op);
                 let r = f.t();
-                f.i(format!(
-                    "{r} = call i64 @meadow_native(ptr {ge}, ptr {go}, i64 {a}, i64 {d})"
-                ));
+                f.push(Inst::Call {
+                    dst: Some(r.to_string()),
+                    tail: false,
+                    cc: None,
+                    ret: Ty::I64,
+                    callee: "@meadow_native".to_string(),
+                    args: vec![
+                        (Ty::Ptr, ge.to_string()),
+                        (Ty::Ptr, go.to_string()),
+                        (Ty::I64, a.to_string()),
+                        (Ty::I64, d.to_string()),
+                    ],
+                });
                 r
             }
             other => {
                 let (g, len) = self.cstr(&format!("the native backend cannot do {other:?} yet"));
-                f.i(format!("call void @meadow_fail(ptr {g}, i64 {len})"));
-                f.i("unreachable".into());
+                f.push(Inst::Call {
+                    dst: None,
+                    tail: false,
+                    cc: None,
+                    ret: Ty::Void,
+                    callee: "@meadow_fail".to_string(),
+                    args: vec![(Ty::Ptr, g.to_string()), (Ty::I64, len.to_string())],
+                });
+                f.push(Inst::Unreachable);
                 return Ok(());
             }
         };
@@ -2388,12 +3149,26 @@ impl<'p> Module<'p> {
             Lit::Str(s) => {
                 let (g, len) = self.cstr(s);
                 let r = f.t();
-                f.i(format!("{r} = call i64 @meadow_text(ptr {g}, i64 {len})"));
+                f.push(Inst::Call {
+                    dst: Some(r.to_string()),
+                    tail: false,
+                    cc: None,
+                    ret: Ty::I64,
+                    callee: "@meadow_text".to_string(),
+                    args: vec![(Ty::Ptr, g.to_string()), (Ty::I64, len.to_string())],
+                });
                 r
             }
             Lit::BigInt(n) => {
                 let r = f.t();
-                f.i(format!("{r} = call i64 @meadow_bigint(i64 {n})"));
+                f.push(Inst::Call {
+                    dst: Some(r.to_string()),
+                    tail: false,
+                    cc: None,
+                    ret: Ty::I64,
+                    callee: "@meadow_bigint".to_string(),
+                    args: vec![(Ty::I64, n.to_string())],
+                });
                 r
             }
         })
@@ -2426,21 +3201,75 @@ impl<'p> Module<'p> {
         let r = f.t();
         let bool_of = |f: &mut Fun, c: String| {
             let z = f.t();
-            f.i(format!("{z} = zext i1 {c} to i64"));
+            f.push(Inst::Cast {
+                dst: z.to_string(),
+                op: Cast::ZExt,
+                from: Ty::I1,
+                v: c.to_string(),
+                to: Ty::I64,
+            });
             z
         };
         match p {
-            Prim::Add => f.i(format!("{r} = add i64 {a}, {b}")),
-            Prim::Sub => f.i(format!("{r} = sub i64 {a}, {b}")),
-            Prim::Mul => f.i(format!("{r} = mul i64 {a}, {b}")),
-            Prim::BitAnd => f.i(format!("{r} = and i64 {a}, {b}")),
-            Prim::BitOr => f.i(format!("{r} = or i64 {a}, {b}")),
-            Prim::BitXor => f.i(format!("{r} = xor i64 {a}, {b}")),
+            Prim::Add => f.push(Inst::Bin {
+                dst: r.to_string(),
+                op: BinOp::Add,
+                ty: Ty::I64,
+                a: a.to_string(),
+                b: b.to_string(),
+            }),
+            Prim::Sub => f.push(Inst::Bin {
+                dst: r.to_string(),
+                op: BinOp::Sub,
+                ty: Ty::I64,
+                a: a.to_string(),
+                b: b.to_string(),
+            }),
+            Prim::Mul => f.push(Inst::Bin {
+                dst: r.to_string(),
+                op: BinOp::Mul,
+                ty: Ty::I64,
+                a: a.to_string(),
+                b: b.to_string(),
+            }),
+            Prim::BitAnd => f.push(Inst::Bin {
+                dst: r.to_string(),
+                op: BinOp::And,
+                ty: Ty::I64,
+                a: a.to_string(),
+                b: b.to_string(),
+            }),
+            Prim::BitOr => f.push(Inst::Bin {
+                dst: r.to_string(),
+                op: BinOp::Or,
+                ty: Ty::I64,
+                a: a.to_string(),
+                b: b.to_string(),
+            }),
+            Prim::BitXor => f.push(Inst::Bin {
+                dst: r.to_string(),
+                op: BinOp::Xor,
+                ty: Ty::I64,
+                a: a.to_string(),
+                b: b.to_string(),
+            }),
             Prim::Shl | Prim::Shr => {
                 let m = f.t();
-                f.i(format!("{m} = and i64 {b}, 63"));
+                f.push(Inst::Bin {
+                    dst: m.to_string(),
+                    op: BinOp::And,
+                    ty: Ty::I64,
+                    a: b.to_string(),
+                    b: "63".to_string(),
+                });
                 let ins = if p == Prim::Shl { "shl" } else { "ashr" };
-                f.i(format!("{r} = {ins} i64 {a}, {m}"));
+                f.push(Inst::Bin {
+                    dst: r.to_string(),
+                    op: BinOp::named(&ins).expect("an operation"),
+                    ty: Ty::I64,
+                    a: a.to_string(),
+                    b: m.to_string(),
+                });
             }
             Prim::Div | Prim::Mod => return Ok(self.divide(p, a, b, f)),
             Prim::AddF | Prim::SubF | Prim::MulF | Prim::DivF => {
@@ -2451,18 +3280,54 @@ impl<'p> Module<'p> {
                     _ => "fdiv",
                 };
                 let (x, y) = (f.t(), f.t());
-                f.i(format!("{x} = bitcast i64 {a} to double"));
-                f.i(format!("{y} = bitcast i64 {b} to double"));
+                f.push(Inst::Cast {
+                    dst: x.to_string(),
+                    op: Cast::Bitcast,
+                    from: Ty::I64,
+                    v: a.to_string(),
+                    to: Ty::F64,
+                });
+                f.push(Inst::Cast {
+                    dst: y.to_string(),
+                    op: Cast::Bitcast,
+                    from: Ty::I64,
+                    v: b.to_string(),
+                    to: Ty::F64,
+                });
                 let z = f.t();
-                f.i(format!("{z} = {ins} double {x}, {y}"));
-                f.i(format!("{r} = bitcast double {z} to i64"));
+                f.push(Inst::Bin {
+                    dst: z.to_string(),
+                    op: BinOp::named(&ins).expect("an operation"),
+                    ty: Ty::F64,
+                    a: x.to_string(),
+                    b: y.to_string(),
+                });
+                f.push(Inst::Cast {
+                    dst: r.to_string(),
+                    op: Cast::Bitcast,
+                    from: Ty::F64,
+                    v: z.to_string(),
+                    to: Ty::I64,
+                });
             }
             Prim::Eq | Prim::Ne | Prim::Lt | Prim::Gt | Prim::Le | Prim::Ge => {
                 let c = f.t();
                 if float {
                     let (x, y) = (f.t(), f.t());
-                    f.i(format!("{x} = bitcast i64 {a} to double"));
-                    f.i(format!("{y} = bitcast i64 {b} to double"));
+                    f.push(Inst::Cast {
+                        dst: x.to_string(),
+                        op: Cast::Bitcast,
+                        from: Ty::I64,
+                        v: a.to_string(),
+                        to: Ty::F64,
+                    });
+                    f.push(Inst::Cast {
+                        dst: y.to_string(),
+                        op: Cast::Bitcast,
+                        from: Ty::I64,
+                        v: b.to_string(),
+                        to: Ty::F64,
+                    });
                     let pred = match p {
                         Prim::Eq => "oeq",
                         Prim::Ne => "une",
@@ -2471,7 +3336,13 @@ impl<'p> Module<'p> {
                         Prim::Le => "ole",
                         _ => "oge",
                     };
-                    f.i(format!("{c} = fcmp {pred} double {x}, {y}"));
+                    f.push(Inst::FCmp {
+                        dst: c.to_string(),
+                        cond: FCmp::named(&pred).expect("an operation"),
+                        ty: Ty::F64,
+                        a: x.to_string(),
+                        b: y.to_string(),
+                    });
                 } else {
                     let pred = match p {
                         Prim::Eq => "eq",
@@ -2481,14 +3352,32 @@ impl<'p> Module<'p> {
                         Prim::Le => "sle",
                         _ => "sge",
                     };
-                    f.i(format!("{c} = icmp {pred} i64 {a}, {b}"));
+                    f.push(Inst::ICmp {
+                        dst: c.to_string(),
+                        cond: ICmp::named(&pred).expect("an operation"),
+                        ty: Ty::I64,
+                        a: a.to_string(),
+                        b: b.to_string(),
+                    });
                 }
                 return Ok(bool_of(f, c));
             }
             Prim::LtF | Prim::GtF | Prim::LeF | Prim::GeF => {
                 let (x, y) = (f.t(), f.t());
-                f.i(format!("{x} = bitcast i64 {a} to double"));
-                f.i(format!("{y} = bitcast i64 {b} to double"));
+                f.push(Inst::Cast {
+                    dst: x.to_string(),
+                    op: Cast::Bitcast,
+                    from: Ty::I64,
+                    v: a.to_string(),
+                    to: Ty::F64,
+                });
+                f.push(Inst::Cast {
+                    dst: y.to_string(),
+                    op: Cast::Bitcast,
+                    from: Ty::I64,
+                    v: b.to_string(),
+                    to: Ty::F64,
+                });
                 let pred = match p {
                     Prim::LtF => "olt",
                     Prim::GtF => "ogt",
@@ -2496,7 +3385,13 @@ impl<'p> Module<'p> {
                     _ => "oge",
                 };
                 let c = f.t();
-                f.i(format!("{c} = fcmp {pred} double {x}, {y}"));
+                f.push(Inst::FCmp {
+                    dst: c.to_string(),
+                    cond: FCmp::named(&pred).expect("an operation"),
+                    ty: Ty::F64,
+                    a: x.to_string(),
+                    b: y.to_string(),
+                });
                 return Ok(bool_of(f, c));
             }
             _ => return err(format!("{p:?} is not a primitive done inline")),
@@ -2514,43 +3409,91 @@ impl<'p> Module<'p> {
         let l = self.layout;
         let p = f.ptr(r);
         let q = f.t();
-        f.i(format!(
-            "{q} = getelementptr i64, ptr {p}, i64 {}",
-            l.first_field(1, false)
-        ));
+        f.push(Inst::Gep {
+            dst: q.to_string(),
+            elem: Ty::I64,
+            base: p.to_string(),
+            index: (l.first_field(1, false)).to_string(),
+        });
         let old = f.t();
-        f.i(format!("{old} = load i64, ptr {q}"));
+        f.push(Inst::Load {
+            dst: old.to_string(),
+            ty: Ty::I64,
+            ptr: q.to_string(),
+            volatile: false,
+        });
         // What it held is gone; what it holds now is one more reference. The
         // old one is erased by the same descriptor, since a `Ref` holds one
         // type.
         self.share(f, v, d, 1);
         self.remember(f, r, v, d);
-        f.i(format!("store i64 {v}, ptr {q}"));
+        f.push(Inst::Store {
+            ty: Ty::I64,
+            v: v.to_string(),
+            ptr: q.to_string(),
+            volatile: false,
+        });
         self.erase(f, &old, d);
         if let D::Dyn(dv) = d {
             // A value of a type variable's type: the block says how to read
             // it, so say it.
             let (at, shift) = l.desc_at(0);
             let w = f.t();
-            f.i(format!("{w} = getelementptr i64, ptr {p}, i64 {at}"));
+            f.push(Inst::Gep {
+                dst: w.to_string(),
+                elem: Ty::I64,
+                base: p.to_string(),
+                index: at.to_string(),
+            });
             let had = f.t();
-            f.i(format!("{had} = load i64, ptr {w}"));
+            f.push(Inst::Load {
+                dst: had.to_string(),
+                ty: Ty::I64,
+                ptr: w.to_string(),
+                volatile: false,
+            });
             let (cleared, bits) = (f.t(), f.t());
-            f.i(format!(
-                "{cleared} = and i64 {had}, {}",
-                !(l.desc_mask() << shift) as i64
-            ));
-            f.i(format!("{bits} = and i64 {dv}, {}", l.desc_mask()));
+            f.push(Inst::Bin {
+                dst: cleared.to_string(),
+                op: BinOp::And,
+                ty: Ty::I64,
+                a: had.to_string(),
+                b: (!(l.desc_mask() << shift) as i64).to_string(),
+            });
+            f.push(Inst::Bin {
+                dst: bits.to_string(),
+                op: BinOp::And,
+                ty: Ty::I64,
+                a: dv.to_string(),
+                b: (l.desc_mask()).to_string(),
+            });
             let bits = if shift > 0 {
                 let s = f.t();
-                f.i(format!("{s} = shl i64 {bits}, {shift}"));
+                f.push(Inst::Bin {
+                    dst: s.to_string(),
+                    op: BinOp::Shl,
+                    ty: Ty::I64,
+                    a: bits.to_string(),
+                    b: shift.to_string(),
+                });
                 s
             } else {
                 bits
             };
             let now = f.t();
-            f.i(format!("{now} = or i64 {cleared}, {bits}"));
-            f.i(format!("store i64 {now}, ptr {w}"));
+            f.push(Inst::Bin {
+                dst: now.to_string(),
+                op: BinOp::Or,
+                ty: Ty::I64,
+                a: cleared.to_string(),
+                b: bits.to_string(),
+            });
+            f.push(Inst::Store {
+                ty: Ty::I64,
+                v: now.to_string(),
+                ptr: w.to_string(),
+                volatile: false,
+            });
         }
     }
 
@@ -2570,12 +3513,19 @@ impl<'p> Module<'p> {
         let header = move |f: &mut Fun, v: &str, field: Field| {
             let p = f.ptr(v);
             let q = f.t();
-            f.i(format!(
-                "{q} = getelementptr i64, ptr {p}, i64 {}",
-                field.word
-            ));
+            f.push(Inst::Gep {
+                dst: q.to_string(),
+                elem: Ty::I64,
+                base: p.to_string(),
+                index: (field.word).to_string(),
+            });
             let w = f.t();
-            f.i(format!("{w} = load i64, ptr {q}"));
+            f.push(Inst::Load {
+                dst: w.to_string(),
+                ty: Ty::I64,
+                ptr: q.to_string(),
+                volatile: false,
+            });
             read_field(f, &w, field)
         };
         match (p, vals) {
@@ -2593,7 +3543,13 @@ impl<'p> Module<'p> {
             (CharFromCode, [n]) if self.rep(args[0]) == Some(Rep::Int) => {
                 Some(self.guarded(p, args, vals, env, f, |f| {
                     let c = f.t();
-                    f.i(format!("{c} = icmp ult i64 {n}, 55296"));
+                    f.push(Inst::ICmp {
+                        dst: c.to_string(),
+                        cond: ICmp::Ult,
+                        ty: Ty::I64,
+                        a: n.to_string(),
+                        b: "55296".to_string(),
+                    });
                     (c, n.clone())
                 }))
             }
@@ -2602,7 +3558,13 @@ impl<'p> Module<'p> {
                 Some(self.guarded(p, args, vals, env, f, move |f| {
                     let n = header(f, &s, l.meta);
                     let c = f.t();
-                    f.i(format!("{c} = icmp ult i64 {i}, {n}"));
+                    f.push(Inst::ICmp {
+                        dst: c.to_string(),
+                        cond: ICmp::Ult,
+                        ty: Ty::I64,
+                        a: i.to_string(),
+                        b: n.to_string(),
+                    });
                     // Only read past the check: computed on the fast path.
                     (c, format!("byte:{s}:{i}"))
                 }))
@@ -2613,7 +3575,13 @@ impl<'p> Module<'p> {
                 Some(self.guarded(p, args, vals, env, f, move |f| {
                     let n = header(f, &a, l.len);
                     let c = f.t();
-                    f.i(format!("{c} = icmp ult i64 {i}, {n}"));
+                    f.push(Inst::ICmp {
+                        dst: c.to_string(),
+                        cond: ICmp::Ult,
+                        ty: Ty::I64,
+                        a: i.to_string(),
+                        b: n.to_string(),
+                    });
                     (c, format!("elem:{a}:{i}"))
                 }))
                 .map(|x| {
@@ -2634,7 +3602,13 @@ impl<'p> Module<'p> {
                 Some(self.guarded(p, args, vals, env, f, move |f| {
                     let n = header(f, &a, l.len);
                     let c = f.t();
-                    f.i(format!("{c} = icmp ult i64 {i}, {n}"));
+                    f.push(Inst::ICmp {
+                        dst: c.to_string(),
+                        cond: ICmp::Ult,
+                        ty: Ty::I64,
+                        a: i.to_string(),
+                        b: n.to_string(),
+                    });
                     (c, format!("store:{a}:{i}:{v}"))
                 }))
             }
@@ -2646,12 +3620,19 @@ impl<'p> Module<'p> {
                 let d = result.map_or(D::Known(desc::REF), |n| self.desc(n, env));
                 let p = f.ptr(r);
                 let q = f.t();
-                f.i(format!(
-                    "{q} = getelementptr i64, ptr {p}, i64 {}",
-                    l.first_field(1, false)
-                ));
+                f.push(Inst::Gep {
+                    dst: q.to_string(),
+                    elem: Ty::I64,
+                    base: p.to_string(),
+                    index: (l.first_field(1, false)).to_string(),
+                });
                 let x = f.t();
-                f.i(format!("{x} = load i64, ptr {q}"));
+                f.push(Inst::Load {
+                    dst: x.to_string(),
+                    ty: Ty::I64,
+                    ptr: q.to_string(),
+                    volatile: false,
+                });
                 self.share(f, &x, &d, 1);
                 Some(x)
             }
@@ -2677,39 +3658,113 @@ impl<'p> Module<'p> {
                 let p = f.ptr(o);
                 // The length is in the word the block's address points at.
                 let w0 = f.t();
-                f.i(format!("{w0} = load i64, ptr {p}"));
+                f.push(Inst::Load {
+                    dst: w0.to_string(),
+                    ty: Ty::I64,
+                    ptr: p.to_string(),
+                    volatile: false,
+                });
                 let n = read_field(f, &w0, l.len);
                 let n = if l.inline_descs > 0 {
                     let (over, less, past) = (f.t(), f.t(), f.t());
                     let k = l.inline_descs;
-                    f.i(format!("{over} = icmp ugt i64 {n}, {k}"));
-                    f.i(format!("{less} = sub i64 {n}, {k}"));
-                    f.i(format!("{past} = select i1 {over}, i64 {less}, i64 0"));
+                    f.push(Inst::ICmp {
+                        dst: over.to_string(),
+                        cond: ICmp::Ugt,
+                        ty: Ty::I64,
+                        a: n.to_string(),
+                        b: k.to_string(),
+                    });
+                    f.push(Inst::Bin {
+                        dst: less.to_string(),
+                        op: BinOp::Sub,
+                        ty: Ty::I64,
+                        a: n.to_string(),
+                        b: k.to_string(),
+                    });
+                    f.push(Inst::Select {
+                        dst: past.to_string(),
+                        cond: over.to_string(),
+                        ty: Ty::I64,
+                        a: less.to_string(),
+                        b: "0".to_string(),
+                    });
                     past
                 } else {
                     n
                 };
                 let (up, dw, at, idx) = (f.t(), f.t(), f.t(), f.t());
                 let per = l.descs_per_word;
-                f.i(format!("{up} = add i64 {n}, {}", per - 1));
-                f.i(format!("{dw} = lshr i64 {up}, {}", per.trailing_zeros()));
-                f.i(format!("{at} = add i64 {dw}, {}", l.header_words));
-                f.i(format!("{idx} = add i64 {at}, {i}"));
+                f.push(Inst::Bin {
+                    dst: up.to_string(),
+                    op: BinOp::Add,
+                    ty: Ty::I64,
+                    a: n.to_string(),
+                    b: (per - 1).to_string(),
+                });
+                f.push(Inst::Bin {
+                    dst: dw.to_string(),
+                    op: BinOp::LShr,
+                    ty: Ty::I64,
+                    a: up.to_string(),
+                    b: (per.trailing_zeros()).to_string(),
+                });
+                f.push(Inst::Bin {
+                    dst: at.to_string(),
+                    op: BinOp::Add,
+                    ty: Ty::I64,
+                    a: dw.to_string(),
+                    b: (l.header_words).to_string(),
+                });
+                f.push(Inst::Bin {
+                    dst: idx.to_string(),
+                    op: BinOp::Add,
+                    ty: Ty::I64,
+                    a: at.to_string(),
+                    b: i.to_string(),
+                });
                 let q = f.t();
-                f.i(format!("{q} = getelementptr i64, ptr {p}, i64 {idx}"));
+                f.push(Inst::Gep {
+                    dst: q.to_string(),
+                    elem: Ty::I64,
+                    base: p.to_string(),
+                    index: idx.to_string(),
+                });
                 let old = f.t();
-                f.i(format!("{old} = load i64, ptr {q}"));
+                f.push(Inst::Load {
+                    dst: old.to_string(),
+                    ty: Ty::I64,
+                    ptr: q.to_string(),
+                    volatile: false,
+                });
                 self.share(f, v, &d, 1);
                 self.remember(f, o, v, &d);
-                f.i(format!("store i64 {v}, ptr {q}"));
+                f.push(Inst::Store {
+                    ty: Ty::I64,
+                    v: v.to_string(),
+                    ptr: q.to_string(),
+                    volatile: false,
+                });
                 self.erase(f, &old, &d);
                 Some("0".to_string())
             }
             (ToFloat, [x]) if self.rep(args[0]) == Some(Rep::Int) => {
                 let d = f.t();
-                f.i(format!("{d} = sitofp i64 {x} to double"));
+                f.push(Inst::Cast {
+                    dst: d.to_string(),
+                    op: Cast::SIToFP,
+                    from: Ty::I64,
+                    v: x.to_string(),
+                    to: Ty::F64,
+                });
                 let r = f.t();
-                f.i(format!("{r} = bitcast double {d} to i64"));
+                f.push(Inst::Cast {
+                    dst: r.to_string(),
+                    op: Cast::Bitcast,
+                    from: Ty::F64,
+                    v: d.to_string(),
+                    to: Ty::I64,
+                });
                 Some(r)
             }
             _ => None,
@@ -2734,32 +3789,71 @@ impl<'p> Module<'p> {
         let first = self.layout.first_field(0, true);
         let (c, answer) = check(f);
         let (fast, slow, done) = (f.b(), f.b(), f.b());
-        f.i(format!("br i1 {c}, label %{fast}, label %{slow}"));
+        f.push(Inst::CondBr {
+            cond: c.to_string(),
+            yes: fast.to_string(),
+            no: slow.to_string(),
+            unlikely: false,
+        });
         f.label(&fast);
         let quick = if let Some(rest) = answer.strip_prefix("byte:") {
             let (s, i) = rest.split_once(':').expect("byte:s:i");
             let p = f.ptr(s);
             let q = f.t();
-            f.i(format!(
-                "{q} = getelementptr i8, ptr {p}, i64 {}",
-                8 * first
-            ));
+            f.push(Inst::Gep {
+                dst: q.to_string(),
+                elem: Ty::I8,
+                base: p.to_string(),
+                index: (8 * first).to_string(),
+            });
             let r = f.t();
-            f.i(format!("{r} = getelementptr i8, ptr {q}, i64 {i}"));
+            f.push(Inst::Gep {
+                dst: r.to_string(),
+                elem: Ty::I8,
+                base: q.to_string(),
+                index: i.to_string(),
+            });
             let b = f.t();
-            f.i(format!("{b} = load i8, ptr {r}"));
+            f.push(Inst::Load {
+                dst: b.to_string(),
+                ty: Ty::I8,
+                ptr: r.to_string(),
+                volatile: false,
+            });
             let x = f.t();
-            f.i(format!("{x} = zext i8 {b} to i64"));
+            f.push(Inst::Cast {
+                dst: x.to_string(),
+                op: Cast::ZExt,
+                from: Ty::I8,
+                v: b.to_string(),
+                to: Ty::I64,
+            });
             x
         } else if let Some(rest) = answer.strip_prefix("elem:") {
             let (a, i) = rest.split_once(':').expect("elem:a:i");
             let k = f.t();
-            f.i(format!("{k} = add i64 {i}, {first}"));
+            f.push(Inst::Bin {
+                dst: k.to_string(),
+                op: BinOp::Add,
+                ty: Ty::I64,
+                a: i.to_string(),
+                b: first.to_string(),
+            });
             let p = f.ptr(a);
             let q = f.t();
-            f.i(format!("{q} = getelementptr i64, ptr {p}, i64 {k}"));
+            f.push(Inst::Gep {
+                dst: q.to_string(),
+                elem: Ty::I64,
+                base: p.to_string(),
+                index: k.to_string(),
+            });
             let x = f.t();
-            f.i(format!("{x} = load i64, ptr {q}"));
+            f.push(Inst::Load {
+                dst: x.to_string(),
+                ty: Ty::I64,
+                ptr: q.to_string(),
+                volatile: false,
+            });
             x
         } else if let Some(rest) = answer.strip_prefix("store:") {
             let mut parts = rest.splitn(3, ':');
@@ -2769,29 +3863,50 @@ impl<'p> Module<'p> {
                 parts.next().expect("store:a:i:v"),
             );
             let k = f.t();
-            f.i(format!("{k} = add i64 {i}, {first}"));
+            f.push(Inst::Bin {
+                dst: k.to_string(),
+                op: BinOp::Add,
+                ty: Ty::I64,
+                a: i.to_string(),
+                b: first.to_string(),
+            });
             let p = f.ptr(a);
             let q = f.t();
-            f.i(format!("{q} = getelementptr i64, ptr {p}, i64 {k}"));
-            f.i(format!("store i64 {v}, ptr {q}"));
+            f.push(Inst::Gep {
+                dst: q.to_string(),
+                elem: Ty::I64,
+                base: p.to_string(),
+                index: k.to_string(),
+            });
+            f.push(Inst::Store {
+                ty: Ty::I64,
+                v: v.to_string(),
+                ptr: q.to_string(),
+                volatile: false,
+            });
             "0".to_string()
         } else {
             answer
         };
         let from_fast = f.cur.clone();
-        f.i(format!("br label %{done}"));
+        f.push(Inst::Br(done.to_string()));
         f.label(&slow);
         // Only ever reached for what the check refused -- which, for an
         // element or a byte, the runtime reports and does not come back from,
         // so the share an element gets after this is the fast path's alone.
         let r = self.generic(p, args, vals, &[], env, f);
         let from_slow = f.cur.clone();
-        f.i(format!("br label %{done}"));
+        f.push(Inst::Br(done.to_string()));
         f.label(&done);
         let out = f.t();
-        f.i(format!(
-            "{out} = phi i64 [ {quick}, %{from_fast} ], [ {r}, %{from_slow} ]"
-        ));
+        f.push(Inst::Phi {
+            dst: out.to_string(),
+            ty: Ty::I64,
+            incoming: vec![
+                (quick.to_string(), from_fast.to_string()),
+                (r.to_string(), from_slow.to_string()),
+            ],
+        });
         out
     }
 
@@ -2801,8 +3916,19 @@ impl<'p> Module<'p> {
         let (zero, minus, normal, done) = (f.b(), f.b(), f.b(), f.b());
         let check = f.b();
         let z = f.t();
-        f.i(format!("{z} = icmp eq i64 {b}, 0"));
-        f.i(format!("br i1 {z}, label %{zero}, label %{check}"));
+        f.push(Inst::ICmp {
+            dst: z.to_string(),
+            cond: ICmp::Eq,
+            ty: Ty::I64,
+            a: b.to_string(),
+            b: "0".to_string(),
+        });
+        f.push(Inst::CondBr {
+            cond: z.to_string(),
+            yes: zero.to_string(),
+            no: check.to_string(),
+            unlikely: false,
+        });
         f.label(&zero);
         let msg = if p == Prim::Div {
             "division by zero"
@@ -2810,30 +3936,71 @@ impl<'p> Module<'p> {
             "modulo by zero"
         };
         let (g, len) = self.cstr(msg);
-        f.i(format!("call void @meadow_fail(ptr {g}, i64 {len})"));
-        f.i("unreachable".into());
+        f.push(Inst::Call {
+            dst: None,
+            tail: false,
+            cc: None,
+            ret: Ty::Void,
+            callee: "@meadow_fail".to_string(),
+            args: vec![(Ty::Ptr, g.to_string()), (Ty::I64, len.to_string())],
+        });
+        f.push(Inst::Unreachable);
         f.label(&check);
         let m = f.t();
-        f.i(format!("{m} = icmp eq i64 {b}, -1"));
-        f.i(format!("br i1 {m}, label %{minus}, label %{normal}"));
+        f.push(Inst::ICmp {
+            dst: m.to_string(),
+            cond: ICmp::Eq,
+            ty: Ty::I64,
+            a: b.to_string(),
+            b: "-1".to_string(),
+        });
+        f.push(Inst::CondBr {
+            cond: m.to_string(),
+            yes: minus.to_string(),
+            no: normal.to_string(),
+            unlikely: false,
+        });
         f.label(&minus);
         let neg = f.t();
         if p == Prim::Div {
-            f.i(format!("{neg} = sub i64 0, {a}"));
+            f.push(Inst::Bin {
+                dst: neg.to_string(),
+                op: BinOp::Sub,
+                ty: Ty::I64,
+                a: "0".to_string(),
+                b: a.to_string(),
+            });
         } else {
-            f.i(format!("{neg} = add i64 0, 0"));
+            f.push(Inst::Bin {
+                dst: neg.to_string(),
+                op: BinOp::Add,
+                ty: Ty::I64,
+                a: "0".to_string(),
+                b: "0".to_string(),
+            });
         }
-        f.i(format!("br label %{done}"));
+        f.push(Inst::Br(done.to_string()));
         f.label(&normal);
         let q = f.t();
         let ins = if p == Prim::Div { "sdiv" } else { "srem" };
-        f.i(format!("{q} = {ins} i64 {a}, {b}"));
-        f.i(format!("br label %{done}"));
+        f.push(Inst::Bin {
+            dst: q.to_string(),
+            op: BinOp::named(&ins).expect("an operation"),
+            ty: Ty::I64,
+            a: a.to_string(),
+            b: b.to_string(),
+        });
+        f.push(Inst::Br(done.to_string()));
         f.label(&done);
         let r = f.t();
-        f.i(format!(
-            "{r} = phi i64 [ {neg}, %{minus} ], [ {q}, %{normal} ]"
-        ));
+        f.push(Inst::Phi {
+            dst: r.to_string(),
+            ty: Ty::I64,
+            incoming: vec![
+                (neg.to_string(), minus.to_string()),
+                (q.to_string(), normal.to_string()),
+            ],
+        });
         r
     }
 
@@ -2857,25 +4024,59 @@ impl<'p> Module<'p> {
         ops.extend(extra.iter().cloned());
         let n = ops.len().max(1);
         let (av, dv) = (f.t(), f.t());
-        f.alloca(format!("{av} = alloca [{n} x i64]"));
-        f.alloca(format!("{dv} = alloca [{n} x i64]"));
+        f.push_alloca(Inst::Alloca {
+            dst: av.to_string(),
+            words: n,
+        });
+        f.push_alloca(Inst::Alloca {
+            dst: dv.to_string(),
+            words: n,
+        });
         for (i, (v, d)) in ops.iter().enumerate() {
             let (q, r) = (f.t(), f.t());
-            f.i(format!("{q} = getelementptr i64, ptr {av}, i64 {i}"));
-            f.i(format!("store i64 {v}, ptr {q}"));
-            f.i(format!("{r} = getelementptr i64, ptr {dv}, i64 {i}"));
+            f.push(Inst::Gep {
+                dst: q.to_string(),
+                elem: Ty::I64,
+                base: av.to_string(),
+                index: i.to_string(),
+            });
+            f.push(Inst::Store {
+                ty: Ty::I64,
+                v: v.to_string(),
+                ptr: q.to_string(),
+                volatile: false,
+            });
+            f.push(Inst::Gep {
+                dst: r.to_string(),
+                elem: Ty::I64,
+                base: dv.to_string(),
+                index: i.to_string(),
+            });
             let dval = match d {
                 D::Known(k) => k.to_string(),
                 D::Dyn(x) => x.clone(),
             };
-            f.i(format!("store i64 {dval}, ptr {r}"));
+            f.push(Inst::Store {
+                ty: Ty::I64,
+                v: dval.to_string(),
+                ptr: r.to_string(),
+                volatile: false,
+            });
         }
         let out = f.t();
-        f.i(format!(
-            "{out} = call i64 @meadow_prim(i64 {}, i64 {}, ptr {av}, ptr {dv})",
-            p.code(),
-            ops.len()
-        ));
+        f.push(Inst::Call {
+            dst: Some(out.to_string()),
+            tail: false,
+            cc: None,
+            ret: Ty::I64,
+            callee: "@meadow_prim".to_string(),
+            args: vec![
+                (Ty::I64, (p.code()).to_string()),
+                (Ty::I64, (ops.len()).to_string()),
+                (Ty::Ptr, av.to_string()),
+                (Ty::Ptr, dv.to_string()),
+            ],
+        });
         out
     }
 
@@ -3631,39 +4832,74 @@ fn spill(f: &mut Fun, ops: &[String], regs: usize, threaded: bool) {
     }
     f.spill = f.spill.max(ops.len() - regs);
     let area = f.t();
-    f.i(spill_area(&area, threaded));
+    f.body.extend(spill_area(&area, threaded));
     for (i, o) in ops.iter().enumerate().skip(regs) {
         let q = f.t();
-        f.i(format!(
-            "{q} = getelementptr i64, ptr {area}, i64 {}",
-            i - regs
-        ));
-        f.i(format!("store i64 {o}, ptr {q}"));
+        f.push(Inst::Gep {
+            dst: q.to_string(),
+            elem: Ty::I64,
+            base: area.to_string(),
+            index: (i - regs).to_string(),
+        });
+        f.push(Inst::Store {
+            ty: Ty::I64,
+            v: o.to_string(),
+            ptr: q.to_string(),
+            volatile: false,
+        });
     }
 }
 
 /// `area` set to the spill area's address.
-fn spill_area(area: &str, threaded: bool) -> String {
+fn spill_area(area: &str, threaded: bool) -> Vec<Inst> {
     if threaded {
-        format!("{area}.ctx = inttoptr i64 {CTX} to ptr\n  {area} = load ptr, ptr {area}.ctx")
+        vec![
+            Inst::Cast {
+                dst: format!("{area}.ctx"),
+                op: Cast::IntToPtr,
+                from: Ty::I64,
+                v: CTX.to_string(),
+                to: Ty::Ptr,
+            },
+            Inst::Load {
+                dst: area.to_string(),
+                ty: Ty::Ptr,
+                ptr: format!("{area}.ctx"),
+                volatile: false,
+            },
+        ]
     } else {
-        format!("{area} = call ptr @meadow_spill_area()")
+        vec![Inst::Call {
+            dst: Some(area.to_string()),
+            tail: false,
+            cc: None,
+            ret: Ty::Ptr,
+            callee: "@meadow_spill_area".into(),
+            args: Vec::new(),
+        }]
     }
 }
 
 /// The loads of a function's parameters past the first `regs`, at its entry.
-fn spilled_params(params: &[String], regs: usize, threaded: bool) -> String {
-    let mut out = String::new();
+fn spilled_params(params: &[String], regs: usize, threaded: bool) -> Vec<Inst> {
+    let mut out = Vec::new();
     if params.len() <= regs {
         return out;
     }
-    let _ = writeln!(out, "  {}", spill_area("%spill.at", threaded));
+    out.extend(spill_area("%spill.at", threaded));
     for (i, p) in params.iter().enumerate().skip(regs) {
-        let _ = writeln!(
-            out,
-            "  {p}.at = getelementptr i64, ptr %spill.at, i64 {}\n  {p} = load i64, ptr {p}.at",
-            i - regs
-        );
+        out.push(Inst::Gep {
+            dst: format!("{p}.at"),
+            elem: Ty::I64,
+            base: "%spill.at".into(),
+            index: (i - regs).to_string(),
+        });
+        out.push(Inst::Load {
+            dst: p.clone(),
+            ty: Ty::I64,
+            ptr: format!("{p}.at"),
+            volatile: false,
+        });
     }
     out
 }
@@ -3690,8 +4926,8 @@ fn env_with(env: &HashMap<Name, V>, names: &[Name], vals: &[String]) -> HashMap<
 struct Fun {
     name: String,
     params: Vec<String>,
-    body: String,
-    allocas: String,
+    body: Vec<Inst>,
+    allocas: Vec<Inst>,
     tmp: usize,
     blk: usize,
     cur: String,
@@ -3718,8 +4954,8 @@ impl Fun {
         Fun {
             name,
             params,
-            body: String::new(),
-            allocas: String::new(),
+            body: Vec::new(),
+            allocas: Vec::new(),
             tmp: 0,
             blk: 0,
             cur: "entry".into(),
@@ -3738,27 +4974,31 @@ impl Fun {
         format!("b{}", self.blk)
     }
 
-    fn i(&mut self, s: String) {
-        self.body.push_str("  ");
-        self.body.push_str(&s);
-        self.body.push('\n');
+    /// An instruction, in the block being written.
+    fn push(&mut self, i: Inst) {
+        self.body.push(i);
     }
 
-    fn alloca(&mut self, s: String) {
-        self.allocas.push_str("  ");
-        self.allocas.push_str(&s);
-        self.allocas.push('\n');
+    /// An `alloca`, which goes with the others at the function's entry.
+    fn push_alloca(&mut self, i: Inst) {
+        self.allocas.push(i);
     }
 
     fn label(&mut self, l: &str) {
-        let _ = writeln!(self.body, "{l}:");
+        self.body.push(Inst::Label(l.to_string()));
         self.cur = l.to_string();
     }
 
     /// `v` as a `ptr`.
     fn ptr(&mut self, v: &str) -> String {
         let p = self.t();
-        self.i(format!("{p} = inttoptr i64 {v} to ptr"));
+        self.push(Inst::Cast {
+            dst: p.to_string(),
+            op: Cast::IntToPtr,
+            from: Ty::I64,
+            v: v.to_string(),
+            to: Ty::Ptr,
+        });
         p
     }
 }

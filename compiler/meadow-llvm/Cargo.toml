@@ -12,6 +12,7 @@ path = "src/lib.rs"
 meadow-axcut.workspace = true
 meadow-intern.workspace = true
 meadow-rt.workspace = true
+meadow-lir.workspace = true
 
 [dev-dependencies]
 meadow-compiler = { path = "../meadow-compiler" }

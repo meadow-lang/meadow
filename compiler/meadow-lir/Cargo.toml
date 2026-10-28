@@ -1,0 +1,11 @@
+[package]
+name = "meadow-lir"
+description = "Meadow's lower-level IR: the linear program's functions with a layout's arithmetic and a memory strategy's operations written out, which the LLVM back end prints and the JIT's second tier compiles."
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "meadow_lir"
+path = "src/lib.rs"
+
+[dependencies]
