@@ -295,24 +295,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "meadow-bytecode"
-version = "0.3.0"
-dependencies = [
- "meadow-intern",
- "meadow-rt",
-]
-
-[[package]]
-name = "meadow-codegen"
-version = "0.3.0"
-dependencies = [
- "meadow-axcut",
- "meadow-bytecode",
- "meadow-intern",
- "meadow-rt",
-]
-
-[[package]]
 name = "meadow-compiler"
 version = "0.3.0"
 dependencies = [

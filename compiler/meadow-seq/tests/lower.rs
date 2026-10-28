@@ -1,6 +1,7 @@
 //! What the lowering actually emits.
 //!
-//! `meadow_glade`'s differential tests already check that the translation *means*
+//! The differential tests (`buildtools/meadow/tests/differential.rs`) already
+//! check that the translation *means*
 //! the same thing as the CEK machine. These check that it means it in the
 //! intended shape — that returning is an `invoke` with no arguments, that
 //! calling is a `substitute` and an `invoke`, and above all that a block's

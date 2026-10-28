@@ -5,9 +5,8 @@
 //! — plus three more for effects, which AxCut does not have.
 //!
 //! It lives beside the IR rather than in the runtime, because it is not a
-//! runtime. `meadow_glade` executes bytecode and knows nothing about sequents; the
-//! whole point of `meadow_codegen` is that everything in this file is compiled
-//! away. What this is for:
+//! runtime: the point of the VM and of the back ends is that everything in this
+//! file is compiled away. What this is for:
 //!
 //! * **Pinning down what the IR means** before a code generator gets an opinion
 //!   about it. When the VM and this disagree, one of them is wrong and there is
@@ -916,9 +915,9 @@ fn plays(name: &str, role: Role) -> bool {
 /// A constructor as a reader wants to see it: `Maybe.Just` prints as `Just`.
 ///
 /// The third of three implementations of this — `meadow_eval`'s `Display` and
-/// `meadow_glade::show` are the others — which is why
-/// `constructors_print_bare_and_agree` in `glade/tests/differential.rs` runs all
-/// three against each other rather than trusting any one of them.
+/// the runtime's `show` (`silo/src/show.rs`) are the others — which is why the
+/// differential tests (`buildtools/meadow/tests/differential.rs`) compare what
+/// the machines print rather than trusting any one of them.
 fn bare_ctor(name: &str) -> &str {
     match name.rsplit_once('.') {
         Some((_, c)) => c,

@@ -317,7 +317,7 @@ pub enum Prim {
     // A function's continuation is a frame on a per-thread stack rather than
     // a heap object, and an effect handler has to capture the frames between
     // a `perform` and itself. The stack is chunked, and these three cut and
-    // rejoin it at chunk boundaries -- see `meadow_glade::heap`'s frame stack.
+    // rejoin it at chunk boundaries, as the bytecode runtime's frame stack did.
     /// `Ref -> ()` -- entering a `handle`: start a chunk, so that whatever the
     /// body pushes can be detached from the handler's own frames in O(1).
     Enter,
@@ -336,9 +336,9 @@ pub enum Prim {
     //
     // The operators above at a type core knows: both operands are `Int`, or
     // both `Float`, so no engine has to look at what it was given to decide
-    // what to do. Nothing in core chooses them yet; the bytecode back end
-    // picks its typed instructions from representations instead (see
-    // `meadow_codegen`). `Int` wraps and dividing it by zero is an error, as `Add`
+    // what to do. Nothing in core chooses them yet; the back ends pick typed
+    // operations from representations instead. `Int` wraps and dividing it by
+    // zero is an error, as `Add`
     // and `Div` on two `Int`s are; `Float` is IEEE.
     IntAdd,
     IntSub,
@@ -657,7 +657,8 @@ impl Prim {
     /// the runtime cares — it must not **allocate**, because the machine puts a
     /// fused comparison's result in a register the collector does not scan.
     ///
-    /// So this is a claim about `meadow_glade::prims`, not only about types. A
+    /// So this is a claim about the runtime's primitives (`silo/src/prims.rs`),
+    /// not only about types. A
     /// primitive that allocates does not belong here however boolean it looks.
     pub const fn compares(self) -> bool {
         use Prim::*;
@@ -921,8 +922,8 @@ pub struct Loc {
 /// | `O1` | native code keeps the machine's books only where they are observed, with short encodings | — |
 /// | `O2` | `match` compiled to a decision tree; generic code specialized; native loops kept inside one function, hot registers in machine registers | code size, compile time |
 ///
-/// The native rows are the code generator's (`meadow_glade::codegen`), which the
-/// JIT and ahead-of-time executables share. `O1` is the default, and it is
+/// The native rows were the bytecode runtime's code generator's, which its JIT
+/// and its ahead-of-time executables shared. `O1` is the default, and it is
 /// where a pass lands that is worth doing on every keystroke. `O0` exists so
 /// that a suspected miscompilation can be bisected against a compiler doing
 /// the least it is allowed to.

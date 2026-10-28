@@ -1,7 +1,7 @@
 //! **The primitives the emitted code does not do inline**, and the effects
 //! that reach the world.
 //!
-//! Ported from `meadow-glade`'s, operation for operation -- the wrapping
+//! Ported from the bytecode runtime's, operation for operation -- the wrapping
 //! arithmetic, the zero checks, the clamping in `arraySlice`, the error
 //! messages a program can see -- since a difference here is a difference
 //! between backends, and the differential tests call it a bug.
@@ -931,6 +931,11 @@ pub fn hash(v: Val) -> i64 {
                 }
                 if heap::is_immediate(x) {
                     let name = show::ctor_name(heap::payload(x) as usize);
+                    // A tag no constructor has is a closure's that
+                    // captures nothing: its method table's.
+                    if name.is_empty() {
+                        return fail(unhashable("a function"));
+                    }
                     h.data(&name, 0);
                     continue;
                 }

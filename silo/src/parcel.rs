@@ -6,7 +6,7 @@
 //! kept, so a structure that is a DAG arrives as one.
 //!
 //! Immutable data copies without anyone being able to tell. What cannot be
-//! copied so is refused, as `meadow-glade` refuses it: a `Ref`, a mutable array,
+//! copied so is refused, as the bytecode runtime refused it: a `Ref`, a mutable array,
 //! a continuation. A thread, a channel or a `TVar` is a handle to something
 //! the scheduler keeps, and crosses as the same handle.
 

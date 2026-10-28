@@ -19,7 +19,7 @@
 //! `getCompact` hands out a pointer **into** the region, and that pointer is
 //! counted like any other -- so the region cannot be freed with the `Compact`
 //! that named it, or a program that reads a compact and then lets go of the
-//! compact is left holding freed memory. `meadow-glade` has no such problem: it
+//! compact is left holding freed memory. The bytecode runtime had no such problem: it
 //! traces, so a collection finds the addresses a heap holds into a region and
 //! the region goes when none are left. Counting cannot discover that; it has
 //! to be told.
@@ -48,7 +48,7 @@
 //!
 //! What this costs, said plainly: every program pays the compare that
 //! recognises a region, on the path every share and erase takes, including
-//! every program that never makes a compact. `meadow-glade` pays nothing for
+//! every program that never makes a compact. The bytecode runtime paid nothing for
 //! the same thing, because it traces and its region addresses sit above every
 //! heap address. Here the price buys `getCompact` staying O(1) while the
 //! region is still freed the moment the last reference into it goes.
@@ -66,7 +66,7 @@
 //! about any of the above. Data, arrays, records, strings, numbers and other
 //! compacts are what is left, and a compact inside a compact is kept as it is
 //! -- its region retained, its contents not copied again. A channel, a thread
-//! or a `TVar` goes in too, as `meadow-glade`'s regions take them: its block
+//! or a `TVar` goes in too, as the bytecode runtime's regions took them: its block
 //! is a handle holding the address of something the scheduler keeps for the
 //! whole run, which never changes and owns nothing -- and a `TVar`, whose
 //! value lives in a region, may then hold a structure linked by `TVar`s.

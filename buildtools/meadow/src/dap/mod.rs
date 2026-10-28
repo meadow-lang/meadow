@@ -3,16 +3,14 @@
 //!
 //! An editor starts it, sends `launch` with a program to debug, and from then
 //! on asks it to run, stop, step and describe what it sees. The debugging
-//! itself is [`session::Session`]; this module is the protocol and the loop.
+//! itself is [`silo::SiloSession`]; this module is the protocol and the loop.
 //!
 //! # Running without blocking
 //!
 //! While the program runs, the adapter still has to answer: a `pause` has to
 //! land, and an editor asks for threads and sets breakpoints whenever it likes.
-//! So stdin is read on a thread of its own, and the program runs in slices of
-//! [`SLICE`] instructions with the queue checked between them. A slice is small
-//! enough that a pause feels immediate and large enough that checking costs
-//! nothing measurable.
+//! So stdin is read on a thread of its own, and the VM -- a process of its
+//! own -- is listened to a moment at a time, with the queue checked between.
 //!
 //! # Output
 //!
@@ -25,87 +23,16 @@ pub mod session;
 pub mod silo;
 
 use serde_json::{Value as Json, json};
-use session::{Mode, Session, Stop};
+use session::{Mode, Stop};
 
-/// What is being debugged: a program on Glade's VM, in this process, or on
-/// Silo's interpreter, in its own (`silo::SiloSession`). The adapter asks
-/// both the same things.
-pub enum Debuggee {
-    Glade(Session),
-    Silo(silo::SiloSession),
-}
+/// What is being debugged: a program on the VM, in a process of its own.
+pub type Debuggee = silo::SiloSession;
 
-/// `Debuggee::$name`, of whichever it is.
-macro_rules! either {
-    ($self:ident, $s:ident => $e:expr) => {
-        match $self {
-            Debuggee::Glade($s) => $e,
-            Debuggee::Silo($s) => $e,
-        }
-    };
-}
-
-impl Debuggee {
-    fn run(&mut self, budget: u64) -> Option<Stop> {
-        either!(self, s => s.run(budget))
-    }
-    fn take_output(&mut self) -> String {
-        either!(self, s => s.take_output())
-    }
-    fn is_finished(&self) -> bool {
-        either!(self, s => s.is_finished())
-    }
-    fn set_breakpoints(&mut self, path: &std::path::Path, lines: &[u32]) -> Vec<Option<u32>> {
-        either!(self, s => s.set_breakpoints(path, lines))
-    }
-    fn resume(&mut self, mode: Mode) {
-        either!(self, s => s.resume(mode))
-    }
-    fn resume_until_in(&mut self, name: &str, module: &std::path::Path) -> bool {
-        either!(self, s => s.resume_until_in(name, module))
-    }
-    fn stop_at_entry(&mut self) -> Option<Stop> {
-        either!(self, s => s.stop_at_entry())
-    }
-    fn frames(&mut self, max: usize) -> Vec<session::Frame> {
-        either!(self, s => s.frames(max))
-    }
-    fn file(&self, loc: meadow_compiler::core::Loc) -> Option<&session::SourceFile> {
-        either!(self, s => s.file(loc))
-    }
-    fn scopes(&mut self, frame: usize) -> Vec<session::Scope> {
-        either!(self, s => s.scopes(frame))
-    }
-    fn variables(&mut self, reference: u32) -> Vec<session::Variable> {
-        either!(self, s => s.variables(reference))
-    }
-    fn evaluate(&mut self, frame: usize, expr: &str) -> Option<session::Variable> {
-        either!(self, s => s.evaluate(frame, expr))
-    }
-    /// Under `"watch"`, rebuild and reload if the sources changed: Silo's
-    /// interpreter takes a new build; Glade's VM is never launched to watch.
-    fn tick(&mut self) {
-        if let Debuggee::Silo(s) = self {
-            s.tick();
-        }
-    }
-    fn watching(&self) -> bool {
-        matches!(self, Debuggee::Silo(s) if s.watching())
-    }
-    /// Stop the running program. Glade's is run a slice at a time, and is
-    /// stopped by not running another; Silo's runs on its own, and is told.
-    fn pause(&mut self) -> Option<Stop> {
-        match self {
-            Debuggee::Glade(_) => Some(Stop::Pause),
-            Debuggee::Silo(s) => s.pause(),
-        }
-    }
-}
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-/// Instructions run between looks at the request queue.
+/// What a look at the VM is given before the request queue is looked at.
 const SLICE: u64 = 20_000;
 
 /// The single thread a Meadow program has.
@@ -363,32 +290,13 @@ impl Adapter {
                     (Some(f), Some(e)) => Some((f.to_string(), e.module.clone())),
                     _ => None,
                 };
-                // Silo's interpreter, when the launch or the package's debug
-                // profile asks for Silo; Glade's VM otherwise.
                 let path = std::path::Path::new(program);
-                let silo = match args["runtime"].as_str() {
-                    Some(r) => r == "silo",
-                    None => {
-                        crate::profile::Resolved::resolve(
-                            crate::profile::Profile::Debug,
-                            path,
-                            Default::default(),
-                        )
-                        .runtime
-                            == crate::aot::Runtime::Silo
-                    }
-                };
-                let launched = if silo {
-                    // `stack`: `heap` for frames on the heap, as Glade's are.
-                    // `watch`: build and reload as the sources change, as
-                    // `meadow run --watch` does.
-                    let stack = args["stack"].as_str().and_then(meadow_llvm::Stack::named);
-                    let watch = args["watch"].as_bool().unwrap_or(false);
-                    silo::SiloSession::launch_watching(path, entry.as_ref(), stack, watch)
-                        .map(Debuggee::Silo)
-                } else {
-                    Session::launch_at(path, entry.as_ref()).map(Debuggee::Glade)
-                };
+                // `stack`: `heap` for frames on the heap. `watch`: build and
+                // reload as the sources change, as `meadow run --watch` does.
+                let stack = args["stack"].as_str().and_then(meadow_llvm::Stack::named);
+                let watch = args["watch"].as_bool().unwrap_or(false);
+                let launched =
+                    silo::SiloSession::launch_watching(path, entry.as_ref(), stack, watch);
                 match launched {
                     Ok(s) => {
                         self.session = Some(s);

@@ -1,12 +1,11 @@
-//! One debugging session on **Silo's interpreter**: the program built as for
-//! Glade's session ([`session::build`]), written as an image, and run by
+//! One debugging session on **the VM**: the program built for debugging
+//! ([`session::build_reloadable`]), written as an image, and run by
 //! `meadow-silo-vm --debug` in a process of its own, which this drives over a
 //! connection of its own (`silo/vm/src/interp/debug.rs` says what is said on
-//! it). The VM's standard output is the program's, forwarded as Glade's
-//! session forwards what its program prints.
+//! it). The VM's standard output is the program's, forwarded to the editor
+//! as `output` events.
 //!
-//! What a person sees is worked out here, as Glade's session works it out:
-//! which source and line each instruction is on, where a step may stop (a
+//! What a person sees is worked out here: which source and line each instruction is on, where a step may stop (a
 //! *boundary*, the first instruction of a source position), which pcs a
 //! breakpoint on a line means, and what each variable is called. The VM says
 //! where it is and what its frames hold.
@@ -134,7 +133,7 @@ impl SiloSession {
     }
 
     /// [`SiloSession::launch_at`], its frames kept as `stack` says: on the
-    /// heap, as Glade's are, or on a native stack that grows -- which is
+    /// heap, or on a native stack that grows -- which is
     /// what it is unless the launch or `MEADOW_STACK` says `heap`. A fixed
     /// stack is never what a debugger wants.
     pub fn launch_with(
@@ -173,8 +172,8 @@ impl SiloSession {
             "debugged-{}.image",
             SESSIONS.fetch_add(1, Ordering::Relaxed)
         ));
-        // A debugger's program counts as the build would, and its stack grows
-        // as Glade's does: a deep recursion is something to look at, not a
+        // A debugger's program counts as the build would, and its stack
+        // grows: a deep recursion is something to look at, not a
         // reason to stop.
         let asked = stack.or_else(|| {
             std::env::var("MEADOW_STACK")
@@ -534,8 +533,8 @@ impl SiloSession {
 
     // --- breakpoints ------------------------------------------------------
 
-    /// As [`session::Session::set_breakpoints`]: the first boundary of each
-    /// line in each procedure, on the line asked for or a little after it.
+    /// The first boundary of each line in each procedure, on the line asked
+    /// for or a little after it.
     pub fn set_breakpoints(&mut self, path: &Path, lines: &[u32]) -> Vec<Option<u32>> {
         let wanted = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let ids: HashSet<u32> = self
@@ -701,8 +700,8 @@ impl SiloSession {
         done
     }
 
-    /// As [`session::Session::run`]: `None` while it is still going. The
-    /// budget is not instructions here but how long to wait for news.
+    /// How it stopped, or `None` while it is still going. The budget is not
+    /// instructions but how long to wait for news.
     pub fn run(&mut self, _budget: u64) -> Option<Stop> {
         self.wait(Some(Duration::from_millis(20)))
     }
@@ -784,7 +783,7 @@ impl SiloSession {
             .take(max)
             .map(|(proc, pc, seg)| {
                 let p = proc.and_then(|p| self.procs.get(p));
-                // The definition's own name, as Glade's frames give it: not
+                // The definition's own name: not
                 // its module's, nor which of its methods or frames this is.
                 let name = session::display_name(p.map_or("?", |p| {
                     let def = p.name.split('/').next().unwrap_or("?");
@@ -797,7 +796,7 @@ impl SiloSession {
                         n => format!("{name} [reload {n}]"),
                     },
                     // A frame waiting on the heap is where the call that
-                    // made its continuation is, as Glade's frames show it.
+                    // made its continuation is.
                     loc: match p {
                         Some(p) if pc == p.entry && p.origin.is_some() => {
                             p.origin.and_then(|o| self.loc_near(o))
@@ -805,7 +804,6 @@ impl SiloSession {
                         Some(_) => self.loc_near(pc),
                         None => None,
                     },
-                    vars: Vec::new(),
                 }
             })
             .collect()
@@ -828,7 +826,7 @@ impl SiloSession {
         self.refs.len() as u32
     }
 
-    /// The named variables of frame `frame`, as Glade's session shows them:
+    /// The named variables of frame `frame`:
     /// those a person wrote, under the names they wrote.
     fn locals(&mut self, frame: usize) -> Vec<Variable> {
         self.stacked();
@@ -909,7 +907,7 @@ impl SiloSession {
         }
     }
 
-    /// As Glade's session's: a name in scope in frame `frame`.
+    /// A name in scope in frame `frame`.
     pub fn evaluate(&mut self, frame: usize, expr: &str) -> Option<Variable> {
         let expr = expr.trim();
         self.locals(frame).into_iter().find(|v| v.name == expr)

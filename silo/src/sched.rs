@@ -249,10 +249,10 @@ fn chan_state(c: &Chan) -> std::sync::MutexGuard<'_, ChanState> {
 /// a `Bool` -- kept as it is, and anything else in a compact region, where
 /// every thread reads it in place. So what a region cannot hold -- a value
 /// reaching a function, a `Ref`, a mutable array or a continuation -- a `TVar`
-/// cannot either, as on `meadow-glade` (`meadow_core::stm`).
+/// cannot either, as on the bytecode runtime.
 ///
 /// Reading a `TVar` that holds a large map costs a pointer, not a copy of the
-/// map -- as it does on `meadow-glade`, whose `stm` module this follows. A
+/// map -- as it did on the bytecode runtime, whose `stm` module this follows. A
 /// `TVar` used to hold a parcel, and every read copied all of it into the
 /// reader's heap and every write all of it out: a query database keeping its
 /// answers in one `TVar` spent nine tenths of its time copying them.
@@ -571,7 +571,7 @@ fn work() {
 }
 
 /// How many OS threads run green threads: `MEADOW_THREADS` if it is set, or
-/// one per core -- as `meadow-glade` reads it.
+/// one per core -- as the bytecode runtime read it.
 fn workers() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(count_workers)

@@ -1953,6 +1953,7 @@ fn compiled(src: &str) -> Result<core::Program, String> {
         ctor_fields: pkg.ctor_fields.clone(),
         variants: pkg.variants.clone(),
         origins: Default::default(),
+        migrations: Default::default(),
     })
 }
 
@@ -3516,7 +3517,7 @@ fn a_command_takes_what_meadow_s_takes() {
         .filter_map(|l| l.split_whitespace().next().map(str::to_string))
         .filter(|c| c != "help")
         .collect();
-    assert!(commands.len() >= 14, "{commands:?}");
+    assert!(commands.len() >= 13, "{commands:?}");
     assert_eq!(
         flags_in(&top),
         flags_in(&help_of(&boot, &["--help"])),

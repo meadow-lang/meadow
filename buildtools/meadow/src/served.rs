@@ -63,8 +63,9 @@ impl Served {
     /// A VM for `image`, its standard input and output the program's if
     /// `console`, and nothing if not -- a run that is given its input keeps
     /// what it writes either way -- and what it says on standard error shown
-    /// if `console`, and kept for [`Served::said`] if not.
-    pub fn start(image: &Path, console: bool) -> Result<Served, String> {
+    /// if `console`, and kept for [`Served::said`] if not. `env` is set for
+    /// it: what tells the VM to run with its JIT.
+    pub fn start(image: &Path, console: bool, env: &[(&str, &str)]) -> Result<Served, String> {
         let listener =
             TcpListener::bind(("127.0.0.1", 0)).map_err(|e| format!("cannot listen: {e}"))?;
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
@@ -74,6 +75,7 @@ impl Served {
             (Stdio::null(), Stdio::null())
         };
         let mut child = Command::new(crate::aot::interpreter()?)
+            .envs(env.iter().copied())
             .arg("--serve")
             .arg(port.to_string())
             .arg(image)

@@ -2467,7 +2467,8 @@ fn list_items(v: &Value) -> Option<Vec<Value>> {
 ///
 /// The canonical name exists so that two types may each own a `Leaf`; a person
 /// reading output already has the context that disambiguates, so the qualifier
-/// would be noise. `meadow_glade::show` strips it the same way, and the
+/// would be noise. The runtime's `show` (`silo/src/show.rs`) strips it the same
+/// way, and the
 /// differential tests compare the two machines' output, so they have to agree.
 fn bare_ctor(name: &str) -> &str {
     match name.rsplit_once('.') {

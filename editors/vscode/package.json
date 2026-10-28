@@ -160,10 +160,15 @@
 								"description": "Stop before the first line of `main` runs.",
 								"default": false
 							},
-							"runtime": {
+							"stack": {
 								"type": "string",
-								"enum": ["glade", "silo"],
-								"description": "Which runtime to debug on: Glade's VM, or Silo's interpreter, running on the runtime a native build uses. By default, what the package's debug profile says."
+								"enum": ["growable", "heap"],
+								"description": "Where the program's frames live: on a native stack that grows (the default), or on the heap, every continuation an object."
+							},
+							"watch": {
+								"type": "boolean",
+								"description": "Build the program again whenever its sources change, and load the new build into it as it runs, as `meadow run --watch` does.",
+								"default": false
 							},
 							"entry": {
 								"type": "object",

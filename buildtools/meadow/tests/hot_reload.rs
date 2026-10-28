@@ -406,7 +406,7 @@ fn a_build_the_program_cannot_take_is_offered_as_a_start_over() {
         });
     }
     let mut said = Vec::new();
-    let mut until = |what: &str, said: &mut Vec<String>| loop {
+    let until = |what: &str, said: &mut Vec<String>| loop {
         let line = rx
             .recv_timeout(Duration::from_secs(120))
             .unwrap_or_else(|_| panic!("waiting for `{what}`: {said:?}"));

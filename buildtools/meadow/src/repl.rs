@@ -850,11 +850,8 @@ const COMMANDS: &[(&str, &str)] = &[
     (":reset", "forget everything defined so far"),
     (
         ":jit / :vm / :cek",
-        "switch machines (the JIT is the default)",
-    ),
-    (
-        ":silo",
-        "evaluate on the merged runtime's VM, as `meadow run --runtime silo --interpret` does",
+        "switch machines: the VM with its JIT, one for the session (the default); \
+         the VM interpreting; or the CEK machine",
     ),
     (":time", "time every entry from now on, or stop"),
     (":time <expr>", "time just this entry"),
@@ -965,12 +962,8 @@ pub struct Session {
     /// Which machine evaluates a line. `:cek` and `:vm` switch it, which is the
     /// quickest way to decide whether something odd is the language or the VM.
     engine: meadow::Engine,
-    /// Whether a line runs on the merged runtime's VM instead -- Silo's
-    /// interpreter, in a process of its own -- as `:silo` says, until one of
-    /// the others is chosen again. It does from the start, where there is one.
-    silo: bool,
-    /// The VM the session's lines run on there: one for the whole session,
-    /// each line's build loaded into it as a reload (REPL-4).
+    /// The VM the session's lines run on with its JIT: one for the whole
+    /// session, each line's build loaded into it as a reload (REPL-4).
     session: Option<meadow::served::Served>,
     /// Report how long every entry took -- `:time` turns it on and off.
     timing: bool,
@@ -1047,9 +1040,11 @@ impl Session {
             prefix: std_pkgs,
             std_len,
             uses: Vec::new(),
-            // What a debug build runs on.
-            engine: meadow::Engine::Jit,
-            silo: meadow::aot::interpreter().is_ok(),
+            // What a debug build runs on -- or, without a VM, the CEK.
+            engine: match meadow::aot::interpreter() {
+                Ok(_) => meadow::Engine::Jit,
+                Err(_) => meadow::Engine::Cek,
+            },
             session: None,
             timing: false,
             tour: None,
@@ -1275,22 +1270,23 @@ impl Session {
                             println!("(reset)");
                         }
                         ":module" => self.list_module(),
-                        ":vm" | ":cek" | ":jit" => {
-                            self.engine = match trimmed {
+                        // `:silo`, from before there was one runtime, is `:jit`.
+                        ":vm" | ":cek" | ":jit" | ":silo" => {
+                            let engine = match trimmed {
                                 ":cek" => meadow::Engine::Cek,
-                                ":jit" => meadow::Engine::Jit,
-                                _ => meadow::Engine::Vm,
+                                ":vm" => meadow::Engine::Vm,
+                                _ => meadow::Engine::Jit,
                             };
-                            self.silo = false;
-                            println!("(evaluating with the {})", self.engine);
-                        }
-                        ":silo" => match meadow::aot::interpreter() {
-                            Ok(_) => {
-                                self.silo = true;
-                                println!("(evaluating on the merged runtime's VM)");
+                            match meadow::aot::interpreter() {
+                                Err(e) if engine != meadow::Engine::Cek => {
+                                    println!("(no VM to evaluate on: {e})")
+                                }
+                                _ => {
+                                    self.engine = engine;
+                                    println!("(evaluating with the {})", self.engine);
+                                }
                             }
-                            Err(e) => println!("(no VM to evaluate on: {e})"),
-                        },
+                        }
                         ":time" => {
                             self.timing = !self.timing;
                             let now = if self.timing { "on" } else { "off" };
@@ -1544,7 +1540,6 @@ impl Session {
                 entry_name: Some("it"),
                 cfg: meadow_compiler::Cfg {
                     backend: match self.engine {
-                        _ if self.silo => "silo",
                         meadow::Engine::Vm => "vm",
                         meadow::Engine::Cek => "cek",
                         meadow::Engine::Jit => "jit",
@@ -1594,12 +1589,12 @@ impl Session {
                 let program = self.program_for(&compiled, entry);
                 let checked = started.elapsed();
                 // Every line is compiled and run as a whole program, so the REPL
-                // gets the bytecode VM for free — and `:cek` switches it, the
-                // same as the flag on `meadow run`.
-                let (result, times) = if self.silo {
-                    // A closure that captures nothing is a word Silo cannot
+                // gets the VM for free — and `:cek` switches it, the same as
+                // the flag on `meadow run`.
+                let (result, times) = if self.engine == meadow::Engine::Jit {
+                    // A closure that captures nothing is a word the VM cannot
                     // tell from a constructor by itself, so it is shown as
-                    // its type says, as Glade shows one.
+                    // its type says.
                     let function = compiled
                         .exports
                         .last()

@@ -209,7 +209,7 @@ cli! {
         emit
           : Option
             [String]
-            "What to write, in place of what a build writes by default: `image`, `bytecode`, `asm`, `exe`, or `expanded`. Comma-separated, or repeated"
+            "What to write, in place of what a build writes by default: `image`, `exe`, or `expanded`. Comma-separated, or repeated"
             split
             ","
             value
@@ -229,8 +229,8 @@ cli! {
             "--"
         types : Flag "Print the type of every top-level binding in your packages first"
         package : Option String "In a workspace: the member to run" short "p" value "NAME"
-        cek : Flag "Evaluate with the CEK machine rather than the bytecode VM"
-        gcStats : Flag "After running, report what the garbage collector did (VM only)"
+        cek : Flag "Evaluate with the CEK machine rather than the VM"
+        gcStats : Flag "After running, report what memory management did"
         profileTo
           : Option
             String
@@ -239,41 +239,17 @@ cli! {
             "FILE"
         sampleEvery : Option Int "Block entries between samples, with `--profile-to`" value "N"
         sampleHz : Option Int = 1000 "Samples a second, for the profile of time" value "HZ"
-        train
-          : Flag
-            "Run on the JIT and write what each call site was seen to enter, for an `aot` build to guard its calls on"
-        watch
-          : Flag "Run on Silo's interpreter, and load each new build into the program as it runs"
+        watch : Flag "Run on the VM, and load each new build into the program as it runs"
       }
       with
       Build
     | exec
-      "Run a bytecode image: what `meadow build` writes under `target/<profile>/bytecode/`, or what a compiler written in Meadow emits"
+      "Run an image on the VM: what `meadow build` writes under `target/<profile>/native/`, or `meadow cut --no-run`"
       {
         image : String "The image"
         args : [String] "Arguments for the program, after `--`" after "--"
         backend : Option String "How to run it: `vm` or `jit`" value "BACKEND"
-        optLevel : Option Int "How hard the JIT optimises: 0, 1 or 2" short "O" value "LEVEL"
       }
-    | link "Compile a bytecode image to machine code and link it into an executable" {
-      image : String "The image"
-      output : Option String "Where to write the executable" short "o" value "FILE"
-      emit : Option [String] "What to write: `exe` or `asm`" split "," value "KIND"
-      optLevel : Option Int "Optimization level: 0, 1 or 2" short "O" value "LEVEL"
-      target : Option String "The architecture to compile for" value "ARCH"
-      threads : Option Int "How many OS threads run the program's green threads" short "j" value "N"
-      nursery : Option String "How large the collector lets a thread's nursery grow" value "SIZE"
-      gc : Option String "How memory is managed: `rc` or a tracing collector" value "STRATEGY"
-      interpret : Flag "Interpret what is built for Silo rather than compiling it"
-      stack : Option String "How deep a program's calls may go on Silo" value "STACK"
-      layout : Option String "How a block is laid out in memory on Silo" value "LAYOUT"
-      noReload
-        : Flag "Build what is interpreted so that no new build of it loads into it as it runs"
-      leaks : Flag "After running, report the blocks the program left behind"
-      features : Option String "Features of the package to build with" value "FEATURES"
-      noDefaultFeatures : Flag "Build without the package's `default` features"
-      allFeatures : Flag "Build with every feature the package has"
-    }
     | test
       "Build a package and run its `@test` functions"
       {
@@ -283,17 +259,14 @@ cli! {
         std : Flag "Also run the standard library's own tests"
         testThreads : Option Int "How many tests run at once" value "N"
         noCapture : Flag "Write what tests print as they print it" alias "nocapture"
-        cek : Flag "Evaluate with the CEK machine rather than the bytecode VM"
+        cek : Flag "Evaluate with the CEK machine rather than the VM"
       }
       with
       Members,
         Build
     | dis
-      "Disassemble a package: the bytecode the VM would run"
-      {
-        path : Maybe String "Package directory (or a single `.mw` file), or a workspace"
-        asm : Flag "The machine code an `aot` build would link, as text"
-      }
+      "Disassemble a package: the code the VM runs"
+      { path : Maybe String "Package directory (or a single `.mw` file), or a workspace" }
       with
       Members,
         Build
@@ -330,16 +303,16 @@ cli! {
       path : Option String "The package whose manifest to change" value "DIR"
     }
     | cut
-      "Run a program of Cut, the IR a front end hands the back end (`docs/CUT.md`): lowered to AxCut and run on Glade, or built for Silo and run as an executable"
+      "Run a program of Cut, the IR a front end hands the back end (`docs/CUT.md`): lowered to AxCut and run on the VM, or built ahead of time and run as an executable"
       {
         file : String "The program, as the text `docs/CUT.md` describes"
         args : [String] "What the program is given, after `--`: what its `argv` answers" after "--"
         runtime : Option String =
-          "glade" "`glade`, on its bytecode, or `silo`, as native code" value "NAME"
-        aot : Flag "On Glade, compile the bytecode to machine code ahead of time and run that"
+          "glade" "`glade`, the runtime; `silo`, its name before, is taken as `--aot`" value "NAME"
+        aot : Flag "Build an executable ahead of time and run that, rather than running it on the VM"
         optLevel : Option Int =
           2 "How hard an executable is optimised: 0, 1 or 2" short "O" value "LEVEL"
-        noRun : Flag "Build what would be run -- the bytecode image, or the executable -- and stop"
+        noRun : Flag "Build what would be run -- the VM's image, or the executable -- and stop"
       }
     | clean
       "Remove what a build wrote: the package's `target` directory, with the images, executables and incremental cache in it"

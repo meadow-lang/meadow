@@ -135,18 +135,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
-name = "bitvec"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddcec3d12c579d40898fe0a9a358a803c23e9c52ca3c425707f81c9436211837"
-dependencies = [
- "funty",
- "radium",
- "tap",
- "wyz",
-]
-
-[[package]]
 name = "by_address"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -580,12 +568,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
-name = "funty"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
-
-[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -692,15 +674,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc627f471c528ff0c4a49e1d5e60450c8f6461dd6d10ba9dcd3a61d3dff7728d"
 dependencies = [
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "iced-x86"
-version = "1.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c447cff8c7f384a7d4f741cfcff32f75f3ad02b406432e8d6c878d56b1edf6b"
-dependencies = [
- "lazy_static",
 ]
 
 [[package]]
@@ -833,12 +806,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lazy_static"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
-
-[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -961,18 +928,14 @@ dependencies = [
  "clap",
  "env_logger",
  "find-msvc-tools",
- "iced-x86",
  "insta",
  "itertools",
  "meadow-axcut",
- "meadow-bytecode",
- "meadow-codegen",
  "meadow-compiler",
  "meadow-cut",
  "meadow-eval",
  "meadow-find",
  "meadow-fmt",
- "meadow-glade",
  "meadow-llvm",
  "meadow-lsp",
  "meadow-seq",
@@ -981,8 +944,6 @@ dependencies = [
  "rustyline",
  "serde_json",
  "yansi",
- "yaxpeax-arch",
- "yaxpeax-arm",
 ]
 
 [[package]]
@@ -1006,24 +967,6 @@ dependencies = [
  "num-traits",
  "postcard",
  "serde",
-]
-
-[[package]]
-name = "meadow-bytecode"
-version = "0.3.0"
-dependencies = [
- "meadow-intern",
- "meadow-rt",
-]
-
-[[package]]
-name = "meadow-codegen"
-version = "0.3.0"
-dependencies = [
- "meadow-axcut",
- "meadow-bytecode",
- "meadow-intern",
- "meadow-rt",
 ]
 
 [[package]]
@@ -1089,10 +1032,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "meadow-exec"
-version = "0.3.0"
-
-[[package]]
 name = "meadow-exhaust"
 version = "0.3.0"
 dependencies = [
@@ -1116,18 +1055,6 @@ dependencies = [
 [[package]]
 name = "meadow-fmt"
 version = "0.3.0"
-
-[[package]]
-name = "meadow-glade"
-version = "0.3.0"
-dependencies = [
- "meadow-bytecode",
- "meadow-exec",
- "meadow-intern",
- "meadow-rt",
- "num-bigint",
- "num-traits",
-]
 
 [[package]]
 name = "meadow-hir"
@@ -1525,12 +1452,6 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
-
-[[package]]
-name = "radium"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
 
 [[package]]
 name = "radix_trie"
@@ -1966,12 +1887,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tap"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
-
-[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2198,40 +2113,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
-name = "wyz"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05f360fc0b24296329c78fda852a1e9ae82de9cf7b27dae4b7f62f118f77b9ed"
-dependencies = [
- "tap",
-]
-
-[[package]]
 name = "yansi"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 dependencies = [
  "is-terminal",
-]
-
-[[package]]
-name = "yaxpeax-arch"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36274fcc5403da2a7636ffda4d02eca12a1b2b8267b9d2e04447bd2ccfc72082"
-dependencies = [
- "num-traits",
-]
-
-[[package]]
-name = "yaxpeax-arm"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79f8d9808ad0b7e434882c66e50704138e7c0bdf3408a9f3159c50603dc3168c"
-dependencies = [
- "bitvec",
- "yaxpeax-arch",
 ]
 
 [[package]]

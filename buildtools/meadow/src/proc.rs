@@ -416,7 +416,8 @@ impl<'a> Macros<'a> {
     fn run_on_vm(&self, image: &Image, entry: usize, given: String) -> Result<String, Failure> {
         let mut vm = image.vm.borrow_mut();
         if vm.is_none() {
-            *vm = Some(crate::served::Served::start(&image.path, false).map_err(Failure::from)?);
+            *vm =
+                Some(crate::served::Served::start(&image.path, false, &[]).map_err(Failure::from)?);
         }
         let s = vm.as_mut().expect("started");
         // The call is one line, however many it holds, as `serve` reads it.

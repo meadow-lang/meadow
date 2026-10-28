@@ -23,15 +23,15 @@ use std::path::Path;
 
 /// How a built program is run.
 ///
-/// Not a compiler option: the program is the same bytecode whichever runs it.
+/// Not a compiler option: the program is the same AxCut whichever runs it.
 /// Chosen by a profile, a package's `backend = ...` in `[profile.<name>]`, or
 /// `--backend` -- in that order of authority, as everything in a profile is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
-    /// The bytecode interpreter.
+    /// The VM, interpreting an image.
     Vm,
-    /// The interpreter, compiling the blocks that run often to machine code as
-    /// it goes -- see `meadow_glade::jit`.
+    /// The VM, compiling the procedures that run often to machine code as it
+    /// goes -- see `silo/vm/src/interp/jit.rs`.
     #[default]
     Jit,
     /// Machine code compiled ahead of time, linked into an executable -- see
@@ -127,20 +127,19 @@ pub struct Resolved {
     /// and write folded stacks beside the build. `--profile-to` says where
     /// instead, and asking for one on the command line does not need this.
     pub sample: bool,
-    /// The runtime system -- Glade, unless the command line or the manifest
-    /// said Silo. `backend` is Glade's, and means nothing with Silo, which is
-    /// always compiled ahead of time: see [`Resolved::native`].
+    /// The runtime system, which there is one of. How it runs the program is
+    /// `backend`'s: see [`Resolved::native`].
     pub runtime: crate::aot::Runtime,
     /// `threads` from the manifest: `-j`'s default.
     pub threads: Option<usize>,
     /// `nursery` from the manifest, in bytes: `--nursery`'s default.
     pub nursery: Option<u64>,
     /// How deep calls may go: `stack` from the manifest, or the profile's --
-    /// growable, as Glade's always are, for the edit-run loop, where a
+    /// growable for the edit-run loop, where a
     /// recursion too deep for a fixed stack should not stop the program; fixed
     /// for a release, where it costs nothing. `--stack` overrides it.
     pub stack: meadow_seq::config::Stack,
-    /// How a block is laid out on Silo: `layout` from the manifest, if it
+    /// How a block is laid out: `layout` from the manifest, if it
     /// says. `--layout` overrides it.
     pub layout: Option<meadow_seq::config::Layout>,
     /// Whether an interpreted build may take a new build of itself while it
@@ -165,7 +164,7 @@ impl Resolved {
             backend_named: false,
             prune: true,
             sample: false,
-            runtime: crate::aot::Runtime::Glade,
+            runtime: crate::aot::Runtime::Silo,
             threads: None,
             nursery: None,
             stack: profile.stack(),
@@ -195,22 +194,13 @@ impl Resolved {
             .unwrap_or_default();
         let runtime = flags.runtime.or(from_manifest.runtime).unwrap_or_default();
         let named = flags.backend.or(from_manifest.backend);
-        // On Silo, a backend named is the engine: its interpreter, the
-        // interpreter with its JIT, or LLVM ahead of time, which it is unless
-        // one is named.
-        if runtime == crate::aot::Runtime::Silo
-            && let Some(b) = named
-        {
-            crate::aot::set_engine(b);
-        }
+        // The backend is the engine: the VM, the VM with its JIT -- a debug
+        // build's -- or LLVM ahead of time, a release build's.
         let backend = named.unwrap_or(profile.backend());
         let mut options = flags.apply(from_manifest.apply(profile.options()));
         // What `@cfg(profile = …)` and `@cfg(backend = …)` see: this build's.
         options.cfg.profile = profile.name();
-        options.cfg.backend = match runtime {
-            crate::aot::Runtime::Silo => "silo",
-            crate::aot::Runtime::Glade => backend.name(),
-        };
+        options.cfg.backend = backend.name();
         Resolved {
             profile,
             options,
@@ -234,29 +224,21 @@ impl Resolved {
     /// one: the JIT, if the backend was only the profile's default, and
     /// nothing, if someone asked for it.
     pub fn fallback(self) -> Option<Resolved> {
-        let glade_aot = self.runtime == crate::aot::Runtime::Glade && self.backend == Backend::Aot;
-        (glade_aot && !self.backend_named).then_some(Resolved {
+        (self.backend == Backend::Aot && !self.backend_named).then_some(Resolved {
             backend: Backend::Jit,
             ..self
         })
     }
 
-    /// Whether the program is compiled ahead of time into an executable: on
-    /// Silo always, and on Glade when its backend is `aot`.
+    /// Whether the program is compiled ahead of time into an executable,
+    /// rather than written as an image for the VM.
     pub fn native(self) -> bool {
-        self.runtime == crate::aot::Runtime::Silo || self.backend == Backend::Aot
+        self.backend == Backend::Aot
     }
 
-    /// What runs the program, as a build reports it: the runtime, and on
-    /// Glade the backend -- `glade vm`, `glade jit`, `glade aot` -- or `silo`,
-    /// which has one way to run a program.
+    /// What runs the program, as a build reports it: `vm`, `jit` or `aot`.
     pub const fn how(self) -> &'static str {
-        match (self.runtime, self.backend) {
-            (crate::aot::Runtime::Silo, _) => "silo",
-            (crate::aot::Runtime::Glade, Backend::Vm) => "glade vm",
-            (crate::aot::Runtime::Glade, Backend::Jit) => "glade jit",
-            (crate::aot::Runtime::Glade, Backend::Aot) => "glade aot",
-        }
+        self.backend.name()
     }
 
     pub const fn opt(self) -> OptLevel {

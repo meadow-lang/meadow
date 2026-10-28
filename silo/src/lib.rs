@@ -37,6 +37,8 @@ pub mod stack;
 pub mod stats;
 pub mod trace;
 pub mod value;
+#[cfg(test)]
+mod standin;
 
 use ctx::Ctx;
 use heap::Word;

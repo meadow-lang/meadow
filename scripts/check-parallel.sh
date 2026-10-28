@@ -71,10 +71,15 @@ if [ -n "$VERSION" ]; then
   job version bash "$HERE/scripts/version-check.sh" "$VERSION" "$ROOT"
 fi
 
-for ws in compiler eval glade buildtools installer; do
+# The VM, which `buildtools`' tests and a checkout's `meadow` run programs
+# on (`aot::interpreter`): built first, where they find it.
+(cd silo && cargo build --quiet --release -p meadow-silo-vm) >"$LOGS/build-vm.log" 2>&1 ||
+  echo "FAIL build-vm" >>"$LOGS/unsorted.txt"
+
+for ws in compiler eval silo buildtools installer; do
   # Every test binary, though one fails: a run is long, and what else is
   # wrong is worth knowing from the same one.
-  job "test-$ws" bash -c "cd $ws && cargo test --quiet --no-fail-fast"
+  job "test-$ws" bash -c "cd $ws && cargo test --workspace --quiet --no-fail-fast"
 done
 
 # As `release.yml` builds and smoke-tests a target it can run: a `meadow` for
@@ -119,6 +124,7 @@ if (cd buildtools && CARGO_TARGET_DIR="$WORK/cli" cargo build --quiet -p meadow)
   "$M" run "$WORK/warm.mw" >"$LOGS/warm.log" 2>&1
 
   job std-vm "$M" test --std
+  job std-jit-all env MEADOW_JIT=1 MEADOW_JIT_THRESHOLD=0 MEADOW_JIT_TIER2=0 "$M" test --std
   job std-cek "$M" test --std --cek
   for example in examples/*/; do
     job "example-$(basename "$example")" "$M" test "$example"
@@ -130,22 +136,23 @@ if (cd buildtools && CARGO_TARGET_DIR="$WORK/cli" cargo build --quiet -p meadow)
     "$1" lsp --check "${sources[@]}"
   ' lsp "$M"
 
-  # The collector under pressure, as `check.sh` has it: once with marking on
-  # its own threads, once on the program's. The examples are copies, since
-  # the plain runs above are building the originals.
-  for mark_threads in 2 0; do
-    job "gc-stress-$mark_threads" bash -c '
-      set -e
-      work="$1"; m="$2"; threads="$3"
-      export MEADOW_GC_NURSERY=64 MEADOW_GC_TRIGGER=256 MEADOW_GC_VERIFY=1 MEADOW_GC_MARK_THREADS="$threads"
-      (cd glade && CARGO_TARGET_DIR="$work/gc-$threads" cargo test --quiet)
-      "$m" test --std
-      mkdir -p "$work/examples/gc-$threads"
-      cp -r examples/Concurrency examples/Stm "$work/examples/gc-$threads/"
-      "$m" test "$work/examples/gc-$threads/Concurrency"
-      "$m" test "$work/examples/gc-$threads/Stm"
-    ' gc "$WORK" "$M" "$mark_threads"
+  # Every strategy and both stacks, the traced ones under pressure, as
+  # `check.sh` has it. The examples are copies, since the plain runs above
+  # are building the originals.
+  for gc in rc tracing generational; do
+    for stack in growable heap; do
+      job "gc-$gc-$stack" env MEADOW_GC_NURSERY=4096 "$M" test --std --gc "$gc" --stack "$stack"
+    done
   done
+  job gc-examples bash -c '
+    set -e
+    work="$1"; m="$2"
+    export MEADOW_GC_NURSERY=4096
+    mkdir -p "$work/examples/gc"
+    cp -r examples/concurrency examples/stm "$work/examples/gc/"
+    "$m" test --gc generational "$work/examples/gc/concurrency"
+    "$m" test --gc generational "$work/examples/gc/stm"
+  ' gc "$WORK" "$M"
 else
   echo "FAIL build-cli" >"$LOGS/unsorted.txt"
 fi

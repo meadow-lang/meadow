@@ -55,7 +55,7 @@ step "build: the VM"
 
 for ws in $WORKSPACES; do
   step "test: $ws"
-  (cd "$ws" && cargo test --quiet)
+  (cd "$ws" && cargo test --workspace --quiet)
 done
 
 # --- the language itself -----------------------------------------------------

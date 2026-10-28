@@ -4,10 +4,10 @@
 //! library ([`stdlib`]).
 //!
 //! It sits on top of the `meadow-compiler` workspace (front-end passes and the
-//! AxCut back end) and the two machines that can run the result: `meadow-glade`,
-//! the bytecode VM, and `meadow-eval`, the CEK machine. [`runtime`] picks
-//! between them. The `meadow` binary — CLI + REPL — is a thin shell over this
-//! crate.
+//! AxCut back end) and the machines that can run the result: the runtime's
+//! VM (`silo/vm`), an executable compiled by LLVM ([`aot`]), and
+//! `meadow-eval`, the CEK machine. [`runtime`] picks between them. The
+//! `meadow` binary — CLI + REPL — is a thin shell over this crate.
 
 pub mod add;
 pub mod aot;
@@ -28,12 +28,10 @@ pub mod linker;
 pub mod listing;
 pub mod lock;
 pub mod package;
-pub mod pgo;
 pub mod pipeline;
 pub mod proc;
 pub mod profile;
 pub mod runtime;
-pub mod samples;
 pub mod semver;
 pub mod served;
 pub mod status;

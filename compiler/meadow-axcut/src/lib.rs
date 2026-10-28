@@ -544,7 +544,7 @@ pub fn commutes(p: Prim) -> bool {
 ///
 /// `fib` retires two `move` instructions in every call, a quarter of
 /// everything it runs, and they are all one shape: a continuation captures the
-/// names the frame will not need again, and `meadow_codegen` gives the next
+/// names the frame will not need again, and a code generator gives the next
 /// value the lowest register *no name is sitting in* -- so the dead names hold
 /// the low registers, the live values are pushed above them, and the
 /// `substitute` before the call has to move them back down.
@@ -553,7 +553,7 @@ pub fn commutes(p: Prim) -> bool {
 /// is not written, because two other things assume an environment never
 /// shrinks:
 ///
-/// * `meadow_codegen` enters a block by zipping its parameters against the
+/// * a code generator enters a block by zipping its parameters against the
 ///   registers of the environment, so a shorter environment is a block entered
 ///   with the wrong arity. Leaving the dead name in and reusing its register is
 ///   worse: the GC map at the next safepoint would still say a reference lives

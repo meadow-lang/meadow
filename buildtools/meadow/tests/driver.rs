@@ -86,7 +86,7 @@ fn what_a_thread_kept_in_a_ref_goes_when_the_thread_does() {
     let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
         .current_dir(&root)
         .env("MEADOW_SILO_LEAKS", "1")
-        .args(["run", "--runtime", "silo", "."])
+        .args(["run", "--aot", "."])
         .output()
         .expect("the meadow binary runs");
     let err = String::from_utf8_lossy(&out.stderr);
@@ -126,7 +126,7 @@ fn a_tvar_nothing_can_reach_lets_its_value_go() {
     let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
         .current_dir(&root)
         .env("MEADOW_SILO_LEAKS", "1")
-        .args(["run", "--runtime", "silo", "."])
+        .args(["run", "--aot", "."])
         .output()
         .expect("the meadow binary runs");
     let err = String::from_utf8_lossy(&out.stderr);
@@ -173,12 +173,7 @@ const GIVES_UP: &str = "use Std.Process (exit)\n\nfun main () =\n  let _ = print
 fn a_program_gives_up_on_standard_error_on_every_engine() {
     let dir = scratch("gives-up");
     let root = package(&dir, "gives-up", GIVES_UP);
-    for engine in [
-        &[][..],
-        &["--backend", "vm"],
-        &["--cek"],
-        &["--runtime", "silo"],
-    ] {
+    for engine in [&[][..], &["--backend", "vm"], &["--cek"], &["--aot"]] {
         let mut args = vec!["run"];
         args.extend_from_slice(engine);
         args.push(".");
@@ -228,8 +223,8 @@ fn an_image_runs_on_its_own() {
     let root = package(&dir, "img", ARGS);
     let (ok, _, err) = meadow(&root, &["build", "."]);
     assert!(ok, "{err}");
-    let image = root.join("target/debug/bytecode/Img.mbc");
-    assert!(image.is_file());
+    let image = root.join("target/debug/native/silo/Img.image");
+    assert!(image.is_file(), "{err}");
     let image = image.to_string_lossy().into_owned();
     for backend in ["jit", "vm"] {
         let (ok, out, err) = meadow(&dir, &["exec", &image, "--backend", backend, "--", "x"]);
@@ -238,24 +233,7 @@ fn an_image_runs_on_its_own() {
     }
     let (ok, _, err) = meadow(&dir, &["exec", &root.join("Meadow.toml").to_string_lossy()]);
     assert!(!ok);
-    assert!(err.contains("not a Meadow image"), "{err}");
-
-    // An executable from it, where there is a runtime library to link.
-    let exe = dir
-        .join("out")
-        .join(format!("img{}", std::env::consts::EXE_SUFFIX));
-    let (ok, _, err) = meadow(&dir, &["link", &image, "-o", &exe.to_string_lossy()]);
-    if !ok {
-        assert!(
-            err.contains("runtime"),
-            "a link failure other than a missing runtime: {err}"
-        );
-        eprintln!("skipping the executable: {err}");
-    } else {
-        let out = Command::new(&exe).args(["a", "b"]).output().unwrap();
-        assert!(out.status.success());
-        assert!(String::from_utf8_lossy(&out.stdout).contains(r#"["a"; "b"]"#));
-    }
+    assert!(err.contains("is not an image"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -379,7 +357,7 @@ fn a_long_chain_of_additions_compiles() {
 
 #[test]
 fn a_long_literal_compiles() {
-    // Past the register file: see `meadow_codegen`, "Spilling".
+    // More elements than a frame has registers.
     let n = 800;
     let items: Vec<String> = (1..=n).map(|i| i.to_string()).collect();
     let src = format!(
@@ -523,7 +501,7 @@ fn a_program_with_no_vector_gets_its_arguments_as_an_array() {
          prim arrayGet(v, 1; μ̃ s: str. <s | k>))))\n",
     )
     .unwrap();
-    for runtime in [&[][..], &["--runtime", "silo"]] {
+    for runtime in [&[][..], &["--aot"]] {
         let mut args = vec!["cut", "argv.cut"];
         args.extend_from_slice(runtime);
         args.extend_from_slice(&["--", "first", "second"]);
@@ -537,7 +515,7 @@ fn a_program_with_no_vector_gets_its_arguments_as_an_array() {
 fn a_program_of_cut_runs_on_glade_and_as_an_executable_of_silos() {
     let dir = scratch("cut");
     std::fs::write(dir.join("count.cut"), CUT).unwrap();
-    for runtime in [&[][..], &["--runtime", "silo"]] {
+    for runtime in [&[][..], &["--aot"]] {
         let mut args = vec!["cut", "count.cut"];
         args.extend_from_slice(runtime);
         let (ok, out, err) = meadow(&dir, &args);
@@ -553,7 +531,7 @@ fn a_program_of_cut_runs_on_glade_and_as_an_executable_of_silos() {
          μ̃ n: i64. prim eq(n, 42; μ̃ u: unit. <\"no\" | k>, μ̃ u: unit. <\"42\" | k>)\n",
     )
     .unwrap();
-    for runtime in [&[][..], &["--runtime", "silo"]] {
+    for runtime in [&[][..], &["--aot"]] {
         let mut args = vec!["cut", "handles.cut"];
         args.extend_from_slice(runtime);
         let (ok, out, err) = meadow(&dir, &args);
@@ -567,7 +545,7 @@ fn a_program_of_cut_runs_on_glade_and_as_an_executable_of_silos() {
          def t:Main/main (; k: ptr) =\n  t:Main/id(desc(i64), 1; μ̃ n: i64. t:Main/id(desc(str), \"generic\"; k))\n",
     )
     .unwrap();
-    for runtime in [&[][..], &["--runtime", "silo"]] {
+    for runtime in [&[][..], &["--aot"]] {
         let mut args = vec!["cut", "generic.cut"];
         args.extend_from_slice(runtime);
         let (ok, out, err) = meadow(&dir, &args);
@@ -584,7 +562,7 @@ fn a_program_of_cut_runs_on_glade_and_as_an_executable_of_silos() {
          def t:Main/main (; k: ptr) =\n  perform t:Main/Console.say(\"said\\n\"; μ̃ u: unit. <unit | k>)\n",
     )
     .unwrap();
-    for runtime in [&[][..], &["--runtime", "silo"]] {
+    for runtime in [&[][..], &["--aot"]] {
         let mut args = vec!["cut", "quiet.cut"];
         args.extend_from_slice(runtime);
         let (ok, out, err) = meadow(&dir, &args);
@@ -758,7 +736,7 @@ fn a_profile_of_a_program_on_the_merged_runtime_s_vm_names_its_functions() {
 }
 
 #[test]
-fn the_merged_runtime_s_vm_says_what_a_program_reached_as_glade_does() {
+fn the_vm_says_what_a_program_reached() {
     if let Err(e) = meadow::aot::interpreter() {
         eprintln!("skipped: {e}");
         return;
@@ -794,11 +772,12 @@ fn the_merged_runtime_s_vm_says_what_a_program_reached_as_glade_does() {
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
-    // Glade's VM, and the merged runtime's: from nothing, and more as the
+    // The VM, interpreting or with its JIT: from nothing, and more as the
     // program gets somewhere new. Native code notes nothing.
     assert_eq!(said(&["--backend", "vm"]), "0 True True");
+    assert_eq!(said(&[]), "0 True True");
     assert_eq!(said(&["--runtime", "silo", "--interpret"]), "0 True True");
-    assert_eq!(said(&["--runtime", "silo"]), "0 False False");
+    assert_eq!(said(&["--aot"]), "0 False False");
 }
 
 #[test]

@@ -120,9 +120,9 @@ pub fn run_on_vm(path: &Path, args: &[String]) -> Result<i32, String> {
         .map_err(|e| format!("could not run the interpreter: {e}"))
 }
 
-/// Build it for Silo -- LLVM's code, linked with the `meadow_silo` runtime
-/// -- beside the file, under `target`, and answer where the executable is.
-pub fn build_for_silo(path: &Path, opt: meadow_compiler::OptLevel) -> Result<PathBuf, String> {
+/// Build it ahead of time -- LLVM's code, linked with the runtime library --
+/// beside the file, under `target`, and answer where the executable is.
+pub fn build_native(path: &Path, opt: meadow_compiler::OptLevel) -> Result<PathBuf, String> {
     let root = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -131,10 +131,7 @@ pub fn build_for_silo(path: &Path, opt: meadow_compiler::OptLevel) -> Result<Pat
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or("a file with a name")?;
-    let target = aot::Target {
-        runtime: aot::Runtime::Silo,
-        ..aot::Target::host()?
-    };
+    let target = aot::Target::host()?;
     aot::build_native_of(root, Profile::Release, opt, name, target, None, || {
         lowered(path)
     })

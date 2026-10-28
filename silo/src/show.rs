@@ -1,5 +1,5 @@
-//! A value as text, exactly as `meadow-glade` renders it -- the differential
-//! tests compare the two backends' output character for character -- and the
+//! A value as text, exactly as the CEK machine renders it -- the differential
+//! tests compare the machines' output character for character -- and the
 //! program's tables it reads names out of.
 
 use crate::heap::{self, Word};

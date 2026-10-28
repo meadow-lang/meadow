@@ -1,21 +1,17 @@
 //! The standard library, through the whole back end.
 //!
-//! `meadow_glade`'s own differential tests are hand-written programs, one
-//! construct at a time. This is the other end: the largest body of Meadow that
-//! exists, compiled the way `meadow test --std` compiles it, and put through
-//! `core` → AxCut → bytecode → the VM.
+//! `tests/differential.rs` holds hand-written programs, one construct at a
+//! time. This is the other end: the largest body of Meadow that exists,
+//! compiled the way `meadow test --std` compiles it, and put through `core`
+//! → AxCut → an image → the VM.
 //!
-//! It answers three separate questions, and they are worth keeping apart —
-//! when one fails, which one it was says where to look.
+//! It answers separate questions, and they are worth keeping apart — when
+//! one fails, which one it was says where to look.
 //!
 //! * **Does everything lower?** [`the_whole_standard_library_lowers`] asserts
 //!   the `Unsupported` set is empty across the entire library. A statement about
 //!   the pass, not about any run, and the one that would catch a `core`
 //!   construct nobody thought to test.
-//! * **Does it compile?** [`the_whole_standard_library_reaches_bytecode`] runs
-//!   the register allocator over every block. What does not fit in the file is
-//!   spilled, so what is left to fail is a block it still cannot express --
-//!   a labelled block of more than 255 parameters -- and this would notice.
 //! * **Does it mean the same thing?** [`the_vm_agrees_with_the_cek`] runs each
 //!   `@test` on both machines and requires the same answer.
 //!
@@ -67,30 +63,6 @@ fn the_whole_standard_library_lowers() {
         lowered.program.defs.len() > 500,
         "only {} blocks — did the library fail to link?",
         lowered.program.defs.len()
-    );
-}
-
-#[test]
-fn the_whole_standard_library_reaches_bytecode() {
-    let std = std_program();
-    let image = runtime::compile(&std.program, Options::debug().entry("result").opt)
-        .expect("the standard library should compile");
-    assert!(
-        image.code.len() > 10_000,
-        "only {} instructions",
-        image.code.len()
-    );
-    assert!(
-        image.regs as usize <= 256,
-        "a block wanted {} registers",
-        image.regs
-    );
-    // Worth printing: it is the number that says whether the missing register
-    // allocator is a real problem yet.
-    println!(
-        "{} instructions, {} registers at the high-water mark",
-        image.code.len(),
-        image.regs
     );
 }
 
@@ -157,9 +129,9 @@ fn the_vm_agrees_with_the_cek() {
     );
 }
 
-/// Native code compiled in the process answers every standard library test
-/// exactly as the bytecode it was compiled from does -- failures included,
-/// word for word -- at both levels a user builds at.
+/// The JIT, compiling every procedure the first time it is entered, answers
+/// every standard library test exactly as the VM interpreting does --
+/// failures included, word for word -- at both levels a user builds at.
 #[test]
 fn the_jit_agrees_with_the_vm() {
     let std = std_program();
@@ -167,8 +139,7 @@ fn the_jit_agrees_with_the_vm() {
     for opt in [meadow::OptLevel::O1, meadow::OptLevel::O2] {
         let vm = runtime::run_tests(&std.program, &vars, Engine::Vm, opt).expect("the VM runner");
         // Every block that runs, compiled the first time it does.
-        let jit = runtime::run_tests_jit_at(&std.program, &vars, Engine::Jit, opt, 1)
-            .expect("the JIT runner");
+        let jit = runtime::run_tests_jit_at(&std.program, &vars, opt, 0).expect("the JIT runner");
         let disagreed: Vec<String> = std
             .tests
             .iter()
@@ -328,6 +299,7 @@ fn calling(program: &core::Program, test: core::Var) -> core::Program {
         ctor_fields: program.ctor_fields.clone(),
         variants: program.variants.clone(),
         origins: Default::default(),
+        migrations: Default::default(),
     }
 }
 
@@ -494,18 +466,5 @@ fn a_debug_build_runs_the_standard_library_the_same() {
         differ.is_empty(),
         "a debug build changed the answer:\n{}",
         differ.join("\n")
-    );
-
-    // And recording the debug information does not change a single instruction.
-    let lowered = meadow_seq::lower_program(&linked.program, opt);
-    let code = meadow_codegen::compile(&lowered.program).expect("compiles");
-    let with = meadow_codegen::compile_with_debug_info(&lowered.program).expect("compiles");
-    assert_eq!(code.code, with.code);
-    let debug = with.debug.expect("debug information");
-    assert_eq!(debug.locs.len(), with.code.len());
-    let known = debug.locs.iter().filter(|l| l.is_some()).count();
-    assert!(
-        known > with.code.len() / 2,
-        "most instructions should know where they came from"
     );
 }
