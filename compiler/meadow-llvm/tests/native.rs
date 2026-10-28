@@ -1,4 +1,4 @@
-//! Programs compiled by `meadow-llvm`, linked with Silo, run --
+//! Programs compiled by `meadow-llvm`, linked with the runtime, run --
 //! and checked against the AxCut abstract machine, which is the meaning they
 //! must keep, and for leaks: a program with no mutable state must end with
 //! every block it acquired given back.
@@ -30,13 +30,13 @@ fn program(src: &str) -> core::Program {
 fn runtime() -> &'static Path {
     static LIB: OnceLock<PathBuf> = OnceLock::new();
     LIB.get_or_init(|| {
-        let aot = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../silo");
+        let aot = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../glade");
         let status = Command::new(env!("CARGO"))
             .args(["build", "--release", "--quiet", "--manifest-path"])
             .arg(aot.join("Cargo.toml"))
             .status()
             .expect("cargo runs");
-        assert!(status.success(), "building Silo failed");
+        assert!(status.success(), "building the runtime failed");
         let lib = if cfg!(windows) {
             "meadow_glade.lib"
         } else {

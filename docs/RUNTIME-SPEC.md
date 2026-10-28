@@ -1017,7 +1017,7 @@ the arguments, and exits with the program's status. `meadow exec FILE.mbc`
 runs a Glade bytecode image as before.
 - *Status:* done; `driver::exec_runs_an_image_of_axcut_on_the_merged_runtime_s_vm`.
 
-**IMG-3.** The VM finds itself, for `meadow`, through `MEADOW_SILO_VM`, then
+**IMG-3.** The VM finds itself, for `meadow`, through `MEADOW_VM` (or `MEADOW_SILO_VM`), then the one built into it, then
 beside `meadow`, then where a checkout builds it.
 - *Status:* done.
 

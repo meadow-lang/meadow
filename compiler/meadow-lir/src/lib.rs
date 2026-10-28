@@ -688,22 +688,47 @@ impl fmt::Display for Func {
     }
 }
 
-/// A global's type: a scalar, or an array of `len` of them.
+/// A global's type: a scalar, or an array of `len` of them -- where each is
+/// `elem`, or, with `fields`, a struct of that many `elem`s: `{ ptr, ptr }`,
+/// a row of a library's table of its exports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GTy {
     pub elem: Ty,
     pub len: Option<usize>,
+    pub fields: Option<usize>,
 }
 
 impl GTy {
     pub fn scalar(elem: Ty) -> GTy {
-        GTy { elem, len: None }
+        GTy {
+            elem,
+            len: None,
+            fields: None,
+        }
     }
 
     pub fn array(len: usize, elem: Ty) -> GTy {
         GTy {
             elem,
             len: Some(len),
+            fields: None,
+        }
+    }
+
+    /// An array of `len` structs of `fields` `elem`s.
+    pub fn array_of_structs(len: usize, fields: usize, elem: Ty) -> GTy {
+        GTy {
+            elem,
+            len: Some(len),
+            fields: Some(fields),
+        }
+    }
+
+    /// The type of one element, as LLVM writes it.
+    fn element(&self) -> String {
+        match self.fields {
+            Some(n) => format!("{{ {} }}", vec![self.elem.to_string(); n].join(", ")),
+            None => self.elem.to_string(),
         }
     }
 }
@@ -711,8 +736,8 @@ impl GTy {
 impl fmt::Display for GTy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.len {
-            Some(n) => write!(f, "[{n} x {}]", self.elem),
-            None => write!(f, "{}", self.elem),
+            Some(n) => write!(f, "[{n} x {}]", self.element()),
+            None => write!(f, "{}", self.element()),
         }
     }
 }
@@ -730,10 +755,13 @@ pub enum Init {
     Bytes(Vec<u8>),
     /// An array of these, each of the array's element type.
     Elems(Vec<Init>),
+    /// A struct's fields, each of the struct's one type.
+    Fields(Vec<Init>),
 }
 
 impl Init {
-    fn write(&self, elem: Ty, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn write(&self, ty: GTy, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let elem = ty.elem;
         match self {
             Init::Int(n) => write!(f, "{n}"),
             Init::Ref(g) => write!(f, "{g}"),
@@ -753,14 +781,27 @@ impl Init {
             }
             Init::Elems(xs) => {
                 f.write_str("[")?;
+                let one = GTy { len: None, ..ty };
+                for (i, x) in xs.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{} ", one.element())?;
+                    x.write(one, f)?;
+                }
+                f.write_str("]")
+            }
+            Init::Fields(xs) => {
+                f.write_str("{ ")?;
+                let one = GTy::scalar(elem);
                 for (i, x) in xs.iter().enumerate() {
                     if i > 0 {
                         f.write_str(", ")?;
                     }
                     write!(f, "{elem} ")?;
-                    x.write(elem, f)?;
+                    x.write(one, f)?;
                 }
-                f.write_str("]")
+                f.write_str(" }")
             }
         }
     }
@@ -792,7 +833,7 @@ impl fmt::Display for Global {
         )?;
         if let Some(init) = &self.init {
             f.write_str(" ")?;
-            init.write(self.ty.elem, f)?;
+            init.write(self.ty, f)?;
         }
         Ok(())
     }

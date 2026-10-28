@@ -181,7 +181,18 @@ pub fn global(line: &str) -> Result<Global, Error> {
             line: line.into(),
             why: "an array's length",
         })?;
-        (GTy::array(n, ty(line, elem)?), r.trim_start())
+        let gty = match elem.strip_prefix("{ ").and_then(|e| e.strip_suffix(" }")) {
+            // A struct of fields of one type.
+            Some(fields) => {
+                let tys: Vec<&str> = fields.split(", ").collect();
+                if tys.iter().any(|t| *t != tys[0]) {
+                    return bad(line, "a struct of fields of more than one type");
+                }
+                GTy::array_of_structs(n, tys.len(), ty(line, tys[0])?)
+            }
+            None => GTy::array(n, ty(line, elem)?),
+        };
+        (gty, r.trim_start())
     } else {
         let (t, r) = rest.split_once(' ').unwrap_or((rest, ""));
         (GTy::scalar(ty(line, t)?), r)
@@ -232,15 +243,14 @@ fn init(line: &str, s: &str) -> Result<Init, Error> {
                 line: line.into(),
                 why: "an array unclosed",
             })?;
-            let mut xs = Vec::new();
-            for e in inner.split(", ") {
-                let (_, v) = e.split_once(' ').ok_or(Error {
-                    line: line.into(),
-                    why: "an element without a type",
-                })?;
-                xs.push(init(line, v)?);
-            }
-            Init::Elems(xs)
+            Init::Elems(typed(line, inner)?)
+        }
+        _ if s.starts_with("{ ") => {
+            let inner = s[2..].strip_suffix(" }").ok_or(Error {
+                line: line.into(),
+                why: "a struct unclosed",
+            })?;
+            Init::Fields(typed(line, inner)?)
         }
         _ if s.starts_with('@') => Init::Ref(s.to_string()),
         _ => Init::Int(s.parse().map_err(|_| Error {
@@ -248,6 +258,49 @@ fn init(line: &str, s: &str) -> Result<Init, Error> {
             why: "an initial value the LIR has not",
         })?),
     })
+}
+
+/// `t v, t v, ...`: each value, whose type is written before it -- a type
+/// that may be a struct's, `{ ptr, ptr }`, and a value that may be one.
+fn typed(line: &str, inner: &str) -> Result<Vec<Init>, Error> {
+    let mut xs = Vec::new();
+    for e in top_level(inner) {
+        // The type, a word or a struct's braces, and then the value.
+        let v = match e.strip_prefix('{') {
+            Some(rest) => rest.split_once("} ").map(|(_, v)| v),
+            None => e.split_once(' ').map(|(_, v)| v),
+        }
+        .ok_or(Error {
+            line: line.into(),
+            why: "an element without a type",
+        })?;
+        xs.push(init(line, v)?);
+    }
+    Ok(xs)
+}
+
+/// `inner` cut at each `, ` outside braces, brackets and quotes.
+fn top_level(inner: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut quoted, mut start) = (0i32, false, 0);
+    let bytes = inner.as_bytes();
+    let mut k = 0;
+    while k < bytes.len() {
+        match bytes[k] {
+            b'"' => quoted = !quoted,
+            b'{' | b'[' if !quoted => depth += 1,
+            b'}' | b']' if !quoted => depth -= 1,
+            b',' if !quoted && depth == 0 && bytes.get(k + 1) == Some(&b' ') => {
+                out.push(&inner[start..k]);
+                start = k + 2;
+                k += 1;
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    out.push(&inner[start..]);
+    out
 }
 
 /// The one function defined in `text`.
@@ -677,6 +730,20 @@ fn call(line: &str, dst: Option<Val>, rhs: &str) -> Result<Inst, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A library's table of its exports, an array of structs of pointers,
+    /// and a string with a comma in it, read and printed again as written.
+    #[test]
+    fn a_table_of_structs_reads_back_as_it_was_written() {
+        for line in [
+            "@meadow_exports = private constant [2 x { ptr, ptr }] [{ ptr, ptr } { ptr @meadow_export_name.0, ptr @\"dep_three\" }, { ptr, ptr } { ptr null, ptr @twice }]",
+            "@mw.s.1 = private constant [4 x i8] c\"a, b\"",
+            "@t = private constant [2 x i64] [i64 1, i64 2]",
+        ] {
+            let g = global(line).unwrap_or_else(|e| panic!("{line}: {e:?}"));
+            assert_eq!(g.to_string(), line);
+        }
+    }
 
     /// Every function of every `.ll` file under `MEADOW_LIR_CORPUS`, read and
     /// printed again, is the text it was: the printer and this agree on
