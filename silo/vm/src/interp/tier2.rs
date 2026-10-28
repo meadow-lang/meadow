@@ -269,6 +269,16 @@ impl Tier2 {
         for (name, at) in runtime_symbols() {
             b.symbol(name, at);
         }
+        // Off x86-64 the code is not position-independent (cranelift-jit's
+        // rule): an address is made by `adrp`, which reaches 2 GB either
+        // way. So the code and its strings are kept in one region, which
+        // they reach each other within, and the runtime's statics, which may
+        // be anywhere, are written as their addresses (`Inner::address`).
+        if !cfg!(target_arch = "x86_64") {
+            let arena = cranelift_jit::ArenaMemoryProvider::new_with_size(1 << 30)
+                .map_err(|e| format!("could not reserve the JIT's memory: {e}"))?;
+            b.memory_provider(Box::new(arena));
+        }
         let module = JITModule::new(b);
         Ok(Some(Tier2 {
             threshold,
@@ -968,7 +978,13 @@ impl Translate<'_> {
             let gv = self.module.declare_data_in_func(*id, b.func);
             return Ok(b.ins().symbol_value(types::I64, gv));
         }
-        // The runtime's statics.
+        // The runtime's statics: off x86-64, at their addresses, which the
+        // code may be too far from to make (see `Tier2::from_env`).
+        if !cfg!(target_arch = "x86_64")
+            && let Some((_, at)) = runtime_symbols().into_iter().find(|(n, _)| *n == g)
+        {
+            return Ok(b.ins().iconst(types::I64, at as i64));
+        }
         let id = self
             .module
             .declare_data(g, Linkage::Import, true, false)

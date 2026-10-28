@@ -1195,13 +1195,21 @@ VM.
   in process (LLVM's ORC, or Cranelift; §19). `--jit-tiers 1|2` chooses
   how far to go.
   - *Status:* done, with Cranelift (`silo/vm/src/interp/tier2.rs`). A
-    definition entered `MEADOW_JIT_TIER2` times more (10,000 by default)
+    definition entered `MEADOW_JIT_TIER2` times more (1,000 by default)
     is lowered as an executable's are, by the LLVM back end's lowering in
     its JIT mode, and compiled. A call between compiled and interpreted
     code goes through the VM, and a tail call into the VM is left pending
     and run by whoever waits, so neither direction takes stack in a loop.
     `--jit-tiers 1` keeps to the first tier. `MEADOW_JIT2_LIMIT` and
     `MEADOW_JIT2_SKIP` choose what it compiles, for finding a fault.
+    Off x86-64 there is no first tier, and the second is the JIT. On
+    aarch64 its code is not position-independent (cranelift-jit's rule), so
+    an address is made by `adrp`, which reaches 2 GB. The code and its
+    strings are kept in one reserved region, and the runtime's statics are
+    written as their addresses. The examples under each strategy, 18
+    programs, print the same interpreted and with everything compiled, on
+    aarch64 Linux under qemu (2026-10-28): fib takes 286 ms against 3.6 s
+    there.
 - **JIT-4.** A compiled procedure keeps the VM's frames, records, line table
   and slots. Calls by name go through slots (HOT-2), so a reload replaces
   compiled code as it replaces interpreted code.

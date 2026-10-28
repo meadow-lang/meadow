@@ -36,6 +36,9 @@
 //! says how many times a procedure is entered before it is compiled: 0
 //! compiles each the first time. Only on x86-64, so far.
 
+// The first tier is x86-64's; elsewhere what only it uses is unused.
+#![cfg_attr(not(target_arch = "x86_64"), allow(dead_code, unused_imports))]
+
 #[cfg(target_arch = "x86_64")]
 mod x64;
 
@@ -62,9 +65,8 @@ impl Jit {
         if !on {
             return Ok(None);
         }
-        if !cfg!(target_arch = "x86_64") {
-            return Err("the JIT compiles for x86-64 only yet: run without MEADOW_JIT".into());
-        }
+        // Off x86-64 there is no first tier (`translate` compiles nothing):
+        // the second, Cranelift's, compiles for the machine as it is.
         let threshold = match std::env::var("MEADOW_JIT_THRESHOLD") {
             Ok(n) => n
                 .trim()
