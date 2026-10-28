@@ -25,6 +25,7 @@ fn image(src: &str) -> meadow_bytecode::Program {
         ctor_fields: pkg.ctor_fields.clone(),
         variants: pkg.variants.clone(),
         origins: Default::default(),
+        migrations: Vec::new(),
     };
     let lowered = meadow_seq::lower_program(&program, core::OptLevel::O1);
     assert!(lowered.unsupported.is_empty(), "{:?}", lowered.unsupported);

@@ -160,6 +160,9 @@ pub struct CompiledPackage {
     /// `@test` functions declared in this unit: `(name, its VarId)`, in
     /// declaration order. `meadow test` calls each with `()`.
     pub tests: Vec<(InternedString, VarId)>,
+    /// `@migrate(C)` functions declared in this unit, and each one's `C`:
+    /// see `core::Program::migrations`.
+    pub migrations: Vec<(VarId, InternedString)>,
     /// Names a dependent gets **unqualified** automatically (the package's prelude
     /// re-exports). `None` = flat-import everything (REPL prefixes, ad-hoc `deps`);
     /// `Some(list)` = only these are flat, the rest need `use`.
@@ -865,6 +868,7 @@ fn compile_unit_inner(
             ctor_fields: lowerer.ctor_fields.clone(),
             variants: variants.clone(),
             origins: Default::default(),
+            migrations: Vec::new(),
         };
         let imported: HashMap<VarId, Scheme> = dep_schemes.iter().cloned().collect();
         let problems = core::lint::check(&program, &variants, &imported);
@@ -1003,6 +1007,7 @@ fn compile_unit_inner(
             variants,
             data_decls,
             tests: resolver.test_vars().to_vec(),
+            migrations: resolver.migrate_vars().to_vec(),
             prelude_exports: None,
             package: false,
             compacting: own_compacting,

@@ -179,6 +179,10 @@ pub struct Resolver {
     extra_refs: Vec<RefSite>,
     /// `@test` functions, in declaration order — `meadow test` runs these.
     test_vars: Vec<(InternedString, VarId)>,
+    /// `@migrate(C)` functions, and the constructor each makes a new value
+    /// of from an old one: what a reload applies to values of an earlier
+    /// build's `C`.
+    migrate_vars: Vec<(VarId, InternedString)>,
     /// The `@macro` declarations: what a call may name with a `!`, and where
     /// each was written, so that a function whose type could never be a
     /// macro's is reported there rather than where someone tries to use it.
@@ -351,6 +355,17 @@ fn vis_of(attrs: &[ast::Attr]) -> (Vis, Option<(InternedString, Span)>) {
 
 fn has_test(attrs: &[ast::Attr]) -> bool {
     attrs.iter().any(|a| &**a.name.value() == "test")
+}
+
+/// The `@migrate(C)` among `attrs`: the constructor it names, or `None` for
+/// one written without exactly one name.
+fn migrate_of(attrs: &[ast::Attr]) -> Option<(Option<InternedString>, Span)> {
+    let a = attrs.iter().find(|a| &**a.name.value() == "migrate")?;
+    let ctor = match a.args.as_slice() {
+        [c] if a.meta.len() == 1 => Some(*c.value()),
+        _ => None,
+    };
+    Some((ctor, a.name.span))
 }
 
 fn has_macro(attrs: &[ast::Attr]) -> bool {
@@ -611,6 +626,7 @@ impl Resolver {
             pub_types: std::collections::HashSet::new(),
             extra_refs: Vec::new(),
             test_vars: Vec::new(),
+            migrate_vars: Vec::new(),
             macro_vars: Vec::new(),
             qualifiers: HashMap::new(),
             qualifier_paths: HashMap::new(),
@@ -2442,7 +2458,38 @@ impl Resolver {
         if has_macro(attrs) {
             self.mark_macro(&hir, base.span);
         }
+        if let Some((ctor, span)) = migrate_of(attrs) {
+            self.mark_migrate(&hir, ctor, span);
+        }
         hir
+    }
+
+    /// Record a `@migrate(C)` function: what a reload calls on a value of an
+    /// earlier build's constructor `C`, with its fields, for the value of the
+    /// new build's type to use in its place. Its parameters are those fields;
+    /// what they must be is checked against the old constructor when the
+    /// reload is made, which is when there is one.
+    fn mark_migrate(&mut self, decl: &hir::LDecl, ctor: Option<InternedString>, span: Span) {
+        let Some(ctor) = ctor else {
+            return self.error(
+                "`@migrate` names the constructor it migrates".to_string(),
+                "write `@migrate(Circle) fun fromOld r = …`, taking the old `Circle`'s fields"
+                    .to_string(),
+                span,
+            );
+        };
+        match decl.value() {
+            hir::Decl::Bind(hir::Bind::Fun(name, _, _, _)) => {
+                let var = *name.value();
+                self.migrate_vars.push((var, ctor));
+            }
+            _ => self.error(
+                "`@migrate` must be a function".to_string(),
+                "write `@migrate(Circle) fun fromOld r = …`, taking the old `Circle`'s fields"
+                    .to_string(),
+                span,
+            ),
+        }
     }
 
     /// Record a `@macro` declaration: a function that may be called as a macro
@@ -2557,6 +2604,11 @@ impl Resolver {
 
     pub fn test_vars(&self) -> &[(InternedString, VarId)] {
         &self.test_vars
+    }
+
+    /// Every `@migrate(C)` function of this unit, and its `C`.
+    pub fn migrate_vars(&self) -> &[(VarId, InternedString)] {
+        &self.migrate_vars
     }
 
     pub fn is_pub_type(&self, name: InternedString) -> bool {

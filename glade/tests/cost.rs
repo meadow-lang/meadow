@@ -24,6 +24,7 @@ fn program(src: &str) -> core::Program {
         ctor_fields: pkg.ctor_fields.clone(),
         variants: pkg.variants.clone(),
         origins: Default::default(),
+        migrations: Vec::new(),
     }
 }
 

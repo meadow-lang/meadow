@@ -374,6 +374,23 @@ pub struct Def {
     pub block: Block,
 }
 
+/// A `@migrate(C)` function: what a reload calls on a value of an earlier
+/// build's constructor `C`, with that value's fields, for the value of this
+/// build's type it answers to stand in for it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Migration {
+    /// The function's direct entry point, which takes the fields and then
+    /// its continuation.
+    pub label: Label,
+    /// The constructor, as [`Program::tags`] names it: of the type the
+    /// function answers -- or, where that type has none of that name, the
+    /// name as written, which a reload refuses.
+    pub ctor: InternedString,
+    /// What the function takes, written as [`Program::ctor_types`] writes a
+    /// constructor's fields: what the old constructor's must have been.
+    pub fields: InternedString,
+}
+
 /// A block C may call, by the name it calls it: what a library built of the
 /// program exports. The block takes `params` and then the continuation it
 /// answers through, and answers `result`.
@@ -456,6 +473,10 @@ pub struct Program {
     /// writes it: what a reload refuses to change under values already made.
     #[serde(default)]
     pub ctor_types: std::collections::HashMap<InternedString, InternedString>,
+    /// The `@migrate` functions, for a program that may be loaded into one
+    /// running an earlier build of it.
+    #[serde(default)]
+    pub migrations: Vec<Migration>,
 }
 
 impl Program {

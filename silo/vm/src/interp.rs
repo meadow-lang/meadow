@@ -92,7 +92,7 @@ enum Next {
 /// it makes run with the JIT: so that the interpreter without it calls only
 /// code without it, and pays nothing for its being there.
 macro_rules! instruction {
-    ($vm:ident, $jit:expr, $p:ident, $env:ident, $code:ident, $pc:ident, $go:ident, $enter:ident, $done:ident, $set_env:ident, $wait_frame:ident, $wait_held:ident) => {
+    ($vm:ident, $jit:expr, $p:ident, $env:ident, $code:ident, $pc:ident, $go:ident, $enter:ident, $done:ident, $set_env:ident, $wait_frame:ident, $wait_held:ident, $here:expr) => {
         // Safety: every pc is a procedure's entry, an instruction's
         // successor within its procedure, or a target `Code::emit` patched
         // in -- all inside the array.
@@ -145,9 +145,21 @@ macro_rules! instruction {
             }
             Ins::Switch(i) => {
                 let sw = &$code.switches[i as usize];
-                let v = $vm.val(sw.scrutinee, &mut $env);
-                let tag = u64::from(heap::meta_of(v));
-                match sw.arms.iter().find(|a| a.tag == tag) {
+                let mut v = $vm.val(sw.scrutinee, &mut $env);
+                let mut tag = u64::from(heap::meta_of(v));
+                let mut arm = sw.arms.iter().find(|a| a.tag == tag);
+                // A value of an earlier build's, which a `@migrate` function
+                // makes one of this build's: see `Vm::migrated`.
+                if arm.is_none()
+                    && $vm.migrating.load(Ordering::Relaxed)
+                    && let Some(m) =
+                        $vm.migrated(v, $here, &mut $env, sw.arms.iter().all(|a| !a.keep))
+                {
+                    v = m;
+                    tag = u64::from(heap::meta_of(v));
+                    arm = sw.arms.iter().find(|a| a.tag == tag);
+                }
+                match arm {
                     Some(a) => {
                         let loaded = load_fields(v, a.fields.len());
                         for (u, x) in a.fields.iter().zip(&loaded) {
@@ -893,6 +905,34 @@ pub struct Vm {
     heap_frames: bool,
     /// The JIT, when it was asked for: see [`jit`].
     jit: Option<Box<jit::Jit>>,
+    /// How a value of each earlier build's constructor a reload migrated is
+    /// made one of the build after (`@migrate`), by its tag; and whether
+    /// there is any, which a `switch` that finds no arm asks.
+    migrations: std::sync::RwLock<HashMap<u32, Migrate>>,
+    migrating: std::sync::atomic::AtomicBool,
+    /// By segment: whether its code is only interpreted -- a build that
+    /// migrates values, every `switch` of whose code must be able to.
+    interpreted: Box<[std::sync::atomic::AtomicBool]>,
+}
+
+/// How a value of an earlier build's constructor is made one of a later
+/// build's: by the `@migrate` function in a slot, called with its fields; or,
+/// for a constructor of a migrated type that the later build did not change,
+/// with its fields as they are, under the later build's tag.
+#[derive(Clone, Copy, Debug)]
+enum Migrate {
+    Call(u32),
+    Retag(u32),
+}
+
+/// What a reload's `@migrate` functions come to: how each old constructor's
+/// values are migrated, by tag; and the slots of old definitions whose calls
+/// go to a new one now, each with the new one's slot -- a definition whose
+/// type is the old one's but for the versions of the migrated types.
+#[derive(Default)]
+struct Plan {
+    migrate: Vec<(u32, Migrate)>,
+    aliases: Vec<(u32, u32)>,
 }
 
 /// Under `--stack heap`, the calls waiting on the loop that made them: the
@@ -1126,6 +1166,11 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
         } else {
             jit::Jit::from_env(c_threads)?.map(Box::new)
         },
+        migrations: std::sync::RwLock::new(HashMap::new()),
+        migrating: std::sync::atomic::AtomicBool::new(false),
+        interpreted: (0..SEGMENTS)
+            .map(|_| std::sync::atomic::AtomicBool::new(false))
+            .collect(),
     };
     // Its records kept from the start: see `meadow_silo::coverage::recording`.
     if vm.debugging {
@@ -1203,11 +1248,12 @@ impl Vm {
                         .into(),
                 );
             }
+            let plan = plan_migrations(program, &state, &c)?;
             let names = names_of(&state);
-            made = Some(c);
+            made = Some((c, plan));
             Ok(names)
         })?;
-        let c = made.expect("compiled");
+        let (c, plan) = made.expect("compiled");
         let _ = self.segs[seg].set(c.segment);
         // Under a debugger, which is told of the new code before anything
         // calls it.
@@ -1215,7 +1261,27 @@ impl Vm {
             d.loaded(seg);
         }
         // The segment in place first: a slot is read by whatever calls it.
-        for (slot, proc) in &c.defs {
+        // Values of the old constructors it migrates, met by its code: its
+        // code is interpreted, where every `switch` can migrate them.
+        if !plan.migrate.is_empty() {
+            self.interpreted[seg].store(true, Ordering::Release);
+            let mut m = self.migrations.write().unwrap_or_else(|p| p.into_inner());
+            m.extend(plan.migrate.iter().copied());
+            self.migrating.store(true, Ordering::Release);
+        }
+        let aliased = plan.aliases.iter().map(|(old, new)| {
+            let proc = c
+                .defs
+                .iter()
+                .find(|(s, _)| s == new)
+                .map_or(u32::MAX, |d| d.1);
+            (*old, proc)
+        });
+        let installed: Vec<(u32, u32)> = c.defs.iter().copied().chain(aliased).collect();
+        for (slot, proc) in &installed {
+            if *proc == u32::MAX {
+                continue;
+            }
             self.defs[*slot as usize].store(*proc, Ordering::Release);
             // What compiled code calls by name is what the slot holds now.
             if let Some(t2) = self.jit.as_ref().and_then(|j| j.tier2.as_ref()) {
@@ -1224,12 +1290,177 @@ impl Vm {
         }
         state.segments = seg + 1;
         *held = state;
+        let migrated = if plan.migrate.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", {} constructors migrated, {} old definitions sent to new ones",
+                plan.migrate.len(),
+                plan.aliases.len()
+            )
+        };
         Ok(format!(
-            "{} definitions replaced, {} added",
+            "{} definitions replaced, {} added{migrated}",
             c.replaced,
             c.defs.len() - c.replaced
         ))
     }
+}
+
+/// A constructor's version, as `Program::ctor_types` writes it --
+/// `{type}#{version}{fields}` -- in its three parts.
+fn version_parts(v: &str) -> Option<(&str, &str, &str)> {
+    let at = v.find('#')?;
+    let hex = v.get(at + 1..at + 17)?;
+    Some((&v[..at], hex, &v[at + 17..]))
+}
+
+/// Fields as a constructor's version writes them, `(x : Int, y : Int)` or
+/// `(Int, Int)`, without their labels: what a `@migrate` function's
+/// parameters are compared by.
+fn unlabelled(fields: &str) -> String {
+    let inner = fields
+        .trim()
+        .strip_prefix('(')
+        .and_then(|f| f.strip_suffix(')'))
+        .unwrap_or(fields);
+    let mut parts = Vec::new();
+    let (mut depth, mut from) = (0i32, 0);
+    for (i, ch) in inner.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&inner[from..i]);
+                from = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&inner[from..]);
+    let shown: Vec<&str> = parts
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .map(|p| match p.split_once(" : ") {
+            Some((label, ty)) if !label.contains(|c: char| c.is_whitespace() || c == '(') => ty,
+            _ => p,
+        })
+        .collect();
+    format!("({})", shown.join(", "))
+}
+
+/// What `program`'s `@migrate` functions come to, against the program
+/// running as `state` numbers it, with `c` the new build compiled: see
+/// [`Plan`]. Refused where a function takes what no earlier version of its
+/// constructor had, or a migrated type's constructor changed with none to
+/// say what it becomes.
+fn plan_migrations(program: &Program, state: &LoadState, c: &Compiled) -> Result<Plan, String> {
+    let mut plan = Plan::default();
+    if program.migrations.is_empty() {
+        return Ok(plan);
+    }
+    // Each migrated type: its new version, and the old ones migrated from.
+    let mut types: Vec<(String, String, Vec<String>)> = Vec::new();
+    for m in &program.migrations {
+        let shown = meadow_rt::spelling(&m.ctor);
+        let Some((ty, new, _)) = program
+            .ctor_types
+            .get(&m.ctor)
+            .and_then(|v| version_parts(v))
+        else {
+            return Err(format!(
+                "`@migrate({shown})` names no constructor of the type its function makes"
+            ));
+        };
+        let Some(&slot) = c.slots.get(&m.label) else {
+            return Err(format!(
+                "`@migrate({shown})`'s function is not in the build"
+            ));
+        };
+        let mut found = false;
+        for ((n, v), tag) in &state.tags {
+            let Some((t, hex, fields)) = v.as_ref().and_then(|v| version_parts(v)) else {
+                continue;
+            };
+            if *n != m.ctor || t != ty || hex == new || unlabelled(fields) != unlabelled(&m.fields)
+            {
+                continue;
+            }
+            plan.migrate.push((*tag, Migrate::Call(slot)));
+            found = true;
+            match types.iter_mut().find(|(t2, ..)| t2 == t) {
+                Some((.., olds)) if olds.iter().any(|o| o == hex) => {}
+                Some((.., olds)) => olds.push(hex.to_string()),
+                None => types.push((t.to_string(), new.to_string(), vec![hex.to_string()])),
+            }
+        }
+        if !found {
+            return Err(format!(
+                "`@migrate({shown})` takes {}, which no earlier `{shown}` had",
+                unlabelled(&m.fields)
+            ));
+        }
+    }
+    // The rest of each old version of a migrated type: a constructor the new
+    // build did not change keeps its fields, under its new tag.
+    for (ty, new, olds) in &types {
+        for ((n, v), tag) in &state.tags {
+            let Some((t, hex, fields)) = v.as_ref().and_then(|v| version_parts(v)) else {
+                continue;
+            };
+            if t != ty || !olds.iter().any(|o| o == hex) || plan.migrate.iter().any(|m| m.0 == *tag)
+            {
+                continue;
+            }
+            let now = program.ctor_types.get(n);
+            let same = now
+                .and_then(|v| version_parts(v))
+                .is_some_and(|(_, h, f)| h == new && unlabelled(f) == unlabelled(fields));
+            match now.and_then(|v| state.tags.get(&(*n, Some(*v)))) {
+                Some(to) if same => plan.migrate.push((*tag, Migrate::Retag(*to))),
+                _ => {
+                    return Err(format!(
+                        "`{}` is migrated from an earlier build only in part: `{}` changed, \
+                         and no `@migrate({})` says what it becomes",
+                        meadow_rt::spelling(ty),
+                        meadow_rt::ctor_spelling(n),
+                        meadow_rt::spelling(n)
+                    ));
+                }
+            }
+        }
+    }
+    // Old code's calls by name, to what the new build made of the
+    // definitions they called: each old definition whose type is a new one's
+    // but for the migrated types' versions.
+    for (label, key) in &c.keys {
+        let key = key.clone();
+        let Some(&slot) = c.slots.get(label) else {
+            continue;
+        };
+        let mut olds = vec![key.clone()];
+        for (_, new, versions) in &types {
+            olds = olds
+                .iter()
+                .flat_map(|k| {
+                    let mut ks = vec![k.clone()];
+                    if k.contains(new.as_str()) {
+                        ks.extend(versions.iter().map(|o| k.replace(new.as_str(), o)));
+                    }
+                    ks
+                })
+                .collect();
+        }
+        for old in olds.iter().filter(|k| **k != key) {
+            if let Some(&was) = state.slots.get(old)
+                && was != slot
+            {
+                plan.aliases.push((was, slot));
+            }
+        }
+    }
+    Ok(plan)
 }
 
 /// A block no person wrote -- a join point, a group of local functions, the
@@ -1299,6 +1530,8 @@ struct Compiled {
     segment: Segment,
     /// Each definition's slot, by its label.
     slots: HashMap<Label, u32>,
+    /// What each block is across builds, by its label: see [`block_keys`].
+    keys: HashMap<Label, String>,
     /// What each of those slots holds now: the definition's procedure.
     defs: Vec<(u32, u32)>,
     /// How many of those slots the program running had already.
@@ -1341,6 +1574,8 @@ fn compile(
     };
     // Each definition's procedure is numbered first, so that a jump to one
     // not yet compiled knows where it will be.
+    // The definition each block is of: its own, or the one it is a copy of.
+    let of: Vec<usize> = lin.iter().map(|(i, ..)| *i).collect();
     let blocks: Vec<(Label, String, &'static LBlock)> = lin
         .into_iter()
         .map(|(i, label, b)| {
@@ -1355,7 +1590,7 @@ fn compile(
     // A slot for each definition: the one it is a new version of, if the
     // program running has one, or one of its own. A first load's are
     // numbered as its procedures are.
-    let keys = def_keys(program);
+    let keys = block_keys(program, &blocks, &of);
     let mut slots = HashMap::new();
     let mut defs = Vec::new();
     let mut replaced = 0;
@@ -1428,6 +1663,7 @@ fn compile(
             lowered,
         },
         slots,
+        keys,
         defs,
         replaced,
         threads: c.threads,
@@ -2644,7 +2880,7 @@ impl Vm {
                 }};
             }
             instruction!(
-                vm, JIT, p, env, code, pc, go, enter, done, set_env, wait_frame, wait_held
+                vm, JIT, p, env, code, pc, go, enter, done, set_env, wait_frame, wait_held, p
             )
         }
     }
@@ -2694,7 +2930,7 @@ impl Vm {
             }};
         }
         instruction!(
-            vm, true, p, env, code, pc, go, enter, done, set_env, wait_frame, wait_held
+            vm, true, p, env, code, pc, go, enter, done, set_env, wait_frame, wait_held, *procedure
         )
     }
 
@@ -2802,6 +3038,67 @@ impl Vm {
             unheld(fr, &rec, &mut 2);
         }
         r
+    }
+
+    /// `v`, which a `switch` in procedure `p`, whose slots are `env`, found
+    /// no arm for: made one of a later build's values if it is of an earlier
+    /// build's constructor a reload migrated (`@migrate`), and `None` if not.
+    /// The `switch` owns `v` if `owned`, and it is let go once its fields are
+    /// in the new value; one it borrows is left as it was.
+    #[cold]
+    #[inline(never)]
+    fn migrated(&self, v: Word, p: u32, env: &mut Env, owned: bool) -> Option<Word> {
+        let tag = heap::meta_of(v) as u32;
+        let how = *self
+            .migrations
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&tag)?;
+        let n = if heap::is_block(v) { heap::len(v) } else { 0 };
+        let fields: Vec<(Word, i64)> = (0..n)
+            .map(|i| {
+                let (w, dd) = (heap::field(v, i), heap::field_desc(v, i));
+                // The new value's, or the function's to take.
+                heap::share(w, dd);
+                (w, dd)
+            })
+            .collect();
+        let made = match how {
+            Migrate::Retag(to) => {
+                let (vals, descs): (Vec<Word>, Vec<i64>) = fields.into_iter().unzip();
+                self.build_in(to, &vals, &descs, None)
+            }
+            Migrate::Call(slot) => {
+                let target = self.target(slot);
+                // The fields, the null continuation, and -- where the
+                // function takes them -- no handlers: a migration performs
+                // nothing.
+                let mut args: Args = fields.iter().map(|(w, _)| V::Val(*w)).collect();
+                args.push(V::Val(0));
+                if self.proc(target).params.len() > args.len() {
+                    args.push(V::Val(heap::immediate(0)));
+                }
+                // Everything the procedure's slots hold, held while it runs:
+                // a collection may come.
+                let held: Vec<(U, Hold)> = (0..env.len())
+                    .filter(|s| matches!(env.get(*s), Some(V::Val(_))))
+                    .map(|s| {
+                        let d = self
+                            .proc(p)
+                            .slot_descs
+                            .get(s)
+                            .copied()
+                            .unwrap_or(D::K(desc::REF));
+                        (U { s: s as Slot, d }, Hold::Owned)
+                    })
+                    .collect();
+                self.waiting_in(&held, env, || self.call::<false>(target, args))
+            }
+        };
+        if owned && !self.tracing {
+            self.erase(v, desc::REF);
+        }
+        Some(made)
     }
 
     /// [`Vm::waiting`], for a frame never made: what it would have held is in
@@ -3196,6 +3493,36 @@ impl Vm {
 /// point, a group of local functions, which only their own definition's
 /// code calls), one whose type the front end does not say, and those alike
 /// in all of it.
+/// What each of the linear `blocks` is across builds, by its label: its
+/// definition's key ([`def_keys`]) -- a copy's, the definition it is a copy
+/// of (`of`) -- and which of its parameters it borrows. A call passes what
+/// the callee owns and keeps what it borrows, so a new version is the old
+/// one's only where it borrows the same: otherwise an old caller would give
+/// it up twice, or never. And so a copy of a definition that owns what the
+/// definition borrows is a version of the old build's copy alike, and old
+/// code calling it calls the new. None for two alike.
+fn block_keys(
+    program: &Program,
+    blocks: &[(Label, String, &'static LBlock)],
+    of: &[usize],
+) -> HashMap<Label, String> {
+    let defs = def_keys(program);
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut keys = Vec::new();
+    for ((label, _, b), i) in blocks.iter().zip(of) {
+        let Some(k) = defs.get(&program.defs[*i].label) else {
+            continue;
+        };
+        let borrows: String = (0..b.params.len())
+            .map(|j| if b.borrows(j) { 'b' } else { 'o' })
+            .collect();
+        let key = format!("{k} [{borrows}]");
+        *seen.entry(key.clone()).or_insert(0) += 1;
+        keys.push((*label, key));
+    }
+    keys.into_iter().filter(|(_, k)| seen[k] == 1).collect()
+}
+
 fn def_keys(program: &Program) -> HashMap<Label, String> {
     fn rep(r: Option<&Rep>) -> String {
         match r {

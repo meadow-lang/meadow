@@ -129,6 +129,27 @@ extern "C" fn entry_debugged() -> Word {
     v
 }
 
+/// How a reload ended, a line a reload, for whoever runs the program to read
+/// at `MEADOW_WATCH_REPORT`: `meadow run --watch`, which offers to start the
+/// program again when one is refused.
+fn report(done: &Result<String, String>) {
+    use std::io::Write as _;
+    let Some(to) = std::env::var_os("MEADOW_WATCH_REPORT") else {
+        return;
+    };
+    let line = match done {
+        Ok(what) => format!("reloaded\t{what}\n"),
+        Err(why) => format!("refused\t{}\n", why.replace('\n', " ")),
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(to)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 /// Load the image at `path` into the running program whenever it is written
 /// anew, from a thread of its own.
 fn watch(path: std::path::PathBuf) {
@@ -153,6 +174,7 @@ fn watch(path: std::path::PathBuf) {
                 Err(e) => eprintln!("not reloaded: {e}"),
             }
             interp::debug::reloaded(&done);
+            report(&done);
         }
     });
 }

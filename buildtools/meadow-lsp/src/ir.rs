@@ -138,6 +138,7 @@ impl Analysis {
                     ctor_fields: Default::default(),
                     variants: Default::default(),
                     origins: Default::default(),
+                    migrations: Default::default(),
                 }
                 .pretty(),
                 segments: Vec::new(),
@@ -182,6 +183,7 @@ impl Analysis {
                 ctor_fields: self.ir.ctor_fields.clone(),
                 variants: self.ir.variants.clone(),
                 origins: Default::default(),
+                migrations: Default::default(),
             },
             &outside,
         );
@@ -281,6 +283,7 @@ impl Analysis {
             ctor_fields,
             variants,
             origins: Default::default(),
+            migrations: Default::default(),
         };
         let lowered = meadow_seq::lower_program(&program, meadow_compiler::Options::debug().opt);
         let listing = lowered.program.listing();

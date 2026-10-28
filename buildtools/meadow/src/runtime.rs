@@ -802,6 +802,7 @@ fn with_tests(program: &core::Program, tests: &[core::Var]) -> (core::Program, u
             ctor_fields: program.ctor_fields.clone(),
             variants: program.variants.clone(),
             origins: Default::default(),
+            migrations: Vec::new(),
         },
         base,
     )
@@ -836,6 +837,7 @@ fn test_image(
         ctor_fields: program.ctor_fields.clone(),
         variants: program.variants.clone(),
         origins: Default::default(),
+        migrations: Vec::new(),
     };
     Ok((compile(&whole, opt)?, base))
 }

@@ -171,6 +171,11 @@ impl Vm {
             if meadow_silo::coverage::recording() {
                 return Jitted::Entry;
             }
+            // A build that migrates values: interpreted, where every
+            // `switch` can migrate one (`Vm::migrated`).
+            if self.interpreted[(*p >> super::SEG) as usize].load(Ordering::Relaxed) {
+                return Jitted::Entry;
+            }
             // A definition the second tier compiled: run as an executable's
             // code is, until it answers or leaves a tail call to the VM.
             if let Some((f, tramp)) = self.tier2(*p) {

@@ -484,6 +484,10 @@ pub struct Program {
     /// Variables a pass made as copies of others, and which: what a debugger
     /// needs to call a specialized copy's variables by their names.
     pub origins: HashMap<Var, Var>,
+    /// The `@migrate(C)` functions, and the constructor each names: what a
+    /// reload applies to a value of an earlier build's `C`, for one of this
+    /// build's type to stand in for it.
+    pub migrations: Vec<(Var, InternedString)>,
 }
 
 impl Program {

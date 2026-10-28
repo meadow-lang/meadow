@@ -1212,6 +1212,76 @@ it on the same try, the 82nd.
 after a call -- is never a boundary, so a step goes past it. That was so
 before reloading, and is so in every segment.
 
+### Hot loading, further (2026-10-28)
+
+**A reload refused** (HOT-40). The interpreter writes how each reload ended
+to a file `meadow run --watch` names. When one is refused, `meadow` says why
+and offers a start over, and saving again takes it: the program is stopped,
+built, and run again from the start.
+
+The offer is taken by saving, not by a key, because the program owns the
+terminal. Reading a key would take input the program was waiting for, and
+handing the program input through `meadow` would stop it from being a
+terminal.
+
+**Migrations** (HOT-41). Before this, a value of a type the new build
+changed stayed with the old code, and the old code went on calling the old
+versions of everything that took it. Now a new build can say what an old
+value becomes:
+
+```
+data Shape = Circle String | Square Int
+
+@migrate(Circle)
+fun fromOld (r : Int) : Shape = Circle (S.repeat "x" r)
+```
+
+The function takes the old constructor's fields, as its version wrote them
+(`Shape#…(Int)`). The reload checks that some earlier `Circle` had them, and
+refuses if none did.
+- **The other constructors.** Each one the new build kept as it was is
+  migrated by keeping its fields under its new tag. One that changed with
+  no `@migrate` refuses the reload.
+- **Old code meets new.** An old definition whose type differs from a new
+  one's only in the migrated types' versions sends its calls to the new
+  one.
+- **The conversion is lazy.** A `switch` in the new code that finds no arm
+  for a value asks whether its tag is a migrated one. If it is, the
+  function makes the new value, and the `switch` takes that apart instead.
+  Nested values are migrated as they are reached, and nothing walks the
+  heap. While the function runs, everything the frame holds is on the
+  shadow chain, as for any call that waits, so a collection, moving or
+  not, finds it.
+- **Two prices.** The new build's code is interpreted, so that every
+  `switch` in it can migrate; a JIT-compiled `switch` cannot. A migration
+  is given no handlers, so it may not perform effects.
+- **Not done.** A new value that reaches old code which takes it apart
+  meets that code's `match` as a constructor it does not know.
+
+**Keys, found on the way.** A definition's slot was found by its module,
+name, versioned type and representations. The memory pass's copies -- a
+block that owns what its definition borrows -- had no key at all, so a
+reload never replaced them; the migration test's `describe` was called
+through one. The key now includes which parameters the block borrows, and a
+copy is keyed by its definition. That fixes a hazard too. A new version
+that owned a parameter the old one borrowed would have been called by old
+code still holding it, and given it up twice.
+
+**A native program, reloaded** (HOT-42). JIT-10 asks for an executable that
+carries the VM and the JIT for what a reload brings. What is built instead
+gets the same result another way. Under `--watch`, a program not asked to
+be interpreted runs on the VM with the JIT's second tier compiling each
+definition the first time it is called (`MEADOW_JIT_THRESHOLD=0`,
+`MEADOW_JIT_TIER2=0`). The code is compiled as an executable's definitions
+are, from the same LIR, so it runs natively from its first call. A reload's
+definitions are compiled the same way, and what tier 2 does not compile
+runs on tier 1 or the interpreter.
+
+An executable linked ahead of time would need its calls by name to go
+through the slot table, with the runtime's addresses fixed at link time
+rather than at load. Tier 2 has the table and makes calls the same way
+already, which is why it is the route taken.
+
 ### Replacing Glade in full (2026-10-24)
 
 The merged runtime is to be Glade's next release, so it has to do all that

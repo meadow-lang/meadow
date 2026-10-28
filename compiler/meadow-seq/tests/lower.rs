@@ -38,6 +38,7 @@ fn main_def(term: Term) -> Program {
         ctor_fields: Default::default(),
         variants: Default::default(),
         origins: Default::default(),
+        migrations: Vec::new(),
     }
 }
 
@@ -161,6 +162,7 @@ fn a_global_reference_is_a_jump_with_the_environment_untouched() {
         ctor_fields: Default::default(),
         variants: Default::default(),
         origins: Default::default(),
+        migrations: Vec::new(),
     };
     let lowered = lower_program(&program, meadow_core::OptLevel::default());
     assert!(lowered.unsupported.is_empty());
@@ -197,6 +199,7 @@ fn a_global_literal_is_put_where_it_is_mentioned() {
         ctor_fields: Default::default(),
         variants: Default::default(),
         origins: Default::default(),
+        migrations: Vec::new(),
     };
     let lowered = lower_program(&program, meadow_core::OptLevel::default());
     assert!(lowered.unsupported.is_empty());

@@ -174,6 +174,7 @@ pub fn program(p: &Program) -> Program {
         ctor_fields: p.ctor_fields.clone(),
         variants: p.variants.clone(),
         origins: p.origins.clone(),
+        migrations: p.migrations.clone(),
     }
 }
 

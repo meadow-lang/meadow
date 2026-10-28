@@ -147,7 +147,9 @@
 //! is bound. Liveness here ignores descriptors; `meadow_axcut::describe` then adds
 //! each one to every environment holding a value it describes.
 
-use crate::{Block, Def, Extern, Label, NO_DESC, Name, Program, Rep, Role, Statement, Tag};
+use crate::{
+    Block, Def, Extern, Label, Migration, NO_DESC, Name, Program, Rep, Role, Statement, Tag,
+};
 use meadow_core as core;
 use meadow_core::{OptLevel, Pat, Term, Var};
 use meadow_hir::VarId;
@@ -594,6 +596,50 @@ pub fn lower_program_with(program: &core::Program, opt: OptLevel, reloadable: bo
         })
         .collect();
 
+    // Each `@migrate(C)` function, with what it takes: a reload checks the
+    // old `C` had those fields, and calls it on each old `C` new code meets.
+    let migrations = program
+        .migrations
+        .iter()
+        .filter(|_| reloadable)
+        .filter_map(|(var, ctor)| {
+            let i = program.defs.iter().position(|d| d.var == *var)?;
+            // Its parameters, however curried, and what it answers.
+            let mut params = Vec::new();
+            let mut ty = &program.defs[i].poly.ty;
+            while let core::Ty::Fun(ps, ret, _) = ty {
+                params.extend(ps.iter().cloned());
+                ty = ret;
+            }
+            let full = match ty {
+                core::Ty::Con(t, _) => program
+                    .variants
+                    .get(t)
+                    .into_iter()
+                    .flatten()
+                    .find(|v| core::spelling(&v.name) == core::spelling(ctor))
+                    .map(|v| v.name),
+                _ => None,
+            };
+            let fields = core::variant_signature(&meadow_infer::VariantSig {
+                name: *ctor,
+                fields: params,
+                labels: None,
+            });
+            // Its direct entry point, which takes the fields: the
+            // definition's own block answers the function as a value.
+            let label = lower
+                .workers
+                .get(var)
+                .map_or(Label(i as u32), |&(worker, _)| worker);
+            Some(Migration {
+                label,
+                ctor: full.unwrap_or(*ctor),
+                fields: InternedString::from(fields.as_str()),
+            })
+        })
+        .collect();
+
     timing.since("lower", lowering);
     Lowered {
         program: Program {
@@ -620,6 +666,7 @@ pub fn lower_program_with(program: &core::Program, opt: OptLevel, reloadable: bo
             pure: lower.pure,
             types,
             ctor_types,
+            migrations,
         },
         unsupported: lower.unsupported,
     }

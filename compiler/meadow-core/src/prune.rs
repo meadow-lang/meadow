@@ -84,7 +84,9 @@ pub fn prune(program: &Program) -> Program {
 /// executable's entry point, and nothing else; a library's public definitions,
 /// every one, since what a caller will reach is not known when it is compiled.
 pub fn prune_from(program: &Program, roots: impl IntoIterator<Item = Var>) -> Program {
-    let keep = Deps::new(&program.defs).reach(roots);
+    // A `@migrate` function too, which nothing calls but a reload.
+    let migrations = program.migrations.iter().map(|(v, _)| *v);
+    let keep = Deps::new(&program.defs).reach(roots.into_iter().chain(migrations));
     Program {
         defs: program
             .defs
@@ -96,6 +98,7 @@ pub fn prune_from(program: &Program, roots: impl IntoIterator<Item = Var>) -> Pr
         ctor_fields: program.ctor_fields.clone(),
         variants: program.variants.clone(),
         origins: program.origins.clone(),
+        migrations: program.migrations.clone(),
     }
 }
 

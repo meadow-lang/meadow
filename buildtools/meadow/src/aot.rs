@@ -233,11 +233,13 @@ pub fn write_image_with(
 ) -> Result<(), String> {
     // The memory pass, done here once rather than by every run: where it
     // starts is the entry, or each test.
-    let roots = match (tests.is_empty(), program.entry) {
+    let mut roots = match (tests.is_empty(), program.entry) {
         (true, Some(e)) => vec![e],
         (true, None) => return Err("the program has no entry point".into()),
         (false, _) => tests.clone(),
     };
+    // And each `@migrate` function, which only a reload calls.
+    roots.extend(program.migrations.iter().map(|m| m.label));
     // The VM keeps frames on a stack of its own under `--stack heap`, where
     // an executable makes every continuation an object: the image keeps them.
     let mut program = program;

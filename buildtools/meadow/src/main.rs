@@ -103,7 +103,13 @@ enum Cmd {
         /// it runs: from then on a call by name runs the new version, and
         /// what is running already finishes as it was. A type the new build
         /// changed is a new type: values already made of the old one go on
-        /// being taken by the code made for them.
+        /// being taken by the code made for them -- unless the new build
+        /// says what they become, with a function `@migrate(Ctor)` taking an
+        /// old `Ctor`'s fields. A build the program cannot take is offered as
+        /// a start over, which saving again takes. Unless it is asked to be
+        /// interpreted, the program runs natively all the same: each
+        /// definition is compiled the first time it is called, as an
+        /// executable's are, and a new build's as they are called.
         #[arg(long)]
         watch: bool,
         #[command(flatten)]
@@ -877,12 +883,34 @@ fn command() {
             // Reloading is the interpreter's, on Silo.
             let mut profile = profile;
             let mut target = target;
+            let asked_to_interpret = target.interpret;
             if watch {
                 profile.runtime = Some("silo".into());
                 target.interpret = true;
                 meadow::watch::set_watching();
             }
             let resolved = profile.resolve(&path);
+            // A program that would have been compiled ahead of time is
+            // compiled as it runs instead, each definition the first time it
+            // is called, as an executable's definitions are compiled: by the
+            // JIT's second tier, from the same LIR. So it runs natively, and
+            // a reload compiles the new definitions as it did the old.
+            let native = !asked_to_interpret
+                && (!resolved.backend_named || resolved.backend == Backend::Aot);
+            if watch && native {
+                for (var, value) in [
+                    ("MEADOW_JIT", "1"),
+                    ("MEADOW_JIT_THRESHOLD", "0"),
+                    ("MEADOW_JIT_TIER2", "0"),
+                ] {
+                    if std::env::var_os(var).is_none() {
+                        // Safety: before anything is built or run, so before
+                        // any thread that reads the environment; the VM's
+                        // process inherits it.
+                        unsafe { std::env::set_var(var, value) };
+                    }
+                }
+            }
             let target = target.with(&resolved);
             if watch && target.no_reload {
                 status::error(

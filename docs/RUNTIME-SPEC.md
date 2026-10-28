@@ -793,7 +793,63 @@ changes, other than under `target/` or a dot-directory. It prints
 `Rebuilding` and then the build's own output. A build that fails leaves the
 program running as it was. When the program ends, `meadow` exits with its
 status.
-- *Status:* done, checked by hand; a test is to be written.
+- *Status:* done; through the command,
+  `hot_reload::a_build_the_program_cannot_take_is_offered_as_a_start_over`.
+
+**HOT-34.** A definition's slot is found by its block's key: the
+definition's module, name, versioned type and representations, and which of
+the block's parameters it borrows. A caller passes what the callee owns and
+keeps what it borrows, so a new version that borrowed otherwise would have
+an old caller give a value up twice, or never. A copy the memory pass makes
+of a definition, owning what the definition borrows, is keyed by the same
+definition and its own borrowing, so old code calling a copy calls the new
+build's copy alike.
+- *Status:* done; `hot_reload::a_migration_takes_an_old_value_to_new_code`
+  goes through a copy.
+
+### 11.5 Migrations
+
+**HOT-40.** When a reload is refused, `meadow run --watch` says why, and
+offers to start the program over with the new build: saving again does so.
+The interpreter says how each reload ended, a line each, at
+`MEADOW_WATCH_REPORT`, which `meadow` gives it.
+- *Status:* done;
+  `hot_reload::a_build_the_program_cannot_take_is_offered_as_a_start_over`.
+
+**HOT-41.** A new build may give a function `@migrate(C)` for a
+constructor `C` of a type it changed. The function takes the fields of an
+earlier build's `C` and answers a value of the new type. Then:
+- an earlier version of `C` with the fields it takes is migrated by it, and
+  one with other fields is not;
+- each other constructor of that earlier version, if the new build has it
+  with the same fields, is migrated by keeping its fields under its new
+  tag; if it changed, the reload is refused, naming it;
+- an old definition whose type is a new one's but for the migrated types'
+  versions sends its calls by name to the new one;
+- a `switch` in the new build's code that meets an old value of a migrated
+  constructor migrates it and takes it apart as the new value.
+
+The new build's code is interpreted, so that every `switch` in it can
+migrate. A migration performs no effects: it is given no handlers. A
+reload is refused when `@migrate(C)` takes what no earlier `C` held
+(`` `@migrate(C)` takes {fields}, which no earlier `C` had ``), or names
+no constructor of the type its function makes.
+- *Status:* done; `hot_reload::a_migration_takes_an_old_value_to_new_code`
+  under each strategy, and
+  `hot_reload::a_migration_must_take_what_the_old_constructor_held`. Not
+  done: a value of the new type that reaches old code that takes it apart
+  meets that code's `match` as an unknown constructor.
+
+**HOT-42.** Under `meadow run --watch`, a program not asked to be
+interpreted runs natively: each definition is compiled by the JIT's second
+tier the first time it is called, as an executable's definitions are
+compiled, from the same LIR, and a new build's definitions likewise. What
+the second tier does not compile runs on the first tier or the
+interpreter, so the engines mix in one program.
+- *Status:* done;
+  `hot_reload::a_program_compiled_as_it_runs_is_reloaded_as_an_interpreted_one_is`.
+  It is the JIT that makes the program native, not an executable linked
+  ahead of time: see `docs/RUNTIME-MERGE.md`, "Hot loading, further".
 
 ## 12. The debugger
 
@@ -1260,10 +1316,14 @@ VM.
 
 - **HOT-40.** When a reload is refused, `meadow run --watch` offers to start
   the program again.
+  - *Status:* done (section 11.5).
 - **HOT-41.** A function from a changed type's old shape to its new shape can
   be given. It is applied to old values, which then reach new code.
+  - *Status:* done (section 11.5): `@migrate(C)`.
 - **HOT-42.** A native program can be reloaded, through mixed engines
   (JIT-10).
+  - *Status:* done (section 11.5), with the JIT compiling the program as it
+    runs.
 
 ### R7. Retire the old Glade, and rename
 

@@ -53,12 +53,14 @@ impl Linker {
         let mut tests = Vec::new();
         let mut ctor_fields = std::collections::HashMap::new();
         let mut variants = std::collections::HashMap::new();
+        let mut migrations = Vec::new();
         let mut entry = None;
 
         for pkg in &packages {
             defs.extend(pkg.defs.iter().cloned());
             ctor_fields.extend(pkg.ctor_fields.clone());
             variants.extend(pkg.variants.clone());
+            migrations.extend(pkg.migrations.iter().copied());
             tests.extend(pkg.test_sites().into_iter().map(|t| TestCase {
                 package: pkg.name,
                 name: InternedString::from(t.qualified()),
@@ -89,6 +91,7 @@ impl Linker {
             ctor_fields,
             variants,
             origins: Default::default(),
+            migrations,
         };
         program.entry = match entry {
             Some(Entry::Main(main)) => Some(start(&mut program, main)),

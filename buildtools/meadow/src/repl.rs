@@ -1686,6 +1686,7 @@ impl Session {
             ctor_fields: Default::default(),
             variants: Default::default(),
             origins: Default::default(),
+            migrations: Vec::new(),
         };
         print!("{}", alone.pretty());
     }
@@ -1714,6 +1715,7 @@ impl Session {
             ctor_fields: self.cache.ctor_fields.clone(),
             variants: self.cache.variants.clone(),
             origins: Default::default(),
+            migrations: Vec::new(),
         };
         let lowered = meadow_seq::cut::to_cut(&program);
         let Some(symbol) = lowered.symbols.get(&var) else {
@@ -1767,6 +1769,7 @@ impl Session {
             ctor_fields: self.cache.ctor_fields.clone(),
             variants: self.cache.variants.clone(),
             origins: Default::default(),
+            migrations: Vec::new(),
         };
         let lowered = meadow_seq::lower_program(&program, self.opts.opt);
         let mut shown = false;
@@ -1809,6 +1812,7 @@ impl Session {
             ctor_fields,
             variants,
             origins: Default::default(),
+            migrations: Vec::new(),
         }
     }
 }

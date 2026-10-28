@@ -74,6 +74,7 @@ pub fn program(p: &Program, opt: OptLevel) -> Program {
         ctor_fields: p.ctor_fields.clone(),
         variants: p.variants.clone(),
         origins: lifter.origins,
+        migrations: p.migrations.clone(),
     }
 }
 

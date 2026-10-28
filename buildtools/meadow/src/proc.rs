@@ -343,6 +343,7 @@ impl<'a> Macros<'a> {
             ctor_fields: program.ctor_fields.clone(),
             variants: program.variants.clone(),
             origins: Default::default(),
+            migrations: Vec::new(),
         };
         // Every package the build has, linked whole, refers to things nothing
         // defined -- what a macro never reaches. Lowered, each is an error
