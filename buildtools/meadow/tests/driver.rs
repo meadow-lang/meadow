@@ -910,3 +910,60 @@ fn the_merged_runtime_s_jit_runs_what_its_vm_runs() {
     assert_eq!(jit, vm, "the JIT prints what the VM prints");
     assert!(said.contains("jit: Jit.fib"), "fib was compiled:\n{said}");
 }
+
+/// JIT-1 and JIT-6: a loop entered once is compiled while it runs. Control
+/// never joins inside a procedure, so a loop is a tail call to its own head,
+/// and every pass through the head is an entry the threshold counts: the
+/// running loop goes on in the compiled code from the pass that crosses it.
+#[test]
+fn a_loop_entered_once_is_compiled_as_it_runs() {
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    if !cfg!(target_arch = "x86_64") {
+        eprintln!("skipped: the JIT compiles for x86-64 only yet");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("meadow-vm-jit-loop-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("Loop/src")).unwrap();
+    std::fs::write(
+        dir.join("Loop/Meadow.toml"),
+        "[package]\nname = \"Loop\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("Loop/src/Main.mw"),
+        "fun count (i : Int) (acc : Int) : Int =\n  \
+           if i >= 100000 then acc else count (i + 1) (acc + i % 7)\n\n\
+         fun main () = println (show (count 0 0))\n",
+    )
+    .unwrap();
+    let run = |engine: &str| {
+        let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
+            .args(["run", "--runtime", "silo", engine])
+            .arg(dir.join("Loop"))
+            .env("MEADOW_JIT_LOG", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (vm, _) = run("--interpret");
+    let (jit, said) = run("--jit");
+    assert_eq!(vm.trim(), "299995");
+    assert_eq!(jit, vm, "the JIT prints what the VM prints");
+    assert!(
+        said.lines()
+            .any(|l| l.starts_with("jit: Loop.count") && !l.contains("not compiled")),
+        "the loop was compiled, though entered from `main` once:\n{said}"
+    );
+}

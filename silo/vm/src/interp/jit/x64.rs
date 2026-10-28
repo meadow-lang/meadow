@@ -151,6 +151,13 @@ impl Asm {
         self.modrm(0b11, src, dst);
     }
 
+    /// `mov dst32, src32`: the low half, the top zeroed.
+    pub(super) fn mov32(&mut self, dst: Reg, src: Reg) {
+        self.rex(false, src, dst);
+        self.byte(0x89);
+        self.modrm(0b11, src, dst);
+    }
+
     /// `mov dst, imm`, at whatever width the value needs.
     pub(super) fn mov_imm(&mut self, dst: Reg, imm: u64) {
         if let Ok(v) = u32::try_from(imm) {
@@ -346,6 +353,26 @@ impl Asm {
         self.modrm(0b11, b, a);
     }
 
+    /// `cqo`: rax sign-extended into rdx, for a division.
+    pub(super) fn cqo(&mut self) {
+        self.byte(0x48);
+        self.byte(0x99);
+    }
+
+    /// `idiv r`: rdx:rax by `r`, the quotient in rax and the remainder in rdx.
+    pub(super) fn idiv(&mut self, r: Reg) {
+        self.rex(true, 0, r);
+        self.byte(0xF7);
+        self.modrm(0b11, 7, r);
+    }
+
+    /// `neg r`.
+    pub(super) fn neg(&mut self, r: Reg) {
+        self.rex(true, 0, r);
+        self.byte(0xF7);
+        self.modrm(0b11, 3, r);
+    }
+
     /// `not r`.
     pub(super) fn not(&mut self, r: Reg) {
         self.rex(true, 0, r);
@@ -493,6 +520,10 @@ mod tests {
         a.step32(RAX, false);
         a.step32(RAX, true);
         a.test32(RDX, RDX);
+        a.mov32(RDX, RDX);
+        a.cqo();
+        a.idiv(RCX);
+        a.neg(RAX);
         let code = a.finish();
         assert_eq!(
             code,
@@ -522,6 +553,10 @@ mod tests {
                 0x83, 0x00, 1, // add dword [rax], 1
                 0x83, 0x28, 1, // sub dword [rax], 1
                 0x85, 0xD2, // test edx, edx
+                0x89, 0xD2, // mov edx, edx
+                0x48, 0x99, // cqo
+                0x48, 0xF7, 0xF9, // idiv rcx
+                0x48, 0xF7, 0xD8, // neg rax
             ]
         );
     }

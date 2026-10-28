@@ -310,6 +310,7 @@ fn main() {
 /// The program is over, as `status` says: its profile written, if one was
 /// taken, and the process ended.
 fn ended(status: i32, profile_to: Option<&std::path::Path>) -> ! {
+    interp::report_steps();
     if let Some(to) = profile_to {
         let (folded, said) = interp::profile::finish();
         eprintln!("{said}");

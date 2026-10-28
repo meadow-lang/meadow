@@ -639,6 +639,11 @@ struct ProfileArgs {
     /// `--backend jit`.
     #[arg(long, conflicts_with = "aot")]
     jit: bool,
+    /// On Silo's JIT, how many times a procedure is entered before it is
+    /// compiled: 0 compiles each when it is first entered. A loop is a tail
+    /// call to its own head, so its passes are entries too. 1000 by default.
+    #[arg(long, value_name = "N")]
+    jit_threshold: Option<u32>,
     /// `--backend aot`: Glade, compiled ahead of time into an executable.
     #[arg(long, visible_alias = "native")]
     aot: bool,
@@ -713,6 +718,11 @@ impl ProfileArgs {
     /// The profile, the package's `Meadow.toml`, and these flags, in that order
     /// of increasing authority.
     fn resolve(&self, path: &std::path::Path) -> Resolved {
+        if let Some(n) = self.jit_threshold {
+            // Safety: before anything is built or run, so before any thread
+            // that reads the environment; the VM's process inherits it.
+            unsafe { std::env::set_var("MEADOW_JIT_THRESHOLD", n.to_string()) };
+        }
         Resolved::resolve(self.profile(), path, self.overrides())
     }
 }

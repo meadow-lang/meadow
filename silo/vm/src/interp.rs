@@ -44,6 +44,7 @@ use smallvec::SmallVec;
 mod code;
 pub mod debug;
 mod jit;
+pub use jit::report_steps;
 mod live;
 pub mod profile;
 use code::{Code, Ins, WideI};
@@ -2189,6 +2190,19 @@ impl Vm {
                 jit::Jitted::At(n) => (code, pc) = (self.entry(p).0, n),
             }
         }
+        self.run_from::<DEBUG, JIT>(p, env, code, pc)
+    }
+
+    /// The interpreter's loop, from `pc` of procedure `p`, whose code is
+    /// `code`: [`Vm::run`] once it is known where to begin.
+    #[inline(always)]
+    fn run_from<'a, const DEBUG: bool, const JIT: bool>(
+        &'a self,
+        mut p: u32,
+        mut env: Env,
+        mut code: &'a Code,
+        mut pc: usize,
+    ) -> Word {
         // The record a debugger reads this activation by, on the running
         // segment's chain while it runs.
         let parent = if DEBUG { meadow_silo::frames::top() } else { 0 };
@@ -2228,6 +2242,13 @@ impl Vm {
             macro_rules! enter {
                 () => {{
                     if JIT {
+                        // Records begun -- a debugger, a profile, coverage --
+                        // are kept by the loop that keeps them, which never
+                        // enters compiled code.
+                        if meadow_silo::coverage::recording() {
+                            let (c, at) = vm.entry(p);
+                            return vm.run_from::<true, false>(p, env, c, at);
+                        }
                         match vm.jitted(&mut p, &mut env) {
                             jit::Jitted::Done(w) => return w,
                             jit::Jitted::At(n) => {

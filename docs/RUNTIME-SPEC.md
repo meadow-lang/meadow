@@ -1098,24 +1098,36 @@ VM.
   machine code once it is entered more than a threshold of times, or once a
   loop head in it is passed more than a threshold of times. Both thresholds
   are options.
-  - *Status:* done for entries (`MEADOW_JIT_THRESHOLD`, 1000 by default).
-    A loop of tail calls counts each call as an entry. A loop within one
-    procedure is not counted yet.
+  - *Status:* done. `--jit-threshold N` (or `MEADOW_JIT_THRESHOLD`) says
+    how many entries, 1000 by default. Control never joins inside a
+    procedure (§ the VM's code), so a loop is a tail call to its own head:
+    its passes are entries, and one threshold is both.
+    `driver::a_loop_entered_once_is_compiled_as_it_runs`.
 - **JIT-2.** Tier 1 is a baseline compiler. Each VM procedure becomes one
   native function, instruction for instruction, over the same registers.
   An instruction it does not compile is run by the interpreter, and the
   native code carries on.
-  - *Status:* begun, x86-64 only (`silo/vm/src/interp/jit.rs`), with
-    `MEADOW_JIT` and `MEADOW_JIT_THRESHOLD` and no driver flag yet. Inline:
-    - the integer arithmetic and comparisons, and the double arithmetic;
+  - *Status:* done for x86-64 (`silo/vm/src/interp/jit.rs`), chosen by
+    `--jit` or `--backend jit`. Inline:
+    - the integer arithmetic, division and comparisons, and the double
+      arithmetic, in the short and the wide forms;
+    - branches: a word's truth, and a comparison done inline;
+    - moves (`Rename`), literals that are words;
+    - a switch on a tag, its arm's fields loaded and the value released;
+    - building a block or a closure in a new block or a reuse token's;
     - reading and writing elements of mutable arrays that are no
       references;
+    - sharing and erasing a reference, under counting;
     - returns to the null continuation;
-    - tail calls into compiled procedures.
+    - tail calls into compiled procedures, and non-tail calls by name,
+      which enter the callee's compiled code at once.
 
-    Every other instruction goes through the interpreter's `step`. Glade's code generator did not
-    fit, so tier 1 has a small encoder of its own; Glade's executable memory
-    is shared (`compiler/meadow-exec`).
+    What is left goes through the interpreter's `step`: building a frame
+    not built, calls of a closure's method, the other primitives.
+    `MEADOW_JIT_SKIP` leaves chosen instructions to `step`, and
+    `MEADOW_JIT_LOG=steps` counts what was left to it. Glade's code
+    generator did not fit, so tier 1 has a small encoder of its own; Glade's
+    executable memory is shared (`compiler/meadow-exec`).
 - **JIT-3.** Tier 2 is an optimizing compiler from the lower-level IR (R3),
   in process (LLVM's ORC, or Cranelift; §19). `--jit-tiers 1|2` chooses
   how far to go.
@@ -1126,10 +1138,16 @@ VM.
   debugger attaches or sets a breakpoint in it, when a reload replaces it,
   and when profiling or coverage begins.
   - *Status:* done for recording: the loop that records (a debugger, a
-    profile, coverage) never enters compiled code. A reload's procedures are
-    a new segment's, compiled anew.
+    profile, coverage) never enters compiled code, and once records begin,
+    compiled code leaves for it at the next procedure entry -- a tail call
+    that would have stayed in compiled code goes back to the driver. A
+    reload's procedures are a new segment's, compiled anew. Std's steered
+    fuzzer, which turns coverage on as it runs, is the test.
 - **JIT-6.** Hot code can enter its compiled form at a loop head, without
   waiting for the procedure to be entered again (on-stack replacement).
+  - *Status:* done by construction: a loop head is a procedure's entry (see
+    JIT-1), and the pass that crosses the threshold enters the compiled
+    code. `driver::a_loop_entered_once_is_compiled_as_it_runs`.
 - **JIT-7.** Under every memory strategy, compiled code meets the VM's
   obligations: MEM-GEN-8 under `generational`, and records around waited
   calls under tracing.
@@ -1143,12 +1161,16 @@ VM.
     script is `scratchpad/jitdiff.sh`.
 - **JIT-9.** (should) A long-running loop under `jit` runs within a factor of
   the AOT build's speed, to be set once tier 1 is measured.
-  - *Status:* matmul under `jit` takes 912 ms, against 2,097 ms
-    interpreted, on the Windows desktop.
+  - *Status:* matmul under `jit` takes 909 ms, against 2,113 ms
+    interpreted, on the Windows desktop; natively it takes about 27 ms, so
+    tier 1 is far from it. Tier 2 (JIT-3) is what is to close it.
 - **JIT-12.** (should) A program the JIT cannot speed up runs no slower
   under `jit` than interpreted.
-  - *Status:* not met yet: fib, binarytrees and rbtree are 2 to 4% slower.
-    That is the driver's lookup at each procedure entry.
+  - *Status:* met by binarytrees (8.1 s against 9.8 s) and rbtree (46.6 s
+    against 60.4 s), which tier 1 now speeds up; not by fib, 398 ms against
+    373 ms, whose calls cost more through the call helper than in the
+    interpreter's loop. Measured with the machine loaded, to be measured
+    again.
 - **JIT-11.** The VM without the JIT is no slower for its being there
   (PERF-3).
   - *Status:* done; measured with code layout held still (functions and

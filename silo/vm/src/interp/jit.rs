@@ -39,8 +39,8 @@
 #[cfg(target_arch = "x86_64")]
 mod x64;
 
-use super::code::{Ins, PrimI};
-use super::{B, Code, D, Env, LOCAL, Next, Op, Proc, V, Vm, Word};
+use super::code::{Ins, PrimI, WideI};
+use super::{Args, B, Callee, Code, D, Env, LOCAL, Next, Op, Proc, V, Vm, Word};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
@@ -128,7 +128,14 @@ pub(super) struct Cx {
     /// The procedure: the one to enter next, when the function leaves for
     /// another.
     p: u32,
+    /// Where a renaming's values wait between being read and being written,
+    /// two words each: what a parallel move needs. Never read before it is
+    /// written, so never cleared.
+    scratch: std::mem::MaybeUninit<[u64; 2 * RENAMED_AT_MOST]>,
 }
+
+/// The most pairs a renaming compiled inline moves.
+const RENAMED_AT_MOST: usize = 32;
 
 /// How a compiled procedure ends: entering `cx.p`, answering `cx.result`, or
 /// handing the interpreter pc `cx.result` of `cx.p`.
@@ -154,6 +161,9 @@ impl Vm {
     /// entered often enough -- and say where the interpreter takes over.
     pub(super) fn jitted(&self, p: &mut u32, env: &mut Env) -> Jitted {
         loop {
+            if meadow_silo::coverage::recording() {
+                return Jitted::Entry;
+            }
             let Some(f) = self.native(*p, false) else {
                 return Jitted::Entry;
             };
@@ -165,6 +175,7 @@ impl Vm {
                 code: &seg.code,
                 result: 0,
                 p: *p,
+                scratch: std::mem::MaybeUninit::uninit(),
             };
             // Safety: a function compiled for this procedure, given the slots
             // it was compiled to read, as `Cx` lays them out.
@@ -175,6 +186,24 @@ impl Vm {
                 DONE => return Jitted::Done(cx.result),
                 _ => return Jitted::At(cx.result as usize),
             }
+        }
+    }
+
+    /// Procedure `p` with `args`, to its native return, from compiled code:
+    /// what [`Vm::call`] does, less what the caller has asked already --
+    /// whether there is stack enough, whether records are kept.
+    fn call_compiled(&self, p: u32, args: Args) -> Word {
+        let mut env = Env::new();
+        self.bind(p, args, &mut env);
+        self.safe_point(p, &mut env);
+        let mut p = p;
+        match self.jitted(&mut p, &mut env) {
+            Jitted::Done(w) => w,
+            Jitted::Entry => {
+                let (code, pc) = self.entry(p);
+                self.run_from::<false, true>(p, env, code, pc)
+            }
+            Jitted::At(n) => self.run_from::<false, true>(p, env, self.entry(p).0, n),
         }
     }
 
@@ -215,6 +244,9 @@ unsafe extern "C" fn step(cx: *mut Cx, pc: u32) -> i64 {
     // Safety: the caller's: a `Cx` the driver made, whose pointers it holds.
     let cx = unsafe { &mut *cx };
     let (vm, env, code) = unsafe { (&*cx.vm, &mut *cx.env, &*cx.code) };
+    if counting_steps() {
+        count_step(code, pc as usize);
+    }
     let next = match vm.step(&mut cx.p, env, code, pc as usize) {
         Next::At(n) => n as i64,
         Next::Enter => -1,
@@ -225,6 +257,88 @@ unsafe extern "C" fn step(cx: *mut Cx, pc: u32) -> i64 {
     };
     cx.slots = env.as_mut_ptr();
     next
+}
+
+/// Make the call by name at `pc` of the procedure `cx` is running, as the
+/// interpreter would, and answer the next pc: the callee entered at once,
+/// compiled if it is. A call whose frame holds anything on the shadow chain,
+/// one with too little stack left, and any while records are kept, are
+/// [`step`]'s.
+///
+/// # Safety
+///
+/// Called by compiled code, with the `Cx` it was given, at a `Call`.
+unsafe extern "C" fn call(cx: *mut Cx, pc: u32) -> i64 {
+    // Safety: as in `step`.
+    let c = unsafe { &mut *cx };
+    let (vm, env, code) = unsafe { (&*c.vm, &mut *c.env, &*c.code) };
+    let Ins::Call(i) = code.ins[pc as usize] else {
+        unreachable!("a call")
+    };
+    let call = &code.calls[i as usize];
+    let Callee::Proc(q) = call.callee else {
+        return unsafe { step(cx, pc) };
+    };
+    if (vm.shadow && !call.held.is_empty())
+        || (vm.growable && meadow_silo::stack::low())
+        || meadow_silo::coverage::recording()
+    {
+        return unsafe { step(cx, pc) };
+    }
+    let mut args: Args = call.args.iter().map(|a| V::Val(vm.val(*a, env))).collect();
+    args.push(V::Val(0));
+    let r = vm.call_compiled(vm.target(q), args);
+    env[call.answer as usize] = V::Val(r);
+    c.slots = env.as_mut_ptr();
+    i64::from(pc) + 1
+}
+
+/// Whether `MEADOW_JIT_LOG=steps` asks how many of each instruction compiled
+/// code left to [`step`]: what is worth compiling inline next.
+fn counting_steps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MEADOW_JIT_LOG").is_ok_and(|v| v == "steps"))
+}
+
+static STEPS: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+
+fn count_step(code: &Code, pc: usize) {
+    let what = match code.ins[pc] {
+        Ins::Prim(i) => match code.prims[i as usize].op {
+            Op::Prim(p, _) | Op::PrimK(p, ..) => leak_name(format!("prim {p:?}")),
+            ref op => leak_name(format!("prim {}", super::code::op_name(op))),
+        },
+        ref i => super::code::name(i),
+    };
+    let mut steps = STEPS.lock().unwrap_or_else(|e| e.into_inner());
+    match steps.iter_mut().find(|(n, _)| *n == what) {
+        Some((_, c)) => *c += 1,
+        None => steps.push((what, 1)),
+    }
+}
+
+/// A name, kept for the rest of the run: one per kind of instruction.
+fn leak_name(s: String) -> &'static str {
+    static NAMES: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(n) = names.iter().find(|n| **n == s) {
+        return n;
+    }
+    let n: &'static str = Box::leak(s.into_boxed_str());
+    names.push(n);
+    n
+}
+
+/// What [`counting_steps`] counted, most first: said when the program ends.
+pub fn report_steps() {
+    if !counting_steps() {
+        return;
+    }
+    let mut steps = STEPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    steps.sort_by(|a, b| b.1.cmp(&a.1));
+    for (what, n) in steps {
+        eprintln!("jit: {n:>12} {what}");
+    }
 }
 
 /// Make the tail call at `pc` of the procedure `cx` is running, as the
@@ -242,6 +356,8 @@ unsafe extern "C" fn transfer(cx: *mut Cx, pc: u32) -> u64 {
     let how = vm.step(&mut cx.p, env, code, pc as usize);
     cx.slots = env.as_mut_ptr();
     match how {
+        // Records begun are kept by the interpreter: the driver's to see.
+        Next::Enter if meadow_silo::coverage::recording() => ENTER,
         Next::Enter => match vm.native(cx.p, true) {
             Some(body) => {
                 cx.code = &vm.seg(cx.p).code;
@@ -314,19 +430,73 @@ fn stepped_at_most() -> usize {
     })
 }
 
+/// Whether `MEADOW_JIT_SKIP` -- names of instructions, as `--dis` counts
+/// them, separated by commas -- leaves this one to `step`: for finding which
+/// instruction's compiled form is at fault.
+#[cfg(target_arch = "x86_64")]
+fn skipped(ins: Ins) -> bool {
+    static SKIP: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let skip = SKIP.get_or_init(|| {
+        std::env::var("MEADOW_JIT_SKIP")
+            .map(|s| s.split(',').map(|n| n.trim().to_string()).collect())
+            .unwrap_or_default()
+    });
+    !skip.is_empty() && skip.iter().any(|n| n == super::code::name(&ins))
+}
+
 /// Where a slot's tag and word are, from the slots' address: a `V` is a tag
 /// word and then its word.
 #[cfg(target_arch = "x86_64")]
-fn tag_of(s: u8) -> i32 {
-    i32::from(s) * std::mem::size_of::<V>() as i32
+fn tag_of(s: impl Into<u32>) -> i32 {
+    s.into() as i32 * std::mem::size_of::<V>() as i32
 }
 
 #[cfg(target_arch = "x86_64")]
-fn word_of(s: u8) -> i32 {
+fn word_of(s: impl Into<u32>) -> i32 {
     tag_of(s) + 8
 }
 
+/// What a block of `kind`, `meta` and fields described by `descs` begins
+/// with, up to its first field: its header and its descriptors' words, as
+/// `heap::build` writes them -- for a kind with no `MUTABLE` bit.
+#[cfg(target_arch = "x86_64")]
+fn block_prefix(kind: u64, meta: u32, descs: &[i64]) -> Vec<u64> {
+    let l = meadow_silo::heap::LAYOUT;
+    debug_assert!(kind == meadow_silo::heap::DATA || kind == meadow_silo::heap::CLOSURE);
+    let n = descs.len();
+    let mut words = vec![0u64; l.first_field(n, false)];
+    let head = l.header(kind, n as u64, u64::from(meta));
+    words[..l.header_words].copy_from_slice(&head[..l.header_words]);
+    l.pack_descs(descs, |w, bits| {
+        if w < l.header_words {
+            words[w] |= bits;
+        } else {
+            words[w] = bits;
+        }
+    });
+    words
+}
+
+/// The runtime's, for compiled code: in the C convention, so that it can call
+/// them.
+#[cfg(target_arch = "x86_64")]
+extern "C" fn acquire(words: u64) -> u64 {
+    meadow_silo::heap::acquire(words as usize)
+}
+
+#[cfg(target_arch = "x86_64")]
+extern "C" fn clean(v: u64) {
+    meadow_silo::heap::clean(v)
+}
+
+#[cfg(target_arch = "x86_64")]
+extern "C" fn share(v: u64, d: i64) {
+    meadow_silo::heap::share(v, d)
+}
+
 /// The tags a slot's `V` has: see the assertion in `super`.
+#[cfg(target_arch = "x86_64")]
+const EMPTY: i8 = 0;
 #[cfg(target_arch = "x86_64")]
 const VAL: i8 = 1;
 #[cfg(target_arch = "x86_64")]
@@ -355,10 +525,10 @@ fn translate(code: &Code, entry: usize, end: usize, counted: bool) -> Option<(Ve
     let body = a.code.len();
     a.load(R12, RBX, slots);
     // Hand the instruction at `pc` to the interpreter, and go where it says.
-    let call_step = |a: &mut Asm, pc: usize| {
+    let call_helper = |a: &mut Asm, pc: usize, helper: u64| {
         a.mov(ARG[0], RBX);
         a.mov_imm(ARG[1], pc as u64);
-        a.mov_imm(RAX, step as *const () as usize as u64);
+        a.mov_imm(RAX, helper);
         a.call(RAX);
         a.load(R12, RBX, slots);
         a.test(RAX, RAX);
@@ -369,6 +539,7 @@ fn translate(code: &Code, entry: usize, end: usize, counted: bool) -> Option<(Ve
         }
         a.jmp(dispatch);
     };
+    let call_step = |a: &mut Asm, pc: usize| call_helper(a, pc, step as *const () as usize as u64);
     // Make the tail call at `pc`, and go into the next procedure's body if it
     // is compiled; leave for the driver if not.
     let out = a.label();
@@ -411,9 +582,16 @@ fn translate(code: &Code, entry: usize, end: usize, counted: bool) -> Option<(Ve
             call_transfer(&mut a, pc);
             continue;
         }
+        if let Ins::Call(i) = code.ins[pc]
+            && matches!(code.calls[i as usize].callee, Callee::Proc(_))
+            && !skipped(code.ins[pc])
+        {
+            call_helper(&mut a, pc, call as *const () as usize as u64);
+            continue;
+        }
         let next = (pc + 1 < end).then(|| at(pc + 1));
         let slow = a.label();
-        if !inline(&mut a, code, code.ins[pc], counted, next, &at, slow) {
+        if skipped(code.ins[pc]) || !inline(&mut a, code, code.ins[pc], counted, next, &at, slow) {
             stepped += 1;
             call_step(&mut a, pc);
             continue;
@@ -475,11 +653,11 @@ fn inline(
     // An operand, from a slot or a constant.
     #[derive(Clone, Copy)]
     enum Src {
-        Slot(u8),
+        Slot(u32),
         K(u64),
     }
     // The slot holds a word, or it is the interpreter's to do.
-    let want_word = |a: &mut Asm, s: u8| {
+    let want_word = |a: &mut Asm, s: u32| {
         a.cmp_mem_imm8(R12, tag_of(s), VAL);
         a.jcc(Cc::Ne, slow);
     };
@@ -514,6 +692,35 @@ fn inline(
                 }
                 a.shift_cl(RAX, op == B::Shr);
             }
+            // As `B::run` divides: by nought is the interpreter's, which
+            // fails; by -1 is a negation, or nought, where the machine's
+            // division would trap on the least integer.
+            (B::Div | B::Mod, _, src) => {
+                let (minus, done) = (a.label(), a.label());
+                match src {
+                    Src::Slot(s) => {
+                        a.load(RCX, R12, word_of(s));
+                        a.test(RCX, RCX);
+                        a.jcc(Cc::E, slow);
+                    }
+                    Src::K(k) => a.mov_imm(RCX, k),
+                }
+                a.alu_imm(Alu::Cmp, RCX, -1);
+                a.jcc(Cc::E, minus);
+                a.cqo();
+                a.idiv(RCX);
+                if op == B::Mod {
+                    a.mov(RAX, RDX);
+                }
+                a.jmp(done);
+                a.bind(minus);
+                if op == B::Div {
+                    a.neg(RAX);
+                } else {
+                    a.mov_imm(RAX, 0);
+                }
+                a.bind(done);
+            }
             _ => return false,
         }
         true
@@ -538,22 +745,23 @@ fn inline(
             }
         },
     };
-    let supported = |op: B| {
+    let supported = |op: B, src: Src| {
         cond(op).is_some()
             || matches!(
                 op,
                 B::Add | B::Sub | B::Mul | B::And | B::Or | B::Xor | B::Shl | B::Shr
             )
+            || (matches!(op, B::Div | B::Mod) && !matches!(src, Src::K(0)))
     };
     // `dst = a op src`.
-    let bin = |a: &mut Asm, op: B, x: u8, src: Src, dst: u8| -> bool {
+    let bin = |a: &mut Asm, op: B, x: u32, src: Src, dst: u32| -> bool {
         let Some(next) = next else { return false };
-        if !supported(op) {
+        if !supported(op, src) {
             return false;
         }
-        want_word(a, x);
+        want_word(a, x.into());
         if let Src::Slot(s) = src {
-            want_word(a, s);
+            want_word(a, s.into());
         }
         // A frame in the destination is the interpreter's to let go of.
         a.cmp_mem_imm8(R12, tag_of(dst), FRAME);
@@ -574,14 +782,14 @@ fn inline(
         true
     };
     // On at `next` if `a op src` holds, at `no` if not.
-    let branch = |a: &mut Asm, op: B, x: u8, src: Src, no: u32| -> bool {
+    let branch = |a: &mut Asm, op: B, x: u32, src: Src, no: u32| -> bool {
         let Some(next) = next else { return false };
-        if !supported(op) {
+        if !supported(op, src) {
             return false;
         }
-        want_word(a, x);
+        want_word(a, x.into());
         if let Src::Slot(s) = src {
-            want_word(a, s);
+            want_word(a, s.into());
         }
         a.load(RAX, R12, word_of(x));
         match cond(op) {
@@ -599,7 +807,7 @@ fn inline(
         true
     };
     // `dst = a op src`, on doubles.
-    let float = |a: &mut Asm, op: B, x: u8, src: Src, dst: u8| -> bool {
+    let float = |a: &mut Asm, op: B, x: u32, src: Src, dst: u32| -> bool {
         let Some(next) = next else { return false };
         let sse = match op {
             B::FAdd => Sse::Add,
@@ -608,9 +816,9 @@ fn inline(
             B::FDiv => Sse::Div,
             _ => return false,
         };
-        want_word(a, x);
+        want_word(a, x.into());
         if let Src::Slot(s) = src {
-            want_word(a, s);
+            want_word(a, s.into());
         }
         a.cmp_mem_imm8(R12, tag_of(dst), FRAME);
         a.jcc(Cc::E, slow);
@@ -672,10 +880,10 @@ fn inline(
             }
         };
         let l = heap::LAYOUT;
-        want_word(a, arr);
-        want_word(a, idx);
+        want_word(a, arr.into());
+        want_word(a, idx.into());
         if let Some(v) = val {
-            want_word(a, v);
+            want_word(a, v.into());
         }
         if let Some(r) = result {
             a.cmp_mem_imm8(R12, tag_of(r), FRAME);
@@ -720,7 +928,7 @@ fn inline(
     };
     // Share the value in slot `s`, described by `d`, or -- if `erase` --
     // erase it and empty the slot, as the interpreter does.
-    let counting = |a: &mut Asm, s: u8, d: D, erase: bool| -> bool {
+    let counting = |a: &mut Asm, s: u32, d: D, erase: bool| -> bool {
         use meadow_rt::desc;
         use meadow_silo::heap;
         let Some(next) = next else { return false };
@@ -731,7 +939,7 @@ fn inline(
             D::K(k) => k == desc::REF,
             D::S(_) => return false,
         };
-        want_word(a, s);
+        want_word(a, s.into());
         let emptied = |a: &mut Asm| {
             if erase {
                 a.store_imm(R12, tag_of(s), 0);
@@ -784,19 +992,411 @@ fn inline(
         emptied(a);
         true
     };
-    match ins {
-        Ins::Share { s, d } => counting(a, s, d.get(), false),
-        Ins::Erase { s, d } => counting(a, s, d.get(), true),
-        Ins::Prim(i) => element(a, &code.prims[i as usize]),
-        Ins::Bin { op, a: x, b, dst } if is_float(op) => float(a, op, x, Src::Slot(b), dst),
-        Ins::BinK { op, a: x, dst, k } if is_float(op) => {
-            float(a, op, x, Src::K(code.consts[k as usize]), dst)
+    // Moves, all read before any is written, as the interpreter takes them: a
+    // word is copied and a frame not built moved, its slot left empty. A
+    // destination holding a frame the move does not take is the
+    // interpreter's, which lets that frame go.
+    let rename = |a: &mut Asm, pairs: &[(u32, u32)]| -> bool {
+        let Some(next) = next else { return false };
+        if pairs.len() > RENAMED_AT_MOST {
+            return false;
         }
-        Ins::Bin { op, a: x, b, dst } => bin(a, op, x, Src::Slot(b), dst),
-        Ins::BinI { op, a: x, dst, k } => bin(a, op, x, Src::K(k as i64 as u64), dst),
-        Ins::BinK { op, a: x, dst, k } => bin(a, op, x, Src::K(code.consts[k as usize]), dst),
-        Ins::IfBin { op, a: x, b, no } => branch(a, op, x, Src::Slot(b), no),
-        Ins::IfBinI { op, a: x, k, no } => branch(a, op, x, Src::K(k as i64 as u64), no),
+        let scratch = std::mem::offset_of!(Cx, scratch) as i32;
+        for &(_, from) in pairs {
+            a.cmp_mem_imm8(R12, tag_of(from), EMPTY);
+            a.jcc(Cc::E, slow);
+        }
+        for &(to, _) in pairs {
+            if !pairs.iter().any(|&(_, from)| from == to) {
+                a.cmp_mem_imm8(R12, tag_of(to), FRAME);
+                a.jcc(Cc::E, slow);
+            }
+        }
+        for (k, &(_, from)) in pairs.iter().enumerate() {
+            let kept = a.label();
+            a.load(RDX, R12, tag_of(from));
+            a.store(RBX, scratch + 16 * k as i32, RDX);
+            a.load(RCX, R12, word_of(from));
+            a.store(RBX, scratch + 16 * k as i32 + 8, RCX);
+            a.alu_imm(Alu::Cmp, RDX, i32::from(FRAME));
+            a.jcc(Cc::Ne, kept);
+            a.store_imm(R12, tag_of(from), i32::from(EMPTY));
+            a.bind(kept);
+        }
+        for (k, &(to, _)) in pairs.iter().enumerate() {
+            a.load(RDX, RBX, scratch + 16 * k as i32);
+            a.store(R12, tag_of(to), RDX);
+            a.load(RCX, RBX, scratch + 16 * k as i32 + 8);
+            a.store(R12, word_of(to), RCX);
+        }
+        a.jmp(next);
+        true
+    };
+    // A literal that is a word.
+    let literal = |a: &mut Asm, x: &PrimI| -> bool {
+        let Some(next) = next else { return false };
+        let (Op::Lit(super::K::W(w)), Some(r)) = (&x.op, x.result) else {
+            return false;
+        };
+        a.cmp_mem_imm8(R12, tag_of(r), FRAME);
+        a.jcc(Cc::E, slow);
+        a.store_imm(R12, tag_of(r), i32::from(VAL));
+        a.mov_imm(RDX, *w);
+        a.store(R12, word_of(r), RDX);
+        a.jmp(next);
+        true
+    };
+    // Share the reference in rax, and go on at `done`: a count up, or the
+    // runtime's for a block in a region.
+    let share_rax = |a: &mut Asm, done: Label| {
+        use meadow_silo::heap;
+        let l = heap::LAYOUT;
+        let region = a.label();
+        a.test_imm(RAX, l.imm_mask as i32);
+        a.jcc(Cc::Ne, done);
+        a.test(RAX, RAX);
+        a.jcc(Cc::E, done);
+        a.cmp32_imm(RAX, heap::REGION_FLOOR);
+        a.jcc(Cc::Ae, region);
+        a.step32(RAX, false);
+        a.jmp(done);
+        a.bind(region);
+        a.mov(ARG[0], RAX);
+        a.mov_imm(ARG[1], meadow_rt::desc::REF as u64);
+        a.mov_imm(RAX, share as *const () as usize as u64);
+        a.call(RAX);
+        a.load(R12, RBX, std::mem::offset_of!(Cx, slots) as i32);
+        a.jmp(done);
+    };
+    // Share the word in slot `s`, described by `d`, as `Vm::share` does: only
+    // a reference is counted.
+    let share_slot = |a: &mut Asm, s: u32, d: D| {
+        use meadow_rt::desc;
+        let done = a.label();
+        match d {
+            D::K(k) if k != desc::REF => return,
+            D::K(_) => {}
+            D::S(ds) => {
+                // A descriptor not held as a word is `ANY`, which is not
+                // counted.
+                a.cmp_mem_imm8(R12, tag_of(ds), VAL);
+                a.jcc(Cc::Ne, done);
+                a.cmp_mem_imm8(R12, word_of(ds), desc::REF as i8);
+                a.jcc(Cc::Ne, done);
+            }
+        }
+        a.load(RAX, R12, word_of(s));
+        share_rax(a, done);
+        a.bind(done);
+    };
+    // A block's header field, of the block at `rax`, into `rdx`.
+    let header = |a: &mut Asm, f: meadow_rt::layout::Field| {
+        a.load(RDX, RAX, 8 * f.word as i32);
+        if f.shift > 0 {
+            a.shr_imm(RDX, f.shift as u8);
+        }
+        if !f.tops() {
+            a.alu_imm(Alu::And, RDX, f.mask() as i32);
+        }
+    };
+    // A switch on the tag of a value: its arm's fields loaded into their
+    // slots and, unless the arm keeps the value, the value released -- the
+    // last reference's block cleaned or kept for reuse, any other's count
+    // down and its fields shared. A block in a region, a scrutinee that is a
+    // frame not built, and a destination holding one are the interpreter's:
+    // nothing is changed before those are ruled out but slots written with
+    // what the interpreter would write in them again.
+    let switch = |a: &mut Asm, sw: &super::code::SwitchI| -> bool {
+        use meadow_silo::heap;
+        let l = heap::LAYOUT;
+        if l.imm_mask > i32::MAX as u64 || (!l.meta.tops() && l.meta.mask() > i32::MAX as u64) {
+            return false;
+        }
+        // A token kept from a value of no fields: the interpreter's.
+        if sw
+            .arms
+            .iter()
+            .any(|arm| arm.fields.is_empty() && arm.reuse.is_some())
+        {
+            return false;
+        }
+        let s = sw.scrutinee;
+        a.cmp_mem_imm8(R12, tag_of(s), VAL);
+        a.jcc(Cc::Ne, slow);
+        a.load(RAX, R12, word_of(s));
+        // The tag: an immediate's payload, or a block's `meta`.
+        let (block, have) = (a.label(), a.label());
+        a.test_imm(RAX, l.imm_mask as i32);
+        a.jcc(Cc::E, block);
+        a.mov(RDX, RAX);
+        a.shr_imm(RDX, l.imm_shift as u8);
+        a.mov32(RDX, RDX);
+        a.jmp(have);
+        a.bind(block);
+        header(a, l.meta);
+        a.bind(have);
+        let arms: Vec<Label> = sw.arms.iter().map(|_| a.label()).collect();
+        for (arm, lbl) in sw.arms.iter().zip(&arms) {
+            match i32::try_from(arm.tag) {
+                Ok(t) => a.alu_imm(Alu::Cmp, RDX, t),
+                Err(_) => {
+                    a.mov_imm(RCX, arm.tag);
+                    a.alu(Alu::Cmp, RDX, RCX);
+                }
+            }
+            a.jcc(Cc::E, *lbl);
+        }
+        // Erase the value, a reference, and go on at `to`: its count down, or
+        // the interpreter's for the last reference or a block in a region --
+        // before anything is changed.
+        let erase_rax = |a: &mut Asm, to: Label| {
+            let go = a.label();
+            a.test_imm(RAX, l.imm_mask as i32);
+            a.jcc(Cc::Ne, go);
+            a.test(RAX, RAX);
+            a.jcc(Cc::E, go);
+            a.load32(RDX, RAX);
+            a.test32(RDX, RDX);
+            a.jcc(Cc::E, slow);
+            a.alu_imm(Alu::Cmp, RDX, heap::REGION_FLOOR as i32);
+            a.jcc(Cc::A, slow);
+            a.step32(RAX, true);
+            let mask = l.mutable.bits_in_place() | l.colour.bits_in_place();
+            a.load(RDX, RAX, 8 * l.flags_word() as i32);
+            a.alu_imm(Alu::And, RDX, mask as i32);
+            a.alu_imm(Alu::Cmp, RDX, l.mutable.bits_in_place() as i32);
+            a.jcc(Cc::Ne, go);
+            a.mov(ARG[0], RAX);
+            a.mov_imm(
+                RAX,
+                meadow_silo::cycles::meadow_candidate as *const () as usize as u64,
+            );
+            a.call(RAX);
+            a.load(R12, RBX, std::mem::offset_of!(Cx, slots) as i32);
+            a.bind(go);
+            a.jmp(to);
+        };
+        // No arm's: the value erased, unless the default keeps it.
+        if !sw.keep_default && counted {
+            erase_rax(a, at(sw.default as usize));
+        } else {
+            a.jmp(at(sw.default as usize));
+        }
+        for (arm, lbl) in sw.arms.iter().zip(&arms) {
+            a.bind(*lbl);
+            let n = arm.fields.len();
+            // An arm of no fields releases its value by erasing it, as
+            // `Vm::release` does: most often it is no block at all.
+            if n == 0 && !arm.keep && counted && arm.reuse.is_none() {
+                erase_rax(a, at(arm.pc as usize));
+                continue;
+            }
+            for u in &arm.fields {
+                a.cmp_mem_imm8(R12, tag_of(u.s), FRAME);
+                a.jcc(Cc::E, slow);
+            }
+            if let Some(t) = arm.reuse {
+                a.cmp_mem_imm8(R12, tag_of(t), FRAME);
+                a.jcc(Cc::E, slow);
+            }
+            let first = l.first_field(n, false) as i32;
+            for (i, u) in arm.fields.iter().enumerate() {
+                a.load(RDX, RAX, 8 * (first + i as i32));
+                a.store_imm(R12, tag_of(u.s), i32::from(VAL));
+                a.store(R12, word_of(u.s), RDX);
+            }
+            if arm.keep || !counted {
+                if let (Some(t), false) = (arm.reuse, arm.keep) {
+                    // Traced, nothing is kept for reuse.
+                    a.store_imm(R12, tag_of(t), i32::from(VAL));
+                    a.store_imm(R12, word_of(t), 0);
+                }
+                a.jmp(at(arm.pc as usize));
+                continue;
+            }
+            let shared = a.label();
+            a.load32(RCX, RAX);
+            a.test32(RCX, RCX);
+            a.jcc(Cc::Ne, shared);
+            // The last reference: the block is the arm's to reuse, or clean.
+            match arm.reuse {
+                Some(t) => {
+                    a.store_imm(R12, tag_of(t), i32::from(VAL));
+                    a.store(R12, word_of(t), RAX);
+                }
+                None => {
+                    a.mov(ARG[0], RAX);
+                    a.mov_imm(RAX, clean as *const () as usize as u64);
+                    a.call(RAX);
+                    a.load(R12, RBX, std::mem::offset_of!(Cx, slots) as i32);
+                }
+            }
+            a.jmp(at(arm.pc as usize));
+            a.bind(shared);
+            a.alu_imm(Alu::Cmp, RCX, heap::REGION_FLOOR as i32);
+            a.jcc(Cc::A, slow);
+            a.step32(RAX, true);
+            for u in &arm.fields {
+                share_slot(a, u.s, u.d);
+            }
+            if let Some(t) = arm.reuse {
+                a.store_imm(R12, tag_of(t), i32::from(VAL));
+                a.store_imm(R12, word_of(t), 0);
+            }
+            a.jmp(at(arm.pc as usize));
+        }
+        true
+    };
+    // A block of `kind` and `meta` holding the values in `fields`, into
+    // `dst`: built in the reuse token's block when there is one, which is
+    // this size, or in a new one. What describes the fields must be known
+    // here, for the header to be.
+    let build = |a: &mut Asm,
+                 kind: u64,
+                 meta: u32,
+                 fields: &[super::U],
+                 reuse: Option<u32>,
+                 dst: u32|
+     -> bool {
+        use meadow_silo::heap;
+        let Some(next) = next else { return false };
+        let mut descs = Vec::with_capacity(fields.len());
+        for u in fields {
+            match u.d {
+                D::K(k) => descs.push(k),
+                D::S(_) => return false,
+            }
+        }
+        for u in fields {
+            want_word(a, u.s);
+        }
+        if let Some(t) = reuse {
+            want_word(a, t);
+        }
+        a.cmp_mem_imm8(R12, tag_of(dst), FRAME);
+        a.jcc(Cc::E, slow);
+        if fields.is_empty() {
+            if let Some(t) = reuse {
+                a.store_imm(R12, tag_of(t), i32::from(EMPTY));
+            }
+            a.store_imm(R12, tag_of(dst), i32::from(VAL));
+            a.mov_imm(RDX, heap::immediate(u64::from(meta)));
+            a.store(R12, word_of(dst), RDX);
+            a.jmp(next);
+            return true;
+        }
+        let prefix = block_prefix(kind, meta, &descs);
+        let write = a.label();
+        if let Some(t) = reuse {
+            a.load(RAX, R12, word_of(t));
+            a.store_imm(R12, tag_of(t), i32::from(EMPTY));
+            a.test(RAX, RAX);
+            a.jcc(Cc::Ne, write);
+        }
+        a.mov_imm(ARG[0], (prefix.len() + fields.len()) as u64);
+        a.mov_imm(RAX, acquire as *const () as usize as u64);
+        a.call(RAX);
+        a.load(R12, RBX, std::mem::offset_of!(Cx, slots) as i32);
+        a.bind(write);
+        for (w, k) in prefix.iter().enumerate() {
+            match i32::try_from(*k as i64) {
+                Ok(k) => a.store_imm(RAX, 8 * w as i32, k),
+                Err(_) => {
+                    a.mov_imm(RDX, *k);
+                    a.store(RAX, 8 * w as i32, RDX);
+                }
+            }
+        }
+        for (i, u) in fields.iter().enumerate() {
+            a.load(RDX, R12, word_of(u.s));
+            a.store(RAX, 8 * (prefix.len() + i) as i32, RDX);
+        }
+        a.store_imm(R12, tag_of(dst), i32::from(VAL));
+        a.store(R12, word_of(dst), RAX);
+        a.jmp(next);
+        true
+    };
+    // A reuse token given up: its block cleaned, if it holds one and blocks
+    // are counted, and its slot emptied.
+    let clean_token = |a: &mut Asm, t: u32| -> bool {
+        let Some(next) = next else { return false };
+        want_word(a, t);
+        a.load(RAX, R12, word_of(t));
+        a.store_imm(R12, tag_of(t), i32::from(EMPTY));
+        if counted {
+            a.test(RAX, RAX);
+            a.jcc(Cc::E, next);
+            a.mov(ARG[0], RAX);
+            a.mov_imm(RAX, clean as *const () as usize as u64);
+            a.call(RAX);
+            a.load(R12, RBX, std::mem::offset_of!(Cx, slots) as i32);
+        }
+        a.jmp(next);
+        true
+    };
+    match ins {
+        Ins::Rename(i) => rename(a, &code.renames[i as usize]),
+        Ins::Switch(i) => switch(a, &code.switches[i as usize]),
+        Ins::Let(i) => {
+            let l = &code.lets[i as usize];
+            build(a, meadow_silo::heap::DATA, l.tag, &l.fields, l.reuse, l.dst)
+        }
+        Ins::New(i) => {
+            let x = &code.news[i as usize];
+            x.frame.is_none()
+                && build(
+                    a,
+                    meadow_silo::heap::CLOSURE,
+                    x.base,
+                    &x.captures,
+                    None,
+                    x.dst,
+                )
+        }
+        Ins::Clean(t) => clean_token(a, t),
+        Ins::Prim(i) if matches!(code.prims[i as usize].op, Op::Lit(_)) => {
+            literal(a, &code.prims[i as usize])
+        }
+        Ins::Share { s, d } => counting(a, s.into(), d.get(), false),
+        Ins::Erase { s, d } => counting(a, s.into(), d.get(), true),
+        Ins::Wide(w) => match code.wides[w as usize] {
+            WideI::Share { s, d } => counting(a, s, d, false),
+            WideI::Erase { s, d } => counting(a, s, d, true),
+            WideI::Bin { op, a: x, b, dst } if is_float(op) => float(a, op, x, Src::Slot(b), dst),
+            WideI::Bin { op, a: x, b, dst } => bin(a, op, x, Src::Slot(b), dst),
+            WideI::BinK { op, a: x, k, dst } if is_float(op) => float(a, op, x, Src::K(k), dst),
+            WideI::BinK { op, a: x, k, dst } => bin(a, op, x, Src::K(k), dst),
+            WideI::IfBin { op, a: x, b, no } => branch(a, op, x, Src::Slot(b), no),
+            WideI::IfBinK { op, a: x, k, no } => branch(a, op, x, Src::K(k), no),
+        },
+        Ins::Prim(i) => element(a, &code.prims[i as usize]),
+        Ins::Bin { op, a: x, b, dst } if is_float(op) => {
+            float(a, op, x.into(), Src::Slot(b.into()), dst.into())
+        }
+        Ins::BinK { op, a: x, dst, k } if is_float(op) => {
+            float(a, op, x.into(), Src::K(code.consts[k as usize]), dst.into())
+        }
+        Ins::Bin { op, a: x, b, dst } => bin(a, op, x.into(), Src::Slot(b.into()), dst.into()),
+        Ins::BinI { op, a: x, dst, k } => bin(a, op, x.into(), Src::K(k as i64 as u64), dst.into()),
+        Ins::BinK { op, a: x, dst, k } => {
+            bin(a, op, x.into(), Src::K(code.consts[k as usize]), dst.into())
+        }
+        Ins::IfBin { op, a: x, b, no } => branch(a, op, x.into(), Src::Slot(b.into()), no),
+        Ins::IfBinI { op, a: x, k, no } => branch(a, op, x.into(), Src::K(k as i64 as u64), no),
+        Ins::Branch(t) => {
+            let t = &code.tests[t as usize];
+            match (&t.test, t.args.as_slice()) {
+                // A word that is not nought.
+                (super::Test::Truth, [u]) => branch(a, B::Ne, u.s, Src::K(0), t.no),
+                (super::Test::Prim(_, super::PK::Inline(q, float)), [x, y]) => {
+                    match B::of(*q, *float) {
+                        Some(op) => branch(a, op, x.s, Src::Slot(y.s), t.no),
+                        None => false,
+                    }
+                }
+                _ => false,
+            }
+        }
         _ => false,
     }
 }
@@ -812,7 +1412,7 @@ mod tests {
         assert_eq!(words(&V::Empty)[0], 0);
         assert_eq!(words(&V::Val(42)), [1, 42]);
         #[cfg(target_arch = "x86_64")]
-        assert_eq!((VAL, FRAME), (1, 2));
+        assert_eq!((EMPTY, VAL, FRAME), (0, 1, 2));
         let frame = V::Frame(Box::new(super::super::Frame {
             proc: 0,
             base: 0,

@@ -969,6 +969,66 @@ What is left of the JIT's cost on code it does not compile is the lookup
 at each procedure entry, 2 to 4%. Compiling the switches, allocation and
 calls is what will turn that around.
 
+**The fifth step: switches, allocation, moves and calls** (2026-10-27).
+`MEADOW_JIT_LOG=steps` counts, by instruction, what compiled code leaves to
+`step`. With everything compiled, binarytrees left 134 million calls, 101
+million renamings, 67 million switches and 67 million `Let`s; rbtree left
+714 million renamings, 636 million switches, 414 million `Let`s, 168
+million literals and 109 million closures. Now inline:
+- **Renamings**, as a parallel move through a scratch area in the context.
+  A word is copied and a frame not built is moved, as `take_val` does.
+- **Literals** that are words.
+- **Switches.** The tag is an immediate's payload or a block's `meta`. The
+  arm's fields go into their slots, and the value is released: the last
+  reference's block is cleaned or kept as the arm's reuse token, and any
+  other's count goes down and its fields are shared. An arm of no fields
+  erases the value, as `release` does, since it is mostly no block. The
+  interpreter takes a block in a region, a scrutinee that is a frame not
+  built, and a destination holding one. Each of those is ruled out before
+  anything changes but slots written with what the interpreter would write
+  in them again, so its slow path is to run the whole instruction again.
+- **`Let` and closures.** When the descriptors are known, the header is
+  computed when compiling. The block is a reuse token's, or a new one from
+  `heap::acquire`, which never collects (a collection only becomes due),
+  so nothing read before it moves.
+- **Branches** on a word's truth, and on a comparison done inline.
+- **Division and remainder**, with nought the interpreter's (which fails
+  with the same message) and -1 a negation or nought, where the machine
+  would trap on the least integer.
+- **The wide forms** of the arithmetic, the compares, sharing and erasing.
+- **Calls by name**, through a helper that enters the callee's compiled code
+  at once, rather than going through `step`, `call`, `exec` and `run`.
+
+`MEADOW_JIT_SKIP=switch,let,...` leaves the named instructions to `step`,
+which is how a fault in one of them is found: rbtree's crash was the arms of
+no fields, read as blocks.
+
+**JIT-5 for coverage.** Std's steered fuzzer failed with everything compiled,
+an older fault that compiling more brought out: it turns coverage on as it
+runs, and a loop of compiled tail calls never went back to the loop that
+records. Now an entry in the JIT's loop, and a tail call made by compiled
+code, look whether records have begun, and if so go to the loop that keeps
+them.
+
+**Loops.** Control never joins inside a procedure, so a loop is a tail call
+to its own head and its passes are entries. The entry threshold is the loop
+threshold, and the pass that crosses it goes on in compiled code (JIT-1,
+JIT-6). `--jit-threshold N` sets it.
+
+Measured with the machine loaded by another build, best of five:
+
+| program | interpreted | with the JIT |
+|---|---|---|
+| fib | 373 ms | 398 ms |
+| matmul | 2,113 ms | 909 ms |
+| binarytrees | 9,762 ms | 8,080 ms |
+| rbtree | 60,448 ms | 46,561 ms |
+
+fib's calls still cost more through the helper than in the interpreter's
+loop: each makes an `Env`, and the helper, the driver and the compiled
+function's prologue each cost a few instructions the interpreter does not
+pay. That is what tier 2 is for: a call there is a native call.
+
 ### Replacing Glade in full (2026-10-24)
 
 The merged runtime is to be Glade's next release, so it has to do all that

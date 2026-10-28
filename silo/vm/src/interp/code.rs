@@ -660,7 +660,7 @@ impl Code {
     }
 }
 
-fn name(i: &Ins) -> &'static str {
+pub(super) fn name(i: &Ins) -> &'static str {
     match i {
         Ins::Share { .. } => "share",
         Ins::Erase { .. } => "erase",
@@ -692,6 +692,22 @@ fn show_d(d: D) -> String {
 
 fn show_u(u: &U) -> String {
     format!("r{}:{}", u.s, show_d(u.d))
+}
+
+/// What kind of operation `op` is, without its operands.
+pub(super) fn op_name(op: &Op) -> &'static str {
+    match op {
+        Op::Lit(_) => "lit",
+        Op::Prim(..) | Op::PrimK(..) => "prim",
+        Op::Field(_) => "field",
+        Op::Array => "array",
+        Op::Record(..) => "record",
+        Op::Select(_) => "select",
+        Op::SelectAt(_) => "select-at",
+        Op::Update(..) => "update",
+        Op::Extend(_) => "extend",
+        Op::Native(..) => "native",
+    }
 }
 
 fn show_op(op: &Op) -> String {

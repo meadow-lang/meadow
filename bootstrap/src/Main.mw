@@ -115,6 +115,12 @@ cli! {
           value
           "BACKEND"
       jit : Flag "`--backend jit`"
+      jitThreshold
+        : Option
+          Int
+          "On Silo's JIT, how many times a procedure is entered before it is compiled: 0 compiles each when it is first entered"
+          value
+          "N"
       aot : Flag "`--backend aot`: Glade, compiled ahead of time into an executable" alias "native"
       cfg
         : Option
@@ -157,7 +163,8 @@ cli! {
           "How a block is laid out in memory on Silo: with a count in its header, or Glade's, with none"
           value
           "LAYOUT"
-      noReload : Flag "Build what is interpreted so that no new build of it loads into it as it runs"
+      noReload
+        : Flag "Build what is interpreted so that no new build of it loads into it as it runs"
       leaks : Flag "After running, report the blocks the program left behind"
       features
         : Option
@@ -230,8 +237,7 @@ cli! {
           : Flag
             "Run on the JIT and write what each call site was seen to enter, for an `aot` build to guard its calls on"
         watch
-          : Flag
-            "Run on Silo's interpreter, and load each new build into the program as it runs"
+          : Flag "Run on Silo's interpreter, and load each new build into the program as it runs"
       }
       with
       Build
@@ -255,7 +261,8 @@ cli! {
       interpret : Flag "Interpret what is built for Silo rather than compiling it"
       stack : Option String "How deep a program's calls may go on Silo" value "STACK"
       layout : Option String "How a block is laid out in memory on Silo" value "LAYOUT"
-      noReload : Flag "Build what is interpreted so that no new build of it loads into it as it runs"
+      noReload
+        : Flag "Build what is interpreted so that no new build of it loads into it as it runs"
       leaks : Flag "After running, report the blocks the program left behind"
       features : Option String "Features of the package to build with" value "FEATURES"
       noDefaultFeatures : Flag "Build without the package's `default` features"
@@ -483,6 +490,7 @@ fun unheeded (b : CliBuild) : [String] =
   V.concatMap (\x -> if fst x then [snd x] else []) [
     (b.noPrune, "--no-prune"),
     (M.isSome b.target, "--target"),
+    (M.isSome b.jitThreshold, "--jit-threshold"),
     (M.isSome b.nursery, "--nursery"),
     (M.isSome b.gc, "--gc"),
     (b.interpret, "--interpret"),
