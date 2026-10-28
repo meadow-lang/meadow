@@ -22,7 +22,7 @@
 use crate::linear::{L, LBlock, SwitchArm};
 use meadow_axcut::config::{Config, Memory, Stack};
 use meadow_axcut::{Extern, Name, Program, Rep, VarId};
-use meadow_lir::{BinOp, Cast, FCmp, Func, ICmp, Inst, Ty};
+use meadow_lir::{BinOp, Cast, FCmp, Func, ICmp, Inst, Item, Module as LirModule, Ty};
 use meadow_rt::desc;
 use meadow_rt::layout::{Field, Layout};
 use meadow_rt::{Lit, Prim};
@@ -260,7 +260,7 @@ pub struct Module<'p> {
     /// Every function written, as text, with how many parameters it takes
     /// in registers -- for declaring it in the other units: see
     /// [`Module::units`].
-    funs: Vec<(String, String, usize)>,
+    funs: Vec<(String, Vec<Func>, usize)>,
     /// The module each of `funs` is of, beside it: see [`Module::in_module`].
     fun_modules: Vec<String>,
     /// The module of the definition being written.
@@ -332,7 +332,7 @@ pub struct Module<'p> {
     growable: bool,
     /// The trampoline of the function being written, which goes with it:
     /// see [`Module::stack_point`].
-    trampoline: Option<String>,
+    trampoline: Option<Func>,
     /// How a block is laid out: the configuration's layout, which the
     /// runtime it is linked with has too (`meadow_rt::layout`). Every word,
     /// shift, mask and kind of a block the code names is taken from it.
@@ -554,7 +554,7 @@ impl<'p> Module<'p> {
             cond: low.to_string(),
             yes: grow.to_string(),
             no: on.to_string(),
-            unlikely: true,
+            unlikely: Some(1),
         });
         f.label(&grow);
         let ctx = usize::from(self.threaded);
@@ -632,20 +632,18 @@ impl<'p> Module<'p> {
             ty: Ty::I64,
             v: Some(r.to_string()),
         });
-        self.trampoline = Some(
-            Func {
-                name: tramp,
-                linkage: "internal".into(),
-                cc: None,
-                ret: Some(Ty::I64),
-                params: vec![(Ty::Ptr, "%args".into())],
-                attrs: "noinline".into(),
-                entry: Vec::new(),
-                allocas: t.allocas,
-                body: t.body,
-            }
-            .to_string(),
-        );
+        self.trampoline = Some(Func {
+            name: tramp,
+            linkage: "internal".into(),
+            cc: None,
+            ret: Some(Ty::I64),
+            params: vec![(Ty::Ptr, "%args".into())],
+            attrs: "noinline".into(),
+            unlabelled: false,
+            entry: Vec::new(),
+            allocas: t.allocas,
+            body: t.body,
+        });
     }
 
     /// The runtime's entry a block is allocated through: counting's own, as it
@@ -683,7 +681,7 @@ impl<'p> Module<'p> {
             cond: c.to_string(),
             yes: give.to_string(),
             no: on.to_string(),
-            unlikely: false,
+            unlikely: None,
         });
         f.label(&give);
         f.push(Inst::Call {
@@ -733,7 +731,7 @@ impl<'p> Module<'p> {
             cond: c.to_string(),
             yes: run.to_string(),
             no: on.to_string(),
-            unlikely: true,
+            unlikely: Some(1),
         });
         f.label(&run);
         let mut which = Vec::new();
@@ -1108,30 +1106,31 @@ impl<'p> Module<'p> {
             .into_iter()
             .chain(f.params.iter().take(regs).map(|p| (Ty::I64, p.clone())))
             .collect();
-        let mut text = Func {
+        let mut funcs = vec![Func {
             name: f.name.clone(),
             linkage: linkage.into(),
             cc: Some(self.cc.into()),
             ret: Some(Ty::I64),
             params,
             attrs: "noinline".into(),
+            unlabelled: false,
             entry: spilled_params(&f.params, regs, self.threaded),
             allocas: f.allocas,
             body: f.body,
-        }
-        .to_string();
-        // In the same text, so in the same unit: it is internal to it.
+        }];
+        // In the same unit: it is internal to it.
         if let Some(t) = self.trampoline.take() {
-            text.push_str(&t);
+            funcs.push(t);
         }
+        let printed: usize = funcs.iter().map(|g| g.to_string().len()).sum();
         let words = f.params.len().min(regs) + usize::from(self.threaded);
         let size = self
             .sizes
             .entry((self.module.clone(), self.def_name.clone()))
             .or_default();
-        size.0 += text.len();
+        size.0 += printed;
         size.1 += 1;
-        self.funs.push((f.name, text, words));
+        self.funs.push((f.name, funcs, words));
         self.fun_modules.push(self.module.clone());
     }
 
@@ -1376,7 +1375,7 @@ impl<'p> Module<'p> {
             cond: last.to_string(),
             yes: clean.to_string(),
             no: shared.to_string(),
-            unlikely: false,
+            unlikely: None,
         });
         f.label(&clean);
         f.push(Inst::Call {
@@ -1438,7 +1437,7 @@ impl<'p> Module<'p> {
             cond: inreg.to_string(),
             yes: gone.to_string(),
             no: on.to_string(),
-            unlikely: false,
+            unlikely: None,
         });
         f.label(&gone);
         f.push(Inst::Call {
@@ -1493,7 +1492,7 @@ impl<'p> Module<'p> {
             cond: last.to_string(),
             yes: mine.to_string(),
             no: shared.to_string(),
-            unlikely: false,
+            unlikely: None,
         });
         f.label(&mine);
         f.push(Inst::Br(done.to_string()));
@@ -1577,7 +1576,7 @@ impl<'p> Module<'p> {
             cond: last.to_string(),
             yes: mine.to_string(),
             no: shared.to_string(),
-            unlikely: false,
+            unlikely: None,
         });
         f.label(&mine);
         let loaded = self.load_fields(f, v, names.len());
@@ -1626,7 +1625,7 @@ impl<'p> Module<'p> {
             cond: has.to_string(),
             yes: give.to_string(),
             no: on.to_string(),
-            unlikely: false,
+            unlikely: None,
         });
         f.label(&give);
         f.push(Inst::Call {
@@ -1801,7 +1800,7 @@ impl<'p> Module<'p> {
                     cond: has.to_string(),
                     yes: keep.to_string(),
                     no: fresh.to_string(),
-                    unlikely: false,
+                    unlikely: None,
                 });
                 f.label(&keep);
                 self.write_block(f, token, kind, meta, vals, descs, Some(origin.as_ref()));
@@ -2204,7 +2203,7 @@ impl<'p> Module<'p> {
                         cond: z.to_string(),
                         yes: ret.to_string(),
                         no: call.to_string(),
-                        unlikely: false,
+                        unlikely: None,
                     });
                     f.label(&ret);
                     f.push(Inst::Ret {
@@ -2491,7 +2490,7 @@ impl<'p> Module<'p> {
             cond: small.to_string(),
             yes: imm.to_string(),
             no: blk.to_string(),
-            unlikely: false,
+            unlikely: None,
         });
         f.label(&imm);
         let m1 = f.t();
@@ -2730,7 +2729,7 @@ impl<'p> Module<'p> {
                 cond: cond.to_string(),
                 yes: t.to_string(),
                 no: e.to_string(),
-                unlikely: false,
+                unlikely: None,
             });
             f.label(&t);
             self.stmt(on_true, &mut env.clone(), f)?;
@@ -3793,7 +3792,7 @@ impl<'p> Module<'p> {
             cond: c.to_string(),
             yes: fast.to_string(),
             no: slow.to_string(),
-            unlikely: false,
+            unlikely: None,
         });
         f.label(&fast);
         let quick = if let Some(rest) = answer.strip_prefix("byte:") {
@@ -3927,7 +3926,7 @@ impl<'p> Module<'p> {
             cond: z.to_string(),
             yes: zero.to_string(),
             no: check.to_string(),
-            unlikely: false,
+            unlikely: None,
         });
         f.label(&zero);
         let msg = if p == Prim::Div {
@@ -3958,7 +3957,7 @@ impl<'p> Module<'p> {
             cond: m.to_string(),
             yes: minus.to_string(),
             no: normal.to_string(),
-            unlikely: false,
+            unlikely: None,
         });
         f.label(&minus);
         let neg = f.t();
@@ -4155,15 +4154,36 @@ impl<'p> Module<'p> {
     /// thread's state in a static, with no scheduler and no thread-local at
     /// all.
     fn units(
-        mut self,
+        self,
         entries: Entries,
         result: i64,
         fingerprint: &str,
         unit: usize,
     ) -> Vec<(String, String)> {
+        self.lir_units(entries, result, fingerprint, unit)
+            .into_iter()
+            .map(|(name, m)| (name, m.to_string()))
+            .collect()
+    }
+
+    /// [`Module::units`] as the LIR they print: the program's modules, each
+    /// its items -- the functions as lowered, and around them the runtime's
+    /// declarations, the helpers, the tables and the ways in, which are
+    /// written as LLVM text and read back as the LIR's items.
+    fn lir_units(
+        mut self,
+        entries: Entries,
+        result: i64,
+        fingerprint: &str,
+        unit: usize,
+    ) -> Vec<(String, LirModule)> {
         let header = self.header(entries, result, fingerprint);
         let funs = std::mem::take(&mut self.funs);
         let arity: HashMap<&str, usize> = funs.iter().map(|(n, _, r)| (n.as_str(), *r)).collect();
+        let texts: Vec<String> = funs
+            .iter()
+            .map(|(_, fs, _)| fs.iter().map(|f| f.to_string()).collect())
+            .collect();
         // A module's functions are a unit of their own, or several where
         // there are more than `unit` bytes of them, in the order they were
         // written: a definition and its methods together, which call one
@@ -4172,8 +4192,8 @@ impl<'p> Module<'p> {
         // into units known by their number.
         let modules = std::mem::take(&mut self.fun_modules);
         let mut order: Vec<&str> = vec![""];
-        let mut of: HashMap<&str, Vec<&str>> = HashMap::new();
-        for ((_, text, _), module) in funs.iter().zip(&modules) {
+        let mut of: HashMap<&str, Vec<(&str, &[Func])>> = HashMap::new();
+        for (((_, fs, _), text), module) in funs.iter().zip(&texts).zip(&modules) {
             // One unit, when that is what was asked for.
             let module = if unit == usize::MAX {
                 ""
@@ -4184,16 +4204,17 @@ impl<'p> Module<'p> {
             if texts.is_empty() && !module.is_empty() {
                 order.push(module);
             }
-            texts.push(text);
+            texts.push((text.as_str(), fs.as_slice()));
         }
-        let mut chunks: Vec<(String, String)> = vec![(String::new(), header)];
+        let mut chunks: Vec<(String, String, Vec<Func>)> =
+            vec![(String::new(), header.clone(), Vec::new())];
         for module in order {
             let mut part = 1;
             let mut size = 0;
             if !module.is_empty() {
-                chunks.push((module.to_string(), String::new()));
+                chunks.push((module.to_string(), String::new(), Vec::new()));
             }
-            for text in of.get(module).into_iter().flatten() {
+            for (text, fs) in of.get(module).into_iter().flatten() {
                 if size >= unit {
                     part += 1;
                     let name = if module.is_empty() {
@@ -4201,11 +4222,13 @@ impl<'p> Module<'p> {
                     } else {
                         format!("{module}.{part}")
                     };
-                    chunks.push((name, String::new()));
+                    chunks.push((name, String::new(), Vec::new()));
                     size = 0;
                 }
                 size += text.len();
-                chunks.last_mut().expect("one").1.push_str(text);
+                let last = chunks.last_mut().expect("one");
+                last.1.push_str(text);
+                last.2.extend(fs.iter().cloned());
             }
         }
         // The method indexes a unit reads, declared as it first names them.
@@ -4269,7 +4292,7 @@ impl<'p> Module<'p> {
         chunks
             .into_iter()
             .enumerate()
-            .map(|(i, (name, body))| {
+            .map(|(i, (name, body, fs))| {
                 let mut out = String::new();
                 if i > 0 {
                     let _ = writeln!(
@@ -4297,8 +4320,20 @@ impl<'p> Module<'p> {
                     out.push_str(&first_only);
                 }
                 out.push_str(&declarations(&body, &arity, self.cc));
-                out.push_str(&body);
-                (name, out)
+                // The first unit's tables and ways in, after what it
+                // declares, as they were when they were the start of its
+                // text.
+                if i == 0 {
+                    out.push_str(&header);
+                }
+                let mut m = LirModule {
+                    items: meadow_lir::parse::items(&out)
+                        .expect("what the back end writes reads back"),
+                };
+                for f in fs {
+                    m.push(Item::Func(f));
+                }
+                (name, m)
             })
             .collect()
     }

@@ -1185,7 +1185,23 @@ VM.
 - **LIR-1.** An IR between linear AxCut and the back ends, in which a
   layout's arithmetic and a strategy's operations are explicit: loads and
   stores at offsets, counts, polls, records, reloads and barriers.
+  - *Status:* done: `compiler/meadow-lir`. Its instructions are LLVM's as
+    far as Meadow's code uses them, on a few scalar types, with operands
+    written as LLVM writes them; a module is functions, declarations,
+    globals and notes (comments, metadata). A header read is a load at an
+    offset and a shift and a mask, a count a load, an add and a store, a
+    poll a volatile load and a branch, a record an alloca and stores.
+    `meadow_lir::parse` reads it back from LLVM text.
 - **LIR-2.** The LLVM back end reads only the LIR, with PERF-1 holding.
+  - *Status:* done. The lowering builds every function as LIR, and the
+    back end's product is LIR modules (`Module::lir_units`), which it
+    prints. The fixed parts of a module -- the runtime's declarations, the
+    helpers that share and erase, the tables, the ways in -- are written as
+    LLVM text, the clearest way to write fixed code, and read back as LIR.
+    The IR of nine programs in four configurations, 432 modules, is as it
+    was (PERF-1), and every function and module of them reads back and
+    prints as it was written (`meadow-lir`'s test, given
+    `MEADOW_LIR_CORPUS`).
 - **LIR-3.** The JIT's tier 2 reads the LIR.
 - **LIR-4.** A layout is lowered once, in the LIR, for every back end.
 

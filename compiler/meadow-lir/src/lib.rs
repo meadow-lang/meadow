@@ -19,6 +19,8 @@
 //! lowering has not been taught to say in LIR yet. A back end other than
 //! LLVM cannot compile a function holding one.
 
+pub mod parse;
+
 use std::fmt::{self, Write};
 
 /// A value's type: the machine's scalars, as LLVM names them.
@@ -430,13 +432,14 @@ pub enum Inst {
     },
     /// `br label %to`.
     Br(String),
-    /// `br i1 cond, label %yes, label %no`, marked as seldom taken if
-    /// `unlikely`.
+    /// `br i1 cond, label %yes, label %no`, with `!prof !n` when `unlikely`
+    /// is `Some(n)`: the module's metadata `n`, which says how seldom the
+    /// first way is taken.
     CondBr {
         cond: Val,
         yes: String,
         no: String,
-        unlikely: bool,
+        unlikely: Option<u8>,
     },
     /// `switch ty v, label %default [ ty k, label %to ... ]`.
     Switch {
@@ -580,8 +583,8 @@ impl fmt::Display for Inst {
                 unlikely,
             } => {
                 write!(f, "br i1 {cond}, label %{yes}, label %{no}")?;
-                if *unlikely {
-                    f.write_str(", !prof !1")?;
+                if let Some(n) = unlikely {
+                    write!(f, ", !prof !{n}")?;
                 }
                 Ok(())
             }
@@ -621,6 +624,9 @@ pub struct Func {
     pub params: Vec<(Ty, Val)>,
     /// What follows the parameters: `noinline`, `alwaysinline`.
     pub attrs: String,
+    /// Whether its first block is written without its `entry:` label, as a
+    /// function of one block may be.
+    pub unlabelled: bool,
     pub entry: Vec<Inst>,
     pub allocas: Vec<Inst>,
     pub body: Vec<Inst>,
@@ -660,7 +666,11 @@ impl fmt::Display for Func {
         if !self.attrs.is_empty() {
             write!(f, " {}", self.attrs)?;
         }
-        f.write_str(" {\nentry:\n")?;
+        f.write_str(if self.unlabelled {
+            " {\n"
+        } else {
+            " {\nentry:\n"
+        })?;
         let mut line = String::new();
         for i in self.insts() {
             line.clear();
@@ -675,6 +685,210 @@ impl fmt::Display for Func {
             f.write_str(&line)?;
         }
         f.write_str("}\n\n")
+    }
+}
+
+/// A global's type: a scalar, or an array of `len` of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GTy {
+    pub elem: Ty,
+    pub len: Option<usize>,
+}
+
+impl GTy {
+    pub fn scalar(elem: Ty) -> GTy {
+        GTy { elem, len: None }
+    }
+
+    pub fn array(len: usize, elem: Ty) -> GTy {
+        GTy {
+            elem,
+            len: Some(len),
+        }
+    }
+}
+
+impl fmt::Display for GTy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.len {
+            Some(n) => write!(f, "[{n} x {}]", self.elem),
+            None => write!(f, "{}", self.elem),
+        }
+    }
+}
+
+/// What a global holds to begin with.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Init {
+    Int(i64),
+    /// Another global's address: `@name`.
+    Ref(String),
+    Null,
+    /// Every byte nought.
+    Zero,
+    /// An array of bytes, a string's: written as LLVM writes text, `c"..."`.
+    Bytes(Vec<u8>),
+    /// An array of these, each of the array's element type.
+    Elems(Vec<Init>),
+}
+
+impl Init {
+    fn write(&self, elem: Ty, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Init::Int(n) => write!(f, "{n}"),
+            Init::Ref(g) => write!(f, "{g}"),
+            Init::Null => f.write_str("null"),
+            Init::Zero => f.write_str("zeroinitializer"),
+            Init::Bytes(bytes) => {
+                f.write_str("c\"")?;
+                for b in bytes {
+                    match b {
+                        b' '..=b'~' if *b != b'"' && *b != b'\\' => {
+                            f.write_char(*b as char)?;
+                        }
+                        _ => write!(f, "\\{b:02X}")?,
+                    }
+                }
+                f.write_str("\"")
+            }
+            Init::Elems(xs) => {
+                f.write_str("[")?;
+                for (i, x) in xs.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{elem} ")?;
+                    x.write(elem, f)?;
+                }
+                f.write_str("]")
+            }
+        }
+    }
+}
+
+/// A global: a constant or a variable, defined here with what it holds, or
+/// defined elsewhere and named here (`linkage` beginning `external`, and no
+/// `init`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Global {
+    pub name: String,
+    pub linkage: String,
+    pub constant: bool,
+    pub ty: GTy,
+    pub init: Option<Init>,
+}
+
+impl fmt::Display for Global {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} = ", self.name)?;
+        if !self.linkage.is_empty() {
+            write!(f, "{} ", self.linkage)?;
+        }
+        write!(
+            f,
+            "{} {}",
+            if self.constant { "constant" } else { "global" },
+            self.ty
+        )?;
+        if let Some(init) = &self.init {
+            f.write_str(" ")?;
+            init.write(self.ty.elem, f)?;
+        }
+        Ok(())
+    }
+}
+
+/// A function defined elsewhere -- the runtime, another unit -- named here.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Decl {
+    pub name: String,
+    pub linkage: String,
+    pub cc: Option<String>,
+    pub ret: Ty,
+    pub params: Vec<Ty>,
+    /// What follows the parameters: `noreturn`.
+    pub attrs: String,
+}
+
+impl fmt::Display for Decl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("declare ")?;
+        if !self.linkage.is_empty() {
+            write!(f, "{} ", self.linkage)?;
+        }
+        if let Some(cc) = &self.cc {
+            write!(f, "{cc} ")?;
+        }
+        write!(f, "{} {}(", self.ret, self.name)?;
+        for (i, t) in self.params.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{t}")?;
+        }
+        f.write_str(")")?;
+        if !self.attrs.is_empty() {
+            write!(f, " {}", self.attrs)?;
+        }
+        Ok(())
+    }
+}
+
+/// What a module is made of.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Item {
+    Func(Func),
+    Decl(Decl),
+    Global(Global),
+    /// What only LLVM reads, written as it is: a comment, a branch weight's
+    /// metadata, a blank line. It means nothing to the code.
+    Note(String),
+}
+
+impl fmt::Display for Item {
+    /// The item as LLVM IR: a definition ends with a blank line, a
+    /// declaration or a global with the end of its line, and a note is its
+    /// text.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Item::Func(x) => write!(f, "{x}"),
+            Item::Decl(x) => writeln!(f, "{x}"),
+            Item::Global(x) => writeln!(f, "{x}"),
+            Item::Note(x) => f.write_str(x),
+        }
+    }
+}
+
+/// A module, or a unit of one: its items in order.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Module {
+    pub items: Vec<Item>,
+}
+
+impl Module {
+    pub fn push(&mut self, i: Item) {
+        self.items.push(i);
+    }
+
+    /// A note: text only LLVM reads.
+    pub fn note(&mut self, text: impl Into<String>) {
+        self.items.push(Item::Note(text.into()));
+    }
+
+    pub fn funcs(&self) -> impl Iterator<Item = &Func> {
+        self.items.iter().filter_map(|i| match i {
+            Item::Func(f) => Some(f),
+            _ => None,
+        })
+    }
+}
+
+impl fmt::Display for Module {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for i in &self.items {
+            write!(f, "{i}")?;
+        }
+        Ok(())
     }
 }
 
@@ -767,7 +981,7 @@ mod tests {
                     cond: "%t2".into(),
                     yes: "b1".into(),
                     no: "b2".into(),
-                    unlikely: true,
+                    unlikely: Some(1),
                 },
                 "br i1 %t2, label %b1, label %b2, !prof !1",
             ),
@@ -808,6 +1022,7 @@ mod tests {
             ret: Some(Ty::I64),
             params: vec![(Ty::I64, "%a0".into())],
             attrs: "noinline".into(),
+            unlabelled: false,
             entry: vec![],
             allocas: vec![Inst::Alloca {
                 dst: "%t1".into(),
