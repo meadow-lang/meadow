@@ -226,6 +226,12 @@ enum Cmd {
         /// what a build already fetched is used.
         #[arg(long)]
         fetch: bool,
+        /// Serve nothing: open each `.mw` file under these paths as an editor
+        /// would, print every error the server would mark in it, and exit 1
+        /// if there is one. What a package depends on is fetched, as by a
+        /// build.
+        #[arg(long, value_name = "PATH", num_args = 1..)]
+        check: Vec<PathBuf>,
     },
     /// Run the debug adapter, speaking the Debug Adapter Protocol over stdin
     /// and stdout.
@@ -1052,8 +1058,8 @@ fn command() {
                 std::process::exit(1);
             }
         }
-        Some(Cmd::Lsp { fetch, .. }) => {
-            if fetch {
+        Some(Cmd::Lsp { fetch, check, .. }) => {
+            if fetch || !check.is_empty() {
                 meadow::editor::allow_fetching();
             }
             // Both shapes of the standard library: the bundle a package depends
@@ -1070,6 +1076,9 @@ fn command() {
             // the edge of the open document, which is where it used to stop
             // anyway.
             let src_root = meadow::stdlib::extract_sources();
+            if !check.is_empty() {
+                std::process::exit(lsp_check(&check, packages, modules, src_root));
+            }
             if let Err(e) = meadow_lsp::server::run(
                 packages,
                 modules,
@@ -1413,6 +1422,94 @@ fn could_not_compile(name: &str, errors: usize) {
         "could not compile `{name}` due to {errors} previous error{}",
         if errors == 1 { "" } else { "s" }
     ));
+}
+
+/// `meadow lsp --check`: every `.mw` file under `paths` -- a directory's,
+/// but for what builds write and dot-directories -- opened in the language
+/// server, and each error it would mark printed where it is: how many there
+/// were, as the exit status says whether there were any.
+fn lsp_check(
+    paths: &[PathBuf],
+    packages: Vec<meadow_compiler::CompiledPackage>,
+    modules: Vec<(String, meadow_compiler::CompiledPackage)>,
+    src_root: Option<PathBuf>,
+) -> i32 {
+    fn walk(at: &std::path::Path, out: &mut Vec<PathBuf>) {
+        if at.is_file() {
+            if at.extension().is_some_and(|e| e == "mw") {
+                out.push(at.to_path_buf());
+            }
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(at) else {
+            return;
+        };
+        let mut entries: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        entries.sort();
+        for e in entries {
+            let name = e.file_name().map(|n| n.to_string_lossy().into_owned());
+            if e.is_dir() && name.is_some_and(|n| n.starts_with('.') || n == "target") {
+                continue;
+            }
+            walk(&e, out);
+        }
+    }
+    let mut files = Vec::new();
+    for p in paths {
+        if !p.exists() {
+            status::error(format!("{}: no such file or directory", shown(p)));
+            return 2;
+        }
+        walk(p, &mut files);
+    }
+    status::status(
+        "Checking",
+        format!("{} files, as the language server sees them", files.len()),
+    );
+    let (mut errors, mut marked) = (0, 0);
+    let mut done = 0;
+    meadow_lsp::server::check(
+        packages,
+        modules,
+        src_root,
+        meadow::stdlib::MODULES,
+        Some(meadow::editor::find_package),
+        &files,
+        &mut |file, diagnostics| {
+            done += 1;
+            status::status(
+                "Checked",
+                format!("{} ({done}/{})", shown(file), files.len()),
+            );
+            if diagnostics.is_empty() {
+                return;
+            }
+            marked += 1;
+            for d in diagnostics {
+                errors += 1;
+                let at = d.range.start;
+                let first = d.message.lines().next().unwrap_or("");
+                println!(
+                    "{}:{}:{}: error: {first}",
+                    shown(file),
+                    at.line + 1,
+                    at.character + 1
+                );
+            }
+        },
+    );
+    // Said whether or not narration is on: it is the answer.
+    if errors == 0 {
+        eprintln!("no errors in {} files", files.len());
+        0
+    } else {
+        eprintln!(
+            "{errors} error{} in {marked} of {} files",
+            if errors == 1 { "" } else { "s" },
+            files.len()
+        );
+        1
+    }
 }
 
 /// `meadow exec`: run the image at `path` on `backend`.
