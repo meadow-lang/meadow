@@ -1,6 +1,6 @@
 //! **Linearization**: AxCut with every share and every erase written down.
 //!
-//! In the AxCut paper (see `docs/SILO.md`) the environment is linear: every
+//! In the AxCut paper (see `docs/RUNTIME.md`) the environment is linear: every
 //! name is used exactly once, a `substitute` that names a variable _n_ times
 //! shares it _n_ − 1 times and one that leaves it out erases it, and every
 //! other statement consumes what it names. Memory is then managed by the
@@ -139,7 +139,7 @@ pub enum L {
         captures: Vec<Name>,
         methods: Vec<LBlock>,
         /// A continuation made for a non-tail call: see `meadow_seq`'s
-        /// `Program::frames`, and `docs/SILO.md` for what becomes of one.
+        /// `Program::frames`, and `docs/RUNTIME.md` for what becomes of one.
         frame: bool,
         rest: Box<L>,
     },

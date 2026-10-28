@@ -1,8 +1,9 @@
 # Meadow
 
 A small ML-family language: Hindley–Milner inference with row-polymorphic
-records, algebraic effects with deep one-shot handlers, and a register bytecode
-VM with a copying collector.
+records, algebraic effects with deep one-shot handlers, and one runtime that
+interprets a program with a JIT or compiles it ahead of time through LLVM,
+counting references or tracing them.
 
 ```
 fun classify n =
@@ -142,19 +143,15 @@ meadow init pkg --name myPkg    # ...or elsewhere, under a name you choose
 meadow run examples/Euler       # build a package and run `main`, on the VM and its JIT
 meadow run --types pkg          # ...printing every top-level binding's type first
 meadow run --release pkg        # ...optimized, as an executable compiled ahead of time
-meadow run --backend vm pkg     # ...on the bytecode VM alone (or `jit`, `aot`)
+meadow run --backend vm pkg     # ...on the VM interpreting alone (or `jit`, `aot`)
 meadow run --cek pkg            # ...on the CEK machine
-meadow build path/to/pkg        # type-check, link, and write the bytecode image
+meadow build path/to/pkg        # type-check, link, and write the image the VM runs
 meadow build --release pkg      # ...optimized, `match` exhaustive, and an executable
 meadow build --aot --target x86_64 pkg  # an executable for another architecture
 meadow run -O2 pkg              # ...or just the optimization level
-meadow dis pkg                  # disassemble: the bytecode the VM would run
-meadow dis --asm pkg            # ...or the native code it compiles to
-meadow build --emit bytecode,asm pkg  # write those as text, in place of the binaries
+meadow dis pkg                  # disassemble: the code the VM runs
 meadow run pkg -- in.txt -v     # pass the program arguments, which `Process.argv` reads
-meadow exec target/debug/bytecode/pkg.mbc   # run a bytecode image
-meadow link pkg.mbc -o pkg      # ...or compile one into an executable
-meadow link --emit asm pkg.mbc  # ...or into the text of its native code
+meadow exec target/debug/native/glade/Pkg.image   # run an image on the VM
 meadow fmt src                  # format .mw sources in place
 meadow fmt --check src          # ...or just report, and exit 1 if any differ
 meadow test                     # run the package's `@test` functions
@@ -208,11 +205,11 @@ writes for you; `meadow run` also takes a single `.mw` file. The `Std` library
 is embedded in the binary, so there is nothing else to install.
 
 What a build makes goes in the package's own `target/` directory, one directory
-per profile: the bytecode image at `target/debug/bytecode/<name>.mbc`, and
-native object code and executables under `target/<profile>/native/`. `--emit`
-chooses what is written: `image` and `exe` are the binaries, `bytecode` the image
-as text (`<name>.mbc.txt`) and `asm` the native code as text (`<name>.s`). `meadow
-init` writes a `.gitignore` that ignores it.
+per profile: the image the VM runs, and the object code and executables LLVM
+makes, under `target/<profile>/native/glade/`. `--emit` chooses what is
+written: `image`, `exe`, or `expanded` (the sources with every macro call
+replaced by what it produced). `meadow init` writes a `.gitignore` that
+ignores it.
 
 Builds are **incremental**. Every package that compiles cleanly, and the
 embedded `Std`, is kept under `target/<profile>/incremental/` with a
@@ -228,55 +225,49 @@ declared once under `[workspace.package]` and `[workspace.dependencies]`
 (`util = { workspace = true }` in a member). The
 [tutorial](docs/TUTORIAL.md#workspaces) has the details.
 
-### Two runtimes: Glade and Silo
+### The runtime: Glade
 
-A program runs on one of two runtime systems, and they are two backends of
-their own:
+A program runs on one runtime, **Glade**, in one of three ways -- its backend:
 
-| runtime                 | what it is                                                                                                                                                                             |
-| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Glade** (the default) | bytecode, on an interpreter and a JIT, or compiled ahead of time into an executable; green threads, and a garbage collector tending the heap                                           |
-| **Silo**                | compiled all the way down by LLVM, counting references instead of collecting, on the native stack; always an executable, with no interpreter in it -- see [docs/SILO.md](docs/SILO.md) |
+| backend |                                                                                                                         | default for |
+| ------- | ----------------------------------------------------------------------------------------------------------------------- | ----------- |
+| `jit`   | the VM, running an image of the program and compiling what runs often to machine code as it goes                         | `--debug`   |
+| `aot`   | an executable, compiled ahead of time by LLVM and linked against the runtime                                              | `--release` |
+| `vm`    | the VM interpreting alone                                                                                                 |             |
 
-`--runtime <glade|silo>` picks one for a command, and `runtime = "…"` in a
-`[profile.<name>]` of the manifest for a package.
-
-Glade compiles its bytecode to machine code itself, for **aarch64** and
-**x86-64**, with no LLVM or Cranelift: typed arithmetic, comparisons, branches,
-moves, constants and the common allocations run as machine instructions, and
-everything else calls back into the runtime. When it compiles is Glade's to
-choose -- its backend:
-
-| Glade backend |                                                                                                                                       | default for |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
-| `jit`         | the VM, compiling each block to machine code once it has run 16 times (`MEADOW_JIT_THRESHOLD`)                                        | `--debug`   |
-| `aot`         | an executable: a Mach-O or ELF object holding the code and the program's image, linked by the system's C compiler against the runtime | `--release` |
-| `vm`          | the bytecode interpreter alone                                                                                                        |             |
-
-`--backend <vm|jit|aot>` (or `--jit`, `--aot`) picks one for a command, and a
-package can pick one per profile in its manifest. Silo has no backend to pick:
-it is compiled ahead of time by what it is, and a backend named beside it is
-an error on the command line and a warning in the manifest.
+A debug build writes an image for the VM, which needs no LLVM and is quick to
+make; a release build writes an executable. `--backend <vm|jit|aot>` (or
+`--jit`, `--aot`, `--interpret`) picks one for a command, and a package can
+pick one per profile in its manifest:
 
 ```toml
 # Meadow.toml
 [profile.debug]
 backend = "vm"
-
-[profile.release]
-runtime = "silo"
 ```
 
-An executable links against its runtime built as a static library: `cargo
-build --release` in `glade` or `silo`, or with `--target x86_64-apple-darwin`
-for the other Mac architecture; `MEADOW_RUNTIME` can name one. A release
-`meadow` carries Glade's inside it. A runtime has to be built from the same
-sources as `meadow`, and a program will not link against one that is not.
-When Glade's `aot` is only the release default and no executable can be made
--- a lone `.mw` file, which has no `target/` to put one in, or no runtime
-library -- the JIT runs the program instead, with a warning; an `aot` that was
-asked for is an error, and so is Silo that cannot be had. `meadow test` runs
-in-process, so it uses the JIT for both of Glade's.
+Either way the program's memory is counted by reference with reuse
+(`--gc rc`, the default), traced (`--gc tracing`), or traced with a young
+generation (`--gc generational`), and its frames are on a native stack that
+grows (`--stack growable`, a debug build's), one of fixed size (`--stack
+fixed`, a release build's), or the heap (`--stack heap`). Every combination
+works on every backend. See [docs/RUNTIME.md](docs/RUNTIME.md) for the design.
+
+The JIT compiles for **x86-64** in two tiers -- a procedure instruction for
+instruction, then a whole definition as an executable's are, with Cranelift --
+and for **aarch64** in the second alone. An executable links against the
+runtime built as a static library, which a release `meadow` carries inside it,
+with the VM; in a checkout they are what `cargo build --release` in `glade`
+leaves, and `MEADOW_RUNTIME` and `MEADOW_VM` can name others. A runtime has to
+be built from the same sources as `meadow`, and a program will not link
+against one that is not. When `aot` is only the release default and no
+executable can be made -- a lone `.mw` file, which has no `target/` to put one
+in, or no C compiler to link with -- the JIT runs the program instead, with a
+warning; an `aot` that was asked for is an error.
+
+`--runtime glade` names the runtime, and so does `--runtime silo`: it was
+built as Silo, beside a bytecode runtime that had Glade's name, and took the
+name when that one was retired ([docs/RUNTIME-MERGE.md](docs/RUNTIME-MERGE.md)).
 
 A package's name is the first segment of a `use` path, so it has to lex as one
 identifier — `meadow init` says so rather than letting a directory called
@@ -284,15 +275,11 @@ identifier — `meadow init` says so rather than letting a directory called
 
 ### Two machines
 
-Programs run on a **register bytecode VM** with a generational garbage
-collector: each green thread's heap is collected in pauses of tens of
-microseconds, however much it keeps alive, because the old generation is marked
-on another OS thread while the program runs.
-Behind it, the compiler lowers to a sequent-calculus IR (AxCut) and then to
-straight-line instructions over a flat register file — with no `call` or `ret`,
-since in that IR returning from a function is entering the continuation it was
-given. A call's continuation is a frame on a chunked, per-thread frame stack
-kept in the heap, as GHC's is, rather than on the machine's.
+Behind the VM and the executables both, the compiler lowers to a
+sequent-calculus IR (AxCut), in which returning from a function is entering
+the continuation it was given. The VM interprets code made from it, a
+procedure at a time; LLVM compiles it, with every copy and drop of a
+reference made explicit, as the AxCut paper does.
 
 The older **CEK abstract machine** is still there, and is still the definition of
 what a Meadow program means. `--cek` on `run` and `test`, or `:cek` in the REPL,
@@ -564,18 +551,18 @@ argument of the wrong type is a compile error before anything runs. In
 }
 ```
 
-The machine has no `call` or `ret` — returning is invoking a continuation,
-a frame on the frame stack or now and then a heap closure — so the adapter
-reconstructs a call stack from the continuation chain, using what
-the compiler records about which name is a function's return continuation. A
-call in tail position replaces its caller's frame, as it does at run time. The
-program's `print` output goes to the Debug Console; `Console.readLine` sees the
-end of input, since the adapter's own stdin is the protocol.
+The program runs on the VM, in a process of its own that the adapter drives,
+and what it shows of a stop is the VM's: each frame, where it will resume, and
+the values its names hold, by the names the program gave them. A call in tail
+position replaces its caller's frame, as it does at run time, and a value the
+program is done with is gone, as it is at run time. The program's `print`
+output goes to the Debug Console. With `"watch": true` the adapter builds the
+program again whenever its sources change and loads the new build into it, as
+`meadow run --watch` does.
 
 A debug session compiles at `-O1` with source positions kept all the way to the
-bytecode. That changes where the compiler remembers things, not what the
-program does: the standard library's test suite runs identically either way,
-and recording the positions changes no instruction.
+VM's code. That changes where the compiler remembers things, not what the
+program does: the standard library's test suite runs identically either way.
 
 ### Profiles
 
@@ -586,7 +573,6 @@ options, not options themselves. There are two:
 | ---------------------- | --------- | ----------- |
 | optimization level     | `-O1`     | `-O2`       |
 | non-exhaustive `match` | allowed   | an error    |
-| runtime                | Glade     | Glade       |
 | backend                | `jit`     | `aot`       |
 
 ```sh
@@ -619,8 +605,7 @@ opt-level = 2               # this package is slow to run, not slow to build
 
 [profile.release]
 strictness = "lenient"      # "lenient" | "strict"
-runtime = "glade"           # "glade" | "silo"
-backend = "jit"             # Glade's: "jit" | "aot" | "vm" -- or `aot = true`
+backend = "jit"             # "jit" | "aot" | "vm" -- or `aot = true`
 threads = 4                 # OS threads for the green ones, as `-j`
 leaks = true                # what the program left behind, as `--leaks`
 target = "aarch64"          # the processor an executable is for, as `--target`
@@ -632,19 +617,19 @@ that names only `opt-level` leaves everything else as debug.
 
 ## Building from a checkout
 
-The tree is six independent Cargo workspaces:
+The tree is five independent Cargo workspaces:
 
 |               |                                                                                                                                                                                                                                                                                                                      |
 | ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `compiler/`   | the front end and back end, one crate per pass — through `meadow-seq` (the AxCut IR and its reference machine) and `meadow-codegen` to `meadow-bytecode`                                                                                                                                                             |
-| `eval/`       | the CEK machine — the specification of what a program means                                                                                                                                                                                                                                                          |
-| `glade/`      | Glade, the default runtime: a register bytecode VM, its JIT and native code generator, green threads, and a low-pause generational collector (a copying nursery, and an Immix old generation marked concurrently and evacuated a block at a time). It loads an image and knows nothing about the IR that produced it |
-| `silo/`       | Silo, the runtime a program compiled by LLVM links against: its heap, counted by reference, its primitives, and its scheduler -- see `docs/SILO.md`                                                                                                                                                                  |
+| `compiler/`   | the front end and back end, one crate per pass — through `meadow-seq` (the AxCut IR and its reference machine) to `meadow-llvm`, which compiles AxCut ahead of time |
+| `eval/`       | the CEK machine — the specification of what a program means |
+| `glade/`      | Glade, the runtime: its heap, counted by reference or traced, its primitives and its scheduler, a static library an executable links against; and in `glade/vm` its VM and JIT -- see `docs/RUNTIME.md` |
 | `buildtools/` | the tools you point at Meadow source: `meadow` (build system, CLI and REPL — the binary) and `meadow-fmt` (the formatter)                                                                                                                                                                                            |
 | `installer/`  | `meadowup`, which installs and updates the toolchain                                                                                                                                                                                                                                                                 |
 
 ```
-core ──▶ AxCut ──▶ bytecode ──▶ VM
+core ──▶ AxCut ──▶ the VM, and its JIT
+          ├─▶ LLVM ──▶ an executable
           │
           └─▶ the AxCut machine, and the CEK machine beside it: two
               independent checks that the pipeline preserved meaning
@@ -653,7 +638,7 @@ core ──▶ AxCut ──▶ bytecode ──▶ VM
 ```sh
 scripts/check.sh                         # everything CI runs
 scripts/check.sh --strict                # ...plus rustfmt and clippy
-scripts/bench.sh                         # the benchmarks, on both runtimes
+scripts/bench.sh                         # the benchmarks
 scripts/bench-compact.sh                 # what compacting a large live value saves the collector
 scripts/install.sh                       # install this checkout the way a release installs
 scripts/install.sh --with-extension      # ...and the VS Code extension and theme with it
@@ -717,8 +702,8 @@ and says how to get the one it asks for.
 To cut a release:
 
 1. Move what is under _Unreleased_ in `CHANGELOG.md` into a section for the
-   version, and set that version in every manifest: the six `Cargo.toml`s
-   (`compiler`, `eval`, `glade`, `silo`, `buildtools`, `installer`),
+   version, and set that version in every manifest: the five `Cargo.toml`s
+   (`compiler`, `eval`, `glade`, `buildtools`, `installer`),
    `lib/Std/Meadow.toml`, `editors/vscode/package.json` and
    `editors/vscode-theme/package.json`.
 2. Run `scripts/check.sh --version v0.2.0`, which fails if any of them, or the

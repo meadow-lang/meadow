@@ -5,7 +5,7 @@
     scripts/silo-profile.py ./program prof.txt [N] [NAMES]
 
 The runtime writes where the program was loaded and, a line a sample, the
-return addresses on the stack, innermost first (silo/src/profile.rs). This
+return addresses on the stack, innermost first (glade/src/profile.rs). This
 puts them against the executable's symbols, as `nm` lists them, and prints
 the N busiest (30 unless said): by the function running, by the innermost
 function of the program itself (`mw.` and then what it is) with the runtime

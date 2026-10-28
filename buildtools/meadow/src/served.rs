@@ -1,7 +1,7 @@
-//! **A VM kept for many runs**: `meadow-silo-vm --serve`, which loads an
+//! **A VM kept for many runs**: `meadow-glade-vm --serve`, which loads an
 //! image, then each one it is sent as a reload, and runs an entry when it is
 //! told -- what a REPL's session runs on, one VM for all of it, and what a
-//! build's macros run on, one VM for every call. `silo/vm/src/main.rs` says
+//! build's macros run on, one VM for every call. `glade/vm/src/main.rs` says
 //! what is said on the connection.
 //!
 //! A program that fails ends the VM, with its message on standard error, as
@@ -87,7 +87,7 @@ impl Served {
                 Stdio::piped()
             })
             .spawn()
-            .map_err(|e| format!("cannot start Silo's interpreter: {e}"))?;
+            .map_err(|e| format!("cannot start the VM: {e}"))?;
         let said = child.stderr.take().map(|mut err| {
             let kept = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
             let (done, ended) = std::sync::mpsc::channel();
@@ -114,13 +114,11 @@ impl Served {
                 Ok((conn, _)) => break conn,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     if let Ok(Some(status)) = child.try_wait() {
-                        return Err(format!(
-                            "Silo's interpreter ended before it began: {status}"
-                        ));
+                        return Err(format!("the VM ended before it began: {status}"));
                     }
                     if Instant::now() > deadline {
                         let _ = child.kill();
-                        return Err("Silo's interpreter did not connect".into());
+                        return Err("the VM did not connect".into());
                     }
                     std::thread::sleep(Duration::from_millis(2));
                 }
@@ -140,7 +138,7 @@ impl Served {
                 log("started");
                 Ok(s)
             }
-            Ok(m) => Err(format!("Silo's interpreter said {m} first")),
+            Ok(m) => Err(format!("the VM said {m} first")),
             Err(e) => Err(e.said()),
         }
     }

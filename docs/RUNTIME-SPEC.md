@@ -56,7 +56,7 @@ reference for how each requirement is met.
   - *planned* (`R1`…`R9`): not met, and the roadmap item that meets it.
 
 **Notation:**
-- `meadow` is the driver, and `vm` stands for `meadow-silo-vm`.
+- `meadow` is the driver, and `vm` stands for `meadow-glade-vm`.
 - *A configuration* is a choice on each axis of [§3](#3-configuration).
 - *Every configuration* means every combination [§17](#17-the-test-matrix)
   lists.
@@ -72,7 +72,7 @@ Meadow had two runtimes:
   native stack.
 
 The merged runtime is one runtime, named Glade, the next release of Glade;
-Silo is retired (Chris, 2026-10-24). Its code is Silo's for now (`silo/`,
+Silo is retired (Chris, 2026-10-24). Its code is Silo's for now (`glade/`,
 `--runtime silo`), and takes Glade's name when the old Glade is retired
 ([R7](#r7-retire-the-old-glade-and-rename)).
 
@@ -133,7 +133,7 @@ any of them, a debug build has `growable` and a release build `fixed`.
 **CFG-3.** `--interpret`, or `MEADOW_INTERPRET`, with `--runtime silo` builds
 an image instead of an executable, and `meadow run` runs it on the VM.
 - *Check:* `meadow build --runtime silo --interpret P` writes
-  `P/target/debug/native/silo/{Name}.image`.
+  `P/target/debug/native/glade/{Name}.image`.
 - *Status:* done; `hot_reload::*` builds images this way.
 
 **CFG-4.** `--no-reload` builds what is interpreted with nothing versioned,
@@ -236,7 +236,7 @@ a block takes its facts from it. There are two:
 - `SILO`, Silo's, with a count;
 - `GLADE`, Glade's as near as machine pointers allow, with no count.
 
-The runtime library and the VM are each built for one, by `meadow-silo`'s
+The runtime library and the VM are each built for one, by `meadow-glade`'s
 `glade-layout` feature (LAY-20). The LLVM back end takes it from the
 configuration.
 
@@ -281,7 +281,7 @@ desc_bits)`.
 **LAY-3.** No code in the runtime, the VM or the LLVM back end writes a header
 word index, shift, mask or kind number as a literal. Each comes from the
 description.
-- *Check:* a grep over `silo/src`, `silo/vm/src` and
+- *Check:* a grep over `glade/src`, `glade/vm/src` and
   `compiler/meadow-llvm/src/emit.rs` finds none outside `heap.rs`'s
   accessors. The exceptions are those documented: the collector's free-block
   test reads the kind's word, and the shadow record's own layout.
@@ -349,17 +349,17 @@ under `SILO`: a cons cell is 4 words rather than 5.
 
 **LAY-20.** The runtime library and the VM are built for one layout:
 `SILO`, or `GLADE` with the `glade-layout` feature. A checkout builds the
-second with `--features meadow-silo/glade-layout --target-dir
-silo/target/glade-layout` (the VM), or `--features glade-layout` (the
+second with `--features meadow-glade/glade-layout --target-dir
+glade/target/glade-layout` (the VM), or `--features glade-layout` (the
 library). `meadow` looks for a `glade` layout's VM and library in
 `glade-layout` directories:
-- in a checkout, under `silo/target`;
+- in a checkout, under `glade/target`;
 - beside `meadow`, both in `lib/{TRIPLE}/` and where the binary is.
 
 No `glade` library is embedded in `meadow`.
 - *Status:* done.
 
-**LAY-21.** A library built for `GLADE` exports `meadow_silo_{hash}_glade`,
+**LAY-21.** A library built for `GLADE` exports `meadow_glade_{hash}_glade`,
 and a program emitted for it refers to that symbol. So a program links only
 with a library built for its layout.
 - *Status:* done.
@@ -645,11 +645,11 @@ the program under the debugger (§12).
 **AOT-1.** `meadow build --runtime silo` compiles a package to a native
 executable through LLVM, linked with the runtime library built from the same
 sources. A runtime library from other sources fails to link: the fingerprint
-symbol `meadow_silo_{hash}` is missing.
+symbol `meadow_glade_{hash}` is missing.
 - *Status:* done.
 
 **AOT-2.** `--target TRIPLE` builds for another system, with the runtime found
-at `lib/{TRIPLE}/libmeadow_silo.a` beside `meadow`, or where a checkout
+at `lib/{TRIPLE}/libmeadow_glade.a` beside `meadow`, or where a checkout
 builds it (`scripts/silo-runtime.sh {TRIPLE}`). The triples include
 `aarch64-linux-android`, `x86_64-linux-android`, `aarch64-apple-ios` and
 `aarch64-apple-ios-sim`.
@@ -1170,7 +1170,7 @@ VM.
   native function, instruction for instruction, over the same registers.
   An instruction it does not compile is run by the interpreter, and the
   native code carries on.
-  - *Status:* done for x86-64 (`silo/vm/src/interp/jit.rs`), chosen by
+  - *Status:* done for x86-64 (`glade/vm/src/interp/jit.rs`), chosen by
     `--jit` or `--backend jit`. Inline:
     - the integer arithmetic, division and comparisons, and the double
       arithmetic, in the short and the wide forms;
@@ -1194,7 +1194,7 @@ VM.
 - **JIT-3.** Tier 2 is an optimizing compiler from the lower-level IR (R3),
   in process (LLVM's ORC, or Cranelift; §19). `--jit-tiers 1|2` chooses
   how far to go.
-  - *Status:* done, with Cranelift (`silo/vm/src/interp/tier2.rs`). A
+  - *Status:* done, with Cranelift (`glade/vm/src/interp/tier2.rs`). A
     definition entered `MEADOW_JIT_TIER2` times more (1,000 by default)
     is lowered as an executable's are, by the LLVM back end's lowering in
     its JIT mode, and compiled. A call between compiled and interpreted
@@ -1338,17 +1338,32 @@ VM.
 ### R7. Retire the old Glade, and rename
 
 - **RET-1.** The REPL runs on one VM for its session (REPL-4).
+  - *Status:* done: `:jit`, the default, keeps one VM for the session, each
+    line loaded into it as a new build.
 - **RET-2.** Procedural macros, MeadowBoot's among them, run on the merged
   runtime.
+  - *Status:* done (`buildtools/meadow/src/proc.rs`).
 - **RET-3.** `meadow cut` runs on the merged runtime.
+  - *Status:* done: on the VM, or with `--aot` as an executable.
 - **RET-4.** `meadow exec` of a `.mbc` image is converted, or retired with a
   message.
+  - *Status:* done: retired with a message, as are `meadow link`, `--emit
+    bytecode`, `--emit asm`, `dis --asm` and `run --train`. `meadow dis`
+    prints the code the VM runs.
 - **RET-5.** The old Glade's engine, collector and JIT are deleted. Nothing
   builds them.
+  - *Status:* done: the bytecode runtime, `meadow-bytecode` and
+    `meadow-codegen` are gone. Its design is kept in `docs/history/`.
 - **RET-6.** The merged runtime takes Glade's name, directory and
   `--runtime glade`. `--runtime silo` stays for a while as another name for
   it.
+  - *Status:* done: `glade/` holds `meadow-glade` and `meadow-glade-vm`,
+    artifacts are under `native/glade/`, and `docs/RUNTIME.md` is its design.
+    The environment variables a run is tuned by keep their names
+    (`MEADOW_SILO_LEAKS`, `MEADOW_SILO_GC_STATS` and the rest), and
+    `MEADOW_SILO_VM` is read where `MEADOW_VM` is not set.
 - **RET-7.** The CEK machine (`eval/`) stays, as the reference semantics.
+  - *Status:* done.
 
 ### R8. The final report
 
@@ -1401,11 +1416,11 @@ settled the design here (MI-0).
   for, so nothing still held is freed. *(Proved; MEM-RC-1.)*
 - **IDY-9.** The rest of the runtime is in Idyll: segments, the scheduler,
   regions, parcels, STM, the primitives, printing and big integers. The big
-  integers are proved against their arithmetic. Done when `silo/src` has no
+  integers are proved against their arithmetic. Done when `glade/src` has no
   Rust.
 - **IDY-10.** The VM's loop is in low-level Idyll, and the JIT's encoder is
   in high-level Idyll, proved against a decoder of the same instructions,
-  with VM-11 and PERF-3 holding. Done when `silo/vm` has no Rust.
+  with VM-11 and PERF-3 holding. Done when `glade/vm` has no Rust.
 
 ### Smaller items, any time
 
@@ -1438,8 +1453,8 @@ settled the design here (MI-0).
 | lowering, reloadable builds | `compiler/meadow-seq`: `lower_program_with` |
 | versions | `compiler/meadow-core/src/versions.rs`, `signature` |
 | LLVM back end | `compiler/meadow-llvm/src/emit.rs` |
-| runtime library | `silo/src`: `heap`, `trace` (with the nursery), `cycles`, `stack`, `segments`, `shadow`, `frames`, `sched`, `prims`, `show`, `coverage`, `stats`, `profile` |
-| the VM | `silo/vm/src`: `interp`, `interp/code`, `interp/debug`, `interp/live`, `interp/profile`, `main` |
+| runtime library | `glade/src`: `heap`, `trace` (with the nursery), `cycles`, `stack`, `segments`, `shadow`, `frames`, `sched`, `prims`, `show`, `coverage`, `stats`, `profile` |
+| the VM | `glade/vm/src`: `interp`, `interp/code`, `interp/debug`, `interp/live`, `interp/profile`, `main` |
 | the driver | `buildtools/meadow/src`: `aot`, `dap`, `repl`, `watch`, `runtime` |
 | tests | `buildtools/meadow/tests`: `dap_silo`, `hot_reload`, `driver`, `bootstrap`; `compiler/meadow-llvm/tests/native.rs` |
 | old Glade | `glade/` (to be retired, R7) |
@@ -1460,4 +1475,4 @@ settled the design here (MI-0).
 | `main`'s fixed stack | 1 GB | `lib::MAIN_STACK` |
 | VM instruction | 8 bytes | `interp/code.rs` |
 | image magic | `meadow axcut image 5\n` | `meadow_axcut::image` |
-| watching interval | 100 ms (VM); 250 ms (sources) | `silo/vm/src/main.rs`, `watch.rs` |
+| watching interval | 100 ms (VM); 250 ms (sources) | `glade/vm/src/main.rs`, `watch.rs` |

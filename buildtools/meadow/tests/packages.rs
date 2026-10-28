@@ -237,13 +237,13 @@ fn a_manifest_chooses_the_runtime_and_its_flags() {
     .unwrap();
 
     let debug = Resolved::resolve(Profile::Debug, &dir, ProfileConfig::default());
-    assert_eq!(debug.runtime, Runtime::Silo);
+    assert_eq!(debug.runtime, Runtime::Glade);
     assert!(debug.native(), "`aot = true` is compiled ahead of time");
     assert_eq!(debug.threads, Some(2));
     assert_eq!(debug.options.cfg.backend, "aot");
 
     let release = Resolved::resolve(Profile::Release, &dir, ProfileConfig::default());
-    assert_eq!(release.runtime, Runtime::Silo);
+    assert_eq!(release.runtime, Runtime::Glade);
     assert!(release.native());
     assert!(release.leaks);
     assert_eq!(
@@ -266,7 +266,7 @@ fn a_manifest_chooses_the_runtime_and_its_flags() {
             ..ProfileConfig::default()
         },
     );
-    assert_eq!(flagged.runtime, Runtime::Silo);
+    assert_eq!(flagged.runtime, Runtime::Glade);
     assert_eq!(flagged.options.cfg.backend, "aot");
 
     std::fs::remove_dir_all(&dir).ok();

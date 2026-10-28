@@ -1,7 +1,7 @@
 //! What a debugging session is made of, whatever runs it: the program built
 //! for debugging ([`build`]), its sources and the names in them ([`sources`]),
 //! and the answers a debugger gives -- why it stopped, its frames, its
-//! variables. [`super::silo::SiloSession`] runs the program on the VM.
+//! variables. [`super::vm::VmSession`] runs the program on the VM.
 //!
 //! Nothing here speaks the protocol. [`super`] turns requests into calls on a
 //! session and its answers back into messages, which keeps this testable

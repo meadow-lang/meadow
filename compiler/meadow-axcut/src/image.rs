@@ -1,5 +1,5 @@
 //! **A program of AxCut as a file**: what `meadow` hands an engine that runs
-//! in a process of its own -- Silo's interpreter, `silo/vm` -- and that reads
+//! in a process of its own -- Silo's interpreter, `glade/vm` -- and that reads
 //! it back. `docs/RUNTIME-MERGE.md`, phase 5.
 //!
 //! The program, made linear -- the memory pass (`linear`) done once, by

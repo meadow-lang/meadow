@@ -1,11 +1,15 @@
 # One runtime: merging Glade and Silo
 
-Status: **design, in progress** on branch `runtime-merge`. Phase 1 has started.
+Status: **done** on branch `runtime-merge`, not merged: there is one runtime,
+which took Glade's name when the bytecode runtime was retired
+(`docs/RUNTIME-SPEC.md`, R7). This is the design log, and says the runtimes'
+names as they were when each part was written: **Glade** below is the bytecode
+runtime, and **Silo** is what is now Glade.
 
 Meadow has two runtimes. **Glade** is a bytecode VM, with a JIT and AOT
-executables, and a generational tracing collector (`docs/RUNTIME.md`).
+executables, and a generational tracing collector (`docs/history/BYTECODE-RUNTIME.md`).
 **Silo** compiles to native code through LLVM, with reference counting, reuse
-and the native stack (`docs/SILO.md`). Both run the same AxCut, which Cut
+and the native stack (`docs/RUNTIME.md`). Both run the same AxCut, which Cut
 lowers to (`docs/CUT.md`), so a difference between them is a runtime
 difference.
 
@@ -17,7 +21,7 @@ works with either engine. It is not a property of the engine.
 release. Silo is retired, and Glade gains everything Silo has, so that it
 replaces Silo in full: native code through LLVM, counting with reuse, the
 native stack and its segments, Silo's speed. Much of the merged runtime's
-code is Silo's today (`silo/`, the `meadow-silo` crates, `--runtime silo`).
+code is Silo's today (`glade/`, the `meadow-glade` crates, `--runtime silo`).
 The names follow when the old Glade's parts are retired (phase 6): the
 merged runtime takes Glade's name and directory, `--runtime glade` selects
 it, configured along the four axes below, and `--runtime silo` stays for a
@@ -57,9 +61,9 @@ AxCut, along four lines.
 | object header | `len │ uniform │ desc │ kind`, `field descs │ meta` | `extra refs │ len`, `kind │ flags │ meta`, field descs |
 | frames | a per-thread stack of 64 KiB heap chunks | the native stack; a frame used once is never built |
 | effects | `handle` enters a chunk of its own; detach and reattach chunks | stack segments (`corosensei`) |
-| native code | blocks of bytecode, any instruction may go back to the interpreter (`docs/NATIVE.md`) | whole functions; there is no interpreter |
+| native code | blocks of bytecode, any instruction may go back to the interpreter (`docs/history/BYTECODE-NATIVE.md`) | whole functions; there is no interpreter |
 | scheduler | M:N, work stealing, a heap per green thread | M:N, a context per green thread |
-| natives | `glade/src/native.rs` | `silo/src/native.rs`, the same operations again |
+| natives | `glade/src/native.rs` | `glade/src/native.rs`, the same operations again |
 
 Two things hold the engines apart, and neither is the bytecode itself:
 
@@ -91,7 +95,7 @@ works out internally today:
 
 - `dup x` and `drop x`;
 - `reset x` / `reuse x in let ...` for building into a block that was just
-  taken apart (`docs/SILO.md`, "Reuse");
+  taken apart (`docs/RUNTIME.md`, "Reuse");
 - borrowed parameters, and the set of pure definitions;
 - which continuations are frames.
 
@@ -140,7 +144,7 @@ A moving, generational collector needs its roots and its write barriers.
   and unlinks it on return. Code reads those values back from the record
   after the call, so the collector may move what they point to. This is
   LLVM's own "shadow stack" strategy. Silo already does it, for effects, in
-  `silo/src/shadow.rs`, where it costs "a few stores and a load around each
+  `glade/src/shadow.rs`, where it costs "a few stores and a load around each
   non-tail call". A frame that holds no reference across a call makes no
   record.
 - **Barriers.** Every store of a reference into an existing object is a
@@ -309,7 +313,7 @@ Each phase lands on its own, and is checked against the reference semantics
    Done when everything Glade does today, the debugger included, works on it,
    and debug builds are no slower to make.
 6. **One runtime.** Glade's chunk stack, its own heap layout and the old
-   `silo/` and `glade/` crates go. What remains is one runtime crate and two
+   `glade/` and `glade/` crates go. What remains is one runtime crate and two
    engines, with the JIT reattached through the LIR.
 
 ## Status (2026-10-22, branch `runtime-merge`)
@@ -330,7 +334,7 @@ path:
 - polls at definition and method entries, recording the parameters on the
   shadow chain;
 - collects with a non-moving mark-sweep over size-class pages
-  (`silo/src/trace.rs`).
+  (`glade/src/trace.rs`).
 
 Nothing moves, so no barriers are needed and the layout is Silo's unchanged.
 The roots are the shadow records, which are already made for effects, the
@@ -348,8 +352,8 @@ absence on programs that build something large:
 
 Programs that build nothing large cost about what counting does.
 
-**Phase 5, the engine, done; the debugger, not yet.** `meadow-silo-vm`
-(`silo/vm`) is an interpreter on Silo's runtime, under both strategies:
+**Phase 5, the engine, done; the debugger, not yet.** `meadow-glade-vm`
+(`glade/vm`) is an interpreter on Silo's runtime, under both strategies:
 `meadow run|build|test --runtime silo --interpret`.
 
 - **What it runs.** `meadow` writes an image (`meadow_axcut::image`) that
@@ -532,7 +536,7 @@ machine:
 - Glade puts its frames on a stack of chunks rather than the general heap,
   which is cheaper. Doing the same is a later step.
 
-**Growable stacks** (`silo/src/stack.rs`):
+**Growable stacks** (`glade/src/stack.rs`):
 - Every stack the runtime runs code on has a limit: `main`'s, a thread's, and
   a handler's segment.
 - Where a function begins, a growable program compares the stack pointer
@@ -565,7 +569,7 @@ than finished, is not given back.
 `meadow run --watch` runs a program on the VM. Whenever the package's
 sources change, it builds the package again and loads the new build into the
 program while it runs.
-- The VM does the loading: `meadow-silo-vm --watch IMAGE` reloads the image
+- The VM does the loading: `meadow-glade-vm --watch IMAGE` reloads the image
   whenever it is written anew.
 - `meadow` writes an image whole, by renaming it into place, so the VM never
   reads half of one.
@@ -688,7 +692,7 @@ with old and new values alive at once, and a build that opted out.
 
 `--gc generational` makes small blocks in a nursery of each heap's own, from
 the front. When it fills, the next safe point copies what is still reached
-out of it into the pages the tracing collector keeps (`silo/src/trace.rs`,
+out of it into the pages the tracing collector keeps (`glade/src/trace.rs`,
 `minor`), and a full collection empties it first and then marks and sweeps
 as before. Under tracing nothing counts, so a block's count is free to say
 that it moved, and the header word its kind was in says where.
@@ -757,7 +761,7 @@ Everything that read Silo's numbers now reads these instead:
 
 The runtime and the VM are built for one layout, by the `glade-layout`
 feature, so that reading a header costs no more than it did. A library built
-for it exports a symbol of its own (`meadow_silo_{hash}_glade`), so a program
+for it exports a symbol of its own (`meadow_glade_{hash}_glade`), so a program
 links only with the library made for its layout. The VM refuses an image of
 the other layout. The image's configuration carries the layout, and so its
 format is version 5.
@@ -879,7 +883,7 @@ goes back to the interpreter at its next entry (JIT-5).
 - The instructions are x86-64 first, then AArch64. Glade's encoders did not
   fit, being written for its own machine state (pinned registers, its
   "thin" steps), so tier 1 has a small encoder of its own
-  (`silo/vm/src/interp/jit/x64.rs`).
+  (`glade/vm/src/interp/jit/x64.rs`).
 
 **Tier 2** is the open question in the spec (§19): LLVM's ORC or Cranelift,
 from the lower-level IR (R3). Tier 1 does not wait for it.
@@ -1070,7 +1074,7 @@ compiles it.
 is compiled. A definition entered `MEADOW_JIT_TIER2` (10,000) times more
 than tier 1's threshold is lowered by the LLVM back end's own lowering,
 with its methods and frames, to the LIR, and Cranelift compiles that in the
-VM's process (`silo/vm/src/interp/tier2.rs`). Its code is an executable's:
+VM's process (`glade/vm/src/interp/tier2.rs`). Its code is an executable's:
 - frames are the native stack, a tail call is a tail call (Cranelift's
   `tail` convention), and values are in registers;
 - what the layout and the strategy decide is what the LIR says;

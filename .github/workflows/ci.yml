@@ -36,7 +36,7 @@ jobs:
     # the same script took 66 minutes in `release.yml` and passed -- and a
     # cancelled run reads as a hang. If a run gets near this, the fix is in the
     # tests (see the dev profiles in `buildtools/Cargo.toml` and
-    # `silo/Cargo.toml`), not here.
+    # `glade/Cargo.toml`), not here.
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -81,7 +81,7 @@ jobs:
         with:
           workspaces: |
             compiler
-            silo
+            glade
             eval
             buildtools
             installer

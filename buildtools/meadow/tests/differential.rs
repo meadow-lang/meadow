@@ -25,7 +25,7 @@
 //! purpose. Anything the lowering cannot translate is asserted *loudly*: a case
 //! that silently reported `Unsupported` and passed would be worse than no case.
 //!
-//! The VM is a program of its own (`meadow-silo-vm`, which
+//! The VM is a program of its own (`meadow-glade-vm`, which
 //! `meadow::aot::interpreter` finds). Without it the cases still hold the AxCut
 //! machine to the CEK machine's answers, and say that they skipped the VM.
 
@@ -920,7 +920,7 @@ fn a_deep_tail_loop_costs_the_vm_no_stack() {
 /// A constructor's real name is `Type.Ctor` — two types may each own a `Leaf`,
 /// and every pass after the resolver keys on the qualified form. Display is the
 /// one place that has to undo it, in two separate implementations
-/// (`meadow_eval`'s `Display` and `meadow_silo::show`), which is exactly the
+/// (`meadow_eval`'s `Display` and `meadow_glade::show`), which is exactly the
 /// shape of thing that drifts: the CEK machine kept printing `Maybe.Just(3)`
 /// for a while after the VM had stopped.
 #[test]

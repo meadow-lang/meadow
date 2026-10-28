@@ -45,7 +45,7 @@ name = \"Fact\"
 
     let (ok, err) = meadow(&root, &["build", "--release", "--emit", "image"]);
     assert!(ok, "{err}");
-    let native = root.join("target/release/native/silo");
+    let native = root.join("target/release/native/glade");
     assert!(native.join("Fact.image").exists(), "{err}");
     assert!(
         !native
@@ -126,7 +126,7 @@ fn a_lone_file_has_nowhere_to_emit_to() {
 
 /// A package whose executable can be built twice over.
 fn buildable(what: &str, body: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-silo-{}-{what}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("meadow-glade-{}-{what}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("src")).expect("a scratch package");
     std::fs::write(
@@ -200,14 +200,14 @@ fn an_executable_that_is_gone_is_linked_again() {
     assert!(again.exists(), "it came back");
 }
 
-// --- what Silo runs ------------------------------------------------------------
+// --- what an executable runs -------------------------------------------------
 
 /// What a Silo program writes after its last newline: kept. The process is
 /// the emitted module's `main`, not Rust's, so nothing flushed stdout's
 /// buffer at exit and the end of the output was lost.
 #[test]
-fn silo_keeps_what_follows_the_last_newline() {
-    let dir = std::env::temp_dir().join(format!("meadow-silo-{}-flush", std::process::id()));
+fn an_executable_keeps_what_follows_the_last_newline() {
+    let dir = std::env::temp_dir().join(format!("meadow-glade-{}-flush", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("src")).expect("a scratch package");
     std::fs::write(
@@ -248,8 +248,8 @@ no newline"
 /// `{ items }` -- a vector where the record was, and a match that fitted
 /// nothing in it. The machines that do not lay records out agreed all along.
 #[test]
-fn silo_reads_a_record_through_a_copy_at_the_callers_row() {
-    let dir = std::env::temp_dir().join(format!("meadow-silo-{}-row", std::process::id()));
+fn an_executable_reads_a_record_through_a_copy_at_the_callers_row() {
+    let dir = std::env::temp_dir().join(format!("meadow-glade-{}-row", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("src")).expect("a scratch package");
     std::fs::write(

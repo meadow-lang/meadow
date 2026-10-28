@@ -1,9 +1,9 @@
 //! The debugger: stepping, packages and entries, and speaking the protocol an
 //! editor drives it with. What a stop shows -- breakpoints, frames, values --
-//! is `tests/dap_silo.rs`'s.
+//! is `tests/dap_vm.rs`'s.
 
 use meadow::dap::session::{Mode, Stop, Variable};
-use meadow::dap::silo::SiloSession as Session;
+use meadow::dap::vm::VmSession as Session;
 use std::path::{Path, PathBuf};
 
 /// A program in a directory of its own, and a session over it.

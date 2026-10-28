@@ -1,6 +1,6 @@
 //! Which machine runs the program.
 //!
-//! The **merged runtime's VM** (`silo/vm`) runs it: `core` lowered to AxCut,
+//! The **merged runtime's VM** (`glade/vm`) runs it: `core` lowered to AxCut,
 //! written as an image, and run by the VM in a process of its own --
 //! interpreted, or with its JIT compiling what runs often. The **CEK
 //! machine** (`meadow_eval`) is there behind `--cek`, and is the
@@ -21,7 +21,7 @@ pub enum Engine {
     /// program means.
     Cek,
     /// The VM, compiling what runs often to machine code as it goes -- see
-    /// `silo/vm/src/interp/jit.rs`.
+    /// `glade/vm/src/interp/jit.rs`.
     Jit,
 }
 
@@ -70,64 +70,6 @@ pub struct Timings {
     pub run: std::time::Duration,
 }
 
-/// `program`, lowered to AxCut and run by Silo's interpreter -- the merged
-/// runtime's VM -- in a process of its own, with what it prints going where
-/// this process's does: its answer, shown, or why it failed. What the REPL's
-/// `:silo` runs an entry on.
-pub fn run_on_vm(program: &core::Program, opt: OptLevel) -> (Result<String, String>, Timings) {
-    use std::time::Instant;
-    let start = Instant::now();
-    let dir = std::env::temp_dir().join(format!("meadow-repl-{}", std::process::id()));
-    let image = dir.join("entry.image");
-    let answer = dir.join("entry.answer");
-    let lowered = meadow_seq::lower_program(program, opt);
-    let written = if !lowered.unsupported.is_empty() {
-        Err(format!(
-            "the back end cannot translate {:?} yet",
-            lowered.unsupported
-        ))
-    } else {
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("could not create {}: {e}", dir.display()))
-            .and_then(|()| {
-                // A stack that grows, as an edit-run loop's should.
-                let config = meadow_llvm::Config {
-                    stack: meadow_llvm::Stack::Growable,
-                    ..crate::aot::config()
-                };
-                crate::aot::write_image_with(&image, lowered.program, Vec::new(), config)
-            })
-    };
-    let compile = Some(start.elapsed());
-    let start = Instant::now();
-    let result = written.and_then(|()| {
-        let _ = std::fs::remove_file(&answer);
-        let status = std::process::Command::new(crate::aot::interpreter()?)
-            .arg("--answer")
-            .arg(&answer)
-            .arg(&image)
-            .status()
-            .map_err(|e| format!("could not run Silo's interpreter: {e}"))?;
-        match std::fs::read_to_string(&answer) {
-            Ok(shown) if status.success() => Ok(shown),
-            // What went wrong it has said already, on stderr.
-            _ => Err(format!(
-                "the program failed ({})",
-                status
-                    .code()
-                    .map_or("killed".to_string(), |c| format!("exit status {c}"))
-            )),
-        }
-    });
-    (
-        result,
-        Timings {
-            compile,
-            run: start.elapsed(),
-        },
-    )
-}
-
 /// `program` run on the merged runtime's VM, lowered at `opt`, with `env`
 /// set for it: what its entry answers, as the VM shows it, or why it did
 /// not -- what the VM said on standard error, as the CEK machine says it, or
@@ -166,7 +108,7 @@ pub fn run_on_vm_with(
         .arg(&image)
         .stdin(std::process::Stdio::null())
         .output()
-        .map_err(|e| format!("could not run Silo's interpreter: {e}"));
+        .map_err(|e| format!("could not run the VM: {e}"));
     let shown = std::fs::read_to_string(&answer);
     let _ = std::fs::remove_file(&image);
     let _ = std::fs::remove_file(&answer);
@@ -190,7 +132,7 @@ pub fn run_on_vm_with(
     }
 }
 
-/// [`run_on_vm`], in a session: `program` loaded into the VM the session has
+/// `program` run on the VM in a session: loaded into the VM the session has
 /// kept, as a reload, and its entry run there -- or, if there is none yet, or
 /// it cannot take this build, or the last run ended it, run on a new one,
 /// kept for the session from then on (REPL-4).
@@ -489,11 +431,11 @@ fn link_tests(
         crate::aot::config(),
     )
     .map_err(|e| e.msg)?;
-    let target = crate::aot::Target::host()?.with_runtime(crate::aot::Runtime::Silo);
+    let target = crate::aot::Target::host()?.with_runtime(crate::aot::Runtime::Glade);
     let runtime = crate::aot::runtimes(target)?
         .into_iter()
         .next()
-        .ok_or("no Silo runtime library")?;
+        .ok_or("no runtime library")?;
     let modules = crate::aot::write_units(dir, "tests", &units)?;
     let exe = dir.join(format!("tests{}", std::env::consts::EXE_SUFFIX));
     crate::aot::clang_link(&modules, &[], &runtime, &exe, opt, target, false)?;
@@ -502,7 +444,7 @@ fn link_tests(
 
 /// Run `tests` as the build says: on the VM if it is interpreted -- with its
 /// JIT, if `MEADOW_JIT` says -- and compiled by the native backend
-/// (`docs/SILO.md`) if not. See [`run_tests_on`].
+/// (`docs/RUNTIME.md`) if not. See [`run_tests_on`].
 pub fn run_tests_native(
     program: &core::Program,
     tests: &[core::Var],
@@ -553,11 +495,13 @@ pub fn run_tests_on(
         .collect();
     // A directory a run, so that runs at once -- a test harness's -- do not
     // meet.
-    let dir = std::env::temp_dir().join("meadow-silo-tests").join(format!(
-        "{}-{}",
-        std::process::id(),
-        RUNS.fetch_add(1, Ordering::Relaxed)
-    ));
+    let dir = std::env::temp_dir()
+        .join("meadow-glade-tests")
+        .join(format!(
+            "{}-{}",
+            std::process::id(),
+            RUNS.fetch_add(1, Ordering::Relaxed)
+        ));
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     // An image of the tests, which the VM runs one of by its number, as the
     // executable would.

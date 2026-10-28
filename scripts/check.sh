@@ -30,9 +30,9 @@ done
 
 # The tree is five independent Cargo workspaces, so there is no one
 # `cargo test --workspace` that covers it. Missing one is the whole reason this
-# script exists. The runtime's (`silo`) comes before `buildtools`, whose tests
+# script exists. The runtime's (`glade`) comes before `buildtools`, whose tests
 # run programs on the VM it builds.
-WORKSPACES="compiler eval silo buildtools installer"
+WORKSPACES="compiler eval glade buildtools installer"
 
 step() { printf '\n\033[1m== %s\033[0m\n' "$1"; }
 
@@ -49,9 +49,9 @@ fi
 # --- tests -------------------------------------------------------------------
 
 # The VM, which `meadow` runs a debug build, the REPL and macros on: found in
-# `silo/target/release` by a checkout's `meadow` (`aot::interpreter`).
+# `glade/target/release` by a checkout's `meadow` (`aot::interpreter`).
 step "build: the VM"
-(cd silo && cargo build --quiet --release -p meadow-silo-vm)
+(cd glade && cargo build --quiet --release -p meadow-glade-vm)
 
 for ws in $WORKSPACES; do
   step "test: $ws"

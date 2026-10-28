@@ -38,9 +38,9 @@ fn runtime() -> &'static Path {
             .expect("cargo runs");
         assert!(status.success(), "building Silo failed");
         let lib = if cfg!(windows) {
-            "meadow_silo.lib"
+            "meadow_glade.lib"
         } else {
-            "libmeadow_silo.a"
+            "libmeadow_glade.a"
         };
         aot.join("target").join("release").join(lib)
     })
@@ -182,7 +182,7 @@ fn run_units(
         assert_eq!(got, want, "native vs the AxCut machine, {name}");
     }
     // Every program, a continuation abandoned or not: what its frames held
-    // is given up with it (`silo/src/shadow.rs`).
+    // is given up with it (`glade/src/shadow.rs`).
     assert!(
         stderr.contains("aot: 0 blocks live at exit"),
         "{name} leaked: {stderr}"
@@ -591,7 +591,7 @@ fn a_thread_waits_inside_two_handlers() {
 // --- cycles ------------------------------------------------------------------
 //
 // Counting alone leaves a cycle behind, so the runtime collects them by trial
-// deletion (`silo/src/cycles.rs`). The leak check in `run` is what these are
+// deletion (`glade/src/cycles.rs`). The leak check in `run` is what these are
 // really testing: a program that ties knots and drops them must end with
 // nothing live.
 
@@ -1343,7 +1343,7 @@ fn run_regions(name: &str, src: &str, check: bool) -> (String, usize) {
 
 /// A thread counts the references it takes into a region for itself, and the
 /// region's own count hears of them when the thread has touched other
-/// regions or ends (`silo/src/region.rs`). Threads that read one compact side
+/// regions or ends (`glade/src/region.rs`). Threads that read one compact side
 /// by side, and a `main` that reads several, leave none behind.
 #[test]
 fn regions_read_by_several_threads_are_all_freed() {
@@ -1398,7 +1398,7 @@ fn what_a_thread_answered_goes_when_nothing_can_await_it() {
 // the call never returns -- an operation inside it was answered by a clause
 // that dropped the continuation -- those values were never given up. They are
 // now recorded around the call and given up when the continuation is
-// discarded (`silo/src/shadow.rs`), so these programs end with nothing live.
+// discarded (`glade/src/shadow.rs`), so these programs end with nothing live.
 
 const HOLDING: &str = "effect Raise { raise : Int -> Int }
      data L = N | C Int L

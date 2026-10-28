@@ -105,7 +105,7 @@ cli! {
       runtime
         : Option
           ("glade" | "silo")
-          "The runtime system: `glade` (the default), bytecode and a garbage collector, or `silo`, compiled all the way down by LLVM and counting references"
+          "The runtime system: `glade`, or `silo`, its name before: there is one, and how it runs a program is `--backend`'s"
           value
           "RUNTIME"
       backend
@@ -562,7 +562,7 @@ fun driven (path : Maybe String) (b : CliBuild) (args : Maybe [String]) =
 
 -- What the back end built natively for the package at `r` -- a library of
 -- what it exports, or a program -- named for the package and put where `meadow
--- build` puts a native program, `target/<profile>/native/silo`, so that two
+-- build` puts a native program, `target/<profile>/native/glade`, so that two
 -- packages' do not share a name. A library is put there; a program is not yet.
 fun placed (r : String) (profile : String) (library : Bool) : Result String String ! { Fs | e } =
   let name =
@@ -580,9 +580,9 @@ fun placed (r : String) (profile : String) (library : Bool) : Result String Stri
       else n
   in
   let built =
-    Path.join (Path.join (linkDirIn r profile) "target/release/native/silo") (fileOf "program")
+    Path.join (Path.join (linkDirIn r profile) "target/release/native/glade") (fileOf "program")
   in
-  let dir = Path.join r "target/${profile}/native/silo" in
+  let dir = Path.join r "target/${profile}/native/glade" in
   let dest = Path.join dir (fileOf name) in
   match createDirAll dir with
   | Err why -> Err why

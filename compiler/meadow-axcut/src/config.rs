@@ -7,7 +7,7 @@
 /// How the program's memory is managed.
 ///
 /// - **`Count`**: the AxCut paper's reference counting, with reuse and
-///   borrowing, as `docs/SILO.md` has it. Silo's own, and the default.
+///   borrowing, as `docs/RUNTIME.md` has it. Silo's own, and the default.
 /// - **`Trace`**: the same blocks, found rather than counted. Nothing is
 ///   shared, erased or reused; the runtime marks what the program's records
 ///   and its context reach and sweeps the rest, at safe points where a

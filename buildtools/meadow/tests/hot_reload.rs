@@ -1,5 +1,5 @@
 //! Loading a new build into a program running on Silo's interpreter
-//! (`meadow-silo-vm --watch`, which `meadow run --watch` drives): a call by
+//! (`meadow-glade-vm --watch`, which `meadow run --watch` drives): a call by
 //! name runs the new version from then on, what is running finishes as it
 //! was, and a value of a type the new build changed is taken only by the
 //! code made for it -- old values by old code, new by new.
@@ -7,7 +7,7 @@
 //! Each program waits, before it goes on, for a file the test writes once
 //! the reload is in: what it prints after says which code ran.
 //!
-//! These need Silo's interpreter built (`meadow-silo-vm`, which
+//! These need Silo's interpreter built (`meadow-glade-vm`, which
 //! `meadow::aot::interpreter` finds); without it they say so and pass.
 
 use std::io::{BufRead, BufReader, Read};
@@ -49,7 +49,7 @@ fn image_with(dir: &Path, src: &str, flags: &[&str]) -> PathBuf {
         "building:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let at = dir.join("target/debug/native/silo/Hot.image");
+    let at = dir.join("target/debug/native/glade/Hot.image");
     assert!(at.exists(), "no image at {}", at.display());
     at
 }

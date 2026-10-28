@@ -63,7 +63,7 @@ $ meadow run hello.mw
 
 ```
    Compiling Hello (/home/you/hello.mw)
-    Finished `debug` profile [O1, glade jit] in 0.10s
+    Finished `debug` profile [O1, jit] in 0.10s
      Running `main` on the JIT
 Hello, Meadow!
 ```
@@ -2752,7 +2752,7 @@ The conditions a build knows:
 | `arch = "x86_64"`, `"aarch64"`                                | …for that processor (`--target` sets it for an executable) |
 | `family = "unix"`, `"windows"`, or bare `unix` / `windows`    | …for that family of systems                                |
 | `profile = "debug"`, `"release"`, or bare `debug` / `release` | the build profile                                          |
-| `backend = "vm"`, `"jit"`, `"aot"`, `"silo"`, `"cek"`         | what runs the program: Glade's backends, Silo, or the CEK  |
+| `backend = "vm"`, `"jit"`, `"aot"`, `"cek"`                   | what runs the program: the runtime's backends, or the CEK  |
 | `opt_level = "0"`, `"1"`, `"2"`                               | the optimization level                                     |
 | bare `test`                                                   | `meadow test` is building it                               |
 | any other name, or `name = "value"`                           | the build turned that flag on                              |

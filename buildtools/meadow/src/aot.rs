@@ -10,15 +10,15 @@
 //!
 //! # The runtime to link
 //!
-//! `libmeadow_silo.a` (`meadow_silo.lib` on Windows), built for the target:
+//! `libmeadow_glade.a` (`meadow_glade.lib` on Windows), built for the target:
 //! where `MEADOW_RUNTIME` names it; else, for the host, the one built into
 //! this `meadow` (see `build.rs`); else beside this `meadow` binary, as
 //! `lib/<triple>/<library>` or plain `<library>` for the host; else, in a
-//! checkout, where `cargo build` in `silo` leaves it.
+//! checkout, where `cargo build` in `glade` leaves it.
 //!
 //! It must be built from the same runtime sources as this `meadow`, whose code
 //! generator assumes that runtime's layout: a library from other sources lacks
-//! the symbol the program refers to (see `silo/build.rs`), so it does not
+//! the symbol the program refers to (see `glade/build.rs`), so it does not
 //! link, and the next place is tried.
 
 use crate::artifacts;
@@ -26,25 +26,26 @@ use crate::profile::Profile;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The runtime a program runs on: one, the merged runtime (`docs/RUNTIME-MERGE.md`),
+/// The runtime a program runs on: Glade, the one there is (`docs/RUNTIME.md`),
 /// which `--runtime glade` names and `--runtime silo`, its name while it was
-/// built, names too. Its VM interprets an image, with a JIT; ahead of time,
-/// LLVM compiles the program into an executable linked against it.
+/// built beside the bytecode runtime that had this one's, names too. Its VM
+/// interprets an image, with a JIT; ahead of time, LLVM compiles the program
+/// into an executable linked against it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Runtime {
     #[default]
-    Silo,
+    Glade,
 }
 
 impl Runtime {
     /// The name of its directory, and of its libraries.
     pub fn name(self) -> &'static str {
-        "silo"
+        "glade"
     }
 
     pub fn named(name: &str) -> Option<Runtime> {
         match name {
-            "glade" | "silo" => Some(Runtime::Silo),
+            "glade" | "silo" => Some(Runtime::Glade),
             _ => None,
         }
     }
@@ -58,8 +59,8 @@ impl Runtime {
     /// The static library's file name, for `format`.
     pub fn library(self, format: Format) -> &'static str {
         match format {
-            Format::Coff => "meadow_silo.lib",
-            Format::MachO | Format::Elf => "libmeadow_silo.a",
+            Format::Coff => "meadow_glade.lib",
+            Format::MachO | Format::Elf => "libmeadow_glade.a",
         }
     }
 }
@@ -125,7 +126,7 @@ impl Format {
     }
 }
 
-/// How a native program's memory is managed: Silo counts references unless
+/// How a native program's memory is managed: the runtime counts references unless
 /// told to trace (`docs/RUNTIME-MERGE.md`). `--gc` sets it for a command, and
 /// `MEADOW_GC=tracing` for everything that runs.
 static GC: std::sync::OnceLock<meadow_llvm::Memory> = std::sync::OnceLock::new();
@@ -152,7 +153,7 @@ pub fn gc() -> meadow_llvm::Memory {
     })
 }
 
-/// How deep a program for Silo's calls may go: what the profile, the
+/// How deep a program's calls may go: what the profile, the
 /// manifest or `--stack` said, or `MEADOW_STACK`.
 static STACK: std::sync::OnceLock<meadow_llvm::Stack> = std::sync::OnceLock::new();
 
@@ -170,8 +171,8 @@ pub fn stack() -> meadow_llvm::Stack {
     })
 }
 
-/// How a block of a program for Silo is laid out: what `--layout` said, or
-/// `MEADOW_LAYOUT`, or Silo's.
+/// How a program's blocks are laid out: what `--layout` said, or
+/// `MEADOW_LAYOUT`, or the `silo` layout.
 static LAYOUT: std::sync::OnceLock<meadow_llvm::Layout> = std::sync::OnceLock::new();
 
 /// Say how blocks are laid out, before anything is built: `--layout`.
@@ -188,7 +189,7 @@ pub fn layout() -> meadow_llvm::Layout {
     })
 }
 
-/// How a program for Silo is run, by either engine.
+/// How a program is run, by either engine.
 pub fn config() -> meadow_llvm::Config {
     meadow_llvm::Config {
         memory: gc(),
@@ -208,7 +209,7 @@ fn layout_dir(dir: PathBuf, layout: meadow_llvm::Layout) -> PathBuf {
     }
 }
 
-/// Whether a program for Silo is interpreted rather than compiled: `--interpret`
+/// Whether a program is interpreted rather than compiled: `--interpret`
 /// Whether an interpreted build may take a new build of itself while it runs:
 /// what `--no-reload`, `reload = false` in a profile, or `MEADOW_RELOAD=0`
 /// turns off. See [`lowered_for`].
@@ -256,7 +257,7 @@ pub fn interpret() -> bool {
         || std::env::var_os("MEADOW_INTERPRET").is_some()
 }
 
-/// Write `program` as an image for Silo's interpreter (`silo/vm`) to `path`:
+/// Write `program` as an image for the VM (`glade/vm`) to `path`:
 /// what a build that interprets makes in place of an executable. Its tests, if
 /// it is a program of them, are where each begins.
 pub fn write_image(
@@ -319,13 +320,15 @@ pub fn is_image(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "image")
 }
 
-/// Silo's interpreter, for the layout [`layout`] says: `MEADOW_SILO_VM`, or
+/// The VM, for the layout [`layout`] says: `MEADOW_VM` (or `MEADOW_SILO_VM`,
+/// its name before), or
 /// beside this executable, or where a checkout builds it -- for another
 /// layout than Silo's, in a directory of the layout's name in each (see
 /// [`layout_dir`]). One built for another layout than an image's refuses it.
 pub fn interpreter() -> Result<PathBuf, String> {
-    let exe = format!("meadow-silo-vm{}", std::env::consts::EXE_SUFFIX);
-    if let Some(path) = std::env::var_os("MEADOW_SILO_VM") {
+    let exe = format!("meadow-glade-vm{}", std::env::consts::EXE_SUFFIX);
+    if let Some(path) = std::env::var_os("MEADOW_VM").or_else(|| std::env::var_os("MEADOW_SILO_VM"))
+    {
         return Ok(PathBuf::from(path));
     }
     let layout = layout();
@@ -343,7 +346,7 @@ pub fn interpreter() -> Result<PathBuf, String> {
         candidates.push(path);
     }
     let built = layout_dir(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../silo/target"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../glade/target"),
         layout,
     );
     for profile in ["release", "debug"] {
@@ -354,14 +357,14 @@ pub fn interpreter() -> Result<PathBuf, String> {
         .find(|p| p.is_file())
         .ok_or_else(|| match layout {
             meadow_llvm::Layout::Silo => "the VM is not built: `cargo build --release \
-                 --manifest-path silo/Cargo.toml -p meadow-silo-vm`, or say where it is with \
-                 MEADOW_SILO_VM"
+                 --manifest-path glade/Cargo.toml -p meadow-glade-vm`, or say where it is with \
+                 MEADOW_VM"
                 .to_string(),
             other => format!(
                 "the VM for the `{name}` layout is not built: `cargo build --release \
-                 --manifest-path silo/Cargo.toml -p meadow-silo-vm --features \
-                 meadow-silo/{name}-layout --target-dir silo/target/{name}-layout`, or say where \
-                 it is with MEADOW_SILO_VM",
+                 --manifest-path glade/Cargo.toml -p meadow-glade-vm --features \
+                 meadow-glade/{name}-layout --target-dir glade/target/{name}-layout`, or say where \
+                 it is with MEADOW_VM",
                 name = other.name()
             ),
         })
@@ -393,7 +396,7 @@ impl Target {
         Ok(Target {
             arch,
             format: Format::host(),
-            runtime: Runtime::Silo,
+            runtime: Runtime::Glade,
         })
     }
 
@@ -412,7 +415,7 @@ impl Target {
         Ok(Target {
             arch,
             format: Format::host(),
-            runtime: Runtime::Silo,
+            runtime: Runtime::Glade,
         })
     }
 
@@ -426,7 +429,7 @@ impl Target {
         Target::host().is_ok_and(|h| (h.arch, h.format) == (self.arch, self.format))
     }
 
-    /// The calling convention Silo's functions are in on this target: see
+    /// The calling convention compiled functions are in on this target: see
     /// [`meadow_llvm::CallConv`].
     pub fn call_conv(self) -> meadow_llvm::CallConv {
         meadow_llvm::CallConv::for_arch(match self.arch {
@@ -453,8 +456,8 @@ impl Target {
 }
 
 /// Compile `program` with the native backend -- AxCut to LLVM IR, compiled and
-/// linked with the `meadow_silo` runtime by clang -- into package `name`'s
-/// executable, answering where it went. See `docs/SILO.md`.
+/// linked with the `meadow_glade` runtime by clang -- into package `name`'s
+/// executable, answering where it went. See `docs/RUNTIME.md`.
 ///
 /// `inputs` is what the program was compiled from, as a build's fingerprint
 /// says it: given, an executable made of the same is left alone before
@@ -542,7 +545,7 @@ pub fn build_native_of(
     let runtime = runtimes(target)?
         .into_iter()
         .next()
-        .ok_or("no Silo runtime library")?;
+        .ok_or("no runtime library")?;
     let stamp = exe.with_extension("stamp");
     let meta = std::fs::metadata(&runtime).ok();
     // The runtime library, as how long it is and when it was written.
@@ -940,7 +943,7 @@ pub fn native_dir(root: &Path, profile: Profile, target: Target) -> PathBuf {
     dir.join(target.runtime.name())
 }
 
-static EMBEDDED_SILO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/runtime-silo"));
+static EMBEDDED_LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/runtime-library"));
 
 static EMBEDDED_VM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vm"));
 
@@ -977,7 +980,7 @@ fn embedded_vm(exe: &str) -> Option<PathBuf> {
 /// Its fingerprint names the directory, so a `meadow` from other sources
 /// writes its own beside it rather than over it.
 fn embedded(runtime: Runtime, lib: &str) -> Option<PathBuf> {
-    let bytes = EMBEDDED_SILO;
+    let bytes = EMBEDDED_LIBRARY;
     if bytes.is_empty() {
         return None;
     }

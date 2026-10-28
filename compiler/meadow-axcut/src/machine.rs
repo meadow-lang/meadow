@@ -915,7 +915,7 @@ fn plays(name: &str, role: Role) -> bool {
 /// A constructor as a reader wants to see it: `Maybe.Just` prints as `Just`.
 ///
 /// The third of three implementations of this — `meadow_eval`'s `Display` and
-/// the runtime's `show` (`silo/src/show.rs`) are the others — which is why the
+/// the runtime's `show` (`glade/src/show.rs`) are the others — which is why the
 /// differential tests (`buildtools/meadow/tests/differential.rs`) compare what
 /// the machines print rather than trusting any one of them.
 fn bare_ctor(name: &str) -> &str {

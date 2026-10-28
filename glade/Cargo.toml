@@ -1,0 +1,40 @@
+[workspace]
+# The VM: the runtime, running a program it is handed as a file.
+members = ["vm"]
+
+[package]
+name = "meadow-glade"
+description = "The runtime of a Meadow program compiled by meadow-llvm: blocks counted by reference as in the AxCut paper, primitives, and the native stack. For production, where a program is run for speed rather than stepped through."
+version = "0.3.0"
+edition = "2024"
+
+[lib]
+name = "meadow_glade"
+path = "src/lib.rs"
+# The static library is what a program links against; the rlib is for tests.
+crate-type = ["rlib", "staticlib"]
+
+[features]
+# Glade's object layout instead of Silo's: no count, a header of two words up
+# to eight fields, only ever traced (`meadow_rt::layout::GLADE`). A library
+# built with it exports a runtime symbol of its own, so a program emitted for
+# the other layout does not link with it.
+glade-layout = []
+
+[dependencies]
+# Descriptors, number formatting and the numeric tower's rules, which this
+# runtime must agree with the others about.
+meadow-rt = { path = "../compiler/meadow-rt" }
+num-bigint = "0.4"
+# Stackful coroutines: the stack segments effect handlers run on (see
+# `src/segments.rs`). Guard pages, and on Windows the thread information block
+# kept in step so stack probes work -- the fiddly part, done.
+corosensei = "0.3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+panic = "abort"

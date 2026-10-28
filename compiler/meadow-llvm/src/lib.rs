@@ -4,7 +4,7 @@
 //! memory by reference counting, the discipline of the AxCut paper -- Schuster,
 //! Müller, Ostermann and Brachthäuser, _Compiling Classical Sequent Calculus to
 //! Stock Hardware: The Duality of Compilation_, OOPSLA 2025,
-//! <https://doi.org/10.1145/3720507>. `docs/SILO.md` is the design; this crate
+//! <https://doi.org/10.1145/3720507>. `docs/RUNTIME.md` is the design; this crate
 //! is its compiler half, and `aot/` in a checkout is the runtime it links
 //! against.
 //!
@@ -40,7 +40,7 @@ impl From<emit::Error> for Error {
 /// The symbol a runtime library built from the sources this compiler was
 /// defines, and that the emitted module refers to: so that a program links
 /// with that runtime and no other. See `build.rs`. A library built for
-/// another object layout than Silo's names it too (`meadow-silo`'s
+/// another object layout than Silo's names it too (`meadow-glade`'s
 /// `glade-layout` feature).
 pub fn runtime_symbol() -> String {
     runtime_symbol_for(Layout::Silo)
@@ -54,16 +54,16 @@ pub fn runtime_symbol_for(layout: Layout) -> String {
 /// The runtime's symbol, for its fingerprint and layout.
 pub(crate) fn symbol_of(fingerprint: &str, layout: meadow_rt::layout::Layout) -> String {
     if layout == meadow_rt::layout::SILO {
-        format!("meadow_silo_{fingerprint}")
+        format!("meadow_glade_{fingerprint}")
     } else {
-        format!("meadow_silo_{fingerprint}_{}", layout.name)
+        format!("meadow_glade_{fingerprint}_{}", layout.name)
     }
 }
 
 /// The fingerprint of the sources that decide the ABI between the emitted
 /// code and the runtime: this crate's and the runtime's. See `build.rs`.
 pub fn fingerprint() -> &'static str {
-    env!("MEADOW_SILO_FINGERPRINT")
+    env!("MEADOW_GLADE_FINGERPRINT")
 }
 
 pub use emit::CallConv;

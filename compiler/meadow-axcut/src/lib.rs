@@ -502,7 +502,7 @@ pub mod linear;
 pub mod machine;
 
 /// A program as a file, for an engine that runs in a process of its own:
-/// Silo's interpreter (`silo/vm`).
+/// Silo's interpreter (`glade/vm`).
 pub mod config;
 pub mod image;
 

@@ -45,7 +45,7 @@ pub struct Options {
     /// Write what tests print as they print it, rather than keeping it to show
     /// beside the ones that fail.
     pub no_capture: bool,
-    /// Compile the tests with the native backend (`--runtime silo`) rather than
+    /// Compile the tests with the native backend (`--aot`) rather than
     /// run them on `engine`.
     pub native: bool,
 }

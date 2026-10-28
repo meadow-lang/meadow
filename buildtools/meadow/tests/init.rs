@@ -263,7 +263,7 @@ fn running_a_package_writes_its_image_under_target() {
 "
     );
     let image = meadow::artifacts::native_dir(&made.root, meadow::Profile::Debug)
-        .join("silo")
+        .join("glade")
         .join(format!("{}.image", made.name));
     assert!(image.exists(), "the image is written");
     let again = std::process::Command::new(env!("CARGO_BIN_EXE_meadow"))

@@ -657,7 +657,7 @@ impl Prim {
     /// the runtime cares — it must not **allocate**, because the machine puts a
     /// fused comparison's result in a register the collector does not scan.
     ///
-    /// So this is a claim about the runtime's primitives (`silo/src/prims.rs`),
+    /// So this is a claim about the runtime's primitives (`glade/src/prims.rs`),
     /// not only about types. A
     /// primitive that allocates does not belong here however boolean it looks.
     pub const fn compares(self) -> bool {

@@ -462,9 +462,9 @@ struct TargetArgs {
     #[arg(long, value_name = "SIZE", value_parser = meadow::profile::nursery_size)]
     nursery: Option<u64>,
     /// After running, report the blocks the program left behind: what it
-    /// still held at exit, by kind, and what held them. Silo counts by
-    /// reference by default, so this is where a cycle shows up. `leaks = true` in a
-    /// profile turns it on for a package.
+    /// still held at exit, by kind, and what held them. Memory is counted by
+    /// reference by default, so this is where a cycle shows up. `leaks = true`
+    /// in a profile turns it on for a package.
     #[arg(long)]
     leaks: bool,
     /// Features of the package to build with, by the names its `[features]`
@@ -1677,7 +1677,16 @@ fn finish(
     if meadow::watch::rebuilding() {
         std::process::exit(0);
     }
-    status::status("Running", format!("`{}`", shown(&exe)));
+    if aot::is_image(&exe) {
+        let entry = match package {
+            Some((_, name)) => format!("{name}::main"),
+            None => "main".to_string(),
+        };
+        let on = if engine == Engine::Jit { "JIT" } else { "VM" };
+        status::status("Running", format!("`{entry}` on the {on}"));
+    } else {
+        status::status("Running", format!("`{}`", shown(&exe)));
+    }
     let watching = meadow::watch::watching() && aot::is_image(&exe);
     let mut command = if aot::is_image(&exe) {
         let mut c = std::process::Command::new(exit_on_error(aot::interpreter()));

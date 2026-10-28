@@ -74,7 +74,7 @@ fn meadowboot_exe() -> PathBuf {
                 "MeadowBoot did not build:\n{}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            dir.join("target/release/native/silo")
+            dir.join("target/release/native/glade")
                 .join(format!("MeadowBoot{}", std::env::consts::EXE_SUFFIX))
         })
         .clone()
@@ -460,7 +460,7 @@ fn escape(s: &str) -> String {
 
 #[test]
 fn every_source_lexes_as_meadow_lexer_lexes_it() {
-    let files = sources(&["lib", "examples", "benches", "bootstrap", "glade", "silo"]);
+    let files = sources(&["lib", "examples", "benches", "bootstrap", "glade"]);
     assert!(files.len() > 50, "only {} sources found", files.len());
     let theirs = per_file("lex", &files);
     let bad = differences(&theirs, |p| {
@@ -1073,7 +1073,7 @@ impl Tree<'_> {
 
 #[test]
 fn every_source_parses_as_meadow_parser_parses_it() {
-    let files = sources(&["lib", "examples", "benches", "bootstrap", "glade", "silo"]);
+    let files = sources(&["lib", "examples", "benches", "bootstrap", "glade"]);
     assert!(files.len() > 50, "only {} sources found", files.len());
     let theirs = per_file("parse", &files);
     let bad = differences(&theirs, |p| {
@@ -1223,7 +1223,7 @@ fn grouped(text: &str, table: &HashMap<InternedString, hir::Fixity>) -> String {
 
 #[test]
 fn every_source_groups_its_operators_as_meadow_rename_groups_them() {
-    let files = sources(&["lib", "examples", "benches", "bootstrap", "glade", "silo"]);
+    let files = sources(&["lib", "examples", "benches", "bootstrap", "glade"]);
     let std = repo().join("lib").join("Std");
     let theirs = per_file("fixity", &files);
     let lib = declared_in(&HashMap::new(), &std);
@@ -1492,7 +1492,7 @@ fn inferred_recording(
 #[test]
 fn every_source_infers_as_meadow_infer_infers_it() {
     let _one_at_a_time = expansions_turn();
-    let files = sources(&["lib", "examples", "benches", "bootstrap", "glade", "silo"]);
+    let files = sources(&["lib", "examples", "benches", "bootstrap", "glade"]);
     // This compiler first, keeping what its macros expanded to, which
     // MeadowBoot is then given -- the standard library's too.
     let rust_started = std::time::Instant::now();
@@ -1798,7 +1798,7 @@ fn rename_dump() {
 #[test]
 fn every_source_renames_as_meadow_rename_renames_it() {
     let _one_at_a_time = expansions_turn();
-    let files = sources(&["lib", "examples", "benches", "bootstrap", "glade", "silo"]);
+    let files = sources(&["lib", "examples", "benches", "bootstrap", "glade"]);
     // This compiler first, keeping what its macros expanded to, which
     // MeadowBoot is then given.
     let rust_started = std::time::Instant::now();
@@ -3382,7 +3382,7 @@ fn a_function_meadowboot_exports_is_called_from_c() {
     } else {
         "libLib.so"
     };
-    let library = lib.join("target/debug/native/silo").join(name);
+    let library = lib.join("target/debug/native/glade").join(name);
     assert!(
         library.exists(),
         "no library at {}:\n{}{}",

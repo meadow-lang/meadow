@@ -8,13 +8,13 @@
 //! [`CallConv`] for why that convention, and [`CallConv::regs`] for what
 //! becomes of an argument past the last register.
 //!
-//! A **frame** (`docs/SILO.md`, "Frames are the native stack") is not built
+//! A **frame** (`docs/RUNTIME.md`, "Frames are the native stack") is not built
 //! while it is only waiting to be the continuation of a call: the call is an
 //! LLVM `call` with a null continuation, and the frame's method is emitted
 //! after it. Anything else done with a frame -- sharing it, storing it --
 //! builds it then, as the object it would have been.
 //!
-//! Memory is the paper's (see `docs/SILO.md`): a block's first word counts the
+//! Memory is the paper's (see `docs/RUNTIME.md`): a block's first word counts the
 //! references besides one; sharing adds to it, erasing takes from it or, at
 //! zero, hands the block to the runtime's free list; loading fields out of a
 //! block whose count is zero takes them without touching a count.
@@ -212,7 +212,7 @@ fn spawns(program: &Program) -> bool {
 /// points only at what was there before it, so no cycle can come of it --
 /// `setRef` and a write into a mutable array are the two ways to make one,
 /// and a program with neither needs no cycle collector at all (see
-/// `silo/src/cycles.rs`).
+/// `glade/src/cycles.rs`).
 ///
 /// `setField`, which destination-passing uses to fill a hole in a structure
 /// being built, is not one of them: what it writes is always newer than what
@@ -245,11 +245,11 @@ fn ties_knots(program: &Program) -> bool {
 
 /// Whether the program can ever hold a value inside a compact region, which
 /// is whether it makes one: a region comes from `compact`, or holds what a
-/// `TVar` holds -- `silo/src/sched.rs` keeps a `TVar`'s value in one, where
+/// `TVar` holds -- `glade/src/sched.rs` keeps a `TVar`'s value in one, where
 /// every thread reads it in place -- and nothing can be read out of one, sent
 /// between threads or added to that did not start there. A program with
 /// neither in it therefore never meets a block whose count says it is in a
-/// region, and its counting helpers do not ask -- see `silo/src/region.rs`,
+/// region, and its counting helpers do not ask -- see `glade/src/region.rs`,
 /// which is where the asking is paid for.
 ///
 /// Leaving out the `TVar`s let a program share a value read from one without
@@ -381,7 +381,7 @@ pub struct Module<'p> {
     /// performs an operation of a general handler anywhere. If it can, every
     /// frame not built that waits on a call is recorded where a discarded
     /// continuation's segments can find what it holds -- see
-    /// `silo/src/shadow.rs`. If it cannot, no record is ever made.
+    /// `glade/src/shadow.rs`. If it cannot, no record is ever made.
     shadow: bool,
     /// The most words any call passes through the spill area, or any function
     /// reads from it: how big the area has to be. See [`spill`].
@@ -393,7 +393,7 @@ pub struct Module<'p> {
     /// Whether blocks move (`Memory::Generational`): then what a record holds
     /// is read back after the poll or the call it was made for, and a store
     /// into a block that may be older than what it stores tells the runtime
-    /// (`silo/src/trace.rs`, "The young generation"). Nothing it does is
+    /// (`glade/src/trace.rs`, "The young generation"). Nothing it does is
     /// written otherwise, so a counted or a traced program's IR is as it was.
     moving: bool,
     /// Whether a function that begins with too little stack left runs on a
@@ -576,7 +576,7 @@ impl<'p> Module<'p> {
     }
 
     /// Under a growable stack, where a function begins: if the stack pointer
-    /// is below the running stack's limit (`silo/src/stack.rs`), the function
+    /// is below the running stack's limit (`glade/src/stack.rs`), the function
     /// is run again on a new piece of stack, through its trampoline, and what
     /// that answers is what it answers. The trampoline takes the context and
     /// the arguments from a buffer, and calls the function as any call does.
@@ -1588,7 +1588,7 @@ impl<'p> Module<'p> {
 
     /// The reference into a compact region that `v`, a block whose count was
     /// `rc`, held -- given up when `v` is released without being the last
-    /// reference, if `v` is inside one: see `silo/src/region.rs`.
+    /// reference, if `v` is inside one: see `glade/src/region.rs`.
     ///
     /// Only after its fields are shared. Those are in the region too, and the
     /// reference `v` gives up may be the region's last: a value read out of a
@@ -2422,7 +2422,7 @@ impl<'p> Module<'p> {
 
     /// Link a record of what `fr` holds into the running segment's shadow
     /// chain, for the call it is about to wait on -- see
-    /// `silo/src/shadow.rs`. Answers where the chain's head is and what it
+    /// `glade/src/shadow.rs`. Answers where the chain's head is and what it
     /// was, for putting back once the call returns; nothing when the program
     /// cannot abandon a continuation, or `fr` holds nothing to give up.
     fn shadow_push(
@@ -2446,7 +2446,7 @@ impl<'p> Module<'p> {
             words: words,
         });
         let slot = if self.threaded {
-            // Word 1 of the context: see `silo/src/ctx.rs`.
+            // Word 1 of the context: see `glade/src/ctx.rs`.
             let c = f.ptr(CTX);
             let s = f.t();
             f.push(Inst::Gep {
@@ -2942,7 +2942,7 @@ impl<'p> Module<'p> {
             return err("a primitive that answers needs one continuation");
         };
         // The stack-segment primitives take the code after them: see
-        // `silo/src/segments.rs`. It is packed as a closure of one argument
+        // `glade/src/segments.rs`. It is packed as a closure of one argument
         // -- what it binds -- and the runtime answers what that code finally
         // returns natively, which this returns.
         if let Extern::Prim(p @ (Prim::Enter | Prim::Detach | Prim::Reattach)) = op {
@@ -4847,7 +4847,7 @@ fn declarations(body: &str, arity: &HashMap<&str, usize>, cc: &str) -> String {
     out
 }
 
-/// What the emitted code calls in the runtime, `silo/src/lib.rs`.
+/// What the emitted code calls in the runtime, `glade/src/lib.rs`.
 const RUNTIME: &str = "\
 declare i64 @meadow_acquire(i64, i64)
 declare i64 @meadow_acquire_traced(i64, i64)
@@ -4999,7 +4999,7 @@ fn lit_desc(l: &Lit) -> i64 {
 }
 
 /// What every function of a program that can spawn calls the running
-/// thread's context, its first parameter: the `Ctx` of `silo/src/ctx.rs`,
+/// thread's context, its first parameter: the `Ctx` of `glade/src/ctx.rs`,
 /// whose first words are the spill area's address and the shadow chain's
 /// head. A thread's context moves between OS threads with it but never
 /// within memory, so this holds across any wait -- where a thread-local
@@ -5407,7 +5407,7 @@ fn export_fn(
 /// The helpers as a program gets them: [`helpers_text`], for its layout. One
 /// that can tie a knot hands every block whose count went down without
 /// reaching zero to the collector, which is where a cycle is noticed
-/// (`silo/src/cycles.rs`); one that cannot has no such call anywhere in it.
+/// (`glade/src/cycles.rs`); one that cannot has no such call anywhere in it.
 ///
 /// A traced program counts nothing, so it has no sharing or erasing to do,
 /// and its `@mw.field` shares nothing: under Silo's layout the count is the
@@ -5424,7 +5424,7 @@ fn helpers(l: &Layout, tracing: bool, cycles: bool, regions: bool) -> String {
     // are built -- and only the first time its count goes down, since it is
     // coloured until a collection looks at it. Both questions are in the same
     // word, so both are asked at once: `mutable` set and the colour black,
-    // which is zero. `silo/src/cycles.rs` says why those two kinds, and the
+    // which is zero. `glade/src/cycles.rs` says why those two kinds, and the
     // layout has the bits.
     let candidate = if cycles {
         format!(
@@ -5447,7 +5447,7 @@ cand:
     // A block inside a compact region carries far more references than it
     // has, so the count a share or an erase has already loaded says whether
     // it is touching one -- and the region has to be told, since that is what
-    // keeps it alive while anything points into it. `silo/src/region.rs` says
+    // keeps it alive while anything points into it. `glade/src/region.rs` says
     // why, and the layout has the number.
     let floor = l.region_floor;
     let share_tail = if regions {
@@ -5696,7 +5696,7 @@ fn invokers(l: &Layout, cc: &str, threaded: bool) -> String {
 }
 
 /// How the runtime runs a closure of one argument -- the code after a stack
-/// segment primitive (`silo/src/segments.rs`) -- when the methods are in a
+/// segment primitive (`glade/src/segments.rs`) -- when the methods are in a
 /// calling convention Rust cannot call: method 0 of `obj`, found as an
 /// `invoke` finds it, called from the C convention. Written for `ghccc`, and
 /// given the module's own convention where it is used.

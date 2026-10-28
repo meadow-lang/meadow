@@ -73,10 +73,10 @@ fi
 
 # The VM, which `buildtools`' tests and a checkout's `meadow` run programs
 # on (`aot::interpreter`): built first, where they find it.
-(cd silo && cargo build --quiet --release -p meadow-silo-vm) >"$LOGS/build-vm.log" 2>&1 ||
+(cd glade && cargo build --quiet --release -p meadow-glade-vm) >"$LOGS/build-vm.log" 2>&1 ||
   echo "FAIL build-vm" >>"$LOGS/unsorted.txt"
 
-for ws in compiler eval silo buildtools installer; do
+for ws in compiler eval glade buildtools installer; do
   # Every test binary, though one fails: a run is long, and what else is
   # wrong is worth knowing from the same one.
   job "test-$ws" bash -c "cd $ws && cargo test --workspace --quiet --no-fail-fast"

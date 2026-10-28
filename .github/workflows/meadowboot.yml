@@ -104,7 +104,7 @@ jobs:
           [ "$RUNNER_OS" = "Windows" ] && exe=".exe"
           dir="meadowboot-${{ matrix.target }}"
           mkdir -p "$dir/lib/Std"
-          cp "bootstrap/target/release/native/silo/MeadowBoot$exe" "buildtools/target/release/meadow$exe" "$dir/"
+          cp "bootstrap/target/release/native/glade/MeadowBoot$exe" "buildtools/target/release/meadow$exe" "$dir/"
           cp lib/Std/Meadow.toml "$dir/lib/Std/"
           cp -r lib/Std/src "$dir/lib/Std/"
           if [ "$RUNNER_OS" != "Windows" ]; then strip "$dir/MeadowBoot" "$dir/meadow"; fi
@@ -127,7 +127,7 @@ jobs:
           cd "$work"
           env -u MEADOW -u MEADOWBOOT_STD "$mb" run Hello | tail -1 | grep -qx '141'
           env -u MEADOW -u MEADOWBOOT_STD "$mb" build Lib
-          ls Lib/target/debug/native/silo/ | grep -E '^(Lib\.dll|libLib\.so|libLib\.dylib)$'
+          ls Lib/target/debug/native/glade/ | grep -E '^(Lib\.dll|libLib\.so|libLib\.dylib)$'
 
       # A zip whose paths use forward slashes, which every unzip reads:
       # 7-Zip's.

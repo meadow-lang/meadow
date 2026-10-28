@@ -223,7 +223,7 @@ fn an_image_runs_on_its_own() {
     let root = package(&dir, "img", ARGS);
     let (ok, _, err) = meadow(&root, &["build", "."]);
     assert!(ok, "{err}");
-    let image = root.join("target/debug/native/silo/Img.image");
+    let image = root.join("target/debug/native/glade/Img.image");
     assert!(image.is_file(), "{err}");
     let image = image.to_string_lossy().into_owned();
     for backend in ["jit", "vm"] {
@@ -512,7 +512,7 @@ fn a_program_with_no_vector_gets_its_arguments_as_an_array() {
 }
 
 #[test]
-fn a_program_of_cut_runs_on_glade_and_as_an_executable_of_silos() {
+fn a_program_of_cut_runs_on_the_vm_and_as_an_executable() {
     let dir = scratch("cut");
     std::fs::write(dir.join("count.cut"), CUT).unwrap();
     for runtime in [&[][..], &["--aot"]] {
@@ -627,7 +627,7 @@ fn the_repl_shows_a_definition_in_each_ir() {
 }
 
 #[test]
-fn the_repl_evaluates_on_the_merged_runtime_s_vm() {
+fn the_repl_evaluates_on_the_vm() {
     if let Err(e) = meadow::aot::interpreter() {
         eprintln!("skipped: {e}");
         return;
@@ -675,7 +675,7 @@ fn the_repl_runs_its_session_on_one_vm() {
 }
 
 #[test]
-fn a_profile_of_a_program_on_the_merged_runtime_s_vm_names_its_functions() {
+fn a_profile_of_a_program_on_the_vm_names_its_functions() {
     if let Err(e) = meadow::aot::interpreter() {
         eprintln!("skipped: {e}");
         return;
@@ -781,7 +781,7 @@ fn the_vm_says_what_a_program_reached() {
 }
 
 #[test]
-fn gc_stats_say_what_memory_did_on_the_merged_runtime_s_vm() {
+fn gc_stats_say_what_memory_did_on_the_vm() {
     if let Err(e) = meadow::aot::interpreter() {
         eprintln!("skipped: {e}");
         return;
@@ -825,7 +825,7 @@ fn gc_stats_say_what_memory_did_on_the_merged_runtime_s_vm() {
 }
 
 #[test]
-fn exec_runs_an_image_of_axcut_on_the_merged_runtime_s_vm() {
+fn exec_runs_an_image_of_axcut_on_the_vm() {
     if let Err(e) = meadow::aot::interpreter() {
         eprintln!("skipped: {e}");
         return;
@@ -855,7 +855,7 @@ fn exec_runs_an_image_of_axcut_on_the_merged_runtime_s_vm() {
     );
     let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
         .arg("exec")
-        .arg(dir.join("Ex/target/debug/native/silo/Ex.image"))
+        .arg(dir.join("Ex/target/debug/native/glade/Ex.image"))
         .args(["--", "a", "b"])
         .output()
         .unwrap();
@@ -871,7 +871,7 @@ fn exec_runs_an_image_of_axcut_on_the_merged_runtime_s_vm() {
 /// runs often -- here everything, at first entry -- and the program prints
 /// what it prints interpreted.
 #[test]
-fn the_merged_runtime_s_jit_runs_what_its_vm_runs() {
+fn the_jit_runs_what_the_vm_runs() {
     if let Err(e) = meadow::aot::interpreter() {
         eprintln!("skipped: {e}");
         return;

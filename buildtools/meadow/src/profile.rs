@@ -31,7 +31,7 @@ pub enum Backend {
     /// The VM, interpreting an image.
     Vm,
     /// The VM, compiling the procedures that run often to machine code as it
-    /// goes -- see `silo/vm/src/interp/jit.rs`.
+    /// goes -- see `glade/vm/src/interp/jit.rs`.
     #[default]
     Jit,
     /// Machine code compiled ahead of time, linked into an executable -- see
@@ -164,7 +164,7 @@ impl Resolved {
             backend_named: false,
             prune: true,
             sample: false,
-            runtime: crate::aot::Runtime::Silo,
+            runtime: crate::aot::Runtime::Glade,
             threads: None,
             nursery: None,
             stack: profile.stack(),

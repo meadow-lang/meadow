@@ -3,7 +3,7 @@
 //!
 //! An editor starts it, sends `launch` with a program to debug, and from then
 //! on asks it to run, stop, step and describe what it sees. The debugging
-//! itself is [`silo::SiloSession`]; this module is the protocol and the loop.
+//! itself is [`vm::VmSession`]; this module is the protocol and the loop.
 //!
 //! # Running without blocking
 //!
@@ -20,13 +20,13 @@
 //! of input.
 
 pub mod session;
-pub mod silo;
+pub mod vm;
 
 use serde_json::{Value as Json, json};
 use session::{Mode, Stop};
 
 /// What is being debugged: a program on the VM, in a process of its own.
-pub type Debuggee = silo::SiloSession;
+pub type Debuggee = vm::VmSession;
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -295,8 +295,7 @@ impl Adapter {
                 // reload as the sources change, as `meadow run --watch` does.
                 let stack = args["stack"].as_str().and_then(meadow_llvm::Stack::named);
                 let watch = args["watch"].as_bool().unwrap_or(false);
-                let launched =
-                    silo::SiloSession::launch_watching(path, entry.as_ref(), stack, watch);
+                let launched = vm::VmSession::launch_watching(path, entry.as_ref(), stack, watch);
                 match launched {
                     Ok(s) => {
                         self.session = Some(s);

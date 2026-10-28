@@ -12,10 +12,10 @@ worth finding.
 1. **A small ML-family language that is pleasant to write real programs in.**
    Hindley–Milner inference, row-polymorphic records, traits, algebraic effects
    with handlers, macros, and scoping and visibility that follow Rust's.
-2. **Two runtimes behind one compiler.** Glade, a bytecode VM with a JIT, an
-   ahead-of-time compiler and a garbage collector, for fast builds and
-   interactive use. Silo, native code through LLVM with reference counting, for
-   speed and a small runtime.
+2. **One runtime, two ways to run.** Glade: a VM with a JIT, for fast builds,
+   debugging, hot loading and interactive use; and native code through LLVM,
+   for speed -- on one heap, counted by reference or traced, with the same
+   primitives and scheduler (`docs/RUNTIME-SPEC.md`).
 3. **A shared back end other languages can target.** The Cut IR and AxCut, with
    a reference interpreter that says what a program means, so that Meadow,
    Idyll and others compile through the same runtimes.
@@ -65,7 +65,11 @@ worth finding.
 | Query-based incremental compilation                                                                         | Planned                                             |
 | Printable IRs with a live view in the REPL and language server                                              | Planned                                             |
 
-## Glade (bytecode VM, JIT, ahead-of-time)
+## The bytecode runtime (retired)
+
+What follows was planned for the bytecode runtime that had Glade's name, which
+is gone (`docs/RUNTIME-MERGE.md`, R7). It is kept for what it says of the
+ideas; where one still applies, it applies to the runtime's VM.
 
 | Task                                                                                                                                                                                                                                                                                                                                                                                                                                | State                                                                                                              |
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
@@ -79,7 +83,9 @@ worth finding.
 | Fix the JIT panic at `-O 2` on MeadowBoot ("r1 holds a value nothing describes")                                                                                                                                                                                                                                                                                                                                                    | Planned                                                                                                            |
 | A larger default nursery                                                                                                                                                                                                                                                                                                                                                                                                            | Planned, undecided. 8 MB makes `binarytrees` 23% faster and lengthens nursery pauses.                              |
 
-## Silo (native code through LLVM)
+## Glade: native code through LLVM
+
+Built as Silo, before the bytecode runtime was retired.
 
 | Task                                                                                                                           | State                                                                                    |
 | ------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |

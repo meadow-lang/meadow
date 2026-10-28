@@ -31,7 +31,7 @@
 //!   count, so a header of two words holds a block of up to eight fields, and
 //!   it is only ever traced.
 //!
-//! A runtime is built for one of them (`meadow-silo`'s `glade-layout`
+//! A runtime is built for one of them (`meadow-glade`'s `glade-layout`
 //! feature). More of a layout may be made a choice after that.
 
 /// A field of a header word: which word, where in it, and how wide. A field
@@ -139,7 +139,7 @@ pub struct Layout {
     /// whether it is waiting in the candidate buffer, whether it died while it
     /// waited, whether its fields were moved out before it died, whether a
     /// block a cycle could run through was ever stored in it, and whether it
-    /// waits for a walk with no budget. See `meadow-silo`'s `heap`.
+    /// waits for a walk with no budget. See `meadow-glade`'s `heap`.
     pub colour: Field,
     pub mutable: Field,
     pub buffered: Field,
@@ -202,7 +202,7 @@ const fn bit(word: usize, shift: u32) -> Field {
     }
 }
 
-/// Silo's layout (`silo/src/heap.rs`):
+/// Silo's layout (`glade/src/heap.rs`):
 ///
 /// ```text
 /// word 0   extra references: u32 (0: the only one) | length: u32

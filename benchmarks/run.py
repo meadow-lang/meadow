@@ -43,11 +43,11 @@ PYTHON = "py" if os.name == "nt" and shutil.which("py") else "python3"
 
 # Built once by `meadow_build`; the debug compiler is slow enough to notice.
 MEADOW = REPO / "buildtools" / "target" / "release" / f"meadow{EXE}"
-# Silo's interpreter, which `meadow-silo-vm` runs a program's image on:
-# `cargo build --release --manifest-path silo/Cargo.toml -p meadow-silo-vm`.
+# Silo's interpreter, which `meadow-glade-vm` runs a program's image on:
+# `cargo build --release --manifest-path glade/Cargo.toml -p meadow-glade-vm`.
 SILO_VM = Path(
     os.environ.get("MEADOW_SILO_VM")
-    or REPO / "silo" / "target" / "release" / f"meadow-silo-vm{EXE}"
+    or REPO / "glade" / "target" / "release" / f"meadow-glade-vm{EXE}"
 )
 
 
@@ -151,7 +151,7 @@ def meadow_package(lang, task):
     build = [str(MEADOW), "build", "--release", "--emit", "exe", str(out)]
     if "-silo" in lang.name:
         build += ["--runtime", "silo"]
-    if lang.name == "meadow-silo-vm":
+    if lang.name == "meadow-glade-vm":
         build += ["--interpret"]
     return build
 
@@ -159,7 +159,7 @@ def meadow_package(lang, task):
 def native_exe(lang, task):
     native = lang.out_dir(task) / "target" / "release" / "native"
     if lang.name.endswith("-silo"):
-        native = native / "silo"
+        native = native / "glade"
     return [str(native / f"{camel(task)}{EXE}")]
 
 
@@ -171,7 +171,7 @@ def glade_vm(lang, task):
 
 def silo_vm(lang, task):
     """The image `meadow build --interpret` wrote, run by Silo's interpreter."""
-    image = lang.out_dir(task) / "target" / "release" / "native" / "silo" / f"{camel(task)}.image"
+    image = lang.out_dir(task) / "target" / "release" / "native" / "glade" / f"{camel(task)}.image"
     return [str(SILO_VM), str(image)]
 
 
@@ -236,7 +236,7 @@ LANGS = [
         note="`meadow build --release`: -O2, compiled ahead of time",
     ),
     Lang(
-        "meadow-silo", ".mw", str(MEADOW), meadow_package, native_exe,
+        "meadow-glade", ".mw", str(MEADOW), meadow_package, native_exe,
         stem=lambda t: t,
         note="`meadow build --release --runtime silo`: the runtime of its own, "
              "counted by reference, on the native stack",
@@ -249,7 +249,7 @@ LANGS = [
         note="Glade's bytecode interpreter, without the JIT: `meadow exec --backend vm`",
     ),
     Lang(
-        "meadow-silo-vm", ".mw", str(MEADOW), meadow_package, silo_vm,
+        "meadow-glade-vm", ".mw", str(MEADOW), meadow_package, silo_vm,
         stem=lambda t: t,
         note="Silo's interpreter: AxCut run on Silo's runtime, nothing compiled",
     ),
@@ -325,7 +325,7 @@ LANGS = [
 
 LANG_BY_NAME = {l.name: l for l in LANGS}
 # Asked for by name only: see their entries.
-INTERPRETERS = {"meadow-vm", "meadow-silo-vm"}
+INTERPRETERS = {"meadow-vm", "meadow-glade-vm"}
 
 
 # --- running ------------------------------------------------------------------
@@ -365,10 +365,10 @@ def measure(argv, cwd, reps):
 
 
 STARTUP = {
-    "meadow-silo": 'use Std.Console (println)\n\ndef main = println "0"\n',
+    "meadow-glade": 'use Std.Console (println)\n\ndef main = println "0"\n',
     "meadow": 'use Std.Console (println)\n\ndef main = println "0"\n',
     "meadow-vm": 'use Std.Console (println)\n\ndef main = println "0"\n',
-    "meadow-silo-vm": 'use Std.Console (println)\n\ndef main = println "0"\n',
+    "meadow-glade-vm": 'use Std.Console (println)\n\ndef main = println "0"\n',
     "rust": 'fn main() { println!("0"); }\n',
     "c": '#include <stdio.h>\nint main(void) { printf("0\\n"); return 0; }\n',
     "cpp": '#include <cstdio>\nint main() { std::printf("0\\n"); }\n',

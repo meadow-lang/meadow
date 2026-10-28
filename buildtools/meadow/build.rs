@@ -4,14 +4,14 @@
 //! and links programs with nothing installed beside the binary.
 //!
 //! Only for a release build of `meadow`, or when `MEADOW_EMBED_RUNTIME=1`
-//! asks: each is a release build of the runtime (`silo/`) with link-time
+//! asks: each is a release build of the runtime (`glade/`) with link-time
 //! optimization, which is minutes, not seconds, and a debug `meadow` in a
 //! checkout finds the ones `cargo build --release` leaves there instead.
 //! `MEADOW_EMBED_RUNTIME=0` leaves them out of a release build too.
 //!
 //! Each is built by a `cargo` of its own, in a target directory of its own,
 //! from the same sources as this binary's code generator -- so the library's
-//! fingerprint (see `silo/build.rs`) is the one the program it links refers
+//! fingerprint (see `glade/build.rs`) is the one the program it links refers
 //! to. A failure to build one is a warning, not an error: `meadow` still
 //! works, and says where else the runtime can come from when it wants it.
 
@@ -56,9 +56,9 @@ fn main() {
     let compiler = root.join("compiler");
     // The library, and every input it -- and so its fingerprint -- depends on.
     let library = vec![
-        root.join("silo/src"),
-        root.join("silo/build.rs"),
-        root.join("silo/Cargo.toml"),
+        root.join("glade/src"),
+        root.join("glade/build.rs"),
+        root.join("glade/Cargo.toml"),
         root.join("compiler/fingerprint.rs"),
         compiler.join("meadow-llvm/src"),
         compiler.join("meadow-rt"),
@@ -68,14 +68,14 @@ fn main() {
     // The VM: the library's sources, its own, and its JIT's.
     let mut vm = library.clone();
     vm.extend([
-        root.join("silo/vm/src"),
-        root.join("silo/vm/Cargo.toml"),
+        root.join("glade/vm/src"),
+        root.join("glade/vm/Cargo.toml"),
         compiler.join("meadow-axcut"),
         compiler.join("meadow-exec"),
         compiler.join("meadow-lir"),
     ]);
     for (what, file, inputs) in [
-        (Part::Library, "runtime-silo", library),
+        (Part::Library, "runtime-library", library),
         (Part::Vm, "vm", vm),
     ] {
         for input in &inputs {
@@ -236,15 +236,15 @@ impl Part {
 /// Build `what` of the runtime, and answer its bytes.
 fn build(out: &Path, what: Part) -> Result<Vec<u8>, String> {
     let here = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let krate = here.join("../../silo");
+    let krate = here.join("../../glade");
     let target = std::env::var("TARGET").map_err(|e| e.to_string())?;
     let dir = target_dir(out);
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut cmd = Command::new(cargo);
     cmd.args(["build", "--release", "--target", &target]);
     match what {
-        Part::Library => cmd.args(["-p", "meadow-silo", "--lib"]),
-        Part::Vm => cmd.args(["-p", "meadow-silo-vm", "--bin", "meadow-silo-vm"]),
+        Part::Library => cmd.args(["-p", "meadow-glade", "--lib"]),
+        Part::Vm => cmd.args(["-p", "meadow-glade-vm", "--bin", "meadow-glade-vm"]),
     };
     cmd.arg("--manifest-path")
         .arg(krate.join("Cargo.toml"))
@@ -278,10 +278,10 @@ fn build(out: &Path, what: Part) -> Result<Vec<u8>, String> {
         ));
     }
     let file = match what {
-        Part::Library if target.contains("windows-msvc") => "meadow_silo.lib",
-        Part::Library => "libmeadow_silo.a",
-        Part::Vm if target.contains("windows") => "meadow-silo-vm.exe",
-        Part::Vm => "meadow-silo-vm",
+        Part::Library if target.contains("windows-msvc") => "meadow_glade.lib",
+        Part::Library => "libmeadow_glade.a",
+        Part::Vm if target.contains("windows") => "meadow-glade-vm.exe",
+        Part::Vm => "meadow-glade-vm",
     };
     let path = dir.join(&target).join("release").join(file);
     std::fs::read(&path).map_err(|e| format!("could not read {}: {e}", path.display()))

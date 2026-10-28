@@ -1,4 +1,4 @@
-//! `meadow run --watch`: run a program on Silo's interpreter and, whenever
+//! `meadow run --watch`: run a program on the VM and, whenever
 //! the package's sources change, build it again and load the new build into
 //! the program as it runs (`docs/RUNTIME-MERGE.md`, "Hot loading").
 //!
@@ -145,7 +145,7 @@ fn reported(path: &Path, read: &mut usize) -> Vec<(String, String)> {
 
 /// What the package's sources are, as when each was last written: its
 /// files, but for what builds write. A debugging session that watches
-/// (`dap::silo`) looks at them as this does.
+/// (`dap::vm`) looks at them as this does.
 pub(crate) fn sources(root: &Path) -> Vec<(PathBuf, u64, Option<std::time::SystemTime>)> {
     let mut out = Vec::new();
     let mut dirs = vec![root.to_path_buf()];
