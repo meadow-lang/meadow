@@ -12,6 +12,7 @@
 //! and a program is the declarations a runtime needs and the definitions that
 //! run.
 
+pub mod any;
 pub mod inline;
 pub mod interp;
 pub mod lower;

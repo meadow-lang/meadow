@@ -201,9 +201,13 @@ pub fn optimized(p: &Program) -> Program {
 }
 
 fn lowered(p: &Program, prints: bool) -> R<Lowered> {
+    // As written, and once inlined, which brings objects into sight of the
+    // calls of their methods: see `crate::any`.
+    crate::any::check(p)?;
     let copied;
     let p = if prints {
         copied = optimized(p);
+        crate::any::check(&copied)?;
         &copied
     } else {
         p
