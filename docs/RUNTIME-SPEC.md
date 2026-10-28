@@ -1424,6 +1424,15 @@ settled the design here (MI-0).
 
 ### Smaller items, any time
 
+- Tier 2 for a closure's code: a closure's entries counted toward the
+  definition it belongs to, and its compiled methods run from the VM.
+  matmul at `-O1` takes 8.7 s under the JIT where it would take 0.6
+  (`docs/RUNTIME-MERGE.md`, "Against the bytecode runtime").
+- A dictionary call on the VM at `-O1` costs more than it did on the
+  bytecode runtime: rbtree under the JIT takes 25.9 s to its 12.1.
+- A debug build of MeadowBoot takes 46.5 s to the bytecode runtime's 36.8:
+  where the image's time goes, measured, and taken back.
+
 - Phone runtimes in the experimental desktop MeadowBoot archives (macOS
   Intel, Linux ARM).
 - PERF-5: the same method table order every build.

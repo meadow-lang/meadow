@@ -1378,6 +1378,36 @@ loop aligned to 64 bytes:
 With layout held still, the branch is as fast as master or faster. The
 differences in the plain builds were layout.
 
+### Against the bytecode runtime, at the debug defaults (measured 2026-10-28)
+
+On the Windows desktop, master's `meadow` -- the bytecode runtime, then
+Glade -- against the branch's, on the same sources, best of three
+whole-process runs, compile included:
+
+| debug run (`-O1`, the JIT) | bytecode runtime | merged | merged at `-O2` |
+|---|---|---|---|
+| fib | 0.17 s | 0.15 s | |
+| binarytrees | 2.02 s | 0.99 s | |
+| matmul | 0.61 s | 8.67 s | 0.19 s |
+| rbtree | 12.1 s | 25.9 s | 3.6 s |
+
+| debug build (clean `target`) | bytecode runtime | merged |
+|---|---|---|
+| MiniML | 0.18 s | 0.23 s |
+| tour | 0.15 s | 0.16 s |
+| MeadowBoot | 36.8 s | 46.5 s |
+
+Two things make matmul and rbtree slower at `-O1`:
+- **Tier 2 does not reach a closure's code.** It compiles a definition
+  entered often, and matmul's loops are closures inside `main`, entered
+  once. Both tiers compiling at once take it to 0.58 s.
+- **`-O1` leaves dictionary calls in, and the VM pays more for one than
+  the bytecode runtime did.** rbtree interpreted takes 147 s at `-O1`;
+  `-O2` specializes them.
+
+The extra build time is the image: the memory pass and its encoding,
+where the bytecode runtime wrote bytecode in one pass. Not profiled yet.
+
 ## Open questions
 
 - **Interpreter speed on the native stack.** It was a question, and it is
