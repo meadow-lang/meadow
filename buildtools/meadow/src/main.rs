@@ -644,6 +644,12 @@ struct ProfileArgs {
     /// call to its own head, so its passes are entries too. 1000 by default.
     #[arg(long, value_name = "N")]
     jit_threshold: Option<u32>,
+    /// On Silo's JIT, how far it goes: `1`, its first tier alone, which
+    /// compiles a procedure instruction for instruction over the VM's slots;
+    /// or `2` (the default), which also compiles a definition entered
+    /// thousands of times more as an executable's definitions are compiled.
+    #[arg(long, value_name = "TIERS", value_parser = ["1", "2"])]
+    jit_tiers: Option<String>,
     /// `--backend aot`: Glade, compiled ahead of time into an executable.
     #[arg(long, visible_alias = "native")]
     aot: bool,
@@ -722,6 +728,10 @@ impl ProfileArgs {
             // Safety: before anything is built or run, so before any thread
             // that reads the environment; the VM's process inherits it.
             unsafe { std::env::set_var("MEADOW_JIT_THRESHOLD", n.to_string()) };
+        }
+        if let Some(t) = &self.jit_tiers {
+            // Safety: as above.
+            unsafe { std::env::set_var("MEADOW_JIT_TIERS", t) };
         }
         Resolved::resolve(self.profile(), path, self.overrides())
     }

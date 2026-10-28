@@ -127,7 +127,66 @@ struct Frame {
     /// Which, so that its code is written once however it is entered.
     id: usize,
     captured: Vec<V>,
-    method: LBlock,
+    method: Block,
+    /// The `new` it was made by, by its address: what the VM numbers its
+    /// method by, for the JIT (see [`Jit`]).
+    origin: usize,
+}
+
+/// A block the lowering writes, as the program has it: the block itself,
+/// where it is the program's -- so that what is in it is where the VM found
+/// it, which is how the VM numbers a `new`'s methods (see [`Jit`]) -- or one
+/// of the lowering's own making.
+#[derive(Debug, Clone)]
+enum Block {
+    /// The program's block, or one inside a block of the lowering's own.
+    /// Safety: the blocks a definition is lowered from outlive its lowering;
+    /// the lowering's own are kept until it is done ([`Module::alive`]); and
+    /// everything queued while writing one is written before [`Module::def`]
+    /// returns.
+    Borrowed(*const LBlock),
+    Owned(Rc<LBlock>),
+}
+
+impl std::ops::Deref for Block {
+    type Target = LBlock;
+
+    fn deref(&self) -> &LBlock {
+        match self {
+            // Safety: see the variant.
+            Block::Borrowed(b) => unsafe { &**b },
+            Block::Owned(b) => b,
+        }
+    }
+}
+
+/// What lowering a definition for the VM's JIT, in the VM's process, does
+/// differently from lowering it for an executable: a closure's methods are
+/// numbered as the VM numbers them -- by the address of the `new` (or of a
+/// stack-segment primitive's body) that makes them, in `bases` -- and a
+/// method's function is asked of the VM (`@meadow_jit_method`), since the
+/// VM's method numbers are not a flat table's.
+///
+/// And as the VM numbers the rest of what a load numbers: an interned name,
+/// by the number it gave it (`syms`); a constructor's tag, as a reload's are
+/// numbered after the running program's (`retag`, by the program's own); and
+/// a top-level value's cache, after the loads before (`global_base`).
+#[derive(Debug, Default, Clone)]
+pub struct Jit {
+    pub bases: HashMap<usize, u32>,
+    pub syms: HashMap<meadow_intern::InternedString, usize>,
+    pub retag: Vec<u32>,
+    pub global_base: u32,
+}
+
+impl Jit {
+    fn tag(&self, t: u64) -> u64 {
+        self.retag
+            .get(t as usize)
+            .copied()
+            .filter(|t| *t != u32::MAX)
+            .map_or(t, u64::from)
+    }
 }
 
 /// A descriptor, as the emitted code has it.
@@ -282,7 +341,17 @@ pub struct Module<'p> {
     /// the index of its first method here.
     methods: Vec<String>,
     /// Methods still to be written: their function's name, and the block.
-    pending: Vec<(String, LBlock, usize)>,
+    pending: Vec<(String, Block, usize)>,
+    /// The blocks of the lowering's own making, kept until the definition
+    /// they are of is written: what is queued from inside one points into it.
+    alive: Vec<Rc<LBlock>>,
+    /// For the JIT: see [`Jit`]. And the VM's number of each method of
+    /// `methods`, by the same index.
+    jit: Option<Jit>,
+    jit_methods: Vec<Option<u32>>,
+    /// Whether a closure was built whose methods the VM has no number for:
+    /// what makes a definition one the JIT cannot compile.
+    jit_unnumbered: std::cell::Cell<bool>,
     next_method: usize,
     /// Interned names, as the small integers a `Sym` literal loads.
     syms: Vec<meadow_intern::InternedString>,
@@ -365,6 +434,10 @@ impl<'p> Module<'p> {
             sizes: HashMap::new(),
             methods: Vec::new(),
             pending: Vec::new(),
+            alive: Vec::new(),
+            jit: None,
+            jit_methods: Vec::new(),
+            jit_unnumbered: std::cell::Cell::new(false),
             next_method: 0,
             syms: Vec::new(),
             strings: HashMap::new(),
@@ -432,6 +505,15 @@ impl<'p> Module<'p> {
     }
 
     fn sym(&mut self, s: meadow_intern::InternedString) -> usize {
+        if let Some(j) = &self.jit {
+            return match j.syms.get(&s) {
+                Some(n) => *n,
+                None => {
+                    self.jit_unnumbered.set(true);
+                    0
+                }
+            };
+        }
         match self.syms.iter().position(|x| *x == s) {
             Some(i) => i,
             None => {
@@ -957,6 +1039,86 @@ impl<'p> Module<'p> {
             .unwrap_or_else(|| format!("@mw.L{}", l.0))
     }
 
+    /// A constructor's tag as the code is to use it: the program's own, or the
+    /// VM's for it (see [`Jit`]).
+    fn tag(&self, t: u64) -> u64 {
+        self.jit.as_ref().map_or(t, |j| j.tag(t))
+    }
+
+    /// [`Module::with`], lowering for the VM's JIT: see [`Jit`].
+    pub fn for_jit(program: &'p Program, conv: CallConv, config: Config, jit: Jit) -> Module<'p> {
+        let mut m = Module::with(program, conv, config);
+        m.jit = Some(jit);
+        m
+    }
+
+    /// Definition `label`, whose block is `b`, lowered for the JIT: the
+    /// functions it is -- its own, its methods', its frames', a trampoline --
+    /// as LIR, and the VM's number of each of its methods, by its function's
+    /// name. `None` if it builds a closure whose methods the VM has no number
+    /// for, which the JIT then leaves to the VM.
+    pub fn jit_def(
+        &mut self,
+        label: meadow_axcut::Label,
+        b: &LBlock,
+    ) -> Result<Option<(Vec<Func>, Vec<(String, u32)>)>, Error> {
+        let had = self.methods.len();
+        self.jit_unnumbered.set(false);
+        self.def(label, b)?;
+        let funs: Vec<Func> = std::mem::take(&mut self.funs)
+            .into_iter()
+            .flat_map(|(_, fs, _)| fs)
+            .collect();
+        self.fun_modules.clear();
+        if self.jit_unnumbered.get() {
+            return Ok(None);
+        }
+        let methods = self.methods[had..]
+            .iter()
+            .zip(&self.jit_methods[had..])
+            .filter_map(|(n, id)| id.map(|id| (n.clone(), id)))
+            .collect();
+        Ok(Some((funs, methods)))
+    }
+
+    /// The function a call by name of `label` calls: what the JIT finds a
+    /// callee's definition by.
+    pub fn label_function(&self, label: meadow_axcut::Label) -> String {
+        self.label_fn(label)
+    }
+
+    /// The module's helpers -- sharing, erasing, a field's read -- as LIR, for
+    /// the JIT to compile beside what calls them. Where the spill area is the
+    /// runtime says, `meadow_spill_area`, in a program with threads or not.
+    pub fn jit_helpers(&self) -> Vec<Func> {
+        let text = helpers(&self.layout, self.tracing, self.cycles, self.regions);
+        meadow_lir::parse::funcs(&text).expect("the helpers read back")
+    }
+
+    /// Each constant string the module's functions name, by its global's
+    /// name, and its bytes with the nought that ends them.
+    pub fn jit_strings(&self) -> Vec<(String, Vec<u8>)> {
+        self.strings
+            .iter()
+            .map(|(text, g)| {
+                let mut bytes = text.as_bytes().to_vec();
+                bytes.push(0);
+                (g.clone(), bytes)
+            })
+            .collect()
+    }
+
+    /// Whether the module's functions take the running thread's context first:
+    /// whether the program can spawn.
+    pub fn threaded(&self) -> bool {
+        self.threaded
+    }
+
+    /// How many words a call passes in registers, the context's among them.
+    pub fn register_words(&self) -> usize {
+        self.reg_words
+    }
+
     pub fn def(&mut self, label: meadow_axcut::Label, b: &LBlock) -> Result<(), Error> {
         let params: Vec<String> = (0..b.params.len()).map(|i| format!("%a{i}")).collect();
         let name = self.label_fn(label);
@@ -982,7 +1144,9 @@ impl<'p> Module<'p> {
         }
         self.stmt(&b.body, &mut env, &mut f)?;
         self.finish(f);
-        self.drain()
+        let drained = self.drain();
+        self.alive.clear();
+        drained
     }
 
     /// Write the methods queued while writing functions, and theirs.
@@ -1024,6 +1188,7 @@ impl<'p> Module<'p> {
                         id: inner.id,
                         captured: rebuild(&inner.captured, next),
                         method: inner.method.clone(),
+                        origin: inner.origin,
                     })),
                 })
                 .collect()
@@ -1186,15 +1351,17 @@ impl<'p> Module<'p> {
     }
 
     /// Queue `methods` as functions, and answer the method-table index of the
-    /// first.
-    fn methods_for(&mut self, methods: &[LBlock], ncap: usize) -> usize {
+    /// first. `key` is what the VM numbers them by: see [`Jit`].
+    fn methods_for(&mut self, methods: Vec<Block>, ncap: usize, key: usize) -> usize {
         let base = self.methods.len();
-        for m in methods {
+        let vm_base = self.jit.as_ref().and_then(|j| j.bases.get(&key)).copied();
+        for (i, m) in methods.into_iter().enumerate() {
             self.stem_methods += 1;
             let name = format!("@mw.M{}.{}", self.stem, self.stem_methods);
             self.next_method += 1;
             self.methods.push(name.clone());
-            self.pending.push((name, m.clone(), ncap));
+            self.jit_methods.push(vm_base.map(|b| b + i as u32));
+            self.pending.push((name, m, ncap));
         }
         base
     }
@@ -1652,14 +1819,25 @@ impl<'p> Module<'p> {
     /// added anywhere before it.
     fn build_closure(&self, f: &mut Fun, base: usize, vals: &[String], descs: &[D]) -> String {
         let l = self.layout;
-        let index = Self::method_index(&self.methods[base]);
-        let m = f.t();
-        f.push(Inst::Load {
-            dst: m.to_string(),
-            ty: Ty::I64,
-            ptr: index.to_string(),
-            volatile: false,
-        });
+        let m = match (&self.jit, self.jit_methods.get(base)) {
+            // For the JIT: the VM's number for the method, as it is.
+            (Some(_), Some(Some(id))) => id.to_string(),
+            (Some(_), _) => {
+                self.jit_unnumbered.set(true);
+                "0".to_string()
+            }
+            (None, _) => {
+                let index = Self::method_index(&self.methods[base]);
+                let m = f.t();
+                f.push(Inst::Load {
+                    dst: m.to_string(),
+                    ty: Ty::I64,
+                    ptr: index.to_string(),
+                    volatile: false,
+                });
+                m
+            }
+        };
         if vals.is_empty() {
             // A small value: `l.immediate(m)`, of an `m` read at run time.
             let s = f.t();
@@ -2026,7 +2204,7 @@ impl<'p> Module<'p> {
         let base = match self.frame_tables.get(&fr.id) {
             Some(b) => *b,
             None => {
-                let b = self.methods_for(std::slice::from_ref(&fr.method), ncap);
+                let b = self.methods_for(vec![fr.method.clone()], ncap, fr.origin);
                 self.frame_tables.insert(fr.id, b);
                 b
             }
@@ -2107,7 +2285,8 @@ impl<'p> Module<'p> {
                     None => None,
                 };
                 let data = self.layout.kinds.data;
-                let v = self.build_in(f, data, *tag as u64, &vals, &descs, token.as_deref());
+                let tag = self.tag(*tag as u64);
+                let v = self.build_in(f, data, tag, &vals, &descs, token.as_deref());
                 env.insert(*name, V::Val(v));
                 self.stmt(rest, env, f)
             }
@@ -2160,11 +2339,13 @@ impl<'p> Module<'p> {
                                 self.next_frame
                             },
                             captured,
-                            method: methods[0].clone(),
+                            method: Block::Borrowed(&methods[0]),
+                            origin: s as *const L as usize,
                         })),
                     );
                 } else {
-                    let base = self.methods_for(methods, captures.len());
+                    let blocks = methods.iter().map(|m| Block::Borrowed(m)).collect();
+                    let base = self.methods_for(blocks, captures.len(), s as *const L as usize);
                     let mut vals = Vec::with_capacity(captures.len());
                     let mut descs = Vec::with_capacity(captures.len());
                     for c in captures {
@@ -2395,6 +2576,7 @@ impl<'p> Module<'p> {
             id: fr.id,
             captured,
             method: fr.method.clone(),
+            origin: fr.origin,
         }
     }
 
@@ -2448,6 +2630,19 @@ impl<'p> Module<'p> {
             a: m.to_string(),
             b: tag.to_string(),
         });
+        if self.jit.is_some() {
+            // The VM's method numbers are by segment, not a flat table's.
+            let fp = f.t();
+            f.push(Inst::Call {
+                dst: Some(fp.clone()),
+                tail: false,
+                cc: None,
+                ret: Ty::Ptr,
+                callee: "@meadow_jit_method".into(),
+                args: vec![(Ty::I64, idx)],
+            });
+            return fp;
+        }
         let slot = f.t();
         f.push(Inst::Gep {
             dst: slot.to_string(),
@@ -2630,7 +2825,7 @@ impl<'p> Module<'p> {
         let mut seen = std::collections::HashSet::new();
         for (a, l) in arms.iter().zip(&labels) {
             if seen.insert(a.tag) {
-                cases.push((a.tag as i64, l.clone()));
+                cases.push((self.tag(a.tag as u64) as i64, l.clone()));
             }
         }
         f.push(Inst::Switch {
@@ -2651,8 +2846,8 @@ impl<'p> Module<'p> {
             match (a.keep, a.reuse) {
                 (true, _) => {}
                 (false, Some(t)) => {
-                    let token =
-                        self.release_reuse(f, &s, a.tag as u64, &a.fields, &loaded, &inner)?;
+                    let tag = self.tag(a.tag as u64);
+                    let token = self.release_reuse(f, &s, tag, &a.fields, &loaded, &inner)?;
                     inner.insert(t, V::Val(token));
                 }
                 (false, None) => self.release(f, &s, &a.fields, &loaded, &inner)?,
@@ -2757,7 +2952,10 @@ impl<'p> Module<'p> {
                 borrowed: Vec::new(),
                 body: body.clone(),
             };
-            let base = self.methods_for(std::slice::from_ref(&method), caps.len());
+            let key = body as *const L as usize;
+            let method = Rc::new(method);
+            self.alive.push(method.clone());
+            let base = self.methods_for(vec![Block::Owned(method)], caps.len(), key);
             let mut vals = Vec::with_capacity(caps.len());
             let mut descs = Vec::with_capacity(caps.len());
             for c in &caps {
@@ -2789,10 +2987,25 @@ impl<'p> Module<'p> {
         let v = match op {
             Extern::Lit(l) => self.literal(l, f)?,
             Extern::Prim(p) => {
-                let vals = args
+                let mut vals = args
                     .iter()
                     .map(|a| self.val(*a, env, f))
                     .collect::<Result<Vec<_>, _>>()?;
+                // A reload's caches are numbered after the loads before it.
+                if let Some(j) = &self.jit
+                    && j.global_base > 0
+                    && matches!(p, Prim::GlobalReady | Prim::GlobalGet | Prim::GlobalSet)
+                {
+                    let at = f.t();
+                    f.push(Inst::Bin {
+                        dst: at.clone(),
+                        op: BinOp::Add,
+                        ty: Ty::I64,
+                        a: vals[0].clone(),
+                        b: j.global_base.to_string(),
+                    });
+                    vals[0] = at;
+                }
                 let result = results.first().copied();
                 if let Some(r) = self.inline_prim(*p, args, &vals, result, env, f) {
                     let mut inner = env.clone();

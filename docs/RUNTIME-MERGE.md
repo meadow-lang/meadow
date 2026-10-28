@@ -1029,6 +1029,104 @@ loop: each makes an `Env`, and the helper, the driver and the compiled
 function's prologue each cost a few instructions the interpreter does not
 pay. That is what tier 2 is for: a call there is a native call.
 
+### The LIR (2026-10-27)
+
+R3's lower-level IR is `compiler/meadow-lir`. It is LLVM's instructions as far
+as Meadow's code uses them -- integer and floating arithmetic, compares,
+casts, loads and stores at offsets, calls and tail calls, branches,
+switches and phis -- on a few scalar types, with each operand written as
+LLVM writes it (`%t3`, a number, `@name`). A module is functions,
+declarations, globals with what they hold, and notes, which are what only
+LLVM reads (comments, branch weights).
+
+**How it was made without changing a byte.** The back end's functions were
+LLVM text, one `format!` per instruction. They became LIR in three steps,
+each checked against a snapshot of the IR of nine programs in four
+configurations (counted, traced, generational, Glade's layout: 432
+modules):
+1. **Raw lines.** Bodies held the instructions as raw lines of text, printed
+   as before.
+2. **Typed instructions.** A converter read each `format!`, matched its text
+   against the LIR's forms, and rewrote the call as the typed instruction:
+   246 of 253. The other seven were rewritten by hand: calls whose
+   arguments were a joined string, the `switch`, and the spill area's two
+   lines.
+3. **Modules.** The back end's product became LIR modules, which it prints.
+   The fixed parts -- the runtime's declarations, the helpers that share and
+   erase, the tables, the ways in -- are written as LLVM text, which is the
+   clearest way to write fixed code, and read back by `meadow_lir::parse`.
+
+The parser is the printer's inverse, and a test holds them to it: every one
+of the snapshot's 81,737 functions, and every module whole, reads back and
+prints as it was written.
+
+**What it is for.** The lowering is written once, for every back end that
+makes machine code (LIR-4): LLVM prints it, and the JIT's second tier
+compiles it.
+
+### Tier 2: the definition, as an executable has it (2026-10-27)
+
+**Design.** The second tier compiles what runs often the way an executable
+is compiled. A definition entered `MEADOW_JIT_TIER2` (10,000) times more
+than tier 1's threshold is lowered by the LLVM back end's own lowering,
+with its methods and frames, to the LIR, and Cranelift compiles that in the
+VM's process (`silo/vm/src/interp/tier2.rs`). Its code is an executable's:
+- frames are the native stack, a tail call is a tail call (Cranelift's
+  `tail` convention), and values are in registers;
+- what the layout and the strategy decide is what the LIR says;
+- the records a collection needs are an executable's, on the shadow chain.
+
+**What differs from an executable.** The lowering has a JIT mode
+(`meadow_llvm::emit::Jit`), which numbers what the VM numbers as the VM did
+when it loaded the program:
+- a closure's methods, by the address of the `new` that makes them, which
+  is how the VM keyed them;
+- tags, after a reload's renumbering;
+- interned names, and a reload's caches.
+
+So a closure compiled code builds is one the interpreter can call, and the
+other way. A method's function is asked of the VM (`@meadow_jit_method`),
+since the VM's method numbers are by segment.
+
+**Calls between the two.**
+- *A call by name* goes through a table by the definition's slot, which a
+  reload clears (JIT-4).
+- *A callee not compiled* is the VM's. A call that waits for its answer asks
+  the VM, which runs the callee on the native stack, as an interpreted call
+  does.
+- *A tail call cannot do that*, or a loop between compiled and interpreted
+  code would take stack at each turn. It leaves the call pending on its
+  thread and answers a sentinel, which travels back up the tail calls to
+  whoever waits: compiled code that called and waits, which asks the VM to
+  run what is pending, or the VM's loop, which runs it as its next
+  procedure.
+
+A real answer equal to the sentinel is told from it by nothing being
+pending.
+
+**Faults found on the way.**
+- *Dangling blocks.* The lowering wrote a method's block from a copy, so a
+  `new` inside one was at another address than the VM's. It now refers to
+  the program's blocks, and keeps the few of its own making -- a segment
+  primitive's packed code -- until the definition is done. Before that,
+  what was queued from inside one pointed into freed memory, which showed
+  as names out of nowhere and crashes.
+- *Frame pointers.* Cranelift's tail calls need them on x86-64.
+- *Addresses out of reach.* The JIT's memory can be further than a 32-bit
+  displacement from the executable's code, so addresses are loaded through
+  a table (`is_pic`), as cranelift-jit asks on x86-64.
+
+**Measured.** With the machine loaded by another build, best of five:
+
+| program | interpreted | tier 1 | tier 2 |
+|---|---|---|---|
+| fib | 357 ms | 427 ms | 61 ms |
+| matmul | 2,113 ms | 909 ms | 228 ms |
+| binarytrees | 9,762 ms | 8,080 ms | 932 ms |
+| rbtree | 60,448 ms | 46,561 ms | 4,810 ms |
+
+These are a whole process's times, its start and its compiling included.
+
 ### Replacing Glade in full (2026-10-24)
 
 The merged runtime is to be Glade's next release, so it has to do all that

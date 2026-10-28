@@ -20,6 +20,15 @@ meadow-rt = { path = "../../compiler/meadow-rt" }
 meadow-intern = { path = "../../compiler/meadow-intern" }
 # Executable memory for the JIT: see `src/interp/jit.rs`.
 meadow-exec = { path = "../../compiler/meadow-exec" }
+# The JIT's second tier: a definition lowered as for an executable, to the
+# LIR, and compiled by Cranelift (`src/interp/tier2.rs`).
+meadow-llvm = { path = "../../compiler/meadow-llvm" }
+meadow-lir = { path = "../../compiler/meadow-lir" }
+cranelift-codegen = "=0.136.2"
+cranelift-frontend = "=0.136.2"
+cranelift-jit = "=0.136.2"
+cranelift-module = "=0.136.2"
+cranelift-native = "=0.136.2"
 # Argument lists and frames' captures without a heap allocation each.
 smallvec = { version = "1.13", features = ["union"] }
 # The protocol a debugger drives the VM by: see `src/interp/debug.rs`.

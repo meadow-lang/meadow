@@ -47,6 +47,7 @@ mod jit;
 pub use jit::report_steps;
 mod live;
 pub mod profile;
+mod tier2;
 use code::{Code, Ins, WideI};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -754,6 +755,23 @@ struct Segment {
     methods: Vec<(u32, usize)>,
     /// What the JIT has compiled of it.
     jit: Box<jit::Table>,
+    /// What its code was compiled from, and how it was numbered: what the
+    /// JIT's second tier lowers a definition from again (`tier2`).
+    lowered: Lowered,
+}
+
+/// A load's linear program, and how loading numbered what is in it: each
+/// definition's block, by its place among the load's, and its slot; each
+/// `new`'s methods, by the address of the `new` (or of the stack-segment
+/// primitive's body whose code it packs); the constructors' tags, the
+/// interned names and the top-level values' caches.
+pub(super) struct Lowered {
+    pub(super) blocks: Vec<(Label, &'static LBlock)>,
+    pub(super) slots: HashMap<Label, u32>,
+    pub(super) bases: HashMap<usize, u32>,
+    pub(super) retag: Vec<u32>,
+    pub(super) syms: HashMap<InternedString, usize>,
+    pub(super) global_base: u32,
 }
 
 /// What loading keeps from one load to the next: how the program running
@@ -964,6 +982,7 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
                 .ok_or("an entry the program does not have")
         })
         .collect::<Result<Vec<u32>, _>>()?;
+    let c_threads = c.threads;
     let tracing = image.config.memory.traced();
     // Blocks that move: what the interpreter can follow, holding every
     // reference where the collector rewrites it (see `Vm::moving`).
@@ -1010,7 +1029,7 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
         debugging: DEBUGGING.load(Ordering::Relaxed) || profile::on(),
         growable,
         shadow: tracing || c.detaches,
-        jit: jit::Jit::from_env()?.map(Box::new),
+        jit: jit::Jit::from_env(c_threads)?.map(Box::new),
     };
     // Its records kept from the start: see `meadow_silo::coverage::recording`.
     if vm.debugging {
@@ -1097,6 +1116,10 @@ impl Vm {
         // The segment in place first: a slot is read by whatever calls it.
         for (slot, proc) in &c.defs {
             self.defs[*slot as usize].store(*proc, Ordering::Release);
+            // What compiled code calls by name is what the slot holds now.
+            if let Some(t2) = self.jit.as_ref().and_then(|j| j.tier2.as_ref()) {
+                t2.forget_slot(*slot);
+            }
         }
         state.segments = seg + 1;
         *held = state;
@@ -1276,11 +1299,24 @@ fn compile(
     if c.procs.len() > LOCAL as usize || c.methods.len() > LOCAL as usize {
         return Err("it has more procedures than a segment can hold".into());
     }
+    let lowered = Lowered {
+        blocks: blocks.iter().map(|(l, _, b)| (*l, *b)).collect(),
+        slots: slots.clone(),
+        bases: c
+            .news
+            .iter()
+            .map(|(k, (b, _))| (*k, *b))
+            .chain(c.codes.iter().map(|(k, (b, _))| (*k, *b)))
+            .collect(),
+        retag: c.retag.clone(),
+        syms: c.syms.clone(),
+        global_base: c.globals,
+    };
     state.syms = c.syms;
     state.globals += c.global_count;
     state.opaque_globals |= c.opaque_globals;
     let procs: Vec<Proc> = c.procs.into_iter().map(|p| p.expect("compiled")).collect();
-    let jit = Box::new(jit::Table::new(&procs, c.code.ins.len()));
+    let jit = Box::new(jit::Table::new(&procs, c.code.ins.len(), c.methods.len()));
     Ok(Compiled {
         segment: Segment {
             program,
@@ -1288,6 +1324,7 @@ fn compile(
             code: c.code,
             methods: c.methods,
             jit,
+            lowered,
         },
         slots,
         defs,

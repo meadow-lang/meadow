@@ -49,11 +49,13 @@ pub(super) struct Jit {
     /// How many times a procedure is entered before it is compiled.
     threshold: u32,
     arena: Mutex<meadow_exec::Arena>,
+    /// The second tier, unless `MEADOW_JIT_TIERS=1`: see `super::tier2`.
+    pub(super) tier2: Option<super::tier2::Tier2>,
 }
 
 impl Jit {
     /// The JIT `MEADOW_JIT` asks for, if this machine has one.
-    pub(super) fn from_env() -> Result<Option<Jit>, String> {
+    pub(super) fn from_env(threaded: bool) -> Result<Option<Jit>, String> {
         let on = std::env::var("MEADOW_JIT")
             .ok()
             .is_some_and(|v| !matches!(v.as_str(), "" | "0" | "false" | "no"));
@@ -70,9 +72,11 @@ impl Jit {
                 .map_err(|_| format!("MEADOW_JIT_THRESHOLD is `{n}`, not a number of entries"))?,
             Err(_) => 1000,
         };
+        let regs = meadow_llvm::CallConv::host().regs();
         Ok(Some(Jit {
             threshold,
             arena: Mutex::new(meadow_exec::Arena::default()),
+            tier2: super::tier2::Tier2::from_env(threaded, regs)?,
         }))
     }
 }
@@ -88,13 +92,15 @@ pub(super) struct Table {
     entered: Box<[AtomicU32]>,
     /// Where each procedure's instructions end.
     ends: Box<[u32]>,
+    /// What the second tier has compiled of the segment.
+    pub(super) tier2: super::tier2::SegTable,
 }
 
 /// A procedure that was not compiled, and will not be.
 const NEVER: *mut u8 = 1 as *mut u8;
 
 impl Table {
-    pub(super) fn new(procs: &[Proc], instructions: usize) -> Table {
+    pub(super) fn new(procs: &[Proc], instructions: usize, methods: usize) -> Table {
         let mut entries: Vec<u32> = procs.iter().map(|p| p.entry).collect();
         entries.sort_unstable();
         entries.dedup();
@@ -110,6 +116,7 @@ impl Table {
             body: procs.iter().map(|_| AtomicPtr::default()).collect(),
             entered: procs.iter().map(|_| AtomicU32::new(0)).collect(),
             ends,
+            tier2: super::tier2::SegTable::new(procs.len(), methods),
         }
     }
 }
@@ -163,6 +170,18 @@ impl Vm {
         loop {
             if meadow_silo::coverage::recording() {
                 return Jitted::Entry;
+            }
+            // A definition the second tier compiled: run as an executable's
+            // code is, until it answers or leaves a tail call to the VM.
+            if let Some((f, tramp)) = self.tier2(*p) {
+                match self.run_tier2(f, tramp, *p, env) {
+                    super::tier2::Ran::Done(w) => return Jitted::Done(w),
+                    super::tier2::Ran::Pending(pend) => {
+                        *p = self.enter_pending(pend, env);
+                        continue;
+                    }
+                    super::tier2::Ran::Not => {}
+                }
             }
             let Some(f) = self.native(*p, false) else {
                 return Jitted::Entry;

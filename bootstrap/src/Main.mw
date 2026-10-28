@@ -121,6 +121,12 @@ cli! {
           "On Silo's JIT, how many times a procedure is entered before it is compiled: 0 compiles each when it is first entered"
           value
           "N"
+      jitTiers
+        : Option
+          ("1" | "2")
+          "On Silo's JIT, how far it goes: its first tier alone, or the second too (the default)"
+          value
+          "TIERS"
       aot : Flag "`--backend aot`: Glade, compiled ahead of time into an executable" alias "native"
       cfg
         : Option
@@ -491,6 +497,7 @@ fun unheeded (b : CliBuild) : [String] =
     (b.noPrune, "--no-prune"),
     (M.isSome b.target, "--target"),
     (M.isSome b.jitThreshold, "--jit-threshold"),
+    (M.isSome b.jitTiers, "--jit-tiers"),
     (M.isSome b.nursery, "--nursery"),
     (M.isSome b.gc, "--gc"),
     (b.interpret, "--interpret"),

@@ -1131,6 +1131,14 @@ VM.
 - **JIT-3.** Tier 2 is an optimizing compiler from the lower-level IR (R3),
   in process (LLVM's ORC, or Cranelift; §19). `--jit-tiers 1|2` chooses
   how far to go.
+  - *Status:* done, with Cranelift (`silo/vm/src/interp/tier2.rs`). A
+    definition entered `MEADOW_JIT_TIER2` times more (10,000 by default)
+    is lowered as an executable's are, by the LLVM back end's lowering in
+    its JIT mode, and compiled. A call between compiled and interpreted
+    code goes through the VM, and a tail call into the VM is left pending
+    and run by whoever waits, so neither direction takes stack in a loop.
+    `--jit-tiers 1` keeps to the first tier. `MEADOW_JIT2_LIMIT` and
+    `MEADOW_JIT2_SKIP` choose what it compiles, for finding a fault.
 - **JIT-4.** A compiled procedure keeps the VM's frames, records, line table
   and slots. Calls by name go through slots (HOT-2), so a reload replaces
   compiled code as it replaces interpreted code.
@@ -1203,7 +1211,12 @@ VM.
     prints as it was written (`meadow-lir`'s test, given
     `MEADOW_LIR_CORPUS`).
 - **LIR-3.** The JIT's tier 2 reads the LIR.
+  - *Status:* done: tier 2 compiles the LIR functions the lowering makes of
+    a definition, and the helpers the module has, as LLVM would print them.
 - **LIR-4.** A layout is lowered once, in the LIR, for every back end.
+  - *Status:* done: one lowering, `meadow_llvm::emit`, writes the LIR both
+    machine-code back ends read, and the layout's arithmetic is in it. The
+    VM and tier 1 read the layout from `meadow_rt::layout` as before.
 
 ### R4. Cheaper heap frames
 
