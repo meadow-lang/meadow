@@ -18,7 +18,7 @@
 //!
 //! | condition | holds when |
 //! |---|---|
-//! | `os = "windows"` / `"linux"` / `"macos"` | the program is built for that system |
+//! | `os = "windows"` / `"linux"` / `"macos"` / `"android"` / `"ios"` | the program is built for that system |
 //! | `arch = "x86_64"` / `"aarch64"` | … that processor |
 //! | `family = "unix"` / `"windows"`, or bare `unix` / `windows` | … that family of systems |
 //! | `profile = "debug"` / `"release"`, or bare `debug` / `release` | the build profile |
@@ -126,7 +126,10 @@ pub fn holds(condition: &ast::Meta, opts: &Options) -> Result<bool, (String, Spa
         }),
         ast::Meta::Value(key, value) => {
             let (actual, allowed): (String, &[&str]) = match &**key.value() {
-                "os" => (cfg.os.to_string(), &["windows", "linux", "macos"]),
+                "os" => (
+                    cfg.os.to_string(),
+                    &["windows", "linux", "macos", "android", "ios"],
+                ),
                 "arch" => (cfg.arch.to_string(), &["x86_64", "aarch64"]),
                 "family" => (cfg.family().to_string(), &["unix", "windows"]),
                 "profile" => (cfg.profile.to_string(), &["debug", "release"]),

@@ -240,8 +240,9 @@ would. Mixing two of them is a type error rather than a silent conversion:
 `toInt 1 + toInt32 1` does not compile. Say which one you mean with a
 conversion (below).
 
-Floating point keeps its own operators, `+. -. *. /.` and `<. >. <=. >=.`, which
-work on `Float` and `Float32`. A float literal nothing settles is a `Float`.
+The floats, `Float` and `Float32`, have the same operators: `+ - * /` and
+`< > <= >=`. A float literal nothing settles is a `Float`, and an integer
+literal is never a float -- write `2.0`, not `2`, beside one.
 
 A function written with the operators works on any integer type. Its type says
 so with a variable named `n`, which stands for "some integer type":
@@ -280,7 +281,7 @@ use Suit.*
 @derive(Debug, PartialEq, Eq, PartialOrd, Ord)
 data Suit = Clubs | Diamonds | Hearts | Spades
 
-def nan = 0.0 /. 0.0
+def nan = 0.0 / 0.0
 
 fun main () =
   let _ = println ([1, 2] == [1, 2], Just 1 != None, "b" > "a") in
@@ -1467,16 +1468,15 @@ Every infix operator is a function with a name made of symbols. `a + b` is
 
 `Std.Ops` defines the language's operators as the methods of traits:
 
-| Trait      | Methods                         | Implemented for    |
-| ---------- | ------------------------------- | ------------------ |
-| `Add`      | `+`                             | every integer type |
-| `Sub`      | `-`                             | every integer type |
-| `Mul`      | `*`                             | every integer type |
-| `Div`      | `/`                             | every integer type |
-| `Rem`      | `%`                             | every integer type |
-| `Pow`      | `^`                             | every integer type |
-| `Shift`    | `<<` `>>` `>>>`                 | every integer type |
-| `Floating` | `+.` `-.` `*.` `/.` `<.` `>.` … | `Float`, `Float32` |
+| Trait   | Methods         | Implemented for                         |
+| ------- | --------------- | --------------------------------------- |
+| `Add`   | `+`             | every integer type, `Float`, `Float32`  |
+| `Sub`   | `-`             | every integer type, `Float`, `Float32`  |
+| `Mul`   | `*`             | every integer type, `Float`, `Float32`  |
+| `Div`   | `/`             | every integer type, `Float`, `Float32`  |
+| `Rem`   | `%`             | every integer type                      |
+| `Pow`   | `^`             | every integer type                      |
+| `Shift` | `<<` `>>` `>>>` | every integer type                      |
 
 `==`, `!=`, `<`, `>`, `<=` and `>=` are `Std.Cmp`'s: the methods of
 `PartialEq` and `PartialOrd` (see [equality and ordering](#one-set-of-operators-for-every-integer-type)).
@@ -4352,10 +4352,10 @@ A file whose brackets do not match is only indented.
 | `\|>`                                                   |            | pipe                             |
 | `or`                                                    |            | short-circuit                    |
 | `and`                                                   |            | short-circuit                    |
-| `==` `!=` `<` `>` `<=` `>=` (and `<.` `>.` `<=.` `>=.`) | `infix 4`  | comparison; do not group         |
+| `==` `!=` `<` `>` `<=` `>=`                             | `infix 4`  | comparison; do not group         |
 | `::` `++`                                               | `infixr 5` | cons, string concatenation       |
-| `+` `-` (and `+.` `-.`), `<<` `>>` `>>>`                | `infixl 6` |                                  |
-| `*` `/` `%` (and `*.` `/.`)                             | `infixl 7` |                                  |
+| `+` `-`, `<<` `>>` `>>>`                                | `infixl 6` |                                  |
+| `*` `/` `%`                                             | `infixl 7` |                                  |
 | `^`                                                     | `infixr 8` | power                            |
 | an operator nothing declares                            | `infixl 9` |                                  |
 | `-` (prefix)                                            |            | negation, tighter than any infix |
@@ -4386,7 +4386,7 @@ Without any `use`, from the prelude:
   `fromArray` `fromList`
 
 Also always available: the operators and their traits (`Std.Ops`: `Add`,
-`Sub`, `Mul`, `Div`, `Rem`, `Pow`, `Shift`, `Floating`; `Std.Cmp`:
+`Sub`, `Mul`, `Div`, `Rem`, `Pow`, `Shift`; `Std.Cmp`:
 `PartialEq`, `Eq`, `PartialOrd`, `Ord`, with `compare` and `partialCmp`;
 `Std.Display` and `Std.Debug`); `++`
 (`Std.String.concat`); `print` and `println`; `runSt`; the effect alias `Eff`; the primitives (`show`, `display`, `hash`,
@@ -4411,8 +4411,8 @@ a worked example.
   annotate a result that must be exact past 2^63 as `BigInt`.
 - A byte is a `UInt8`, and so is arithmetic on it: `toInt (b - 48)` before
   accumulating digits.
-- `+` is for integers and `+.` for floats; two different integer types never mix
-  without a conversion.
+- `+` is for integers and floats alike, but two number types never mix
+  without a conversion: `toFloat n + 0.5`, and `2.0`, not `2`, beside a float.
 - `[1..5]` is **half-open**, as `range 1 5` is; `[1..=5]` includes the 5.
 - `@pub` is public, as in Rust; `@pub(pkg)` stops at the package, like `pub(crate)`.
 - A package that marks nothing has no visibility rules at all — mark one thing

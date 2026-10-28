@@ -46,8 +46,8 @@ tree = "1e40cb862351b783230e90e3e51eae44c3f197a3"
 [[package]]
 name = "Nettle"
 source = "git+https://github.com/meadow-lang/Nettle.git?branch=master"
-rev = "dc1757850d72971e3ab077e1eb977645e18b15d8"
-tree = "90350e8de9be9b476a1d2c4734aed3dfb85deb60"
+rev = "2f177b10b6d518d7a3d8321e06e582231475cd93"
+tree = "61a768b4a661370c036d9e4a0b2060827efa7d62"
 
 [[package]]
 name = "Pretty"

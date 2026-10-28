@@ -182,18 +182,38 @@ impl Lowered {
     }
 }
 
+/// What a program to run is lowered from: `p` copied for the
+/// representations its generic definitions are called at -- see
+/// [`crate::specialize`] -- and its small definitions inlined -- see
+/// [`crate::inline`]. `MEADOW_CUT_GENERIC=1` leaves them generic, and
+/// `MEADOW_CUT_INLINE=0` leaves the calls, to measure each by.
+pub fn optimized(p: &Program) -> Program {
+    let copied = if std::env::var_os("MEADOW_CUT_GENERIC").is_none() {
+        crate::specialize::program(p)
+    } else {
+        p.clone()
+    };
+    if std::env::var("MEADOW_CUT_INLINE").as_deref() == Ok("0") {
+        copied
+    } else {
+        crate::inline::program(&copied)
+    }
+}
+
 fn lowered(p: &Program, prints: bool) -> R<Lowered> {
-    // A program to run is first copied for the representations its generic
-    // definitions are called at -- see [`crate::specialize`].
-    // `MEADOW_CUT_GENERIC=1` leaves them generic, to measure the copies by.
+    // As written, and once inlined, which brings objects into sight of the
+    // calls of their methods: see `crate::any`.
+    crate::any::check(p)?;
     let copied;
-    let p = if prints && std::env::var_os("MEADOW_CUT_GENERIC").is_none() {
-        copied = crate::specialize::program(p);
+    let p = if prints {
+        copied = optimized(p);
+        crate::any::check(&copied)?;
         &copied
     } else {
         p
     };
-    let lazy = lazily(p);
+    let mut lazy = lazily(p);
+    started(p, &mut lazy);
     let whole = p;
     let p = &lazy;
     let mut l = Lower {
@@ -2409,6 +2429,59 @@ fn lazily(p: &Program) -> Program {
         });
     }
     out
+}
+
+/// `lazy`, with an entry that first makes each value that might perform, in
+/// the order `whole` writes them, and then runs the entry: a value's effects
+/// happen when the program starts, once (`docs/CUT.md`). The rest are made
+/// when they are first read, which a program cannot tell from their being
+/// made at the start -- and so one that is never read is never made.
+fn started(whole: &Program, lazy: &mut Program) {
+    let Some(entry) = lazy.entry.clone() else {
+        return;
+    };
+    let pure = crate::pure::defs(lazy);
+    let performing: Vec<(Symbol, Rep)> = whole
+        .vals
+        .iter()
+        .filter(|v| {
+            let made = forcing(&v.symbol);
+            lazy.defs
+                .iter()
+                .position(|d| d.symbol == made)
+                .is_some_and(|i| !pure.contains(&i))
+        })
+        .map(|v| (v.symbol.clone(), v.rep.clone()))
+        .collect();
+    if performing.is_empty() {
+        return;
+    }
+    let mut body = Statement::Call(
+        entry.clone(),
+        Vec::new(),
+        vec![Consumer::Var("#k".to_string())],
+    );
+    for (symbol, rep) in performing.into_iter().rev() {
+        let made = Binder {
+            name: "#made".to_string(),
+            rep,
+        };
+        body = Statement::Call(
+            forcing(&symbol),
+            Vec::new(),
+            vec![Consumer::MuTilde(made, Box::new(body))],
+        );
+    }
+    let symbol = entry.child("#values");
+    lazy.defs.push(Def {
+        symbol: symbol.clone(),
+        rep_vars: Vec::new(),
+        effect_vars: Vec::new(),
+        params: Vec::new(),
+        conts: vec!["#k".to_string()],
+        body,
+    });
+    lazy.entry = Some(symbol);
 }
 
 /// `s` with `halt` the continuation `#halt`.

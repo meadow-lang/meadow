@@ -511,6 +511,52 @@ fn a_program_with_no_vector_gets_its_arguments_as_an_array() {
     }
 }
 
+/// A val that performs does so when the program starts, in the order the
+/// program writes it, and once -- read or not: `docs/CUT.md`. Found by
+/// Idyll's session, whose top-level `let`s that print or set things are vals.
+#[test]
+fn a_val_that_performs_does_so_at_the_start_whether_or_not_it_is_read() {
+    let dir = scratch("cut-val-effects");
+    std::fs::write(
+        dir.join("val.cut"),
+        "cut 0\nentry t:Main/main\nanswer none\n\n\
+         native {\n  t:Main/C.out = Console.writeOutput\n}\n\n\
+         effect t:Main/C { out(str) -> unit }\n\n\
+         val t:Main/unread : unit =\n  perform t:Main/C.out(\"first\\n\"; halt)\n\n\
+         val t:Main/read : unit =\n  perform t:Main/C.out(\"second\\n\"; halt)\n\n\
+         def t:Main/main (; k: ptr) =\n  <t:Main/read | μ̃ a: unit.\n    \
+         <t:Main/read | μ̃ b: unit. perform t:Main/C.out(\"entry\\n\"; k)>>\n",
+    )
+    .unwrap();
+    for runtime in [&[][..], &["--runtime", "silo"]] {
+        let mut args = vec!["cut", "val.cut"];
+        args.extend_from_slice(runtime);
+        let (ok, out, err) = meadow(&dir, &args);
+        assert!(ok, "{runtime:?}: {err}");
+        assert_eq!(out, "first\nsecond\nentry\n", "{runtime:?}");
+    }
+}
+
+/// `meadow cut --emit` prints what a program is made into -- its AxCut, or
+/// the LLVM IR a Silo build compiles -- and runs nothing: what a front end's
+/// tools show of the back end's lowering.
+#[test]
+fn a_program_of_cut_is_printed_as_axcut_and_as_llvm() {
+    let dir = scratch("cut-emit");
+    std::fs::write(dir.join("count.cut"), CUT).unwrap();
+    let (ok, out, err) = meadow(&dir, &["cut", "count.cut", "--emit", "axcut"]);
+    assert!(ok, "{err}");
+    assert!(out.contains("-- t:Main/count"), "{out}");
+    assert!(!out.contains("counting\n200002"), "nothing ran: {out}");
+    let (ok, out, err) = meadow(&dir, &["cut", "count.cut", "--emit", "llvm"]);
+    assert!(ok, "{err}");
+    assert!(out.contains("define "), "{out}");
+    assert!(!out.contains("counting\n200002"), "nothing ran: {out}");
+    let (ok, _, err) = meadow(&dir, &["cut", "count.cut", "--emit", "bytes"]);
+    assert!(!ok);
+    assert!(err.contains("`axcut` or `llvm`"), "{err}");
+}
+
 #[test]
 fn a_program_of_cut_runs_on_the_vm_and_as_an_executable() {
     let dir = scratch("cut");
@@ -895,8 +941,8 @@ fn the_jit_runs_what_the_vm_runs() {
          fun main () =\n  \
            let total = runSt (\\() ->\n    \
              let a = St.newArray 100 0.5 in\n    \
-             let _ = St.forRange 0 100 (\\i -> St.set a i (toFloat i *. 2.0)) in\n    \
-             let rec sum i acc = if i >= 100 then acc else sum (i + 1) (acc +. St.get a i) in\n    \
+             let _ = St.forRange 0 100 (\\i -> St.set a i (toFloat i * 2.0)) in\n    \
+             let rec sum i acc = if i >= 100 then acc else sum (i + 1) (acc + St.get a i) in\n    \
              sum 0 0.0) in\n  \
            println (show (fib 20) ++ \" \" ++ show total)\n",
     )

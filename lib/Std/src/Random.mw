@@ -60,7 +60,7 @@ fun mix z0 =
 -- In [0, 1), from the top 53 bits -- the ones a `Float` can hold exactly.
 @pub fun stepFloat (s : Int) : (Float, Int) =
   match step s with
-  | (v, s2) -> (toFloat (v >>> 11) /. 9007199254740992.0, s2)
+  | (v, s2) -> (toFloat (v >>> 11) / 9007199254740992.0, s2)
 
 -- `v mod m`, always in [0, m). `%` follows the sign of the dividend, and the
 -- generator produces negative values half the time.
@@ -163,7 +163,7 @@ use Std.Maybe.Maybe.*
   assertEq (withSeed 1 (\u2 -> between 5 1)) 5 "inverted"
 
 @test fun nextFloatIsInTheUnitInterval () =
-  assertTrue (withSeed 9 (\u2 -> let x = nextFloat () in x >=. 0.0 and x <. 1.0)) "[0, 1)"
+  assertTrue (withSeed 9 (\u2 -> let x = nextFloat () in x >= 0.0 and x < 1.0)) "[0, 1)"
 
 @test fun thePureGeneratorThreadsItsState () =
   -- `step` is the interface `withSeed` is built on; the state must move.

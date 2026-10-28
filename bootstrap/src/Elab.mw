@@ -295,10 +295,10 @@ fun fraction (text : String) : Float =
   let parts = S.split "." text in
   if V.len parts == 2 then
     (let part = V.getOr "" parts 1 in
-     toFloat (M.unwrapOr 0 (S.toInt (V.getOr "" parts 0 ++ part))) /. tenTo (stringByteLength part))
+     toFloat (M.unwrapOr 0 (S.toInt (V.getOr "" parts 0 ++ part))) / tenTo (stringByteLength part))
   else toFloat (M.unwrapOr 0 (S.toInt text))
 
-fun tenTo (k : Int) : Float = if k <= 0 then 1.0 else 10.0 *. tenTo (k - 1)
+fun tenTo (k : Int) : Float = if k <= 0 then 1.0 else 10.0 * tenTo (k - 1)
 
 -- The width a sized integer type's name says, as core writes it.
 fun widthOf (name : String) : Maybe String =

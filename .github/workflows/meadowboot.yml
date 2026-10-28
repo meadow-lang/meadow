@@ -2,7 +2,10 @@
 # platform it runs on, and attach an archive of it to the release of the tag
 # pushed. Each archive holds MeadowBoot, the `meadow` it hands the back end to
 # (built from the same commit), and the standard library's sources, which it
-# compiles: MeadowBoot finds the other two beside itself.
+# compiles: MeadowBoot finds the other two beside itself. It holds too Silo's
+# runtime for each phone its system builds for, in `lib/<triple>/`, where that
+# `meadow` looks for a target's: Android's on every desktop, and iOS's on a
+# Mac. A build for one needs only the NDK, or Xcode, beside the archive.
 #
 # Cut one by pushing a tag, which is pushed once and does not move:
 #
@@ -39,10 +42,13 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            phones: aarch64-linux-android x86_64-linux-android
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            phones: aarch64-linux-android x86_64-linux-android
           - target: aarch64-apple-darwin
             os: macos-latest
+            phones: aarch64-apple-ios aarch64-apple-ios-sim aarch64-linux-android x86_64-linux-android
           # Built natively on the platforms' own runners, and experimental
           # until each has been seen to work: Silo on ARM has been run under
           # emulation only, and the Intel macOS runner is the last of its kind.
@@ -110,6 +116,25 @@ jobs:
           if [ "$RUNNER_OS" != "Windows" ]; then strip "$dir/MeadowBoot" "$dir/meadow"; fi
           echo "BUNDLE=$dir" >> "$GITHUB_ENV"
 
+      # Silo's runtime for each phone, built from this commit as the `meadow`
+      # beside it is -- the two agree on a fingerprint of the sources -- with
+      # the NDK the runner carries, or Xcode.
+      #
+      # On Windows this has not been seen to work, and an archive without
+      # them is better than none.
+      - name: Phone runtimes
+        if: matrix.phones != ''
+        continue-on-error: ${{ runner.os == 'Windows' }}
+        shell: bash
+        run: |
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          for t in ${{ matrix.phones }}; do
+            lib=$(bash scripts/glade-runtime.sh "$t" | tail -n 1)
+            mkdir -p "$BUNDLE/lib/$t"
+            cp "$lib" "$BUNDLE/lib/$t/"
+          done
+          ls -R "$BUNDLE/lib" | grep -v '\.mw$' | head -40
+
       # The bundle on its own, told nothing: a program runs, and a package
       # that exports to C builds to a library named for it.
       - name: Smoke test
@@ -128,6 +153,15 @@ jobs:
           env -u MEADOW -u MEADOWBOOT_STD "$mb" run Hello | tail -1 | grep -qx '141'
           env -u MEADOW -u MEADOWBOOT_STD "$mb" build Lib
           ls Lib/target/debug/native/glade/ | grep -E '^(Lib\.dll|libLib\.so|libLib\.dylib)$'
+          # And for a phone, from the runtimes the bundle carries: Android's
+          # with the NDK, iOS's with Xcode. Run, they are the `android` and
+          # `ios` workflows'; here, that the archive can make them.
+          [ "$RUNNER_OS" = "Windows" ] && exit 0
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          for t in ${{ matrix.phones }}; do
+            env -u MEADOW -u MEADOWBOOT_STD "$mb" build --release --target "$t" Lib
+            ls "Lib/target/release/native/$t/glade/"
+          done
 
       # A zip whose paths use forward slashes, which every unzip reads:
       # 7-Zip's.

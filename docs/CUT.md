@@ -52,6 +52,12 @@ the VM, or, with `--aot`, built as an executable and run. The lowering
 takes everything here but a `μ` where a value is wanted other than as a
 definition's argument, and refuses a program with one, saying so.
 
+`meadow cut FILE --emit axcut` prints what the program is lowered to, and
+`--emit llvm` the LLVM IR a Silo build of it compiles, each unit after the
+first under a `; ---- unit NAME ----` line; neither runs it. They are for a
+front end's tools to show the back end's lowering beside its own, as a REPL's
+viewer does. Like AxCut's text form, what they print is not a contract.
+
 ## Representations
 
 A value's _representation_ is what a register holding it contains: how many
@@ -193,7 +199,9 @@ gives its value to the continuation `halt`, and what it gives is the value.
 Vals are computed in the order the program lists them. A front end lists them
 so that every val comes after the vals it reads, across packages as OCaml
 initialises modules. A val may perform effects, and they happen then, once. A
-use of a val reads the value. It does not compute it again.
+use of a val reads the value. It does not compute it again. A val that cannot
+perform may be computed instead when it is first read, which a program cannot
+tell apart, and a val nothing reads may not be computed at all.
 
 A `def` is a statement with parameters and runs each time it is called. A
 top-level value is a `val`, never a `def` without parameters.

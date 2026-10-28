@@ -1,0 +1,108 @@
+name: android
+
+# Meadow for Android, built on Linux and run on an emulator: a program built
+# with `meadow build --runtime silo --target x86_64-linux-android`, and a
+# library of `@export`s built with MeadowBoot's `build --target`, loaded by a
+# C program as an app would load it. What a phone runs is aarch64; the
+# emulator is x86-64, which a runner can run at speed, and the two builds
+# differ only in the triple.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "buildtools/meadow/src/aot.rs"
+      - "buildtools/meadow/src/cut.rs"
+      - "bootstrap/src/Main.mw"
+      - "glade/**"
+      - "compiler/meadow-llvm/**"
+      - "compiler/meadow-rt/**"
+      - "scripts/glade-runtime.sh"
+      - ".github/workflows/android.yml"
+
+jobs:
+  emulator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      # The emulator wants KVM, which the runner has but does not open to
+      # the user the steps run as.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install Rust
+        run: rustup update stable
+
+      - name: Build meadow
+        working-directory: buildtools
+        run: cargo build --release -p meadow
+
+      # The runner image carries an NDK; `ANDROID_NDK_LATEST_HOME` is where.
+      - name: Build Silo's runtime for Android
+        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" scripts/glade-runtime.sh x86_64-linux-android
+
+      - name: Build MeadowBoot
+        run: buildtools/target/release/meadow build --release bootstrap
+
+      - name: Build a program, a library and its host for Android
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          meadow="$PWD/buildtools/target/release/meadow"
+          t=x86_64-linux-android
+          mkdir -p "$RUNNER_TEMP/Hello/src" "$RUNNER_TEMP/Lib/src" out
+          printf '[package]\nname = "Hello"\nversion = "0.1.0"\n' > "$RUNNER_TEMP/Hello/Meadow.toml"
+          cat > "$RUNNER_TEMP/Hello/src/Main.mw" <<'EOF'
+          use Std.Collections.Vector as V
+          fun main () = println "hello from Meadow on Android, ${show (V.len (V.range 0 3))} things"
+          EOF
+          printf '[package]\nname = "Lib"\nversion = "0.1.0"\n' > "$RUNNER_TEMP/Lib/Meadow.toml"
+          cat > "$RUNNER_TEMP/Lib/src/Main.mw" <<'EOF'
+          @export
+          fun twice (x : Int32) : Int32 = x * 2
+
+          @export
+          fun add (a : Int) (b : Int) : Int = a + b
+          EOF
+          cat > "$RUNNER_TEMP/host.c" <<'EOF'
+          #include <dlfcn.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          int main(int argc, char **argv) {
+            void *h = dlopen(argv[1], RTLD_NOW);
+            if (!h) { printf("dlopen: %s\n", dlerror()); return 1; }
+            int32_t (*twice)(int32_t) = dlsym(h, "twice");
+            int64_t (*add)(int64_t, int64_t) = dlsym(h, "add");
+            if (!twice || !add) { printf("an export is missing\n"); return 1; }
+            printf("twice 21 = %d, add 40 2 = %lld\n", twice(21), (long long)add(40, 2));
+            return twice(21) == 42 && add(40, 2) == 42 ? 0 : 1;
+          }
+          EOF
+          "$meadow" build --release --runtime silo --target $t "$RUNNER_TEMP/Hello"
+          cp "$RUNNER_TEMP/Hello/target/release/native/$t/glade/Hello" out/
+          MEADOWBOOT_STD="$PWD/lib/Std" MEADOW="$meadow" \
+            bootstrap/target/release/native/glade/MeadowBoot build --release --target $t "$RUNNER_TEMP/Lib"
+          cp "$RUNNER_TEMP/Lib/target/release/native/$t/glade/libLib.so" out/
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" \
+            --target=${t}24 "$RUNNER_TEMP/host.c" -o out/host -ldl
+          file out/*
+
+      - name: Run them on an emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: default
+          disable-animations: true
+          script: |
+            adb push out /data/local/tmp/meadow
+            adb shell chmod 755 /data/local/tmp/meadow/Hello /data/local/tmp/meadow/host
+            adb shell /data/local/tmp/meadow/Hello | tee hello.txt
+            adb shell "cd /data/local/tmp/meadow && ./host ./libLib.so" | tee host.txt
+            grep -q "hello from Meadow on Android, 3 things" hello.txt
+            grep -q "twice 21 = 42, add 40 2 = 42" host.txt

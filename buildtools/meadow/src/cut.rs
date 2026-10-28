@@ -25,6 +25,50 @@ pub fn lowered(path: &Path) -> Result<meadow_seq::Program, String> {
     Ok(lowered)
 }
 
+/// What `meadow cut --emit` prints of the program at `path`: `inlined`, the
+/// Cut it is lowered from once its small definitions are inlined
+/// (`meadow_cut::inline`); `axcut`, each definition it is lowered to, under
+/// a line naming it; or `llvm`, the LLVM IR an executable of it for this
+/// machine is compiled from -- each unit, after the first, under a line naming it. A
+/// view of the back end's, for a front end's tools to show: its form is not
+/// a contract (`docs/CUT.md`).
+pub fn emitted(path: &Path, what: &str) -> Result<String, String> {
+    use std::fmt::Write;
+    let mut out = String::new();
+    match what {
+        "inlined" => {
+            let text =
+                std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let program =
+                meadow_cut::parse(&text).map_err(|e| format!("{}:{e}", path.display()))?;
+            out = meadow_cut::print::program(&meadow_cut::lower::optimized(&program));
+        }
+        "axcut" => {
+            for d in &lowered(path)?.defs {
+                let _ = writeln!(out, "-- {} (L{})\n{}", d.name, d.label.0, d.block);
+            }
+        }
+        "llvm" => {
+            let program = lowered(path)?;
+            let conv = aot::Target::host()?.call_conv();
+            let units = meadow_llvm::compile_split(&program, meadow_llvm::UNIT, conv)
+                .map_err(|e| format!("{}: {}", path.display(), e.msg))?;
+            for (i, u) in units.iter().enumerate() {
+                if i > 0 {
+                    let _ = writeln!(out, "\n; ---- unit {} ----\n", u.name);
+                }
+                out.push_str(&u.text);
+            }
+        }
+        other => {
+            return Err(format!(
+                "`{other}` is not what `meadow cut --emit` prints: `inlined`, `axcut` or `llvm`"
+            ));
+        }
+    }
+    Ok(out)
+}
+
 /// The program's image, for the merged runtime's VM, kept beside the file,
 /// under `target`, for the next run of the same text by the same `meadow`:
 /// where it is.
@@ -90,6 +134,11 @@ fn image_key(path: &Path) -> Option<(PathBuf, String, u64)> {
     exe.len().hash(&mut h);
     exe.modified().ok()?.hash(&mut h);
     [aot::gc() as u8, aot::stack() as u8, aot::layout() as u8].hash(&mut h);
+    // What changes how a program of Cut is lowered: an image made one way is
+    // not what a run asking for the other wants.
+    for knob in ["MEADOW_CUT_INLINE", "MEADOW_CUT_GENERIC"] {
+        std::env::var(knob).ok().hash(&mut h);
+    }
     let root = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -121,8 +170,13 @@ pub fn run_on_vm(path: &Path, args: &[String]) -> Result<i32, String> {
 }
 
 /// Build it ahead of time -- LLVM's code, linked with the runtime library --
-/// beside the file, under `target`, and answer where the executable is.
-pub fn build_native(path: &Path, opt: meadow_compiler::OptLevel) -> Result<PathBuf, String> {
+/// beside the file, under `target`, and answer where the executable is: for
+/// `on`, or this machine.
+pub fn build_native(
+    path: &Path,
+    opt: meadow_compiler::OptLevel,
+    on: Option<aot::Target>,
+) -> Result<PathBuf, String> {
     let root = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -131,7 +185,10 @@ pub fn build_native(path: &Path, opt: meadow_compiler::OptLevel) -> Result<PathB
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or("a file with a name")?;
-    let target = aot::Target::host()?;
+    let target = match on {
+        Some(t) => t,
+        None => aot::Target::host()?,
+    };
     aot::build_native_of(root, Profile::Release, opt, name, target, None, || {
         lowered(path)
     })

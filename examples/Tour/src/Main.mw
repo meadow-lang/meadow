@@ -68,9 +68,7 @@ fun main () =
   let _ = println ("factorial 30 as an Int, wrapping: " ++ show (factorial 30)) in
   let _ = println ("factorial 30 as a BigInt, exact: " ++ show (factorial (toBigInt 30))) in
   let _ = println ("200 + 100 as a UInt8: " ++ show (toUInt8 200 + 100)) in
-  let _ =
-    println ("a third as a Float32 and a Float: " ++ show (toFloat32 1.0 /. 3.0, 1.0 /. 3.0))
-  in
+  let _ = println ("a third as a Float32 and a Float: " ++ show (toFloat32 1.0 / 3.0, 1.0 / 3.0)) in
 
   let _ = println "== local mutation" in
   let _ = println ("primes below 50: " ++ show (primesBelow 50)) in
@@ -89,7 +87,7 @@ use Std.Test (assertEq, assertTrue)
 
 @test fun areasAreRight () =
   let _ = assertEq (area (Rect 2.0 3.0)) 6.0 "a rectangle" in
-  assertTrue (area (Triangle 3.0 4.0 5.0) -. 6.0 <. 0.000001) "a 3-4-5 triangle has area 6"
+  assertTrue (area (Triangle 3.0 4.0 5.0) - 6.0 < 0.000001) "a 3-4-5 triangle has area 6"
 
 @test fun factorialIsGenericOverItsNumberType () =
   let _ =

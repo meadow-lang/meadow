@@ -12,7 +12,7 @@
 -- "text"`, and inline tables of those, `Name = { path = "../x" }`.
 
 use Std.Fs (Fs, readToString, readDir, isDir, exists)
-use Std.Process (Process, getEnv, currentExe)
+use Std.Process (Process, getEnv, setEnv, currentExe)
 use Std.Path as Path
 use Std.Collections.Vector as V
 use Std.String as S
@@ -108,6 +108,9 @@ fun under (dir : String) : [String] ! { Fs | e } =
 -- unit at `root`: its dependencies, then the standard library.
 @pub fun dependenciesOf (root : String) (dir : String) (text : String)
     : Result String [String] ! { Fs, Process | e } =
+  -- A root with a lock says so to the builds this one starts, of the programs
+  -- that serve its dependencies' macros, so that they pin what it pins.
+  let said = (if M.isSome (lockOf root) then setEnv ("MEADOWBOOT_LOCK", root) else ()) in
   let manifest = readToml text in
   let std = stdDir () in
   let named = V.filter (\(e : Entry) -> e.section == "dependencies") manifest in
@@ -157,24 +160,35 @@ fun locate (root : String) (dir : String) (e : Entry) : Result String String ! {
        | None -> Err "`${e.key}` is not in `Meadow.lock`: run `meadow build` once to fetch it")
   | _ -> Err "`${e.key}` is neither a `path` nor a `git` dependency"
 
--- The commit `Meadow.lock` pins package `name` at: the root's, or the unit's.
-fun pinned (root : String) (dir : String) (name : String) : Maybe String ! { Fs | e } =
+-- The `Meadow.lock` of the unit at `dir`, where it has one.
+fun lockOf (dir : String) : Maybe String ! { Fs | e } =
+  -- Under the name it had before, where one is still spelt so.
+  match (match readToString (Path.join dir "Meadow.lock") with
+   | Ok text -> Ok text
+   | Err _ -> readToString (Path.join dir "meadow.lock")) with
+  | Ok text -> Just text
+  | Err _ -> None
+
+-- The commit `Meadow.lock` pins package `name` at: the root's; then that of
+-- the build that started this one, `MEADOWBOOT_LOCK`, for the program that
+-- serves a dependency's macros, whose root has no lock; or the unit's.
+fun pinned (root : String) (dir : String) (name : String) : Maybe String ! { Fs, Process | e } =
   let inLock =
     \d ->
-      -- Under the name it had before, where one is still spelt so.
-      match (match readToString (Path.join d "Meadow.lock") with
-       | Ok text -> Ok text
-       | Err _ -> readToString (Path.join d "meadow.lock")) with
-      | Ok text ->
+      M.andThen
+        (\text ->
           M.andThen
             (\(p : Entry) -> field "rev" p.value)
             (V.find
                (\(p : Entry) -> p.section == "package" and field "name" p.value == Just name)
-               (tables (readToml text)))
-      | Err _ -> None
+               (tables (readToml text))))
+        (lockOf d)
   in match inLock root with
      | Just rev -> Just rev
-     | None -> inLock dir
+     | None ->
+         (match M.andThen inLock (getEnv "MEADOWBOOT_LOCK") with
+          | Just rev -> Just rev
+          | None -> inLock dir)
 
 -- Where `meadow` checked out commit `rev` of `url`: `git/checkouts/<name>-<hash
 -- of the url>/<rev>` under its home. The directory holding `rev` whose name

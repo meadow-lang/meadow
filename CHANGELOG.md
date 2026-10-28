@@ -13,8 +13,15 @@ beyond the last release is under _Unreleased_.
 
 ## Unreleased
 
-### Breaks
+### Breaking
 
+- The float operators `+.`, `-.`, `*.`, `/.`, `<.`, `>.`, `<=.` and `>=.`
+  are gone, and so is their trait, `Std.Ops.Floating`. `Float` and `Float32`
+  implement `Add`, `Sub`, `Mul` and `Div`, and were already `PartialOrd`, so
+  `x + y` and `x < y` are what float code writes now, at the same cost. Write
+  `+` for `+.`, `<` for `<.`, and so on. A program built without `Std` names
+  the float primitives (`_primAddF x y`), since there `+` is the integers'
+  primitive.
 - There is one runtime. What was Silo -- its library, which an executable
   links against, and its VM, which runs everything else -- is now Glade, in
   `glade/`, and the bytecode runtime that was Glade is gone, with its
@@ -50,6 +57,57 @@ beyond the last release is under _Unreleased_.
 - A release `meadow` carries the VM built into it, as it carries the runtime
   library, and runs it from `~/.meadow/lib/` with nothing installed beside
   the binary.
+
+## 0.4.0 - 2026-10-24
+
+Meadow on phones: Silo builds a program, or a library an app loads, for
+Android from any desktop and for iOS from a Mac, and the MeadowBoot archives
+carry the runtime each needs. And the standard library speaks to the network:
+`Std.Net`, `Std.Tls` and `Std.Http`, with `Std.Log` for what a program says it
+is doing.
+
+### Breaking
+
+- One `use … as` alias for two modules is an error, labelled at both. The
+  second took the first's place before, silently, and what the first module
+  exported was then "not exported" by the alias. The same `use` repeated is
+  still let be.
+
+### Added
+
+- Android: `--target aarch64-linux-android` or `x86_64-linux-android`, from
+  any desktop, builds a Silo program or an `@export` library (`libName.so`)
+  with the NDK's clang. The NDK is found from `ANDROID_NDK_HOME`,
+  `ANDROID_NDK_ROOT`, `ANDROID_NDK_LATEST_HOME` or `ANDROID_NDK`, and the API
+  level is `MEADOW_ANDROID_API`, 24 by default. CI runs a program, and a C
+  host that loads a Meadow library, on an Android emulator.
+- iOS: `--target aarch64-apple-ios`, `aarch64-apple-ios-sim` or
+  `x86_64-apple-ios`, on a Mac, builds with Xcode's clang for iOS
+  `MEADOW_IOS_MIN` (15.0 by default) and later. An `@export` library for iOS
+  is static, `libName.a`, with Silo's runtime in it, since an app loads no
+  code from outside itself. CI runs a program and a C host of a Meadow
+  library in the simulator, and links both for a device.
+- `--target` takes a target triple as well as an architecture, in
+  `meadow build`, `meadow cut` and MeadowBoot's `build` and `cut`. A build
+  for another system compiles with that system's `@cfg`, where
+  `os = "android"` and `os = "ios"` are now known, and is not run.
+  `scripts/silo-runtime.sh <triple>` builds Silo's runtime for one; the
+  MeadowBoot archives carry Android's, and on macOS iOS's, in
+  `lib/<triple>/`, where `meadow` looks for a target's.
+- A library of `@export` functions carries a table of them by name, which
+  `Std.Ffi.own ()` looks in, so that it finds them in an app whose release
+  build stripped its symbols.
+- `Reflect`, and so `@derive(Reflect)`, for `Char`, `Float32`, every
+  fixed-width integer, and pairs and triples. A value read back that does not
+  fit its type -- 256 as a `UInt8`, a surrogate as a `Char`, a list of two as
+  a triple -- is an error, not wrapped.
+- The language server goes to the definition of a module, at a `use` path, an
+  alias or a qualifier, and of a record field; and a module's type in an
+  inlay hint is a link to it.
+- Two diagnostics for Silo's heap: `MEADOW_SILO_POISON` fills what is freed
+  with junk and never reuses it, and at exit reports any block written since
+  or freed twice; `MEADOW_KEEP_IR` keeps a Silo build's LLVM IR after it
+  links.
 - A constructor is written through the module a `use … as` names, as its
   functions and types are: `use Mira as M` and then `M.VoxelHit b f d k`, in
   a pattern or an expression, of the package's own modules and a
@@ -88,6 +146,35 @@ beyond the last release is under _Unreleased_.
   a server's thousand reading connections need no more workers than cores. A
   program ends when `main` does even with a thread still accepting, and
   closing a socket wakes a call another thread waits in on it.
+
+### Fixed
+
+- `Std.Ffi` calls a C function of seven or eight integer and pointer
+  arguments on x86-64 Linux and macOS, as it did on every other target; it
+  refused more than six there.
+- Silo's cycle collector frees a garbage cycle whole when it reaches past the
+  candidates of one run. It left the rest for their own turn, pointing at
+  what it had freed, and a program that made such cycles could corrupt its
+  heap.
+- A Silo program that ends with `Process.exit` writes what it was asked to
+  report, as one that returns from `main` does: `MEADOW_SILO_PROFILE`'s
+  samples and the counts of `MEADOW_SILO_PRIMS` and `MEADOW_SILO_CYCLES`.
+- A Cut program's `Process.argv`, and the other sequences a runtime makes, are
+  plain arrays when the program declares no vector, as `docs/CUT.md` says.
+  Glade made one with an unknown tag, and Silo gave it a wrong length.
+- A Cut handler that resumes runs on Glade and Silo: `resume` is `apply`, as
+  `docs/CUT.md` says, and an object's methods it does not define take its
+  captures. Lowering one panicked before.
+- `stringByteAt` given straight to a continuation is a `u8`, as every runtime
+  answers it, and not a pointer.
+- Silo, at `-O2`: a literal in a tuple, matched through an inlined copy of a
+  generic, is tested as its own type, where it reached the runtime boxed.
+- A package whose directory is spelt differently from its name links on
+  Windows: two of its units were one file there, and one overwrote the other.
+- `meadowup` and `meadowup-init.sh` send `GITHUB_TOKEN` with their requests
+  to GitHub where it is set, so that a CI job installing Meadow is held to
+  its token's rate limit. Unnamed, a runner's requests share its address's,
+  and GitHub answered 403 when that was spent.
 
 ## 0.3.0 - 2026-10-16
 

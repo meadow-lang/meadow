@@ -922,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "meadow"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "chumsky",
  "clap",
@@ -948,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-ast"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "meadow-intern",
  "meadow-lexer",
@@ -959,7 +959,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-axcut"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "meadow-intern",
  "meadow-rt",
@@ -971,7 +971,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-compiler"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "meadow-ast",
  "meadow-core",
@@ -991,7 +991,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-core"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "meadow-hir",
  "meadow-infer",
@@ -1005,7 +1005,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-cut"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "meadow-axcut",
  "meadow-intern",
@@ -1014,7 +1014,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-diagnostics"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "ariadne",
  "chumsky",
@@ -1023,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-eval"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "meadow-core",
  "meadow-intern",
@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-exhaust"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "meadow-diagnostics",
  "meadow-hir",
@@ -1044,7 +1044,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-find"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "meadow",
  "meadow-compiler",
@@ -1054,11 +1054,11 @@ dependencies = [
 
 [[package]]
 name = "meadow-fmt"
-version = "0.3.0"
+version = "0.5.0"
 
 [[package]]
 name = "meadow-hir"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "meadow-axcut",
  "meadow-intern",
@@ -1071,7 +1071,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-infer"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "meadow-diagnostics",
  "meadow-hir",
@@ -1082,7 +1082,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-intern"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "lasso",
  "once_cell",
@@ -1091,7 +1091,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-lexer"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "logos",
  "meadow-diagnostics",
@@ -1105,11 +1105,11 @@ dependencies = [
 
 [[package]]
 name = "meadow-lir"
-version = "0.3.0"
+version = "0.5.0"
 
 [[package]]
 name = "meadow-llvm"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "meadow-axcut",
  "meadow-intern",
@@ -1119,7 +1119,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-lsp"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "lsp-server",
  "lsp-types",
@@ -1135,7 +1135,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-parser"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "chumsky",
  "itertools",
@@ -1150,7 +1150,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-rename"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "itertools",
  "meadow-ast",
@@ -1163,7 +1163,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-rt"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "libc",
  "meadow-intern",
@@ -1178,14 +1178,14 @@ dependencies = [
 
 [[package]]
 name = "meadow-scc"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "meadow-hir",
 ]
 
 [[package]]
 name = "meadow-seq"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "meadow-axcut",
  "meadow-core",
@@ -1200,7 +1200,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-source"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "ariadne",
  "meadow-intern",
@@ -1210,7 +1210,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-span"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "chumsky",
  "serde",

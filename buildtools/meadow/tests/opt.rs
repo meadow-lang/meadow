@@ -118,9 +118,9 @@ fn a_folded_constant_can_be_any_literal() {
     is("def c = 'a'\ndef result = c == 'a'\n", "True");
     is("def s = \"hi\"\ndef result = s == \"hi\"\n", "True");
     is("def s = \"hi\"\ndef result = s == \"ho\"\n", "False");
-    is("def x = 1.5\ndef result = x +. 0.25\n", "1.75");
-    is("def x = 1.5\ndef result = x -. 0.25\n", "1.25");
-    is("def x = 0.25\ndef result = 1.5 -. x\n", "1.25");
+    is("def x = 1.5\ndef result = x + 0.25\n", "1.75");
+    is("def x = 1.5\ndef result = x - 0.25\n", "1.25");
+    is("def x = 0.25\ndef result = 1.5 - x\n", "1.25");
     is("def b = True\ndef result = b == True\n", "True");
     // `()` compares equal to itself and nothing else can be written.
     is("def u = ()\ndef result = u == ()\n", "True");
@@ -213,15 +213,15 @@ fn a_condition_that_cannot_fuse_still_branches() {
 #[test]
 fn fusing_covers_the_other_numeric_types() {
     is(
-        "def x = 1.5\ndef result = if x <. 2.0 then \"lt\" else \"ge\"\n",
+        "def x = 1.5\ndef result = if x < 2.0 then \"lt\" else \"ge\"\n",
         "\"lt\"",
     );
     is(
-        "def x = 2.5\ndef result = if x <. 2.0 then \"lt\" else \"ge\"\n",
+        "def x = 2.5\ndef result = if x < 2.0 then \"lt\" else \"ge\"\n",
         "\"ge\"",
     );
     is(
-        "def x = 2.0\ndef result = if x <=. 2.0 then \"le\" else \"gt\"\n",
+        "def x = 2.0\ndef result = if x <= 2.0 then \"le\" else \"gt\"\n",
         "\"le\"",
     );
     is(

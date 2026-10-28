@@ -10,7 +10,7 @@
 -- Floats: `Float` (also `Float64`) and `Float32`.
 --
 -- Every integer type shares `+ - * / % ^`, `< > <= >=`, `neg` and the bitwise
--- operators; both float types share `+. -. *. /.` and `<. >. <=. >=.`. The two
+-- operators; both float types share `+ - * /` and `< > <= >=`. The two
 -- operands of one operator are always the same type -- a `UInt8` never meets an
 -- `Int` without a conversion. A fixed-width type wraps on overflow.
 --

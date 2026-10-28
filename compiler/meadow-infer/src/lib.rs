@@ -182,7 +182,7 @@ pub enum VarKind {
     /// `Int` (see `Arena::default_num_vars`). Printed `n`, `n1`, ….
     Num,
     /// The same for **float** types, `Float` (`Float64`) and `Float32`: what a
-    /// float literal and `+.` and friends have. Defaults to `Float`. Printed
+    /// float literal and the float primitives have. Defaults to `Float`. Printed
     /// `f`, `f1`, ….
     Frac,
 }
@@ -4048,7 +4048,7 @@ impl Infer {
                 let (class, operators) = if integer {
                     ("an integer type", "`+`, `<` and the rest")
                 } else {
-                    ("a float type", "`+.`, `<.` and the rest")
+                    ("a float type", "the float primitives")
                 };
                 (
                     format!("type mismatch: `{}` is not {class}", show(&ty)),

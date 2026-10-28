@@ -4773,10 +4773,11 @@ impl<'p> Module<'p> {
             }
             Entries::Library(exports) => {
                 let (get, arg) = self.entry_ctx();
+                let mut made = Vec::new();
                 for e in &exports {
                     let callee = self.label_fn(e.label);
                     let cc = self.cc.to_string();
-                    if let Err(why) = export_fn(
+                    match export_fn(
                         &mut out,
                         &e.name,
                         &callee,
@@ -4784,10 +4785,15 @@ impl<'p> Module<'p> {
                         (&get, &arg),
                         &e.params,
                         e.result,
+                        exports.len(),
                     ) {
-                        let _ = writeln!(out, "; {why}");
+                        Ok(()) => made.push(e.name.to_string()),
+                        Err(why) => {
+                            let _ = writeln!(out, "; {why}");
+                        }
                     }
                 }
+                export_table(&mut out, &made, exports.len());
             }
         }
         out
@@ -4851,7 +4857,7 @@ fn declarations(body: &str, arity: &HashMap<&str, usize>, cc: &str) -> String {
 const RUNTIME: &str = "\
 declare i64 @meadow_acquire(i64, i64)
 declare i64 @meadow_acquire_traced(i64, i64)
-declare void @meadow_export_enter()
+declare void @meadow_export_enter(ptr, i64)
 declare i32 @meadow_export_run(ptr, ptr)
 declare void @meadow_free(i64, i64)
 declare void @meadow_clean(i64, i64)
@@ -5300,10 +5306,50 @@ fn c_type(rep: meadow_axcut::Rep) -> Option<(&'static str, &'static str)> {
     })
 }
 
+/// `@meadow_exports`: each of the library's C functions by its name, which
+/// each hands the runtime as it is entered, so that `Std.Ffi.own ()` finds
+/// them by name where the loader cannot -- in a library linked into the
+/// program that uses it, as iOS's is, whose names a release build strips.
+/// Naming them all here keeps them all wherever one of them is kept. The
+/// table has `room` rows: one for an export that could not be made is null.
+fn export_table(out: &mut String, made: &[String], room: usize) {
+    let mut rows = Vec::new();
+    for (i, name) in made.iter().enumerate() {
+        let text: String = name
+            .bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || b == b'_' {
+                    (b as char).to_string()
+                } else {
+                    format!("\\{b:02X}")
+                }
+            })
+            .collect();
+        let _ = writeln!(
+            out,
+            "@meadow_export_name.{i} = private unnamed_addr constant [{} x i8] c\"{text}\\00\"",
+            name.len() + 1
+        );
+        rows.push(format!(
+            "{{ ptr, ptr }} {{ ptr @meadow_export_name.{i}, ptr @\"{name}\" }}"
+        ));
+    }
+    while rows.len() < room {
+        rows.push("{ ptr, ptr } zeroinitializer".to_string());
+    }
+    let _ = writeln!(
+        out,
+        "@meadow_exports = private constant [{room} x {{ ptr, ptr }}] [{}]\n",
+        rows.join(", ")
+    );
+}
+
 /// A C function `name` that runs export block `label` of `params`
 /// answering `result`: the runtime made ready for this thread, each argument
 /// made the word it is, the block entered as a program's entry is -- its
 /// continuation the native return -- and the word made what C is answered.
+/// It hands the runtime the library's table of `exports` C functions.
+#[allow(clippy::too_many_arguments)]
 fn export_fn(
     out: &mut String,
     name: &str,
@@ -5312,6 +5358,7 @@ fn export_fn(
     ctx: (&str, &str),
     params: &[meadow_axcut::Rep],
     result: meadow_axcut::Rep,
+    exports: usize,
 ) -> Result<(), String> {
     let mut sig = Vec::new();
     let mut body = String::new();
@@ -5375,7 +5422,7 @@ fn export_fn(
     // -- zero where the call failed -- as C's type.
     let _ = write!(
         out,
-        "define dllexport {rty} @\"{name}\"({}) {{\n  call void @meadow_export_enter()\n  %env = alloca [{} x i64]\n{body}",
+        "define dllexport {rty} @\"{name}\"({}) {{\n  call void @meadow_export_enter(ptr @meadow_exports, i64 {exports})\n  %env = alloca [{} x i64]\n{body}",
         sig.join(", "),
         n + 1
     );

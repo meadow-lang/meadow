@@ -25,9 +25,9 @@ fun main () =
       St.forRange 0 n (\k ->
         let aik = St.get a (i * n + k) in
         St.forRange 0 n (\j ->
-          St.set c (i * n + j) (St.get c (i * n + j) +. aik *. St.get b (k * n + j))))) in
+          St.set c (i * n + j) (St.get c (i * n + j) + aik * St.get b (k * n + j))))) in
     let rec diag i acc =
-      if i >= n then acc else diag (i + 1) (acc +. St.get c (i * n + i))
+      if i >= n then acc else diag (i + 1) (acc + St.get c (i * n + i))
     in
     diag 0 0.0)
 in println (floor total)

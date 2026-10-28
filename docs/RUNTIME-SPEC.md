@@ -650,7 +650,7 @@ symbol `meadow_glade_{hash}` is missing.
 
 **AOT-2.** `--target TRIPLE` builds for another system, with the runtime found
 at `lib/{TRIPLE}/libmeadow_glade.a` beside `meadow`, or where a checkout
-builds it (`scripts/silo-runtime.sh {TRIPLE}`). The triples include
+builds it (`scripts/glade-runtime.sh {TRIPLE}`). The triples include
 `aarch64-linux-android`, `x86_64-linux-android`, `aarch64-apple-ios` and
 `aarch64-apple-ios-sim`.
 - *Status:* done; the `android` and `ios` workflows, and v0.4.0.

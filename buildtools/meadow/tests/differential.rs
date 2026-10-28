@@ -197,7 +197,7 @@ fn literals() {
     assert_eq!(agree("def result = ()"), "()");
     assert_eq!(agree("def result = 'q'"), "'q'");
     assert_eq!(agree(r#"def result = "hi""#), "\"hi\"");
-    assert_eq!(agree("def result = 1.5 +. 1.0"), "2.5");
+    assert_eq!(agree("def result = _primAddF 1.5 1.0"), "2.5");
 }
 
 #[test]
@@ -992,7 +992,7 @@ fn a_records_fields_select_by_name_everywhere() {
     assert_eq!(
         agree(
             "record Box a = { item : a, count : Int, weight : Float }\n\
-             fun weigh (b : Box a) : Float = b.weight *. 2.0\n\
+             fun weigh (b : Box a) : Float = _primMulF b.weight 2.0\n\
              fun first (b : Box [Int;]) : [Int;] = b.item\n\
              def result = let b = Box { weight = 1.5, item = [4; 5], count = 3 } in\n\
              \x20 (weigh b, first b, b.count)"
@@ -1137,7 +1137,7 @@ fn sized_numbers_are_stored_in_fields_and_arrays() {
 #[test]
 fn float32_keeps_single_precision() {
     assert_eq!(
-        agree("def result = toFloat32 1.5 +. toFloat32 0.25"),
+        agree("def result = _primAddF (toFloat32 1.5) (toFloat32 0.25)"),
         "1.75"
     );
     // Printed as the shortest text that reads back as the same `Float32`.
@@ -1413,7 +1413,7 @@ fn mutually_recursive_generic_functions_are_copied_together() {
 
 #[test]
 fn a_float_literal_in_generic_code_takes_the_float_type() {
-    let src = "fun third x = x /. 3.0
+    let src = "fun third x = _primDivF x 3.0
                def result = (third (toFloat32 1.0), third 1.0)";
     assert_eq!(agree(src), "(0.33333334, 0.3333333333333333)");
 }
@@ -1934,8 +1934,8 @@ fn typed_division_by_zero_fails_the_same_way_everywhere() {
 #[test]
 fn typed_float_arithmetic_is_ieee() {
     let src = "fun f (a : Float) (b : Float) =
-                 (a +. b, a -. b, a *. b, a /. b, a <. b, a >=. b, a == b, a != b)
-               def result = let nan = 0.0 /. 0.0 in (f 1.5 0.25, f nan nan, f 0.0 (0.0 -. 0.0))";
+                 (_primAddF a b, _primSubF a b, _primMulF a b, _primDivF a b, _primLtF a b, _primGeF a b, a == b, a != b)
+               def result = let nan = _primDivF 0.0 0.0 in (f 1.5 0.25, f nan nan, f 0.0 (_primSubF 0.0 0.0))";
     let out = agree(src);
     assert!(
         out.starts_with("((1.75, 1.25, 0.375, 6.0, False, True, False, True)"),

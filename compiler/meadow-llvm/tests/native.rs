@@ -253,7 +253,7 @@ fn arithmetic_and_comparison() {
     assert_eq!(
         run(
             "arith",
-            "def result = (1 + 2 * 3, 10 - 4, 7 / 2, 7 % 3, 2.5 +. 1.0, 3 < 4, 'a' == 'b')"
+            "def result = (1 + 2 * 3, 10 - 4, 7 / 2, 7 % 3, _primAddF 2.5 1.0, 3 < 4, 'a' == 'b')"
         ),
         "(7, 6, 3, 1, 3.5, True, False)"
     );

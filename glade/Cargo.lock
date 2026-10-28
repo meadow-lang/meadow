@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-axcut"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "meadow-intern",
  "meadow-rt",
@@ -502,11 +502,11 @@ dependencies = [
 
 [[package]]
 name = "meadow-exec"
-version = "0.3.0"
+version = "0.5.0"
 
 [[package]]
 name = "meadow-glade"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "corosensei",
  "meadow-rt",
@@ -515,7 +515,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-glade-vm"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -535,7 +535,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-intern"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "lasso",
  "once_cell",
@@ -544,11 +544,11 @@ dependencies = [
 
 [[package]]
 name = "meadow-lir"
-version = "0.3.0"
+version = "0.5.0"
 
 [[package]]
 name = "meadow-llvm"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "meadow-axcut",
  "meadow-intern",
@@ -558,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-rt"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "libc",
  "meadow-intern",
@@ -573,7 +573,7 @@ dependencies = [
 
 [[package]]
 name = "meadow-span"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "chumsky",
  "serde",

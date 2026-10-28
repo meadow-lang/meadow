@@ -1,7 +1,7 @@
 [package]
 name = "meadow-glade-vm"
 description = "Glade's VM: a program of AxCut run on the runtime without compiling it ahead of time -- interpreted, with a JIT, counted or traced as the program is built for. What a debug build runs on."
-version = "0.3.0"
+version = "0.5.0"
 edition = "2024"
 
 [[bin]]
