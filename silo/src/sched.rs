@@ -526,10 +526,7 @@ fn work() {
                     break g;
                 }
                 if w.running == 0 && w.calls == 0 {
-                    crate::fail(
-                        "deadlock: every thread is waiting, on a channel nobody will send to \
-                         or on another waiting thread",
-                    )
+                    crate::fail(meadow_rt::thread::DEADLOCK)
                 }
                 w = CHANGED.wait(w).unwrap_or_else(|p| p.into_inner());
             }
@@ -835,8 +832,11 @@ fn ready(g: Box<Green>, with: Wake) {
 /// its context; answer what it is woken with.
 fn park(request: Request) -> Wake {
     cx().request = Some(request);
+    // A program that starts no thread runs without the scheduler, on no
+    // thread of its own: one that waits waits for what no other thread can
+    // do, as the scheduler would find with every thread waiting.
     let Some(y) = segments::innermost() else {
-        crate::fail("a thread operation ran outside every thread")
+        crate::fail(meadow_rt::thread::DEADLOCK)
     };
     match segments::suspend(y, Up::Park) {
         Down::Wake => std::mem::replace(&mut cx().wake, Wake::Nothing),

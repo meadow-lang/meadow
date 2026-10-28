@@ -1852,16 +1852,16 @@ fn every_source_renames_as_meadow_rename_renames_it() {
 
 // --- evaluating: the CEK machine ------------------------------------------------
 
-/// The programs `glade/tests/differential.rs` checks every back end with: the
-/// string literal given to each `agree(…)` there. Read from that file, so a
-/// case added there is one here.
-fn glade_programs() -> Vec<String> {
+/// The programs `buildtools/meadow/tests/differential.rs` checks every back
+/// end with: the string literal given to each `agree(…)` there. Read from
+/// that file, so a case added there is one here.
+fn differential_programs() -> Vec<String> {
     // Read as the compiler reads a Rust file: a checkout on Windows has
     // `\r\n` line endings, and a `\r` left in a case's text -- before the
     // newline a `\` continues a string over, say -- makes it a different
     // program, or none.
-    let text = std::fs::read_to_string(repo().join("glade/tests/differential.rs"))
-        .expect("the glade cases")
+    let text = std::fs::read_to_string(repo().join("buildtools/meadow/tests/differential.rs"))
+        .expect("the differential cases")
         .replace("\r\n", "\n");
     let mut out = Vec::new();
     let mut rest = text.as_str();
@@ -2366,7 +2366,7 @@ def result = (f 8, f 7, f 40, g (3, 10), g (3, 1))
 /// the Rust CEK machine answers for it: the file to run, and the answer.
 fn run_cases(dir: &Path) -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
-    let glade = glade_programs();
+    let glade = differential_programs();
     let theirs = glade.len();
     let programs: Vec<String> = glade.into_iter().chain(trait_programs()).collect();
     for (i, src) in programs.iter().enumerate() {
@@ -3783,7 +3783,7 @@ fn every_glade_case_evaluates_as_the_cek_machine_evaluates_it() {
     std::fs::create_dir_all(&dir).expect("a scratch directory");
     let mut files = Vec::new();
     let mut wants = std::collections::HashMap::new();
-    for (i, src) in glade_programs().iter().enumerate() {
+    for (i, src) in differential_programs().iter().enumerate() {
         let p = match compiled(src) {
             Ok(p) => p,
             Err(e) => {

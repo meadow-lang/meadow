@@ -129,6 +129,23 @@ extern "C" fn entry_debugged() -> Word {
     v
 }
 
+/// `f`, on a thread with stack enough for a program as deeply nested as one
+/// may be: decoding an image, and compiling it, go as deep as its terms,
+/// which a list literal of a few hundred elements nests as many times -- more
+/// than the main thread's megabyte holds. The stack is address space, taken
+/// only as it is used.
+fn deep<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .name("load".into())
+            .stack_size(1 << 30)
+            .spawn_scoped(s, f)
+            .expect("a thread to load the program on")
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+    })
+}
+
 /// `--serve PORT`: the connection to whoever keeps this VM for many runs --
 /// a REPL's session, a build's macros -- which says, a JSON object a line,
 /// what to load and what to run, and is answered likewise:
@@ -180,7 +197,7 @@ extern "C" fn entry_served() -> Word {
                 .and_then(|bytes| {
                     // What the new code is made of, for as long as it may run.
                     let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
-                    meadow_axcut::image::decode(bytes).and_then(|i| interp::vm().reload(i))
+                    deep(|| meadow_axcut::image::decode(bytes).and_then(|i| interp::vm().reload(i)))
                 });
             say(match done {
                 Ok(what) => serde_json::json!({ "reloaded": what }),
@@ -253,7 +270,8 @@ fn watch(path: std::path::PathBuf) {
             };
             // What the new code is made of, for as long as it may run.
             let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
-            let done = meadow_axcut::image::decode(bytes).and_then(|i| interp::vm().reload(i));
+            let done =
+                deep(|| meadow_axcut::image::decode(bytes).and_then(|i| interp::vm().reload(i)));
             match &done {
                 Ok(what) => eprintln!("reloaded {}: {what}", path.display()),
                 Err(e) => eprintln!("not reloaded: {e}"),
@@ -367,22 +385,20 @@ fn main() {
     // The program borrows from these for as long as it runs.
     let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
     let began = std::time::Instant::now();
-    let decoded = meadow_axcut::image::decode(bytes);
-    if std::env::var_os("MEADOW_VM_STATS").is_some() {
-        eprintln!("vm: {} bytes decoded in {:?}", bytes.len(), began.elapsed());
-    }
-    let image = match decoded {
-        Ok(i) => i,
-        Err(e) => {
-            eprintln!("error: {path}: {e}");
-            std::process::exit(2);
-        }
-    };
     // What `Process.argv` answers: what followed the image.
     meadow_rt::args::set(args[2..].to_vec());
-    if let Err(e) = interp::load(image) {
+    let path_shown = path.clone();
+    let loaded = deep(move || {
+        let decoded = meadow_axcut::image::decode(bytes);
+        if std::env::var_os("MEADOW_VM_STATS").is_some() {
+            eprintln!("vm: {} bytes decoded in {:?}", bytes.len(), began.elapsed());
+        }
+        let image = decoded.map_err(|e| (2, format!("{path_shown}: {e}")))?;
+        interp::load(image).map_err(|e| (1, e))
+    });
+    if let Err((status, e)) = loaded {
         eprintln!("error: {e}");
-        std::process::exit(1);
+        std::process::exit(status);
     }
     if dis {
         print!("{}", interp::vm().disassemble());

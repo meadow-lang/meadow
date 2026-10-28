@@ -374,7 +374,10 @@ impl Vm {
             seg.jit.tier2.state[local].store(2, Ordering::Release);
             return;
         }
-        let made = inner.compile(self, seg_id, local);
+        // On a fresh piece of stack: Cranelift's passes recurse as deep as a
+        // function is large, and the program may be anywhere on its own --
+        // on the main thread's megabyte, near its end.
+        let made = meadow_silo::stack::grow(|| inner.compile(self, seg_id, local));
         let log = std::env::var_os("MEADOW_JIT_LOG").is_some();
         match made {
             Ok((f, methods, arity)) => {
@@ -665,9 +668,21 @@ impl Inner {
         }
         let lowering = self.lowerings.get_mut(&seg_id).expect("made");
         let (label, block) = seg.lowered.blocks[def];
+        lowering.take_spill_words();
         let Some((funcs, methods)) = lowering.jit_def(label, block).map_err(|e| e.msg)? else {
             return Err("it makes a closure the VM numbered as it packed it".into());
         };
+        // Its calls' arguments past the registers go through the running
+        // thread's spill area, which is as big as it is: the interpreter
+        // takes a definition that would need more, needing none.
+        let spills = lowering.take_spill_words() as i64;
+        // Safety: set before the runtime started, and only read since.
+        if spills > unsafe { crate::meadow_spill_words } {
+            return Err(format!(
+                "its calls pass {spills} words through the spill area, which holds {}",
+                unsafe { crate::meadow_spill_words }
+            ));
+        }
         let def_name = lowering.label_function(label);
         let strings = lowering.jit_strings();
         let helpers = if self.helpers.contains_key(&seg_id) {

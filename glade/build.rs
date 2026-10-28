@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-include!("fingerprint.rs");
+include!("../compiler/fingerprint.rs");
 
 fn main() {
     let here = Path::new(env!("CARGO_MANIFEST_DIR"));

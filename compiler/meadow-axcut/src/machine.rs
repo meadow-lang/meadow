@@ -1494,6 +1494,9 @@ fn compact_into<'p>(region: &RefCell<Region<'p>>, v: &Value<'p>) -> Result<(), E
         // A node is counted, and its children visited, the first time only.
         let mut first = |p: *const ()| !r.seen.contains(&p) && new.insert(p);
         match &v {
+            // A constructor of no fields is a word, not a block: nothing to
+            // copy.
+            Value::Data(_, _, fields) if fields.is_empty() => {}
             Value::Data(_, _, fields) => {
                 if first(Rc::as_ptr(fields) as *const ()) {
                     slots += meadow_rt::compact::object_slots(false, fields.len());
@@ -1502,7 +1505,7 @@ fn compact_into<'p>(region: &RefCell<Region<'p>>, v: &Value<'p>) -> Result<(), E
             }
             Value::Array(xs) => {
                 if first(Rc::as_ptr(xs) as *const ()) {
-                    slots += meadow_rt::compact::object_slots(true, xs.len());
+                    slots += meadow_rt::compact::array_slots(xs.len());
                     stack.extend(xs.iter().cloned());
                 }
             }

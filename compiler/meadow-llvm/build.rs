@@ -2,12 +2,12 @@
 //! crate emits and the runtime it links against, as `MEADOW_SILO_FINGERPRINT`:
 //! this crate's, the LIR's it prints, and the runtime's. The runtime exports a symbol named after it
 //! (`silo/build.rs` hashes the same trees with the same function,
-//! `glade/fingerprint.rs`), and the emitted module refers to that symbol, so a
+//! `compiler/fingerprint.rs`), and the emitted module refers to that symbol, so a
 //! program links only with a runtime built from the same sources.
 
 use std::path::Path;
 
-include!("../../glade/fingerprint.rs");
+include!("../fingerprint.rs");
 
 fn main() {
     let here = Path::new(env!("CARGO_MANIFEST_DIR"));

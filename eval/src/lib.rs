@@ -2765,6 +2765,9 @@ fn compact_into(
         // A node is counted, and its children visited, the first time only.
         let mut first = |p: *const ()| !r.seen.contains(&p) && new.insert(p);
         match &v {
+            // A constructor of no fields is a word, not a block: nothing to
+            // copy.
+            Value::Ctor(_, fields) if fields.is_empty() => {}
             Value::Ctor(_, fields) => {
                 if first(Rc::as_ptr(fields) as *const ()) {
                     slots += meadow_core::compact::object_slots(false, fields.len());
@@ -2777,7 +2780,7 @@ fn compact_into(
             }
             Value::Array(xs) => {
                 if first(Rc::as_ptr(xs) as *const ()) {
-                    slots += meadow_core::compact::object_slots(true, xs.len());
+                    slots += meadow_core::compact::array_slots(xs.len());
                     stack.extend(xs.iter().cloned());
                 }
             }

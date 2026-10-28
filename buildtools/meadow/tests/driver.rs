@@ -898,7 +898,7 @@ fn the_merged_runtime_s_jit_runs_what_its_vm_runs() {
         return;
     }
     if !cfg!(target_arch = "x86_64") {
-        eprintln!("skipped: the JIT compiles for x86-64 only yet");
+        eprintln!("skipped: the first tier compiles for x86-64 only");
         return;
     }
     let dir = std::env::temp_dir().join(format!("meadow-vm-jit-{}", std::process::id()));
@@ -958,7 +958,7 @@ fn a_loop_entered_once_is_compiled_as_it_runs() {
         return;
     }
     if !cfg!(target_arch = "x86_64") {
-        eprintln!("skipped: the JIT compiles for x86-64 only yet");
+        eprintln!("skipped: the first tier compiles for x86-64 only");
         return;
     }
     let dir = std::env::temp_dir().join(format!("meadow-vm-jit-loop-{}", std::process::id()));
@@ -997,9 +997,12 @@ fn a_loop_entered_once_is_compiled_as_it_runs() {
     let (jit, said) = run("--jit");
     assert_eq!(vm.trim(), "299995");
     assert_eq!(jit, vm, "the JIT prints what the VM prints");
+    // By either tier: the second takes a definition entered as often as the
+    // first does.
     assert!(
-        said.lines()
-            .any(|l| l.starts_with("jit: Loop.count") && !l.contains("not compiled")),
+        said.lines().any(|l| (l.starts_with("jit: Loop.count")
+            || l.starts_with("jit2: Loop.count"))
+            && !l.contains("not compiled")),
         "the loop was compiled, though entered from `main` once:\n{said}"
     );
 }

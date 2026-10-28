@@ -810,7 +810,7 @@ impl Heap {
 
     /// Slots an object of `kind` with `len` fields takes.
     pub fn size_of(kind: Kind, len: usize) -> usize {
-        meadow_rt::compact::object_slots(kind.is_uniform(), len)
+        meadow_rt::compact::header_slots(kind.is_uniform(), len) + len
     }
 
     pub fn alloc(&mut self, kind: Kind, meta: u32, fields: &[Value]) -> Addr {

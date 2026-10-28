@@ -1057,6 +1057,13 @@ impl<'p> Module<'p> {
     /// as LIR, and the VM's number of each of its methods, by its function's
     /// name. `None` if it builds a closure whose methods the VM has no number
     /// for, which the JIT then leaves to the VM.
+    /// The most words any function lowered since this was last asked passes
+    /// through the spill area, or reads from it, and the count begun again:
+    /// what the JIT checks a definition's code against the area it has.
+    pub fn take_spill_words(&mut self) -> usize {
+        std::mem::take(&mut self.spill_words)
+    }
+
     pub fn jit_def(
         &mut self,
         label: meadow_axcut::Label,

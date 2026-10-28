@@ -5,11 +5,11 @@
 //! runtime built from the sources its compiler was.
 //!
 //! `compiler/meadow-llvm/build.rs` hashes the same trees with the same
-//! function, `glade/fingerprint.rs`.
+//! function, `compiler/fingerprint.rs`.
 
 use std::path::Path;
 
-include!("../glade/fingerprint.rs");
+include!("../compiler/fingerprint.rs");
 
 fn main() {
     let here = Path::new(env!("CARGO_MANIFEST_DIR"));

@@ -1282,6 +1282,45 @@ through the slot table, with the runtime's addresses fixed at link time
 rather than at load. Tier 2 has the table and makes calls the same way
 already, which is why it is the route taken.
 
+### Glade's differential cases, on the merged VM (2026-10-28)
+
+Glade's `tests/differential.rs` -- 119 cases, each run by the CEK machine,
+the AxCut machine and Glade's VM at every optimization level -- is the
+merged runtime's now (`buildtools/meadow/tests/differential.rs`). The third
+engine is the merged VM, interpreted and with its JIT compiling everything
+at first entry, at one worker and at eight. Moved over, 13 cases disagreed.
+- **Deep programs.** A list literal of a few hundred elements nests its
+  term as many times, and the VM's main thread overflowed its megabyte
+  decoding the image. The VM now decodes and loads on a thread with a
+  gigabyte of stack, which is address space until it is used.
+- **The spill area.** A call's arguments past the registers go through the
+  thread's spill area, 256 words in the VM. A definition of three hundred
+  parameters passes far more, and tier 2's code wrote past the area:
+  valgrind under WSL found it. The area now holds twice the widest
+  procedure's parameters, and tier 2 asks the emitter how many words a
+  definition's code passes and leaves to the interpreter one that would
+  need more.
+- **Compiling on a fresh stack.** Cranelift's passes recurse as deep as a
+  function is large, and tier 2 compiled on whatever stack the program was
+  on. It compiles on a new piece of stack now.
+- **`compactSize`.** The CEK and AxCut machines counted a region in Glade's
+  layout. They count the merged runtime's now: its header, the fields, an
+  array's room to grow, a word for the region, and nothing for a
+  constructor of no fields, which is a word and not a block.
+- **Waiting with no scheduler.** A program that starts no thread runs
+  without the scheduler, and a transaction that waits there failed as "a
+  thread operation ran outside every thread". It is the deadlock the CEK
+  machine reports, in the words the runtimes share, which the scheduler
+  now uses too.
+- **Not done.** A function that captures nothing is a word on the merged
+  runtime, which a `TVar` cannot tell from a constructor's, so the VM
+  keeps one in a `TVar` that the CEK machine refuses. One that captures
+  something is refused on every engine. And threads are cooperative: on
+  one worker (`MEADOW_THREADS=1`), a thread that never waits starves the
+  rest, where Glade's VM switched threads on a budget of instructions. The
+  case that shows it is `#[ignore]`d until a poll in compiled code, on
+  every engine, lets the scheduler take a thread off its worker.
+
 ### Replacing Glade in full (2026-10-24)
 
 The merged runtime is to be Glade's next release, so it has to do all that

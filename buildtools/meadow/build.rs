@@ -80,7 +80,7 @@ fn main() {
                 root.join("silo/src"),
                 root.join("silo/build.rs"),
                 root.join("silo/Cargo.toml"),
-                root.join("glade/fingerprint.rs"),
+                root.join("compiler/fingerprint.rs"),
                 compiler.join("meadow-llvm/src"),
                 compiler.join("meadow-rt"),
                 compiler.join("meadow-intern"),

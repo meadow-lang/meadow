@@ -735,6 +735,10 @@ const SEGMENTS: usize = 1024;
 /// How many definitions, over every load.
 const DEFS: usize = 1 << 18;
 
+/// Words of a thread's spill area past the widest procedure's parameters, for
+/// what a call adds to them: its continuation, the thread's context.
+pub(super) const SPILL_SPARE: i64 = 8;
+
 /// One load's code: what the program's first image made, or what a reload
 /// added (`docs/RUNTIME-MERGE.md`, "Hot loading"). Nothing in one changes
 /// once it is in place, and nothing moves: code already running, and the
@@ -1115,6 +1119,17 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
         ..LoadState::default()
     };
     let c = compile(program, image.linear, 0, &mut state)?;
+    // What compiled code passes in the spill area, past what registers
+    // hold, goes with how many parameters a procedure takes: the area holds
+    // twice the widest's, and never fewer than the 256 words it always had.
+    // The JIT compiles nothing that would need more (`tier2`).
+    let widest = c
+        .segment
+        .procs
+        .iter()
+        .map(|p| p.params.len())
+        .max()
+        .unwrap_or(0);
     let entries = entries
         .iter()
         .map(|l| {
@@ -1197,6 +1212,7 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
         crate::meadow_cycles = u8::from(!tracing);
         crate::meadow_gc = if moving { 2 } else { u8::from(tracing) };
         crate::meadow_result_desc = result;
+        crate::meadow_spill_words = (2 * widest as i64 + SPILL_SPARE).max(256);
     }
     meadow_silo::show::install(names);
     VM.set(vm)

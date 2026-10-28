@@ -145,6 +145,60 @@ pub fn run_on_vm(program: &core::Program, opt: OptLevel) -> (Result<String, Stri
     )
 }
 
+/// `program` run on the merged runtime's VM, lowered at `opt`, with `env`
+/// set for it: what its entry answers, as the VM shows it, or why it did
+/// not -- what the VM said on standard error, and how it ended. What the
+/// program printed is left out. Each run has a file of its own, so that runs
+/// at once, as a test's are, do not meet.
+pub fn run_on_vm_with(
+    program: &core::Program,
+    opt: OptLevel,
+    env: &[(&str, &str)],
+) -> Result<String, String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!("meadow-vm-runs-{}", std::process::id()));
+    let n = RUNS.fetch_add(1, Ordering::Relaxed);
+    let image = dir.join(format!("run-{n}.image"));
+    let answer = dir.join(format!("run-{n}.answer"));
+    let lowered = meadow_seq::lower_program(program, opt);
+    if !lowered.unsupported.is_empty() {
+        return Err(format!(
+            "the back end cannot translate {:?} yet",
+            lowered.unsupported
+        ));
+    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    let config = meadow_llvm::Config {
+        stack: meadow_llvm::Stack::Growable,
+        ..crate::aot::config()
+    };
+    crate::aot::write_image_with(&image, lowered.program, Vec::new(), config)?;
+    let out = std::process::Command::new(crate::aot::interpreter()?)
+        .envs(env.iter().copied())
+        .arg("--answer")
+        .arg(&answer)
+        .arg(&image)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("could not run Silo's interpreter: {e}"));
+    let shown = std::fs::read_to_string(&answer);
+    let _ = std::fs::remove_file(&image);
+    let _ = std::fs::remove_file(&answer);
+    let out = out?;
+    match shown {
+        Ok(shown) if out.status.success() => Ok(shown),
+        _ => Err(format!(
+            "{}the program failed ({})",
+            String::from_utf8_lossy(&out.stderr),
+            out.status
+                .code()
+                .map_or("killed".to_string(), |c| format!("exit status {c}"))
+        )),
+    }
+}
+
 /// [`run_on_vm`], in a session: `program` loaded into the VM the session has
 /// kept, as a reload, and its entry run there -- or, if there is none yet, or
 /// it cannot take this build, or the last run ended it, run on a new one,

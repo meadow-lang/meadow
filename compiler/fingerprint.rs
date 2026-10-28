@@ -1,7 +1,7 @@
 // A fingerprint of source trees, for a runtime library's ABI symbol: shared,
-// by `include!`, between `glade/build.rs` and `silo/build.rs`, which must answer
-// alike for the same trees -- the code generator in `glade` names the symbol
-// the `meadow-silo` library exports.
+// by `include!`, between the runtime's `build.rs` and `meadow-llvm`'s, which
+// must answer alike for the same trees -- the code generator names the symbol
+// the runtime's library exports.
 //
 // FNV-1a over every `.rs` file's path, relative to its root, and contents, in
 // sorted order: stable across toolchains, unlike `DefaultHasher`.
