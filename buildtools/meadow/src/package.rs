@@ -32,22 +32,24 @@
 //! [profile.release]
 //! opt-level = 2
 //! strictness = "strict"    # "lenient" | "strict"
-//! runtime = "glade"        # "glade" | "silo"
-//! backend = "aot"          # Glade's: "jit" | "aot" (or "vm"); or `aot = true`
+//! runtime = "glade"        # "glade", or "silo", its name before: the one runtime
+//! backend = "aot"          # "jit" | "aot" | "vm"; or `aot = true`
 //! prune = true             # compile only what `main` reaches
 //! cfg = "fast, feature=gpu" # flags `@cfg(…)` can test
 //! threads = 4              # OS threads for the green ones: `-j`
-//! nursery = "8M"           # how large Glade's nursery may grow: `--nursery`
+//! nursery = "8M"           # how large a young generation may grow: `--nursery`
+//! stack = "growable"       # "fixed" | "growable": `--stack`
+//! layout = "glade"         # how a block is laid out, "silo" | "glade": `--layout`
+//! reload = false           # an interpreted build no new build loads into: `--no-reload`
 //! leaks = true             # report what the program left behind: `--leaks`
 //! target = "aarch64"       # the processor a native build is for: `--target`
 //! ```
 //!
-//! `runtime` picks the runtime system, and the two are two backends of their
-//! own. **Glade**, the default, has a choice of its own: `backend = "jit"`,
-//! bytecode compiled as it runs, or `"aot"`, compiled ahead of time into an
-//! executable (`"vm"`, the interpreter alone, is there too). **Silo** has
-//! none: it is compiled all the way down by LLVM, ahead of time by what it is,
-//! and a `backend` beside it is warned about and ignored.
+//! `backend` is how the runtime runs a program: `"jit"`, an image the VM
+//! runs, compiling what runs often as it goes -- a debug build's; `"aot"`,
+//! compiled ahead of time by LLVM into an executable -- a release build's;
+//! or `"vm"`, the VM interpreting alone. There is one runtime, and `runtime`
+//! names it, by either name.
 //!
 //! Only the keys that are present are overridden; the rest keep the profile's
 //! built-in meaning (see [`crate::Profile`]). A command-line flag wins over
@@ -255,14 +257,21 @@ pub struct ProfileConfig {
     /// runs -- see [`crate::profile::Resolved::sample`]. Carries the debug info
     /// a profile's frames are named by, which an ordinary release build drops.
     pub profile: Option<bool>,
-    /// The runtime system: Glade or Silo -- see [`crate::aot::Runtime`].
+    /// The runtime system, by either of its names -- see [`crate::aot::Runtime`].
     pub runtime: Option<crate::aot::Runtime>,
     /// `threads = N`: how many OS threads run the green ones, as `-j` says.
     pub threads: Option<usize>,
-    /// `nursery = "8M"`: how large Glade's collector lets a thread's nursery
-    /// grow, in bytes, as `--nursery` says. One that is not a size, or is
+    /// `nursery = "8M"`: how large the generational collector lets a
+    /// thread's nursery grow, in bytes, as `--nursery` says. One that is not a size, or is
     /// outside what a nursery may be, is ignored.
     pub nursery: Option<u64>,
+    /// `stack = "growable"`: how deep calls may go, as `--stack` says.
+    pub stack: Option<meadow_seq::config::Stack>,
+    /// `layout = "glade"`: how a block is laid out, as `--layout` says.
+    pub layout: Option<meadow_seq::config::Layout>,
+    /// `reload = false`: an interpreted build that cannot take a new build
+    /// of itself while it runs, as `--no-reload` says.
+    pub reload: Option<bool>,
     /// `leaks = true`: report what the program left behind, as `--leaks`.
     pub leaks: Option<bool>,
     /// `target = "aarch64"`: the processor a native build is for, as
@@ -1269,6 +1278,15 @@ fn parse_manifest(text: &str, dir: &Path) -> (Manifest, Inherits) {
                     "runtime" => p.runtime = crate::aot::Runtime::named(unquote(value)),
                     "threads" => p.threads = unquote(value).parse().ok().filter(|n| *n > 0),
                     "nursery" => p.nursery = crate::profile::nursery_size(unquote(value)).ok(),
+                    "stack" => p.stack = meadow_seq::config::Stack::named(unquote(value)),
+                    "layout" => p.layout = meadow_seq::config::Layout::named(unquote(value)),
+                    "reload" => {
+                        p.reload = match unquote(value) {
+                            "true" => Some(true),
+                            "false" => Some(false),
+                            _ => None,
+                        }
+                    }
                     "leaks" => {
                         p.leaks = match unquote(value) {
                             "true" => Some(true),

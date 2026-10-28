@@ -1,0 +1,7 @@
+[package]
+name = "meadow-exec"
+description = "Executable memory for machine code made while a program runs, never writable and executable at once: Glade's JIT's and the merged runtime's VM's."
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

@@ -1,7 +1,9 @@
-//! The debugger: stopping where asked, reading the stack back out of a machine
-//! that has none, and speaking the protocol an editor drives it with.
+//! The debugger: stepping, packages and entries, and speaking the protocol an
+//! editor drives it with. What a stop shows -- breakpoints, frames, values --
+//! is `tests/dap_vm.rs`'s.
 
-use meadow::dap::session::{Mode, Session, Stop, Variable};
+use meadow::dap::session::{Mode, Stop, Variable};
+use meadow::dap::vm::VmSession as Session;
 use std::path::{Path, PathBuf};
 
 /// A program in a directory of its own, and a session over it.
@@ -11,7 +13,7 @@ fn launch(who: &str, src: &str) -> (Session, PathBuf) {
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("main.mw");
     std::fs::write(&file, src).unwrap();
-    let s = Session::launch(&file).unwrap_or_else(|e| panic!("launch: {e}"));
+    let s = Session::launch_at(&file, None).unwrap_or_else(|e| panic!("launch: {e}"));
     (s, file)
 }
 
@@ -26,7 +28,7 @@ fn go(s: &mut Session, mode: Mode) -> Stop {
 }
 
 /// `(function, line)` of each frame, innermost first.
-fn stack(s: &Session) -> Vec<(String, u32)> {
+fn stack(s: &mut Session) -> Vec<(String, u32)> {
     s.frames(50)
         .into_iter()
         .map(|f| {
@@ -68,68 +70,18 @@ fun main () =
 ";
 
 #[test]
-fn it_runs_to_the_end_with_nothing_set() {
-    let (mut s, _) = launch("end", PROGRAM);
-    assert_eq!(
-        go(&mut s, Mode::Continue),
-        Stop::Exited(Ok("()".to_string()))
-    );
-    assert_eq!(s.take_output(), "48\n");
-}
-
-#[test]
-fn a_breakpoint_stops_with_the_caller_underneath() {
-    let (mut s, file) = launch("bp", PROGRAM);
-    assert_eq!(s.set_breakpoints(&file, &[2]), vec![Some(2)]);
-    assert_eq!(go(&mut s, Mode::Continue), Stop::Breakpoint);
-    let st = stack(&s);
-    assert_eq!(st[0], ("double".to_string(), 2), "{st:?}");
-    assert_eq!(
-        st[1].0, "main",
-        "the caller, waiting for the answer: {st:?}"
-    );
-    assert_eq!(st[1].1, 10, "it resumes at the call: {st:?}");
-
-    // `double` is generic over its number type, so `n`'s own type is a
-    // variable; the value says what it is -- an `Int`, since `21` in `main`
-    // is pinned to nothing else.
-    let n = local(&mut s, 0, "n");
-    assert_eq!((n.value.as_str(), n.ty.as_deref()), ("21", Some("Int")));
-}
-
-#[test]
-fn a_recursive_function_has_a_frame_per_call() {
-    let (mut s, file) = launch("rec", PROGRAM);
-    s.set_breakpoints(&file, &[6]);
-    assert_eq!(go(&mut s, Mode::Continue), Stop::Breakpoint);
-    let names: Vec<String> = stack(&s).into_iter().map(|(n, _)| n).collect();
-    assert_eq!(names, ["sum", "sum", "sum", "sum", "main"], "{names:?}");
-    // The frames underneath still hold what each call bound.
-    assert_eq!(local(&mut s, 1, "x").value, "3");
-    assert_eq!(local(&mut s, 3, "x").value, "1");
-}
-
-#[test]
-fn a_line_with_no_code_moves_to_the_next_one_that_has_some() {
-    let (mut s, file) = launch("move", PROGRAM);
-    // Line 3 is blank, line 4 is `fun sum xs =` and its body starts on 5.
-    let landed = s.set_breakpoints(&file, &[3])[0];
-    assert!(matches!(landed, Some(l) if l > 3), "{landed:?}");
-}
-
-#[test]
 fn stepping_in_enters_the_call_and_out_returns_from_it() {
     let (mut s, file) = launch("step", PROGRAM);
     s.set_breakpoints(&file, &[10]);
     assert_eq!(go(&mut s, Mode::Continue), Stop::Breakpoint);
-    assert_eq!(stack(&s)[0].0, "main");
+    assert_eq!(stack(&mut s)[0].0, "main");
 
     assert_eq!(go(&mut s, Mode::StepIn), Stop::Step);
-    let inside = stack(&s);
+    let inside = stack(&mut s);
     assert_eq!(inside[0].0, "double", "{inside:?}");
 
     assert_eq!(go(&mut s, Mode::StepOut), Stop::Step);
-    let back = stack(&s);
+    let back = stack(&mut s);
     assert_eq!(back[0].0, "main", "{back:?}");
     assert_eq!(back.len(), 1, "nothing left above main: {back:?}");
 }
@@ -141,7 +93,7 @@ fn stepping_over_a_call_stays_in_the_function() {
     assert_eq!(go(&mut s, Mode::Continue), Stop::Breakpoint);
     for _ in 0..4 {
         match go(&mut s, Mode::StepOver) {
-            Stop::Step => assert_eq!(stack(&s)[0].0, "main", "{:?}", stack(&s)),
+            Stop::Step => assert_eq!(stack(&mut s)[0].0, "main", "{:?}", stack(&mut s)),
             Stop::Exited(r) => {
                 assert_eq!(r, Ok("()".to_string()));
                 return;
@@ -159,50 +111,6 @@ fn output_is_captured_rather_than_printed() {
         Stop::Exited(Ok("()".to_string()))
     );
     assert_eq!(s.take_output(), "hello\n");
-}
-
-#[test]
-fn a_failure_stops_where_it_happened() {
-    let (mut s, _) = launch(
-        "fail",
-        "fun f n =\n  n / 0\n\nfun main () = println (f 7)\n",
-    );
-    match go(&mut s, Mode::Continue) {
-        Stop::Exception(msg) => assert!(msg.contains("zero"), "{msg}"),
-        other => panic!("{other:?}"),
-    }
-    let st = stack(&s);
-    assert_eq!(st[0].0, "f", "{st:?}");
-    assert_eq!(local(&mut s, 0, "n").value, "7");
-    assert!(s.is_finished());
-}
-
-#[test]
-fn values_can_be_opened_up() {
-    let src = "fun f pair =\n  pair\n\nfun main () = match f (Just [1; 2], { x = 1, y = \"s\" }) with | (_, r) -> println r.y\n";
-    let (mut s, file) = launch("open", src);
-    s.set_breakpoints(&file, &[2]);
-    assert_eq!(go(&mut s, Mode::Continue), Stop::Breakpoint);
-    let pair = local(&mut s, 0, "pair");
-    assert_eq!(pair.value, "(Just [1; 2], { x = 1, y = \"s\" })");
-    assert!(pair.children > 0);
-    let parts = s.variables(pair.children);
-    assert_eq!(parts.len(), 2);
-    let record = s.variables(parts[1].children);
-    let names: Vec<&str> = record.iter().map(|v| v.name.as_str()).collect();
-    assert_eq!(names, ["x", "y"]);
-}
-
-#[test]
-fn the_raw_machine_is_there_too() {
-    let (mut s, file) = launch("raw", PROGRAM);
-    s.set_breakpoints(&file, &[2]);
-    go(&mut s, Mode::Continue);
-    let scopes: Vec<&str> = s.scopes(0).iter().map(|sc| sc.name).collect();
-    assert_eq!(scopes, ["Locals", "Registers", "Handlers", "Heap"]);
-    let reference = s.scopes(0)[1].reference;
-    let regs = s.variables(reference);
-    assert!(regs.iter().any(|r| r.name.contains("(n)")), "{regs:?}");
 }
 
 // --- the protocol ----------------------------------------------------------------
@@ -372,7 +280,7 @@ fn a_call_inside_a_call_is_still_one_frame() {
     let (mut s, file) = launch("nested", src);
     s.set_breakpoints(&file, &[2]);
     assert_eq!(go(&mut s, Mode::Continue), Stop::Breakpoint);
-    let names: Vec<String> = stack(&s).into_iter().map(|(n, _)| n).collect();
+    let names: Vec<String> = stack(&mut s).into_iter().map(|(n, _)| n).collect();
     assert_eq!(names, ["inc", "main"]);
 }
 
@@ -418,19 +326,21 @@ fn a_package_of_several_modules_debugs_across_them() {
         .expect("the lambda arm") as u32
         + 1;
 
-    let mut s = Session::launch(&dir).unwrap_or_else(|e| panic!("launch: {e}"));
+    let mut s = Session::launch_at(&dir, None).unwrap_or_else(|e| panic!("launch: {e}"));
     assert_eq!(s.set_breakpoints(&eval, &[line]), vec![Some(line)]);
     assert_eq!(go(&mut s, Mode::Continue), Stop::Breakpoint);
-    let st = stack(&s);
+    let st = stack(&mut s);
     assert_eq!(st[0].0, "eval", "{st:?}");
     // `main` calls `runSource`, which calls `run`, which calls `toResult`, each
-    // in tail position: each call replaced its caller's frame, and the stack
-    // bottoms out in `toResult`, whose `handle` is still waiting.
+    // in tail position: each call replaced its caller's frame, and under them
+    // is `toResult`'s `handle`, still waiting, and the handler's frames.
     let names: Vec<&str> = st.iter().map(|(n, _)| n.as_str()).collect();
-    assert_eq!(names, ["eval", "eval", "run", "toResult"], "{st:?}");
-    let e = local(&mut s, 0, "e");
-    assert!(e.value.starts_with("Lam \"x\""), "{e:?}");
-    assert_eq!(e.ty.as_deref(), Some("Expr"));
+    assert_eq!(names[..4], ["eval", "eval", "run", "toResult"], "{st:?}");
+    // What the arm bound, from a module of its own: `e` itself is taken
+    // apart by the match, and gone.
+    let param = local(&mut s, 0, "param");
+    assert_eq!(param.value, "\"x\"", "{param:?}");
+    assert_eq!(param.ty.as_deref(), Some("String"));
 
     assert_eq!(
         go(&mut s, Mode::Continue),
@@ -490,7 +400,7 @@ fn a_private_function_in_a_module_can_be_the_entry() {
         }
     };
     assert_eq!(stop, Stop::Entry);
-    let st = stack(&s);
+    let st = stack(&mut s);
     assert_eq!(st[0], ("secret".to_string(), 2), "{st:?}");
     // The entry is a call in tail position, so `secret` is the whole stack.
     assert_eq!(st.len(), 1, "{st:?}");
@@ -506,7 +416,7 @@ fn a_package_with_no_main_can_still_be_debugged_at_a_function() {
     let dir = package("NoMain", &[("src/Main.mw", "fun square n = n * n\n")]);
     let main = dir.join("src/Main.mw");
     assert!(
-        Session::launch(&dir).is_err(),
+        Session::launch_at(&dir, None).is_err(),
         "nothing to run without an entry"
     );
     let mut s = Session::launch_at(&dir, Some(&entry(&main, "square 9"))).unwrap();
@@ -541,7 +451,7 @@ fn mini_ml_eval_can_be_debugged_without_touching_main() {
     };
     assert_eq!(stop, Stop::Entry);
     assert!(
-        local(&mut s, 0, "e").value.starts_with("App (Lam"),
+        local(&mut s, 0, "e").value.starts_with("App(Lam"),
         "{:?}",
         locals(&mut s, 0)
     );

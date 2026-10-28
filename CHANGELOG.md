@@ -22,6 +22,41 @@ beyond the last release is under _Unreleased_.
   `+` for `+.`, `<` for `<.`, and so on. A program built without `Std` names
   the float primitives (`_primAddF x y`), since there `+` is the integers'
   primitive.
+- There is one runtime. What was Silo -- its library, which an executable
+  links against, and its VM, which runs everything else -- is now Glade, in
+  `glade/`, and the bytecode runtime that was Glade is gone, with its
+  bytecode, its collector and its JIT. `--runtime glade` and `runtime =
+  "glade"` name it, and `--runtime silo` and `runtime = "silo"` still do.
+  How it runs a program is the backend's: `jit` (a debug build's default),
+  the VM running an image of AxCut and compiling what runs often as it goes;
+  `vm`, the VM interpreting alone; or `aot` (a release build's default), an
+  executable compiled by LLVM. A release build that cannot be linked runs on
+  the JIT instead, unless `aot` was asked for by name.
+- `--runtime silo` in a debug build no longer means an executable: the
+  backend does, and `--aot` asks for one.
+- A `.mbc` bytecode image is no longer anything `meadow` runs: `meadow
+  exec` takes the `.image` a build writes under
+  `target/<profile>/native/glade/`. `meadow link` is gone; `meadow build
+  --release` (or `--aot`) builds an executable.
+- `--emit bytecode` and `--emit asm` are gone, and so is `meadow dis --asm`:
+  `meadow dis` prints the code the VM runs, and `MEADOW_KEEP_IR=1` keeps the
+  LLVM IR an executable is compiled from. `meadow run --train` and the
+  profile-guided `aot` builds it fed are gone with the bytecode JIT.
+- What `@cfg(backend = …)` sees is the backend -- `vm`, `jit`, `aot` or
+  `cek` -- and never `silo`.
+- Native artifacts are under `target/<profile>/native/glade/` where they were
+  under `native/silo/`.
+
+### Added
+
+- The debugger runs a program on the VM, in a process of its own: a launch
+  takes `"stack"` (`growable` or `heap`) and `"watch"`, which builds and
+  loads a new build into the program as its sources change.
+- The REPL evaluates on one VM for the whole session, with its JIT, each line
+  loaded into it as a new build; `:vm` and `:cek` switch machines, as before.
+- A release `meadow` carries the VM built into it, as it carries the runtime
+  library, and runs it from `~/.meadow/lib/` with nothing installed beside
+  the binary.
 
 ## 0.4.0 - 2026-10-24
 
@@ -105,7 +140,7 @@ is doing.
   `https://`. `text`, `html`, `json` and `withHeader` build a response;
   `header` reads one in any case, and `bodyText` and `requestText` read a
   body.
-- A thread waiting on a socket holds up only itself. Glade and Silo make a
+- A thread waiting on a socket holds up only itself. The runtime makes a
   call that may wait on an I/O thread while the worker runs the program's
   other threads, and the CEK machine makes it on an OS thread of its own, so
   a server's thousand reading connections need no more workers than cores. A

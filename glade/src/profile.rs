@@ -1,560 +1,160 @@
-//! **Where a program spends itself**: sampling, and what the samples are.
+//! **A sampling profile of a native program, taken by the program.**
 //!
-//! # The machine has no stack pointer, and that is the interesting part
+//! `MEADOW_SILO_PROFILE=<file>` has the runtime interrupt itself a thousand
+//! times for each second of processor time it uses, and write down where it
+//! was: the return addresses on the stack, innermost first. At exit they go
+//! to the file, a line a sample, after a line saying where the program was
+//! loaded -- so that addresses can be put against the symbols `nm` lists of
+//! the executable, which is what `scripts/silo-profile.py` does.
 //!
-//! A profile wants a *stack* at each sample, and [`crate::Vm`] has nothing to
-//! unwind one from -- no `call`, no `ret`, no stack pointer; see
-//! `docs/RUNTIME.md`. What it has instead is a chain of continuations: the
-//! function running holds the one it will answer, that one captured the one
-//! *its* caller will answer, and so on down to the `halt` at the bottom. Most
-//! links are frames on the frame stack and a few are heap closures; they are
-//! laid out alike, and the walk does not care which it is on.
+//! It exists for where nothing outside the process may look: a container
+//! that allows neither `perf` nor `ptrace` leaves a program no profiler but
+//! itself. On macOS `sample` does this without being asked.
 //!
-//! Walking the chain is walking the call stack, and each link's entry pc -- a
-//! frame's `meta`, or method 0 of a closure's table -- is where control goes
-//! when the function under it returns: a return address, which is exactly the
-//! frame a profile wants.
-//!
-//! Three things make that walk possible, and all three already existed for the
-//! debugger:
-//!
-//! * [`meadow_bytecode::DebugInfo::env_of`] and `envs` say which name is in
-//!   which register at any pc;
-//! * `returns` says which names are a function's *own* return continuation, as
-//!   against `continuations`, the ones it makes for calls of its own -- the
-//!   difference between where this function goes and where it sends others;
-//! * a closure keeps its captures in fields `0..len`, in the same order its
-//!   method's block takes them, so the register a name sits in at the method's
-//!   entry is the field it was captured into.
-//!
-//! # Sampling where a block is entered
-//!
-//! [`crate::Vm::advance`] is consulted at each block the machine enters, by the
-//! interpreter, the JIT and the ahead-of-time backend alike. Sampling there
-//! costs one branch, needs no signal handler and no access to another thread's
-//! machine, and gives the same answer twice for the same program -- which a
-//! profile that is used to decide things ought to.
-//!
-//! What it measures is instructions, not seconds. Time spent in the collector
-//! is not here; `--gc-stats` is where that lives.
+//! The handler does as little as a handler can: it takes a slot in a table
+//! that was there before the program started, and walks the stack into it.
+//! Nothing is allocated and nothing is named until the program is over.
 
-use meadow_bytecode::{DebugInfo, Pc, Reg};
-use std::collections::HashMap;
+#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+mod imp {
+    use std::ffi::{c_char, c_int, c_void};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Block entries between samples, unless asked for another.
-pub const EVERY: u64 = 1000;
+    /// How many frames of a sample are kept, and how many samples: four
+    /// minutes of one processor, after which no more are taken.
+    const DEPTH: usize = 12;
+    const SAMPLES: usize = 1 << 18;
 
-/// Frames to walk, unless asked for another. Deep enough for real recursion to
-/// show, bounded because a chain can be as long as a program is recursive.
-pub const DEPTH: usize = 64;
+    static mut TABLE: [usize; SAMPLES * DEPTH] = [0; SAMPLES * DEPTH];
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-/// Times a second to sample, unless asked for another.
-pub const HZ: u64 = 1000;
+    const SIGPROF: c_int = 27;
+    const ITIMER_PROF: c_int = 2;
 
-/// What makes a block entry a sample.
-///
-/// Two profiles, and they answer different questions. Counting entries gives a
-/// profile of *work*: deterministic, the same twice for the same program, and
-/// blind to anything that costs seconds without retiring instructions.
-/// Counting ticks gives a profile of *time*: it sees a cache miss and a
-/// collection, and it is the one to trust about which of two changes was
-/// worth making.
-///
-/// A tick does not interrupt anything. A thread sleeps and moves a counter,
-/// and each machine notices at the next block it enters -- so the walk happens
-/// where the machine is consistent, and there is no signal handler reading a
-/// half-built stack. Every machine running at the time takes one sample per
-/// tick, which is what makes the counts come out proportional to processor
-/// time rather than wall-clock.
-#[derive(Debug, Clone)]
-enum When {
-    /// Every `n` block entries, counting down.
-    Entries { every: u64, countdown: u64 },
-    /// Once per tick of a shared clock, which somebody else is moving.
-    Ticks {
-        clock: std::sync::Arc<std::sync::atomic::AtomicU64>,
-        seen: u64,
-    },
-}
-
-/// A clock that moves on its own, for a profile of time.
-///
-/// Stops when it is dropped, so a run's profile cannot outlive the run and
-/// leave a thread behind.
-pub struct Ticker {
-    clock: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl Ticker {
-    /// A clock moving `hz` times a second.
-    pub fn at(hz: u64) -> Ticker {
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-        let clock = std::sync::Arc::new(AtomicU64::new(0));
-        let stop = std::sync::Arc::new(AtomicBool::new(false));
-        let (c, s) = (clock.clone(), stop.clone());
-        let period = std::time::Duration::from_nanos(1_000_000_000 / hz.max(1));
-        std::thread::spawn(move || {
-            while !s.load(Ordering::Relaxed) {
-                std::thread::sleep(period);
-                c.fetch_add(1, Ordering::Relaxed);
-            }
-        });
-        Ticker { clock, stop }
+    /// Two `timeval`s. A `timeval`'s microseconds are narrower than this on
+    /// macOS, with padding after: a small number written wide is the same
+    /// number there, the machine being little-endian.
+    #[repr(C)]
+    struct Timer {
+        every_s: i64,
+        every_us: i64,
+        first_s: i64,
+        first_us: i64,
     }
 
-    /// A profile that samples on this clock.
-    pub fn profile(&self, depth: usize) -> Profile {
-        Profile {
-            when: When::Ticks {
-                clock: self.clock.clone(),
-                seen: 0,
-            },
-            depth: depth.max(1),
-            stacks: HashMap::new(),
-            taken: 0,
-            shallow: 0,
+    #[repr(C)]
+    struct Where {
+        file: *const c_char,
+        base: *mut c_void,
+        symbol: *const c_char,
+        at: *mut c_void,
+    }
+
+    unsafe extern "C" {
+        fn signal(sig: c_int, handler: usize) -> usize;
+        fn setitimer(which: c_int, new: *const Timer, old: *mut Timer) -> c_int;
+        fn backtrace(into: *mut *mut c_void, size: c_int) -> c_int;
+        fn dladdr(addr: *const c_void, info: *mut Where) -> c_int;
+    }
+
+    extern "C" fn tick(_: c_int) {
+        let i = NEXT.fetch_add(1, Ordering::Relaxed);
+        if i >= SAMPLES {
+            return;
         }
-    }
-}
-
-impl Drop for Ticker {
-    fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// Samples, by the stack they landed on.
-#[derive(Debug, Clone)]
-pub struct Profile {
-    when: When,
-    depth: usize,
-    /// Innermost frame first, as a profile is usually read.
-    stacks: HashMap<Vec<Pc>, u64>,
-    taken: u64,
-    /// Samples that got no further than the frame they were taken in, because
-    /// the program carries no debug info to walk by.
-    shallow: u64,
-}
-
-impl Profile {
-    /// A profile that samples every `every` block entries.
-    pub fn new(every: u64, depth: usize) -> Profile {
-        Profile {
-            when: When::Entries {
-                every: every.max(1),
-                countdown: every.max(1),
-            },
-            depth: depth.max(1),
-            stacks: HashMap::new(),
-            taken: 0,
-            shallow: 0,
-        }
-    }
-
-    /// Does this profile measure time rather than work?
-    pub fn is_timed(&self) -> bool {
-        matches!(self.when, When::Ticks { .. })
-    }
-
-    /// How deep a sample walks.
-    pub fn depth(&self) -> usize {
-        self.depth
-    }
-
-    /// Is this block entry a sample? Counts down either way.
-    pub fn due(&mut self) -> bool {
-        match &mut self.when {
-            When::Entries { every, countdown } => {
-                *countdown -= 1;
-                if *countdown > 0 {
-                    return false;
-                }
-                *countdown = *every;
-                true
-            }
-            When::Ticks { clock, seen } => {
-                let now = clock.load(std::sync::atomic::Ordering::Relaxed);
-                if now == *seen {
-                    return false;
-                }
-                *seen = now;
-                true
+        // This frame and the one the signal arrived through come first, and
+        // are not the program's.
+        let mut frames = [std::ptr::null_mut::<c_void>(); DEPTH + 2];
+        // Safety: room for as many as it is told of.
+        let n = unsafe { backtrace(frames.as_mut_ptr(), (DEPTH + 2) as c_int) } as usize;
+        for k in 2..n.min(DEPTH + 2) {
+            // Safety: slot `i` is this handler's alone, and inside the table.
+            unsafe {
+                (&raw mut TABLE)
+                    .cast::<usize>()
+                    .add(i * DEPTH + (k - 2))
+                    .write(frames[k] as usize);
             }
         }
     }
 
-    pub fn record(&mut self, stack: Vec<Pc>) {
-        self.taken += 1;
-        if stack.len() <= 1 {
-            self.shallow += 1;
+    pub fn start() {
+        if std::env::var_os("MEADOW_SILO_PROFILE").is_none() {
+            return;
         }
-        *self.stacks.entry(stack).or_insert(0) += 1;
-    }
-
-    pub fn taken(&self) -> u64 {
-        self.taken
-    }
-
-    /// Samples that saw only the frame they were taken in. A profile that is
-    /// nearly all of these was taken of a program built without debug info,
-    /// and is a list of places rather than a tree.
-    pub fn shallow(&self) -> u64 {
-        self.shallow
-    }
-
-    /// Every stack and its count, innermost frame first.
-    pub fn stacks(&self) -> impl Iterator<Item = (&[Pc], u64)> {
-        self.stacks.iter().map(|(s, n)| (s.as_slice(), *n))
-    }
-
-    /// Take in another thread's samples. Each green thread profiles its own
-    /// machine, and a run's profile is all of them.
-    pub fn merge(&mut self, other: &Profile) {
-        self.taken += other.taken;
-        self.shallow += other.shallow;
-        for (stack, n) in &other.stacks {
-            *self.stacks.entry(stack.clone()).or_insert(0) += n;
-        }
-    }
-}
-
-/// Where each `invoke` went and which way each tag test went: what a JIT
-/// could speculate on.
-///
-/// The types say what kind of thing a call enters; they do not say *which*
-/// one. An `invoke` enters whatever object is in its register -- a function
-/// value, a heap continuation, a frame -- and this counts, per site, the
-/// method entries it reached. A site that only ever reached one is one a
-/// compiler could guard on and inline. The same for `JumpUnlessTag`: a test
-/// that nearly always goes one way is one to lay out as the straight path.
-///
-/// Exact, per interpreted instruction, under the same feature as [`Ops`]: run
-/// with `--backend vm` to see every one, since native code does not come back
-/// through the interpreter to be counted.
-#[cfg(feature = "profile-alloc")]
-#[derive(Debug, Clone, Default)]
-pub struct Feedback {
-    /// Per `invoke` site: per target, `(frame invokes, closure invokes)`.
-    pub calls: HashMap<Pc, HashMap<Pc, (u64, u64)>>,
-    /// Per `JumpUnlessTag` site: `[matched, did not]`.
-    pub tags: HashMap<Pc, [u64; 2]>,
-    /// `move`s, by the instruction that ends the run of moves they are in:
-    /// what they gather registers for.
-    pub moves: HashMap<u8, u64>,
-}
-
-#[cfg(feature = "profile-alloc")]
-impl Feedback {
-    pub fn call(&mut self, site: Pc, target: Pc, frame: bool) {
-        let e = self
-            .calls
-            .entry(site)
-            .or_default()
-            .entry(target)
-            .or_default();
-        if frame {
-            e.0 += 1;
-        } else {
-            e.1 += 1;
-        }
-    }
-
-    pub fn tag(&mut self, site: Pc, matched: bool) {
-        self.tags.entry(site).or_default()[usize::from(!matched)] += 1;
-    }
-
-    pub fn merge(&mut self, other: &Feedback) {
-        for (site, targets) in &other.calls {
-            let into = self.calls.entry(*site).or_default();
-            for (target, (f, c)) in targets {
-                let e = into.entry(*target).or_default();
-                e.0 += f;
-                e.1 += c;
-            }
-        }
-        for (op, n) in &other.moves {
-            *self.moves.entry(*op).or_default() += n;
-        }
-        for (site, [m, n]) in &other.tags {
-            let e = self.tags.entry(*site).or_default();
-            e[0] += m;
-            e[1] += n;
-        }
-    }
-}
-
-/// How many of each instruction a run retired.
-///
-/// Exact rather than sampled -- the interpreter passes through one place -- and
-/// under the same feature as [`Sites`], because it is a counter on the hottest
-/// loop in the runtime. What it answers is the question a stack profile cannot:
-/// a program that is all in one function still spends its time on *something*,
-/// and a calling convention that costs more than the arithmetic it carries
-/// shows up here and nowhere else.
-#[cfg(feature = "profile-alloc")]
-#[derive(Debug, Clone)]
-pub struct Ops {
-    counts: Vec<u64>,
-}
-
-#[cfg(feature = "profile-alloc")]
-impl Default for Ops {
-    fn default() -> Ops {
-        Ops {
-            counts: vec![0; 256],
-        }
-    }
-}
-
-#[cfg(feature = "profile-alloc")]
-impl Ops {
-    pub fn note(&mut self, op: meadow_bytecode::Op) {
-        self.counts[op as usize] += 1;
-    }
-
-    pub fn merge(&mut self, other: &Ops) {
-        for (a, b) in self.counts.iter_mut().zip(&other.counts) {
-            *a += b;
-        }
-    }
-
-    pub fn total(&self) -> u64 {
-        self.counts.iter().sum()
-    }
-
-    /// Every instruction that ran at least once, most first.
-    pub fn each(&self) -> Vec<(meadow_bytecode::Op, u64)> {
-        let mut out: Vec<(meadow_bytecode::Op, u64)> = meadow_bytecode::Op::ALL
-            .iter()
-            .filter_map(|op| {
-                let n = self.counts[*op as usize];
-                (n > 0).then_some((*op, n))
-            })
-            .collect();
-        out.sort_by(|a, b| b.1.cmp(&a.1));
-        out
-    }
-}
-
-/// The register holding the function's own return continuation at `pc`.
-///
-/// `returns` less `continuations`: the first is where *this* function goes when
-/// it is done, the second are the ones it hands to calls it makes. Only the
-/// first is a frame below this one.
-pub fn continuation_reg(debug: &DebugInfo, pc: usize) -> Option<Reg> {
-    let which = *debug.env_of.get(pc)? as usize;
-    debug
-        .envs
-        .get(which)?
-        .iter()
-        .find(|(name, _)| debug.returns.contains(name) && !debug.continuations.contains(name))
-        .map(|(_, r)| *r)
-}
-
-/// Where a program's allocation comes from, by the instruction that asked for
-/// it.
-///
-/// Only under `--features profile-alloc`. The accounting is two map lookups on
-/// the bump allocator, which is the fast path a generational collector exists
-/// to have, so it is not something to carry when nobody is looking.
-///
-/// Sites rather than stacks: an allocation happens inside [`crate::heap::Heap`],
-/// which has no machine to walk a chain of continuations with. The instruction
-/// is enough to name the function, which is the question people ask of an
-/// allocation profile -- *what is making all this garbage* -- and the sampling
-/// profile answers the rest.
-#[cfg(feature = "profile-alloc")]
-#[derive(Debug, Clone, Default)]
-pub struct Sites {
-    by_pc: HashMap<Pc, Allocated>,
-}
-
-/// What one instruction allocated.
-#[cfg(feature = "profile-alloc")]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Allocated {
-    pub objects: u64,
-    pub slots: u64,
-}
-
-#[cfg(feature = "profile-alloc")]
-impl Sites {
-    /// One object of `slots` words, asked for at `pc`.
-    pub fn note(&mut self, pc: Pc, slots: usize) {
-        let e = self.by_pc.entry(pc).or_default();
-        e.objects += 1;
-        e.slots += slots as u64;
-    }
-
-    pub fn each(&self) -> impl Iterator<Item = (Pc, Allocated)> + '_ {
-        self.by_pc.iter().map(|(pc, a)| (*pc, *a))
-    }
-
-    pub fn merge(&mut self, other: &Sites) {
-        for (pc, a) in &other.by_pc {
-            let e = self.by_pc.entry(*pc).or_default();
-            e.objects += a.objects;
-            e.slots += a.slots;
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.by_pc.is_empty()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_sample_is_taken_every_nth_entry() {
-        let mut p = Profile::new(3, 8);
-        let due: Vec<bool> = (0..7).map(|_| p.due()).collect();
-        assert_eq!(due, [false, false, true, false, false, true, false]);
-    }
-
-    /// A timed profile samples when the clock moves, not when instructions
-    /// do -- so a machine that enters a great many blocks between two ticks
-    /// contributes one sample, and one that enters two contributes one as well.
-    #[test]
-    fn a_timed_profile_samples_when_the_clock_moves() {
-        let ticker = Ticker::at(1000);
-        let mut p = ticker.profile(8);
-        assert!(p.is_timed());
-
-        // Nothing has ticked past what it has seen yet, so nothing is due --
-        // however many blocks go by.
-        let before = (0..1000).filter(|_| p.due()).count();
-        assert!(before <= 1, "at most the first tick: {before}");
-
-        // Once the clock has moved, exactly one entry is a sample, and the
-        // next is not until it moves again.
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        assert!(p.due(), "the clock moved");
-        assert!(!p.due(), "and has not moved again");
-    }
-
-    /// The clock stops with the profile that was taken on it, so a run cannot
-    /// leave a thread behind.
-    #[test]
-    fn a_ticker_stops_when_it_is_dropped() {
-        let clock = {
-            let ticker = Ticker::at(2000);
-            let clock = ticker.clock.clone();
-            // Given time to start, however busy the machine is: twenty
-            // milliseconds was not always enough beside twenty other jobs.
-            let begun = std::time::Instant::now();
-            while clock.load(std::sync::atomic::Ordering::Relaxed) == 0
-                && begun.elapsed() < std::time::Duration::from_secs(5)
-            {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            assert!(
-                clock.load(std::sync::atomic::Ordering::Relaxed) > 0,
-                "it ran"
-            );
-            clock
+        // The unwinder is loaded the first time it is used, which must not
+        // be inside the handler.
+        let mut warm = [std::ptr::null_mut::<c_void>(); 2];
+        let every = Timer {
+            every_s: 0,
+            every_us: 1000,
+            first_s: 0,
+            first_us: 1000,
         };
-        let at_drop = clock.load(std::sync::atomic::Ordering::Relaxed);
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        let after = clock.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(
-            after <= at_drop + 1,
-            "kept ticking after the drop: {at_drop} then {after}"
-        );
+        // Safety: a handler that touches only its table, and a timer.
+        unsafe {
+            backtrace(warm.as_mut_ptr(), 2);
+            signal(SIGPROF, tick as *const () as usize);
+            setitimer(ITIMER_PROF, &every, std::ptr::null_mut());
+        }
     }
 
-    #[test]
-    fn samples_on_one_stack_are_counted_together() {
-        let mut p = Profile::new(1, 8);
-        p.record(vec![1, 2, 3]);
-        p.record(vec![1, 2, 3]);
-        p.record(vec![4]);
-        let mut got: Vec<(Vec<Pc>, u64)> = p.stacks().map(|(s, n)| (s.to_vec(), n)).collect();
-        got.sort();
-        assert_eq!(got, [(vec![1, 2, 3], 2), (vec![4], 1)]);
-        assert_eq!(p.taken(), 3);
-        assert_eq!(p.shallow(), 1, "the one-frame stack");
-    }
-
-    #[test]
-    fn merging_adds_the_counts_up() {
-        let mut a = Profile::new(1, 8);
-        a.record(vec![1, 2]);
-        let mut b = Profile::new(1, 8);
-        b.record(vec![1, 2]);
-        b.record(vec![9]);
-        a.merge(&b);
-        assert_eq!(a.taken(), 3);
-        let mut got: Vec<(Vec<Pc>, u64)> = a.stacks().map(|(s, n)| (s.to_vec(), n)).collect();
-        got.sort();
-        assert_eq!(got, [(vec![1, 2], 2), (vec![9], 1)]);
+    pub fn finish() {
+        let Some(path) = std::env::var_os("MEADOW_SILO_PROFILE") else {
+            return;
+        };
+        let off = Timer {
+            every_s: 0,
+            every_us: 0,
+            first_s: 0,
+            first_us: 0,
+        };
+        // Safety: the timer stopped, so the table is no longer written.
+        unsafe { setitimer(ITIMER_PROF, &off, std::ptr::null_mut()) };
+        let mut at = Where {
+            file: std::ptr::null(),
+            base: std::ptr::null_mut(),
+            symbol: std::ptr::null(),
+            at: std::ptr::null_mut(),
+        };
+        // Safety: an address in this program, and room for the answer.
+        unsafe { dladdr(finish as *const c_void, &mut at) };
+        let taken = NEXT.load(Ordering::Relaxed).min(SAMPLES);
+        let mut out = format!("base {:x}\n", at.base as usize);
+        for i in 0..taken {
+            let mut line = String::new();
+            for k in 0..DEPTH {
+                // Safety: inside the table, and nothing writes it now.
+                let a = unsafe { (&raw const TABLE).cast::<usize>().add(i * DEPTH + k).read() };
+                if a == 0 {
+                    break;
+                }
+                if k > 0 {
+                    line.push(' ');
+                }
+                line.push_str(&format!("{a:x}"));
+            }
+            out.push_str(&line);
+            out.push('\n');
+        }
+        if let Err(e) = std::fs::write(&path, out) {
+            eprintln!("aot: the profile could not be written: {e}");
+        }
     }
 }
 
-#[cfg(all(test, feature = "profile-alloc"))]
-mod alloc_tests {
-    use super::*;
+#[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+mod imp {
+    pub fn start() {}
+    pub fn finish() {}
+}
 
-    #[test]
-    fn allocation_is_counted_by_the_instruction_that_asked() {
-        let mut s = Sites::default();
-        s.note(7, 4);
-        s.note(7, 6);
-        s.note(9, 2);
-        let mut got: Vec<(Pc, Allocated)> = s.each().collect();
-        got.sort_by_key(|(pc, _)| *pc);
-        assert_eq!(
-            got,
-            [
-                (
-                    7,
-                    Allocated {
-                        objects: 2,
-                        slots: 10
-                    }
-                ),
-                (
-                    9,
-                    Allocated {
-                        objects: 1,
-                        slots: 2
-                    }
-                ),
-            ]
-        );
-    }
+/// Begin sampling, if `MEADOW_SILO_PROFILE` names a file to write to.
+pub fn start() {
+    imp::start();
+}
 
-    #[test]
-    fn merging_adds_the_sites_up() {
-        let mut a = Sites::default();
-        a.note(1, 3);
-        let mut b = Sites::default();
-        b.note(1, 5);
-        b.note(2, 1);
-        a.merge(&b);
-        let mut got: Vec<(Pc, Allocated)> = a.each().collect();
-        got.sort_by_key(|(pc, _)| *pc);
-        assert_eq!(
-            got,
-            [
-                (
-                    1,
-                    Allocated {
-                        objects: 2,
-                        slots: 8
-                    }
-                ),
-                (
-                    2,
-                    Allocated {
-                        objects: 1,
-                        slots: 1
-                    }
-                ),
-            ]
-        );
-    }
+/// Stop, and write what was sampled.
+pub fn finish() {
+    imp::finish();
 }

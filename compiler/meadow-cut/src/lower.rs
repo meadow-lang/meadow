@@ -56,7 +56,7 @@
 //! operation whose clause is given its continuation cuts the segments
 //! between it and its handler off (`Detach`), and the resumption, which is
 //! checked to be called once, puts them back (`Reattach`): `meadow_seq`'s
-//! lowering of the same, `docs/SILO.md`'s "Effects: stack segments".
+//! lowering of the same, `docs/RUNTIME.md`'s "Effects: stack segments".
 //! `MEADOW_CUT_FRAMES=none` keeps everything on the heap, for telling a
 //! fault in this from one anywhere else.
 //!
@@ -1464,7 +1464,7 @@ impl Lower {
         ));
         // The handled body on a segment of the stack of its own, which an
         // operation that captures its continuation cuts off whole
-        // (`docs/SILO.md`, "Effects: stack segments"). With every
+        // (`docs/RUNTIME.md`, "Effects: stack segments"). With every
         // continuation on the heap there is nothing on the stack to cut.
         if self.segmented() {
             let entered = self.fresh(ax::Rep::Bits(desc::UNIT));

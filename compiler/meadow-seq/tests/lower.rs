@@ -1,6 +1,7 @@
 //! What the lowering actually emits.
 //!
-//! `meadow_glade`'s differential tests already check that the translation *means*
+//! The differential tests (`buildtools/meadow/tests/differential.rs`) already
+//! check that the translation *means*
 //! the same thing as the CEK machine. These check that it means it in the
 //! intended shape — that returning is an `invoke` with no arguments, that
 //! calling is a `substitute` and an `invoke`, and above all that a block's
@@ -38,6 +39,7 @@ fn main_def(term: Term) -> Program {
         ctor_fields: Default::default(),
         variants: Default::default(),
         origins: Default::default(),
+        migrations: Vec::new(),
     }
 }
 
@@ -161,6 +163,7 @@ fn a_global_reference_is_a_jump_with_the_environment_untouched() {
         ctor_fields: Default::default(),
         variants: Default::default(),
         origins: Default::default(),
+        migrations: Vec::new(),
     };
     let lowered = lower_program(&program, meadow_core::OptLevel::default());
     assert!(lowered.unsupported.is_empty());
@@ -197,6 +200,7 @@ fn a_global_literal_is_put_where_it_is_mentioned() {
         ctor_fields: Default::default(),
         variants: Default::default(),
         origins: Default::default(),
+        migrations: Vec::new(),
     };
     let lowered = lower_program(&program, meadow_core::OptLevel::default());
     assert!(lowered.unsupported.is_empty());

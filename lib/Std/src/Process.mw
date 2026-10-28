@@ -44,7 +44,8 @@ use Std.Collections.Vector (Vector)
   -- forgets them and answers 0. Between those it only grows, and grows when
   -- the program gets somewhere it had not been: what `Std.Test.Fuzz` steers
   -- by. On the bytecode machine, which from the first asking interprets this
-  -- thread and compiles none of it; a native program is always told 0.
+  -- thread and compiles none of it, and on Silo's interpreter, which from
+  -- then notes every instruction it runs; a native program is always told 0.
   covered : Bool -> Int,
   -- Calling C: what `Std.Ffi` is written over, and where to look for how to
   -- use these. A library and a function are addresses; an argument is

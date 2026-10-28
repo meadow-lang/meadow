@@ -6,7 +6,7 @@
 //!    Compiling json v0.3.0 (https://github.com/someone/meadow-json#a1b2c3d4)
 //!    Compiling app v0.1.0 (/home/me/app)
 //!     Building [=================>       ] 2/3: app
-//!     Finished `debug` profile [O1, glade jit] in 0.42s
+//!     Finished `debug` profile [O1, jit] in 0.42s
 //!      Running `main`
 //! ```
 //!

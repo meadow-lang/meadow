@@ -6,8 +6,8 @@ mod repl;
 
 use clap::{Parser, Subcommand};
 use meadow::{
-    Backend, Engine, OptLevel, Profile, Resolved, Strictness, aot, artifacts, format, init,
-    listing::{self, Emit},
+    Backend, Engine, OptLevel, Profile, Resolved, Strictness, aot, format, init,
+    listing::Emit,
     package::ProfileConfig,
     pipeline, runtime, status, test,
     workspace::{Selected, Selection},
@@ -44,8 +44,7 @@ enum Cmd {
         #[arg(long)]
         annotations: bool,
         /// What to write, in place of what a build writes by default -- the
-        /// bytecode image, and for an `aot` build an executable: `image`,
-        /// `bytecode` (the image as text), `asm` (the native code as text),
+        /// image the VM runs, or for an `aot` build an executable: `image`,
         /// `exe`, or `expanded` (the sources with every macro call replaced
         /// by what it produced). Comma-separated, or repeated.
         #[arg(long, value_name = "KIND", value_delimiter = ',', value_parser = emit)]
@@ -72,8 +71,9 @@ enum Cmd {
         profile: ProfileArgs,
         #[command(flatten)]
         engine: EngineArgs,
-        /// After running, report what the garbage collector did (VM only): how
-        /// many collections, how long they took, and how much they copied.
+        /// After running, report what memory management did: its collections
+        /// and pauses when memory is traced, and its blocks and cycle
+        /// collections when it is counted -- on the VM or natively.
         #[arg(long)]
         gc_stats: bool,
         /// Sample where the program spends itself and write folded stacks to
@@ -88,18 +88,22 @@ enum Cmd {
         sample_every: Option<u64>,
         /// Samples a second, for the profile of time. Ignored with
         /// `--sample-every`.
-        #[arg(long, value_name = "HZ", default_value_t = meadow_glade::profile::HZ)]
+        #[arg(long, value_name = "HZ", default_value_t = SAMPLE_HZ)]
         sample_hz: u64,
-        /// Run on the JIT and write what each call site was seen to enter to
-        /// `target/<profile>/calls.pgo`, for an `aot` build of the same
-        /// program to guard its calls on: profile-guided optimization.
+        /// Run on the VM and, whenever the package's sources
+        /// change, build it again and load the new build into the program as
+        /// it runs: from then on a call by name runs the new version, and
+        /// what is running already finishes as it was. A type the new build
+        /// changed is a new type: values already made of the old one go on
+        /// being taken by the code made for them -- unless the new build
+        /// says what they become, with a function `@migrate(Ctor)` taking an
+        /// old `Ctor`'s fields. A build the program cannot take is offered as
+        /// a start over, which saving again takes. Unless it is asked to be
+        /// interpreted, the program runs natively all the same: each
+        /// definition is compiled the first time it is called, as an
+        /// executable's are, and a new build's as they are called.
         #[arg(long)]
-        train: bool,
-        /// Which collector the VM uses: `generational` (the default: a nursery,
-        /// and an old generation marked concurrently, for short pauses) or
-        /// `copying` (one space, copied whole). `MEADOW_GC` sets the same.
-        #[arg(long, value_parser = ["generational", "copying"])]
-        gc: Option<String>,
+        watch: bool,
         #[command(flatten)]
         target: TargetArgs,
         /// Arguments for the program, after `--`: what `Process.argv` gives
@@ -107,40 +111,25 @@ enum Cmd {
         #[arg(last = true, value_name = "ARGS")]
         args: Vec<String>,
     },
-    /// Run a bytecode image: what `meadow build` writes under
-    /// `target/<profile>/bytecode/`, or what a compiler written in Meadow
-    /// emits.
+    /// Run an image on the VM: what `meadow build` writes under
+    /// `target/<profile>/native/`, or `meadow cut --no-run`.
     Exec {
-        /// The `.mbc` file.
+        /// The `.image`.
         image: PathBuf,
-        /// `vm` (the interpreter alone) or `jit` (the default). For an
-        /// executable, `meadow link` the image.
+        /// `vm` (the VM interpreting) or `jit` (the default: the VM,
+        /// compiling what runs often as it goes).
         #[arg(long, value_name = "BACKEND", value_parser = backend)]
         backend: Option<Backend>,
-        /// Optimization level for the JIT: 0, 1 or 2.
-        #[arg(short = 'O', long = "opt-level", value_name = "LEVEL", value_parser = opt_level)]
-        opt: Option<OptLevel>,
         /// Arguments for the program, after `--`.
         #[arg(last = true, value_name = "ARGS")]
         args: Vec<String>,
     },
-    /// Compile a bytecode image to machine code and link it into an
-    /// executable.
+    /// Where linking a bytecode image went. Hidden: it is here only to say
+    /// so to anyone whose fingers still type it.
+    #[command(hide = true)]
     Link {
-        /// The `.mbc` file.
-        image: PathBuf,
-        /// The file to write. The image's name beside it, by default.
-        #[arg(short = 'o', long = "output", value_name = "FILE")]
-        output: Option<PathBuf>,
-        /// `exe` (the default), or `asm`: the native code as text, in place of
-        /// the executable.
-        #[arg(long, value_name = "KIND", value_parser = ["exe", "asm"], default_value = "exe")]
-        emit: String,
-        /// Optimization level: 0, 1 or 2 (the default).
-        #[arg(short = 'O', long = "opt-level", value_name = "LEVEL", value_parser = opt_level)]
-        opt: Option<OptLevel>,
-        #[command(flatten)]
-        target: TargetArgs,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        rest: Vec<String>,
     },
     /// Build a package and run its `@test` functions.
     Test {
@@ -174,14 +163,11 @@ enum Cmd {
         #[command(flatten)]
         target: TargetArgs,
     },
-    /// Disassemble a package: the bytecode the VM would run.
+    /// Disassemble a package: the code the VM runs.
     Dis {
         /// Package directory (or a single `.mw` file).
         #[arg(default_value = ".")]
         path: PathBuf,
-        /// The native code an `aot` build compiles the bytecode to, instead.
-        #[arg(long)]
-        asm: bool,
         #[command(flatten)]
         packages: PackageArgs,
         #[command(flatten)]
@@ -213,6 +199,12 @@ enum Cmd {
         /// what a build already fetched is used.
         #[arg(long)]
         fetch: bool,
+        /// Serve nothing: open each `.mw` file under these paths as an editor
+        /// would, print every error the server would mark in it, and exit 1
+        /// if there is one. What a package depends on is fetched, as by a
+        /// build.
+        #[arg(long, value_name = "PATH", num_args = 1..)]
+        check: Vec<PathBuf>,
     },
     /// Run the debug adapter, speaking the Debug Adapter Protocol over stdin
     /// and stdout.
@@ -278,8 +270,8 @@ enum Cmd {
         path: PathBuf,
     },
     /// Run a program of Cut, the IR a front end hands the back end
-    /// (`docs/CUT.md`): lowered to AxCut and run on Glade, or built for Silo
-    /// and run as an executable.
+    /// (`docs/CUT.md`): lowered to AxCut and run on the VM, or built ahead
+    /// of time and run as an executable.
     ///
     /// For whoever writes a front end, Meadow's own in Meadow among them.
     /// Effects a program handles are not lowered yet.
@@ -287,11 +279,12 @@ enum Cmd {
         /// The program, as the text `docs/CUT.md` describes.
         #[arg(value_name = "FILE")]
         file: PathBuf,
-        /// `glade`, on its bytecode, or `silo`, as native code.
+        /// `glade`, the runtime; `silo`, its name before the old runtime was
+        /// retired, is taken as `--aot`, which is what it meant then.
         #[arg(long, default_value = "glade", value_name = "NAME")]
         runtime: String,
-        /// On Glade, compile the bytecode to machine code ahead of time and
-        /// run that executable, rather than interpreting it.
+        /// Build an executable ahead of time and run that, rather than
+        /// running it on the VM.
         #[arg(long)]
         aot: bool,
         /// How hard an executable is optimised: 0, 1 or 2.
@@ -302,19 +295,19 @@ enum Cmd {
             value_name = "LEVEL"
         )]
         opt: u8,
-        /// Build what would be run -- the bytecode image, or the executable
-        /// -- and stop: what a front end's `build` asks for.
+        /// Build what would be run -- the VM's image, or the executable --
+        /// and stop: what a front end's `build` asks for.
         #[arg(long)]
         no_run: bool,
-        /// On Silo, what to build for: an architecture of this system, or a
+        /// What an executable is built for: an architecture of this system, or a
         /// target triple for another, such as `aarch64-linux-android`. A
         /// build for another system is built and not run.
         #[arg(long, value_name = "TARGET")]
         target: Option<String>,
         /// Print what the program is made into, and run nothing: `inlined`,
         /// the Cut it is lowered from once its small definitions are inlined;
-        /// `axcut`, the AxCut it is lowered to; or `llvm`, the LLVM IR a Silo
-        /// build compiles.
+        /// `axcut`, the AxCut it is lowered to; or `llvm`, the LLVM IR an
+        /// executable is compiled from.
         #[arg(long, value_name = "WHAT")]
         emit: Option<String>,
         /// What the program is given, after `--`: what its `argv` answers.
@@ -433,21 +426,58 @@ struct TargetArgs {
     runtime: aot::Runtime,
     /// How many OS threads run the program's green threads. One per core by
     /// default, and `1` runs them all on one, in turn. `MEADOW_THREADS` says
-    /// the same, and `threads = N` in a profile; both runtimes read it.
+    /// the same, and `threads = N` in a profile.
     #[arg(long, short = 'j', value_name = "N")]
     threads: Option<usize>,
-    /// How large Glade's collector lets a thread's nursery grow: `8M`, `512K`,
-    /// `1G`, or bytes, from 256K to 1G. 2M by default. A larger one collects
+    /// How memory is managed: `rc`, counting references with reuse (the
+    /// default); `tracing`, a collector that marks and sweeps in place; or
+    /// `generational`, a collector with a young generation, which `copying`
+    /// names too. `MEADOW_GC` says the same.
+    #[arg(long, value_name = "STRATEGY", value_parser = ["rc", "tracing", "generational", "copying"])]
+    gc: Option<String>,
+    /// Write an image for the VM rather than an executable, whatever the
+    /// backend: the program is lowered to AxCut and run on the same heap,
+    /// strategies and primitives, with nothing for LLVM to do, so it starts
+    /// as soon as it is lowered. `MEADOW_INTERPRET` says the same.
+    #[arg(long)]
+    interpret: bool,
+    /// Where a program's frames live: `fixed`, the native stack, as deep as
+    /// a thread's (a gigabyte for `main`), at no cost; `growable`, the
+    /// native stack, as deep as memory allows, for a compare where each
+    /// function begins; or `heap`, every continuation an object, as deep as
+    /// memory allows, for an allocation at each non-tail call. Growable in a debug build and fixed in a
+    /// release one, unless `stack = "…"` in a profile says otherwise.
+    /// `MEADOW_STACK` says the same.
+    #[arg(long, value_name = "STACK", value_parser = stack_kind)]
+    stack: Option<meadow_llvm::Stack>,
+    /// How a block is laid out in memory: `silo`, with a count in
+    /// every header, or `glade`, with none, so that a block of up to eight
+    /// fields has a header of two words rather than three -- which is only
+    /// ever traced (`--gc tracing` or `generational`). Each is a runtime
+    /// library and an interpreter of its own. `MEADOW_LAYOUT` says the same,
+    /// and `layout = "…"` in a profile.
+    #[arg(long, value_name = "LAYOUT", value_parser = ["silo", "glade"])]
+    layout: Option<String>,
+    /// Build what is interpreted so that no new build of it can be loaded
+    /// into it while it runs (`meadow run --watch`): its definitions,
+    /// constructors and effects are not written with the versions of the
+    /// types they carry, and an image is smaller and lowered sooner. A
+    /// native build is never reloaded, and this changes nothing in it.
+    /// `reload = false` in a profile, or `MEADOW_RELOAD=0`, says the same.
+    #[arg(long)]
+    no_reload: bool,
+    /// How large the generational collector lets a thread's nursery grow:
+    /// `8M`, `512K`, `1G`, or bytes, from 256K to 1G. A larger one collects
     /// less often and promotes less, which a program that allocates a great
     /// deal runs faster for, and its nursery pauses are longer.
     /// `MEADOW_GC_NURSERY` says the same in words of eight bytes, and
-    /// `nursery = "…"` in a profile. Silo has no nursery.
+    /// `nursery = "…"` in a profile.
     #[arg(long, value_name = "SIZE", value_parser = meadow::profile::nursery_size)]
     nursery: Option<u64>,
     /// After running, report the blocks the program left behind: what it
-    /// still held at exit, by kind, and what held them. Silo counts by
-    /// reference, so this is where a cycle shows up. `leaks = true` in a
-    /// profile turns it on for a package.
+    /// still held at exit, by kind, and what held them. Memory is counted by
+    /// reference by default, so this is where a cycle shows up. `leaks = true`
+    /// in a profile turns it on for a package.
     #[arg(long)]
     leaks: bool,
     /// Features of the package to build with, by the names its `[features]`
@@ -461,6 +491,12 @@ struct TargetArgs {
     /// Build with every feature the package has.
     #[arg(long)]
     all_features: bool,
+}
+
+/// `--stack`'s kind, by name.
+fn stack_kind(s: &str) -> Result<meadow_llvm::Stack, String> {
+    meadow_llvm::Stack::named(s)
+        .ok_or_else(|| format!("`{s}` is not a stack: `fixed`, `growable` or `heap`"))
 }
 
 impl TargetArgs {
@@ -481,6 +517,14 @@ impl TargetArgs {
                 .or_else(|| profile.target.map(|t| t.to_string())),
             runtime: profile.runtime,
             threads: self.threads.or(profile.threads),
+            gc: self.gc.clone(),
+            interpret: self.interpret,
+            stack: self.stack.or(Some(profile.stack)),
+            layout: self
+                .layout
+                .clone()
+                .or_else(|| profile.layout.map(|l| l.name().to_string())),
+            no_reload: self.no_reload || !profile.reload,
             nursery: self.nursery.or(profile.nursery),
             leaks: self.leaks || profile.leaks,
             features: self.features.clone(),
@@ -489,10 +533,30 @@ impl TargetArgs {
         }
     }
 
-    /// Tell the runtime what these ask for. The environment is how both
-    /// runtimes are told, and a program Silo runs is a process
-    /// of its own, which inherits it.
+    /// Tell the runtime what these ask for. The environment is how it is
+    /// told, and a program is run in a process of its own, which inherits
+    /// it.
     fn configure(&self) {
+        if self.interpret {
+            meadow::aot::set_interpret();
+        }
+        if let Some(s) = self.stack {
+            meadow::aot::set_stack(s);
+        }
+        if self.no_reload {
+            meadow::aot::set_no_reload();
+        }
+        if let Some(l) = self.layout.as_deref().and_then(meadow_llvm::Layout::named) {
+            meadow::aot::set_layout(l);
+            // What a program run in a process of its own builds for, and
+            // which interpreter runs it. Safety: as below.
+            unsafe { std::env::set_var("MEADOW_LAYOUT", l.name()) };
+        }
+        if let Some(g) = &self.gc {
+            meadow::aot::set_gc(meadow::aot::strategy(g));
+            // What the VM is told. Safety: as below.
+            unsafe { std::env::set_var("MEADOW_GC", g) };
+        }
         if let Some(n) = self.threads.filter(|n| *n > 0) {
             // Safety: before the program, its threads or any child of it.
             unsafe { std::env::set_var("MEADOW_THREADS", n.to_string()) };
@@ -504,6 +568,11 @@ impl TargetArgs {
         if self.leaks {
             // Safety: as above.
             unsafe { std::env::set_var("MEADOW_SILO_LEAKS", "1") };
+        }
+        // A combination that cannot be met is refused, never run as another.
+        if let Err(e) = meadow::aot::config().check() {
+            status::error(e);
+            std::process::exit(2);
         }
     }
 
@@ -539,26 +608,34 @@ struct ProfileArgs {
     /// Allow a non-exhaustive `match`, whatever the profile says.
     #[arg(long)]
     lenient: bool,
-    /// The runtime system: `glade` (the default) -- bytecode, run by the
-    /// interpreter and the JIT or compiled ahead of time with `--aot`, and a
-    /// garbage collector -- or `silo`, compiled all the way down by LLVM,
-    /// counting references, and always an executable. `runtime = "…"` in a
-    /// `[profile.<name>]` of `Meadow.toml` sets it for a package; this
-    /// overrides that.
+    /// The runtime system: `glade`, or `silo`, its name before the old
+    /// runtime was retired. There is one, and either name means it; how it
+    /// runs a program is `--backend`'s.
     #[arg(long, value_name = "RUNTIME", value_parser = ["glade", "silo"])]
     runtime: Option<String>,
-    /// How Glade runs the program: `vm` (the bytecode interpreter), `jit`
-    /// (which compiles what runs often to machine code as it goes) or `aot`
-    /// (machine code compiled ahead of time, into an executable). Debug builds
+    /// How the program runs: `vm` (the VM, interpreting an image), `jit` (the
+    /// VM, compiling what runs often to machine code as it goes) or `aot`
+    /// (compiled ahead of time by LLVM, into an executable). Debug builds
     /// default to `jit` and release builds to `aot`; `backend = "..."` in a
     /// `[profile.<name>]` of `Meadow.toml` overrides that, and this overrides
-    /// both. Silo is always compiled ahead of time.
+    /// both.
     #[arg(long, value_name = "BACKEND", value_parser = backend, conflicts_with_all = ["jit", "aot"])]
     backend: Option<Backend>,
     /// `--backend jit`.
     #[arg(long, conflicts_with = "aot")]
     jit: bool,
-    /// `--backend aot`: Glade, compiled ahead of time into an executable.
+    /// On the JIT, how many times a procedure is entered before it is
+    /// compiled: 0 compiles each when it is first entered. A loop is a tail
+    /// call to its own head, so its passes are entries too. 1000 by default.
+    #[arg(long, value_name = "N")]
+    jit_threshold: Option<u32>,
+    /// On the JIT, how far it goes: `1`, its first tier alone, which
+    /// compiles a procedure instruction for instruction over the VM's slots;
+    /// or `2` (the default), which also compiles a definition entered
+    /// a thousand times more as an executable's definitions are compiled.
+    #[arg(long, value_name = "TIERS", value_parser = ["1", "2"])]
+    jit_tiers: Option<String>,
+    /// `--backend aot`: compiled ahead of time into an executable.
     #[arg(long, visible_alias = "native")]
     aot: bool,
     /// Turn on a flag for `@cfg(…)` to test: `--cfg fast`, `--cfg feature=gpu`.
@@ -573,8 +650,10 @@ struct ProfileArgs {
 }
 
 fn emit(s: &str) -> Result<Emit, String> {
-    Emit::parse(s)
-        .ok_or_else(|| format!("expected image, bytecode, asm, exe or expanded, got `{s}`"))
+    if let Some(why) = Emit::retired(s) {
+        return Err(why.to_string());
+    }
+    Emit::parse(s).ok_or_else(|| format!("expected image, exe or expanded, got `{s}`"))
 }
 
 fn backend(s: &str) -> Result<Backend, String> {
@@ -618,6 +697,12 @@ impl ProfileArgs {
             threads: None,
             // Asked for with `--nursery`, which `TargetArgs` reads.
             nursery: None,
+            // Asked for with `--stack`, likewise.
+            stack: None,
+            // And with `--layout`.
+            layout: None,
+            // And with `--no-reload`.
+            reload: None,
             leaks: None,
             target: None,
         }
@@ -626,26 +711,39 @@ impl ProfileArgs {
     /// The profile, the package's `Meadow.toml`, and these flags, in that order
     /// of increasing authority.
     fn resolve(&self, path: &std::path::Path) -> Resolved {
-        let silo = self.runtime.as_deref() == Some("silo");
-        if silo && (self.backend.is_some() || self.jit || self.aot) {
-            eprintln!(
-                "error: Silo is compiled ahead of time by what it is, and has no backend to \
-                 choose; `--backend`, `--jit` and `--aot` are Glade's"
-            );
-            std::process::exit(2);
+        if let Some(n) = self.jit_threshold {
+            // Safety: before anything is built or run, so before any thread
+            // that reads the environment; the VM's process inherits it.
+            unsafe { std::env::set_var("MEADOW_JIT_THRESHOLD", n.to_string()) };
         }
-        Resolved::resolve(self.profile(), path, self.overrides())
+        if let Some(t) = &self.jit_tiers {
+            // Safety: as above.
+            unsafe { std::env::set_var("MEADOW_JIT_TIERS", t) };
+        }
+        let resolved = Resolved::resolve(self.profile(), path, self.overrides());
+        aot::set_engine(resolved.backend);
+        resolved
     }
 }
 
-/// `--cek` — run on the CEK abstract machine instead of the bytecode VM.
+/// Samples a second, for a profile of time.
+const SAMPLE_HZ: u64 = 1000;
+
+/// How `meadow run --profile-to` samples: every so many block entries, or
+/// so many times a second.
+struct Sampling {
+    every: Option<u64>,
+    hz: u64,
+}
+
+/// `--cek` — run on the CEK abstract machine instead of the VM.
 ///
 /// The VM, with its JIT, is the default. The CEK is the specification of what a Meadow program
 /// means, so if the two disagree it is right and the VM has a bug; this flag is
 /// what makes that comparison available without a rebuild.
 #[derive(clap::Args)]
 struct EngineArgs {
-    /// Evaluate with the CEK machine rather than the bytecode VM.
+    /// Evaluate with the CEK machine rather than the VM.
     #[arg(long, conflicts_with_all = ["jit", "aot", "backend"])]
     cek: bool,
 }
@@ -660,9 +758,10 @@ impl EngineArgs {
         profile
     }
 
-    /// The machine that runs a program in this process, for `backend`. An
-    /// `aot` backend's native code runs in a process of its own, so here --
-    /// where tests run -- it is the JIT's.
+    /// The machine that runs a program, for `backend`. An `aot` backend's
+    /// native code is an executable of its own, so where an image runs
+    /// instead -- tests, and a release build that cannot be linked -- it is
+    /// the JIT's.
     fn engine(&self, backend: Backend) -> Engine {
         if self.cek {
             return Engine::Cek;
@@ -735,6 +834,9 @@ fn command() {
             let selected = select(&packages.selection(), &path);
             let profile = profile.resolve(&path);
             let target = target.with(&profile);
+            // What is built depends on it: a strategy for memory, or an image
+            // to interpret in place of an executable.
+            target.configure();
             match &selected.paths[..] {
                 [one] => build(
                     one,
@@ -745,7 +847,6 @@ fn command() {
                     &emit,
                     profile,
                     &target,
-                    false,
                 ),
                 many => build_many(
                     many,
@@ -766,24 +867,49 @@ fn command() {
             profile_to,
             sample_every,
             sample_hz,
-            train,
-            gc,
+            watch,
             target,
             args,
         }) => {
             meadow_compiler::core::args::set(args);
-            let resolved = profile.resolve(&path);
-            let target = target.with(&resolved);
-            target.configure();
-            if let Some(gc) = gc {
-                meadow_glade::heap::configure(meadow_glade::heap::GcConfig {
-                    collector: match gc.as_str() {
-                        "copying" => meadow_glade::heap::Collector::Copying,
-                        _ => meadow_glade::heap::Collector::Generational,
-                    },
-                    ..meadow_glade::heap::GcConfig::from_env()
-                });
+            // Reloading is the VM's.
+            let mut target = target;
+            let asked_to_interpret = target.interpret;
+            if watch {
+                target.interpret = true;
+                meadow::watch::set_watching();
             }
+            let resolved = profile.resolve(&path);
+            // A program that would have been compiled ahead of time is
+            // compiled as it runs instead, each definition the first time it
+            // is called, as an executable's definitions are compiled: by the
+            // JIT's second tier, from the same LIR. So it runs natively, and
+            // a reload compiles the new definitions as it did the old.
+            let native = !asked_to_interpret
+                && (!resolved.backend_named || resolved.backend == Backend::Aot);
+            if watch && native {
+                for (var, value) in [
+                    ("MEADOW_JIT", "1"),
+                    ("MEADOW_JIT_THRESHOLD", "0"),
+                    ("MEADOW_JIT_TIER2", "0"),
+                ] {
+                    if std::env::var_os(var).is_none() {
+                        // Safety: before anything is built or run, so before
+                        // any thread that reads the environment; the VM's
+                        // process inherits it.
+                        unsafe { std::env::set_var(var, value) };
+                    }
+                }
+            }
+            let target = target.with(&resolved);
+            if watch && target.no_reload {
+                status::error(
+                    "`--watch` loads each new build into the program, which `--no-reload` \
+                     (or `reload = false`) builds it not to take",
+                );
+                std::process::exit(2);
+            }
+            target.configure();
             let selection = Selection {
                 packages: package.into_iter().collect(),
                 ..Selection::default()
@@ -793,18 +919,10 @@ fn command() {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             });
-            let mut profile = engine.resolve(resolved);
-            // Training is the JIT watching, whatever the profile would run.
-            if train {
-                profile.backend = Backend::Jit;
-            }
+            let profile = engine.resolve(resolved);
             build(
                 one,
-                Some(if train {
-                    Engine::Jit
-                } else {
-                    engine.engine(profile.backend)
-                }),
+                Some(engine.engine(profile.backend)),
                 Listing {
                     types,
                     annotations: false,
@@ -813,56 +931,43 @@ fn command() {
                 profile_to.map(|to| {
                     (
                         to,
-                        meadow_glade::sched::Sampling {
+                        Sampling {
                             every: sample_every,
                             hz: sample_hz,
-                            depth: meadow_glade::profile::DEPTH,
                         },
                     )
                 }),
                 &[],
                 profile,
                 &target,
-                train,
             )
         }
         Some(Cmd::Exec {
             image,
             backend,
-            opt,
             args,
         }) => {
             meadow_compiler::core::args::set(args);
-            exec(
-                &image,
-                backend.unwrap_or(Backend::Jit),
-                opt.unwrap_or(OptLevel::O1),
-            );
+            exec(&image, backend.unwrap_or(Backend::Jit));
         }
-        Some(Cmd::Link {
-            image,
-            output,
-            emit,
-            opt,
-            target,
-        }) => link(
-            &image,
-            output,
-            emit == "asm",
-            opt.unwrap_or(OptLevel::O2),
-            &target,
-        ),
+        Some(Cmd::Link { .. }) => {
+            eprintln!(
+                "error: `meadow link` compiled the old runtime's bytecode, which is gone; \
+                 `meadow build --release` (or `--aot`) builds an executable"
+            );
+            std::process::exit(1);
+        }
         Some(Cmd::Dis {
             path,
-            asm,
             packages,
             profile,
             target,
         }) => {
             let selected = select(&packages.selection(), &path);
             let resolved = profile.resolve(&path);
-            let arch = asm.then(|| exit_on_error(target.with(&resolved).target()).arch);
-            disassemble(&selected.paths, resolved, arch)
+            let target = target.with(&resolved);
+            target.configure();
+            disassemble(&selected.paths, resolved, &target)
         }
         Some(Cmd::Test {
             path,
@@ -880,9 +985,9 @@ fn command() {
             let target = target.with(&resolved);
             target.configure();
             match test::run(&test::Options {
-                native: target
-                    .target()
-                    .is_ok_and(|t| t.runtime == aot::Runtime::Silo),
+                // Compiled ahead of time when that is asked for by name; on
+                // the VM otherwise.
+                native: resolved.native() && resolved.backend_named,
                 threads: test_threads.filter(|n| *n > 0),
                 no_capture,
                 packages: packages.selection(),
@@ -907,8 +1012,8 @@ fn command() {
                 std::process::exit(1);
             }
         }
-        Some(Cmd::Lsp { fetch, .. }) => {
-            if fetch {
+        Some(Cmd::Lsp { fetch, check, .. }) => {
+            if fetch || !check.is_empty() {
                 meadow::editor::allow_fetching();
             }
             // Both shapes of the standard library: the bundle a package depends
@@ -925,6 +1030,9 @@ fn command() {
             // the edge of the open document, which is where it used to stop
             // anyway.
             let src_root = meadow::stdlib::extract_sources();
+            if !check.is_empty() {
+                std::process::exit(lsp_check(&check, packages, modules, src_root));
+            }
             if let Err(e) = meadow_lsp::server::run(
                 packages,
                 modules,
@@ -1044,45 +1152,28 @@ fn command() {
                 1 => meadow_compiler::OptLevel::O1,
                 _ => meadow_compiler::OptLevel::O2,
             };
-            let ran = match aot::Runtime::named(&runtime) {
+            // On the VM, with its JIT; ahead of time, an executable -- which
+            // `--runtime silo` asked for before there was one runtime.
+            let ahead = match runtime.as_str() {
+                "glade" => Some(ahead),
+                "silo" => Some(true),
+                _ => None,
+            };
+            let ran = match ahead {
                 _ if emit.is_some() => {
                     meadow::cut::emitted(&file, emit.as_deref().unwrap_or_default()).map(|text| {
                         print!("{text}");
                         0
                     })
                 }
-                Some(aot::Runtime::Glade) if no_run && ahead => {
-                    meadow::cut::build_for_glade(&file, opt).map(|_| 0)
-                }
-                Some(aot::Runtime::Glade) if no_run => {
-                    meadow::cut::kept_for_glade(&file).map(|()| 0)
-                }
-                Some(aot::Runtime::Silo) if no_run => {
-                    meadow::cut::build_for_silo(&file, opt, target).map(|exe| {
-                        meadow::status::status("Built", exe.display().to_string());
-                        0
-                    })
-                }
-                Some(aot::Runtime::Glade) if target.is_some_and(|t| !t.is_host()) => Err(
-                    "Glade builds for this system only: build for another with `--runtime silo`"
-                        .to_string(),
-                ),
-                Some(aot::Runtime::Glade) if ahead => meadow::cut::build_for_glade(&file, opt)
-                    .and_then(|exe| {
-                        std::process::Command::new(&exe)
-                            .args(&args)
-                            .status()
-                            .map(|s| s.code().unwrap_or(1))
-                            .map_err(|e| format!("{}: {e}", exe.display()))
-                    }),
-                Some(aot::Runtime::Glade) => {
-                    // The process is `meadow`, not the program: what the
-                    // program was given is what followed `--`.
-                    meadow_compiler::core::args::set(args);
-                    meadow::cut::run_on_glade(&file).map(|()| 0)
-                }
-                Some(aot::Runtime::Silo) => {
-                    meadow::cut::build_for_silo(&file, opt, target).and_then(|exe| {
+                Some(false) if no_run => meadow::cut::kept(&file).map(|()| 0),
+                Some(true) if no_run => meadow::cut::build_native(&file, opt, target).map(|exe| {
+                    meadow::status::status("Built", exe.display().to_string());
+                    0
+                }),
+                Some(false) => meadow::cut::run_on_vm(&file, &args),
+                Some(true) => {
+                    meadow::cut::build_native(&file, opt, target).and_then(|exe| {
                         // A library is built, and there is nothing to run.
                         if matches!(
                             exe.extension().and_then(|e| e.to_str()),
@@ -1207,11 +1298,10 @@ fn build(
     engine: Option<Engine>,
     listing: Listing,
     gc_stats: bool,
-    sampling: Option<(PathBuf, meadow_glade::sched::Sampling)>,
+    sampling: Option<(PathBuf, Sampling)>,
     emit: &[Emit],
     profile: Resolved,
     target: &TargetArgs,
-    train: bool,
 ) {
     let profile = for_target(profile, target);
     let started = std::time::Instant::now();
@@ -1252,16 +1342,7 @@ fn build(
         emit,
         profile,
         target,
-        train,
     );
-}
-
-/// How a run names what it runs: the package's `main`.
-fn linked_entry(package: &Option<String>) -> String {
-    match package {
-        Some(name) => format!("{name}::main"),
-        None => "main".to_string(),
-    }
 }
 
 /// What a build prints on stdout besides the program's own output.
@@ -1284,7 +1365,7 @@ impl Listing {
     }
 }
 
-/// `    Finished `debug` profile [O1, glade jit] in 0.42s`
+/// `    Finished `debug` profile [O1, jit] in 0.42s`
 fn finished(profile: &Resolved, started: std::time::Instant) {
     status::status(
         "Finished",
@@ -1306,72 +1387,124 @@ fn could_not_compile(name: &str, errors: usize) {
     ));
 }
 
+/// `meadow lsp --check`: every `.mw` file under `paths` -- a directory's,
+/// but for what builds write and dot-directories -- opened in the language
+/// server, and each error it would mark printed where it is: how many there
+/// were, as the exit status says whether there were any.
+fn lsp_check(
+    paths: &[PathBuf],
+    packages: Vec<meadow_compiler::CompiledPackage>,
+    modules: Vec<(String, meadow_compiler::CompiledPackage)>,
+    src_root: Option<PathBuf>,
+) -> i32 {
+    fn walk(at: &std::path::Path, out: &mut Vec<PathBuf>) {
+        if at.is_file() {
+            if at.extension().is_some_and(|e| e == "mw") {
+                out.push(at.to_path_buf());
+            }
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(at) else {
+            return;
+        };
+        let mut entries: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        entries.sort();
+        for e in entries {
+            let name = e.file_name().map(|n| n.to_string_lossy().into_owned());
+            if e.is_dir() && name.is_some_and(|n| n.starts_with('.') || n == "target") {
+                continue;
+            }
+            walk(&e, out);
+        }
+    }
+    let mut files = Vec::new();
+    for p in paths {
+        if !p.exists() {
+            status::error(format!("{}: no such file or directory", shown(p)));
+            return 2;
+        }
+        walk(p, &mut files);
+    }
+    status::status(
+        "Checking",
+        format!("{} files, as the language server sees them", files.len()),
+    );
+    let (mut errors, mut marked) = (0, 0);
+    let mut done = 0;
+    meadow_lsp::server::check(
+        packages,
+        modules,
+        src_root,
+        meadow::stdlib::MODULES,
+        Some(meadow::editor::find_package),
+        &files,
+        &mut |file, diagnostics| {
+            done += 1;
+            status::status(
+                "Checked",
+                format!("{} ({done}/{})", shown(file), files.len()),
+            );
+            if diagnostics.is_empty() {
+                return;
+            }
+            marked += 1;
+            for d in diagnostics {
+                errors += 1;
+                let at = d.range.start;
+                let first = d.message.lines().next().unwrap_or("");
+                println!(
+                    "{}:{}:{}: error: {first}",
+                    shown(file),
+                    at.line + 1,
+                    at.character + 1
+                );
+            }
+        },
+    );
+    // Said whether or not narration is on: it is the answer.
+    if errors == 0 {
+        eprintln!("no errors in {} files", files.len());
+        0
+    } else {
+        eprintln!(
+            "{errors} error{} in {marked} of {} files",
+            if errors == 1 { "" } else { "s" },
+            files.len()
+        );
+        1
+    }
+}
+
 /// `meadow exec`: run the image at `path` on `backend`.
-fn exec(path: &std::path::Path, backend: Backend, opt: OptLevel) {
-    let image = read_image(path);
+fn exec(path: &std::path::Path, backend: Backend) {
+    if !aot::is_image(path) {
+        eprintln!(
+            "error: {} is not an image; a `.mbc` was the old runtime's bytecode, which is gone, \
+             and `meadow build` writes the image the VM runs",
+            shown(path)
+        );
+        std::process::exit(1);
+    }
     let engine = match backend {
         Backend::Vm => Engine::Vm,
         Backend::Jit => Engine::Jit,
         Backend::Aot => {
             eprintln!(
-                "error: an image runs on `vm` or `jit`; `meadow link` makes it an executable"
+                "error: an image runs on `vm` or `jit`; `meadow build --aot` builds an executable"
             );
             std::process::exit(1);
         }
     };
-    let result = match runtime::native(&image, engine, opt) {
-        Ok(jit) => runtime::run_image_with_stats(&image, jit.as_ref()).0,
-        Err(e) => Err(e),
-    };
-    match result {
-        // `main` gives nothing back: what it had to say, it printed.
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("{e}");
+    let status = std::process::Command::new(exit_on_error(aot::interpreter()))
+        .envs(engine.env().iter().copied())
+        .arg(path)
+        .args(meadow_compiler::core::args::get())
+        .status()
+        .unwrap_or_else(|e| {
+            eprintln!("error: could not run {}: {e}", path.display());
             std::process::exit(1);
-        }
-    }
-}
-
-/// `meadow link`: the image at `path`, as an executable -- or, with `asm`, as
-/// the text of the native code the executable would be linked from.
-fn link(
-    path: &std::path::Path,
-    output: Option<PathBuf>,
-    asm: bool,
-    opt: OptLevel,
-    target: &TargetArgs,
-) {
-    let image = read_image(path);
-    let made = target.target().and_then(|target| {
-        if asm {
-            let out = output.unwrap_or_else(|| path.with_extension("s"));
-            let text = listing::asm(&image, target.arch, opt);
-            return artifacts::write_text(&out, &text).map(|()| ("asm", out));
-        }
-        let exe = output.unwrap_or_else(|| {
-            path.with_extension(target.format.exe_suffix().trim_start_matches('.'))
         });
-        aot::link_image(&image, opt, target, &Default::default(), &exe).map(|()| ("native", exe))
-    });
-    match made {
-        Ok((what, file)) => eprintln!("{what}: {}", file.display()),
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
-fn read_image(path: &std::path::Path) -> meadow_bytecode::Program {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| {
-        eprintln!("error: could not read {}: {e}", path.display());
-        std::process::exit(1);
-    });
-    meadow_bytecode::image::decode(&bytes).unwrap_or_else(|e| {
-        eprintln!("error: {}: {e}", path.display());
-        std::process::exit(1);
-    })
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 /// [`build`] for several packages of a workspace, sharing what they have in
@@ -1416,7 +1549,6 @@ fn build_many(
             emit,
             profile,
             target,
-            false,
         );
     }
     if !out.diagnostics.is_empty() {
@@ -1431,17 +1563,17 @@ fn for_target(mut profile: Resolved, target: &TargetArgs) -> Resolved {
         && let Ok(t) = target.target()
     {
         profile.options.cfg.arch = match t.arch {
-            meadow_glade::codegen::Arch::Aarch64 => "aarch64",
-            meadow_glade::codegen::Arch::X86_64 => "x86_64",
+            aot::Arch::Aarch64 => "aarch64",
+            aot::Arch::X86_64 => "x86_64",
         };
         profile.options.cfg.os = t.os.cfg_name();
     }
     profile
 }
 
-/// Everything [`build`] does once a package is linked: print it, write its
-/// image and executable -- or what `emit` asks for instead -- and, with
-/// `engine`, run it.
+/// Everything [`build`] does once a package is linked: print it, write the
+/// image the VM runs or its executable -- or what `emit` asks for instead --
+/// and, with `engine`, run it.
 fn finish(
     linked: meadow::linker::LinkedProgram,
     package: &Option<(PathBuf, meadow_compiler::intern::InternedString)>,
@@ -1449,17 +1581,16 @@ fn finish(
     engine: Option<Engine>,
     listing: Listing,
     gc_stats: bool,
-    sampling: Option<(PathBuf, meadow_glade::sched::Sampling)>,
+    sampling: Option<(PathBuf, Sampling)>,
     emit: &[Emit],
     profile: Resolved,
     target: &TargetArgs,
-    train: bool,
 ) {
     listing.print(&linked);
     if !emit.is_empty() && package.is_none() {
         eprintln!(
             "error: `--emit` writes under a package's `target` directory, and a lone file has none; \
-             `meadow dis` prints its bytecode, and `meadow dis --asm` its native code"
+             `meadow dis` prints the code the VM runs"
         );
         std::process::exit(1);
     }
@@ -1489,143 +1620,82 @@ fn finish(
     if engine.is_none() && emit.is_empty() && linked.program.entry.is_none() {
         return;
     }
-    let aot = profile.native() && engine != Some(Engine::Cek);
-    // What is written: what was asked for, or else the image -- and for an
-    // `aot` build, its executable.
-    let wants = |kind: Emit| match kind {
-        _ if !emit.is_empty() => emit.contains(&kind),
-        Emit::Image => true,
-        Emit::Exe => aot,
-        Emit::Bytecode | Emit::Asm | Emit::Expanded => false,
-    };
 
     // What runs: the entry point and what it reaches, unless the profile says
     // to keep everything.
     let program = profile.program(&linked.program);
 
-    // What the VM runs is written under the package's `target` directory
-    // whenever it is made: by `build`, and by `run` on the VM.
-    let image = match engine {
-        None | Some(Engine::Vm) | Some(Engine::Jit) => {
-            match runtime::compile(&program, profile.opt()) {
-                Ok(image) => {
-                    if let Some((root, name)) = package {
-                        let written = (|| {
-                            if wants(Emit::Image) {
-                                artifacts::write_image(root, profile.profile, name, &image)?;
-                            }
-                            if wants(Emit::Bytecode) {
-                                let path =
-                                    artifacts::bytecode_text_path(root, profile.profile, name);
-                                artifacts::write_text(&path, &listing::bytecode(&image))?;
-                                eprintln!("bytecode: {}", shown(&path));
-                            }
-                            if wants(Emit::Asm) {
-                                let t = target.target()?;
-                                let path = aot::write_asm(
-                                    root,
-                                    profile.profile,
-                                    profile.opt(),
-                                    name,
-                                    &image,
-                                    t,
-                                )?;
-                                eprintln!("asm: {}", shown(&path));
-                            }
-                            Ok::<(), String>(())
-                        })();
-                        if let Err(e) = written {
-                            eprintln!("error: {e}");
-                            std::process::exit(1);
-                        }
-                    }
-                    Some(image)
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
-                }
-            }
+    // The CEK machine runs it here, in this process: it is the specification.
+    if engine == Some(Engine::Cek) {
+        if gc_stats {
+            eprintln!("gc: the CEK machine reference-counts, so there is nothing to report");
         }
-        Some(Engine::Cek) => None,
-    };
+        if let Err(e) = runtime::run(&program, Engine::Cek, profile.opt()) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
-    // Machine code, linked into an executable -- and, for `run`, run: what an
-    // `aot` backend is, unless `--cek` asked for the CEK machine.
-    let exe = match engine {
-        None => wants(Emit::Exe),
-        Some(_) => aot,
+    // A lone file has no `target` directory: what the VM runs is written to
+    // a temporary one, and nothing is compiled ahead of time.
+    let (root, name) = match package {
+        Some((root, name)) => (root.clone(), name.to_string()),
+        None => (
+            std::env::temp_dir().join(format!("meadow-run-{}", std::process::id())),
+            "main".to_string(),
+        ),
     };
-    if let (true, Some(image)) = (exe, &image) {
-        let exe = target.target().and_then(|target| {
-            let (root, name) = package
-                .as_ref()
-                .ok_or("a native executable needs a package to put it in")?;
-            // The native backend compiles AxCut itself, not the image.
-            if target.runtime == aot::Runtime::Silo {
-                return aot::build_native(
-                    root,
-                    profile.profile,
-                    profile.opt(),
-                    name,
-                    &program,
-                    target,
-                    fingerprint,
-                );
-            }
-            // What a training run saw the calls enter, if one was made of
-            // this image: see `meadow::pgo`.
-            let at = meadow::pgo::path(root, profile.profile.name());
-            let calls = match meadow::pgo::read(&at, image)? {
-                meadow::pgo::Found::Calls(calls) => {
-                    status::status("Guided", format!("by {}", shown(&at)));
-                    calls
-                }
-                meadow::pgo::Found::Stale => {
-                    status::note(
-                        "Unguided",
-                        format!(
-                            "{} is of an older build; `meadow run --train` makes a new one",
-                            shown(&at)
-                        ),
-                    );
-                    Default::default()
-                }
-                meadow::pgo::Found::None => Default::default(),
-            };
-            aot::build(
-                root,
+    let native = profile.native() && package.is_some();
+    // What is written: what was asked for, or else the image -- or, for an
+    // `aot` build, the executable.
+    let wants = |kind: Emit| match kind {
+        _ if !emit.is_empty() => emit.contains(&kind),
+        Emit::Image => !native,
+        Emit::Exe => native,
+        Emit::Expanded => false,
+    };
+    let image = || {
+        target.target().and_then(|t| {
+            aot::build_image(&root, profile.profile, profile.opt(), &name, &program, t)
+        })
+    };
+    let mut engine = engine;
+    let mut made = None;
+    if wants(Emit::Image) {
+        let image = exit_on_error(image());
+        if engine.is_none() {
+            status::note("Image", shown(&image));
+        }
+        made = Some(image);
+    }
+    if wants(Emit::Exe) {
+        let exe = target.target().and_then(|t| {
+            aot::build_native(
+                &root,
                 profile.profile,
                 profile.opt(),
-                name,
-                image,
-                target,
-                &calls,
+                &name,
+                &program,
+                t,
+                fingerprint,
             )
         });
         match exe {
-            Ok(exe) if engine.is_none() => {
-                status::note("Executable", shown(&exe));
-            }
             Ok(exe) => {
-                status::status("Running", format!("`{}`", shown(&exe)));
-                let status = std::process::Command::new(&exe)
-                    .args(meadow_compiler::core::args::get())
-                    .status()
-                    .unwrap_or_else(|e| {
-                        eprintln!("error: could not run {}: {e}", exe.display());
-                        std::process::exit(1);
-                    });
-                std::process::exit(status.code().unwrap_or(1));
+                if engine.is_none() {
+                    status::note("Executable", shown(&exe));
+                }
+                made = Some(exe);
             }
-            // A release build of a lone file, or on a machine that cannot link
-            // one: the JIT runs it, unless `aot` was asked for by name.
+            // On a machine that cannot link one: the JIT runs it, unless
+            // `aot` was asked for by name.
             Err(e) if profile.fallback().is_some() && emit.is_empty() => {
-                if package.is_some() {
-                    status::warning(format!("no native executable: {e}"));
-                    if engine.is_some() {
-                        status::note("Falling back", "to the JIT; `--aot` makes this an error");
-                    }
+                status::warning(format!("no native executable: {e}"));
+                if engine.is_some() {
+                    status::note("Falling back", "to the JIT; `--aot` makes this an error");
+                    engine = Some(Engine::Jit);
+                    made = Some(exit_on_error(image()));
                 }
             }
             Err(e) => {
@@ -1634,153 +1704,83 @@ fn finish(
             }
         }
     }
-
-    if let Some(engine) = engine {
-        let entry = linked_entry(&package.as_ref().map(|(_, n)| n.to_string()));
-        status::status(
-            "Running",
-            format!(
-                "`{entry}` on the {}",
-                match engine {
-                    Engine::Cek => "CEK machine",
-                    Engine::Vm => "VM",
-                    Engine::Jit => "JIT",
-                }
-            ),
-        );
-        // Sampling wants an image that carries debug info, which is what its
-        // frames are named by, so it compiles its own -- the same instructions,
-        // and more in the image beside them.
-        // `--profile-to` says where; `profile = true` in the manifest asks for
-        // one without saying, and gets it beside the build.
-        let sampling = sampling.or_else(|| {
+    let (Some(engine), Some(exe)) = (engine, made) else {
+        return;
+    };
+    // The program a watching run rebuilt this for is running.
+    if meadow::watch::rebuilding() {
+        std::process::exit(0);
+    }
+    if aot::is_image(&exe) {
+        let entry = match package {
+            Some((_, name)) => format!("{name}::main"),
+            None => "main".to_string(),
+        };
+        let on = if engine == Engine::Jit { "JIT" } else { "VM" };
+        status::status("Running", format!("`{entry}` on the {on}"));
+    } else {
+        status::status("Running", format!("`{}`", shown(&exe)));
+    }
+    let watching = meadow::watch::watching() && aot::is_image(&exe);
+    let mut command = if aot::is_image(&exe) {
+        let mut c = std::process::Command::new(exit_on_error(aot::interpreter()));
+        c.envs(engine.env().iter().copied());
+        if watching {
+            c.arg("--watch");
+        }
+        // A profile: by time, or by work, written as folded stacks where it
+        // is asked for, or beside the build when the profile says `profile`.
+        let sampled = sampling.map(|(to, how)| (to, Some(how)));
+        let sampled = sampled.or_else(|| {
             profile.sample.then(|| {
                 let to = match package {
                     Some((root, _)) => root
                         .join("target")
                         .join(profile.profile.name())
                         .join("profile.folded"),
-                    None => std::path::PathBuf::from("profile.folded"),
+                    None => PathBuf::from("profile.folded"),
                 };
-                (
-                    to,
-                    meadow_glade::sched::Sampling {
-                        every: None,
-                        hz: meadow_glade::profile::HZ,
-                        depth: meadow_glade::profile::DEPTH,
-                    },
-                )
+                (to, None)
             })
         });
-        if let Some((to, how)) = sampling {
-            let result = match runtime::compile_for_profile(&program, profile.opt()) {
-                Err(e) => Err(e),
-                Ok(image) => match runtime::native(&image, engine, profile.opt()) {
-                    Err(e) => Err(e),
-                    Ok(jit) => {
-                        let (result, profile, stats) =
-                            runtime::run_image_sampled(&image, jit.as_ref(), how);
-                        #[cfg(feature = "profile-alloc")]
-                        eprint!(
-                            "{}{}",
-                            meadow::samples::instructions(&stats.ops),
-                            meadow::samples::feedback(&stats.feedback, &image)
-                        );
-                        #[cfg(feature = "profile-alloc")]
-                        if !stats.sites.is_empty() {
-                            // Beside the samples: where the garbage came from.
-                            let beside = to.with_extension("alloc");
-                            let text = meadow::samples::allocation(&stats.sites, &image);
-                            if std::fs::write(&beside, text).is_ok() {
-                                status::status("Allocation", beside.display().to_string());
-                            }
-                        }
-                        let _ = &stats;
-                        match profile {
-                            None => eprintln!("profile: nothing was sampled"),
-                            Some(p) => {
-                                eprintln!("{}", meadow::samples::summary(&p));
-                                let folded = meadow::samples::folded(&p, &image);
-                                match std::fs::write(&to, folded) {
-                                    Ok(()) => status::status("Profile", to.display().to_string()),
-                                    Err(e) => eprintln!("profile: {}: {e}", to.display()),
-                                }
-                            }
-                        }
-                        result
-                    }
-                },
-            };
-            match result {
-                // `main` gives nothing back: what it had to say, it printed.
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("{e}");
-                    std::process::exit(1);
-                }
+        if let Some((to, how)) = sampled {
+            c.arg("--profile").arg(&to);
+            if let Some(how) = how {
+                match how.every {
+                    Some(n) => c.arg("--profile-every").arg(n.to_string()),
+                    None => c.arg("--profile-hz").arg(how.hz.to_string()),
+                };
             }
-            return;
+            status::status("Profiling", format!("to {}", shown(&to)));
         }
-
-        let (result, stats) = match &image {
-            Some(image) => match runtime::native(image, engine, profile.opt()) {
-                Ok(jit) => {
-                    let ran = runtime::run_image_with_stats(image, jit.as_ref());
-                    if train {
-                        train_from(jit.as_ref(), image, package.as_ref(), &profile);
-                    }
-                    ran
-                }
-                Err(e) => (Err(e), None),
-            },
-            None => runtime::run_with_stats(&program, engine, profile.opt()),
-        };
-        if gc_stats {
-            match stats {
-                Some(stats) => eprintln!("{stats}"),
-                None => {
-                    eprintln!("gc: the CEK machine reference-counts, so there is nothing to report")
-                }
-            }
-        }
-        match result {
-            // `main` gives nothing back: what it had to say, it printed.
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("{e}");
-                std::process::exit(1);
-            }
-        }
-    }
-}
-
-/// After `meadow run --train`: write what the JIT saw each call site enter,
-/// for an `aot` build of the same image. See `meadow::pgo`.
-fn train_from(
-    jit: Option<&meadow_glade::jit::Native>,
-    image: &meadow_bytecode::Program,
-    package: Option<&(PathBuf, meadow_compiler::intern::InternedString)>,
-    profile: &Resolved,
-) {
-    let (Some(jit), Some((root, _))) = (jit, package) else {
-        eprintln!("error: training needs a package to write its profile in, and the JIT");
-        std::process::exit(1);
+        c.arg(&exe);
+        c
+    } else {
+        std::process::Command::new(&exe)
     };
-    let calls = jit.calls();
-    let to = meadow::pgo::path(root, profile.profile.name());
-    match meadow::pgo::write(&to, image, &calls) {
-        Ok(()) => status::status(
-            "Trained",
-            format!("{} call sites, in {}", calls.len(), shown(&to)),
-        ),
-        Err(e) => eprintln!("error: {e}"),
+    command.args(meadow_compiler::core::args::get());
+    // What its memory did, said by the runtime at the end: either engine,
+    // either strategy.
+    if gc_stats {
+        command.env("MEADOW_SILO_GC_STATS", "1");
     }
+    if let (true, Some((root, _))) = (watching, package) {
+        std::process::exit(meadow::watch::run(command, root));
+    }
+    let status = command.status().unwrap_or_else(|e| {
+        eprintln!("error: could not run {}: {e}", exe.display());
+        std::process::exit(1);
+    });
+    // A lone file's temporary directory goes with the run.
+    if package.is_none() {
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    std::process::exit(status.code().unwrap_or(1));
 }
 
-/// Print the bytecode the VM would run — the back end's output, addresses and
-/// all — for each package in `paths`; or, for `arch`, the native code an
-/// `aot` build compiles it to.
-fn disassemble(paths: &[PathBuf], profile: Resolved, arch: Option<meadow_glade::codegen::Arch>) {
+/// Print the code the VM runs -- each procedure's instructions, as the VM
+/// disassembles them -- for each package in `paths`.
+fn disassemble(paths: &[PathBuf], profile: Resolved, target: &TargetArgs) {
     let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
     let out = pipeline::build_each(&refs, profile.options);
     for d in &out.diagnostics {
@@ -1790,22 +1790,36 @@ fn disassemble(paths: &[PathBuf], profile: Resolved, arch: Option<meadow_glade::
         std::process::exit(1);
     }
     let several = out.each.len() > 1;
+    let dir = std::env::temp_dir().join(format!("meadow-dis-{}", std::process::id()));
     for built in out.each {
         let linked = built.linked.expect("each is linked");
-        if several && let Some((_, name)) = &built.package {
+        let name = match &built.package {
+            Some((_, name)) => name.to_string(),
+            None => "main".to_string(),
+        };
+        if several {
             println!("=== {name} ===");
         }
-        match runtime::compile(&profile.program(&linked.program), profile.opt()) {
-            Ok(image) => match arch {
-                Some(arch) => print!("{}", listing::asm(&image, arch, profile.opt())),
-                None => print!("{}", listing::bytecode(&image)),
-            },
-            Err(e) => {
-                eprintln!("error: {e}");
+        let program = profile.program(&linked.program);
+        let image = exit_on_error(target.target().and_then(|t| {
+            aot::build_image(&dir, profile.profile, profile.opt(), &name, &program, t)
+        }));
+        // Flushed first: the VM writes to the same stdout.
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let status = std::process::Command::new(exit_on_error(aot::interpreter()))
+            .arg("--dis")
+            .arg(&image)
+            .status()
+            .unwrap_or_else(|e| {
+                eprintln!("error: could not run the VM: {e}");
                 std::process::exit(1);
-            }
+            });
+        if !status.success() {
+            std::process::exit(status.code().unwrap_or(1));
         }
     }
+    let _ = std::fs::remove_dir_all(&dir);
     if !out.diagnostics.is_empty() {
         std::process::exit(1);
     }

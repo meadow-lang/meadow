@@ -3,16 +3,14 @@
 //!
 //! An editor starts it, sends `launch` with a program to debug, and from then
 //! on asks it to run, stop, step and describe what it sees. The debugging
-//! itself is [`session::Session`]; this module is the protocol and the loop.
+//! itself is [`vm::VmSession`]; this module is the protocol and the loop.
 //!
 //! # Running without blocking
 //!
 //! While the program runs, the adapter still has to answer: a `pause` has to
 //! land, and an editor asks for threads and sets breakpoints whenever it likes.
-//! So stdin is read on a thread of its own, and the program runs in slices of
-//! [`SLICE`] instructions with the queue checked between them. A slice is small
-//! enough that a pause feels immediate and large enough that checking costs
-//! nothing measurable.
+//! So stdin is read on a thread of its own, and the VM -- a process of its
+//! own -- is listened to a moment at a time, with the queue checked between.
 //!
 //! # Output
 //!
@@ -22,14 +20,19 @@
 //! of input.
 
 pub mod session;
+pub mod vm;
 
 use serde_json::{Value as Json, json};
-use session::{Mode, Session, Stop};
+use session::{Mode, Stop};
+
+/// What is being debugged: a program on the VM, in a process of its own.
+pub type Debuggee = vm::VmSession;
+
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-/// Instructions run between looks at the request queue.
+/// What a look at the VM is given before the request queue is looked at.
 const SLICE: u64 = 20_000;
 
 /// The single thread a Meadow program has.
@@ -78,7 +81,7 @@ pub fn read_message(input: &mut impl BufRead) -> Option<Json> {
 pub struct Adapter {
     out: Box<dyn Write>,
     seq: i64,
-    session: Option<Session>,
+    session: Option<Debuggee>,
     /// Breakpoints the editor set before the program was built, by file.
     pending_breakpoints: Vec<(PathBuf, Vec<u32>)>,
     stop_on_entry: bool,
@@ -116,6 +119,13 @@ impl Adapter {
                     Err(mpsc::TryRecvError::Empty) => None,
                     Err(mpsc::TryRecvError::Disconnected) => break,
                 }
+            } else if self.session.as_ref().is_some_and(Debuggee::watching) {
+                // Stopped, and watching the sources all the same.
+                match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+                    Ok(m) => Some(m),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
             } else {
                 match rx.recv() {
                     Ok(m) => Some(m),
@@ -124,6 +134,10 @@ impl Adapter {
             };
             if let Some(m) = msg {
                 self.handle(m);
+            }
+            if let Some(s) = &mut self.session {
+                s.tick();
+                self.flush_output();
             }
             if self.running {
                 self.slice();
@@ -276,7 +290,13 @@ impl Adapter {
                     (Some(f), Some(e)) => Some((f.to_string(), e.module.clone())),
                     _ => None,
                 };
-                match Session::launch_at(std::path::Path::new(program), entry.as_ref()) {
+                let path = std::path::Path::new(program);
+                // `stack`: `heap` for frames on the heap. `watch`: build and
+                // reload as the sources change, as `meadow run --watch` does.
+                let stack = args["stack"].as_str().and_then(meadow_llvm::Stack::named);
+                let watch = args["watch"].as_bool().unwrap_or(false);
+                let launched = vm::VmSession::launch_watching(path, entry.as_ref(), stack, watch);
+                match launched {
                     Ok(s) => {
                         self.session = Some(s);
                         for (path, lines) in std::mem::take(&mut self.pending_breakpoints) {
@@ -362,7 +382,10 @@ impl Adapter {
                     Some(0) | None => 1000,
                     Some(n) => n as usize,
                 };
-                let Some(s) = &self.session else {
+                let (lines_from_1, columns_from_1) = (self.lines_from_1, self.columns_from_1);
+                let line_out = |l: u32| if lines_from_1 { l } else { l - 1 };
+                let column_out = |c: u32| if columns_from_1 { c } else { c - 1 };
+                let Some(s) = &mut self.session else {
                     return self.respond(&req, json!({ "stackFrames": [], "totalFrames": 0 }));
                 };
                 let frames = s.frames(start + levels);
@@ -377,11 +400,11 @@ impl Adapter {
                             f.loc.and_then(|l| s.file(l).map(|file| (file, l)))
                         {
                             let (line, col) = file.position(loc.span.start);
-                            row["line"] = json!(self.line_out(line));
-                            row["column"] = json!(self.column_out(col));
+                            row["line"] = json!(line_out(line));
+                            row["column"] = json!(column_out(col));
                             let (end_line, end_col) = file.position(loc.span.end);
-                            row["endLine"] = json!(self.line_out(end_line));
-                            row["endColumn"] = json!(self.column_out(end_col));
+                            row["endLine"] = json!(line_out(end_line));
+                            row["endColumn"] = json!(column_out(end_col));
                             row["source"] = source_json(file);
                         }
                         row
@@ -479,8 +502,11 @@ impl Adapter {
                 self.respond(&req, json!({}));
                 if self.running {
                     self.running = false;
+                    let stop = self.session.as_mut().and_then(Debuggee::pause);
                     self.flush_output();
-                    self.report(Stop::Pause);
+                    if let Some(stop) = stop {
+                        self.report(stop);
+                    }
                 }
             }
 
@@ -503,10 +529,6 @@ impl Adapter {
 
     fn line_out(&self, line: u32) -> u32 {
         if self.lines_from_1 { line } else { line - 1 }
-    }
-
-    fn column_out(&self, col: u32) -> u32 {
-        if self.columns_from_1 { col } else { col - 1 }
     }
 }
 

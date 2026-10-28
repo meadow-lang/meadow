@@ -14,14 +14,15 @@
 //! arrays all the way down, which the evaluator hands over as plain `Vec`s,
 //! so nothing here has to know how a `[a]` is laid out either.
 //!
-//! It runs on Glade's bytecode machine. Every macro the build can call is put
-//! behind `Std.Macro.Serve.serve` in one image, compiled the first time a macro is
-//! called and kept for the build; a run is handed what the call gives the
-//! macro -- whether the round is settled, the bindings it can see, the
-//! argument -- as a `Wire` written out on its input, and writes the `Wire` it
-//! answers on its output. A program the bytecode back end cannot translate has
-//! its macros run by the CEK machine instead, the way they were before: the
-//! same terms, built as values rather than text.
+//! It runs on the merged runtime's VM. Every macro the build can call is put
+//! behind `Std.Macro.Serve.serve` in one image, an entry a macro, compiled the
+//! first time a macro is called and run on one VM kept for the build
+//! (`crate::served`); a run is handed what the call gives the macro --
+//! whether the round is settled, the bindings it can see, the argument -- as
+//! a `Wire` written out on its input, and writes the `Wire` it answers on its
+//! output. A program the back end cannot translate, or a build with no VM,
+//! has its macros run by the CEK machine instead, the way they were before:
+//! the same terms, built as values rather than text.
 //!
 //! What each call answered is kept, beside the package that made the call, in
 //! `target/<profile>/incremental/<name>-<options>.macros`, under a fingerprint
@@ -32,9 +33,9 @@
 //! Two things make this safe to do during a build. A macro's signature forbids
 //! the effects that would let it learn anything about the world, so what it
 //! answers depends only on what it was given and what it read -- which is why
-//! the answers are cached here on exactly that. And it runs with a step
-//! budget, so a macro that does not stop fails the build instead of hanging
-//! it.
+//! the answers are cached here on exactly that. And it runs with a budget --
+//! of steps on the CEK machine, of time on the VM -- so a macro that does not
+//! stop fails the build instead of hanging it.
 
 use meadow_compiler::expand::Datum;
 use meadow_compiler::expand::proc::{Failure, Outcome, Runner, Scope};
@@ -113,9 +114,9 @@ pub struct Macros<'a> {
     /// macro cannot tell one build from another, so the same tokens and the
     /// same bindings always give the same answer.
     answers: RefCell<HashMap<AnswerKey, Vec<(Reads, Outcome)>>>,
-    /// Every macro behind `serve`, compiled to bytecode once: `None` until a
-    /// macro is first called, and `Some(None)` if the back end could not
-    /// translate the program.
+    /// Every macro behind `serve`, compiled once: `None` until a macro is
+    /// first called, and `Some(None)` if the back end could not translate the
+    /// program.
     image: RefCell<Option<Option<Arc<Image>>>>,
     /// Where the answers are kept between runs, if anywhere; whether they
     /// have been read from there yet; and whether there are new ones to write.
@@ -124,10 +125,19 @@ pub struct Macros<'a> {
     learned: std::cell::Cell<bool>,
 }
 
-/// The macros' image, and where each macro's run starts in it.
+/// The macros' image, written where the VM reads it; which of its entries
+/// each macro's run is; and the VM running it, once one is started -- one
+/// for every call of the build, and another after a call ends one.
 struct Image {
-    code: meadow_bytecode::Program,
-    entries: Vec<(core::Var, meadow_bytecode::Pc)>,
+    path: std::path::PathBuf,
+    entries: Vec<(core::Var, usize)>,
+    vm: RefCell<Option<crate::served::Served>>,
+}
+
+impl Drop for Image {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 impl<'a> Macros<'a> {
@@ -293,7 +303,6 @@ impl<'a> Macros<'a> {
             .filter(|e| e.is_macro)
             .map(|e| e.var)
             .collect();
-        let base = program.defs.len();
         let mut defs = program.defs.clone();
         // A macro generic in its argument -- `defineOne ts = …`, nothing
         // said of `ts` -- takes a descriptor for it, which only an
@@ -343,52 +352,95 @@ impl<'a> Macros<'a> {
             ctor_fields: program.ctor_fields.clone(),
             variants: program.variants.clone(),
             origins: Default::default(),
+            migrations: Vec::new(),
         };
         // Every package the build has, linked whole, refers to things nothing
         // defined -- what a macro never reaches. Lowered, each is an error
         // raised if it is ever run, which is what the CEK machine does with
         // it: so the one thing lowering says it cannot translate is let stand.
-        let lowered = meadow_seq::lower_program(&whole, meadow_compiler::OptLevel::O1);
-        let code = match meadow_codegen::compile(&lowered.program) {
-            Ok(code) => code,
-            Err(why) => {
-                timed(|| format!("the back end cannot compile the macros: {}", why.msg));
-                return None;
-            }
-        };
-        let entries = macros
-            .iter()
-            .enumerate()
-            .filter_map(|(i, v)| code.entries.get(base + i).map(|pc| (*v, *pc)))
+        if let Err(why) = crate::aot::interpreter() {
+            timed(|| format!("no VM to run the macros on: {why}"));
+            return None;
+        }
+        // Only what the macros reach: the image is made linear, which is
+        // the work, a definition at a time.
+        let made: Vec<core::Var> = (0..macros.len())
+            .map(|i| meadow_compiler::hir::VarId::synthetic(i as u32))
             .collect();
-        Some(Arc::new(Image { code, entries }))
+        let whole = core::prune::prune_from(&whole, made.iter().copied());
+        // An entry a macro, by where its definition is now: a program of
+        // entries, as one of tests is.
+        let labels: Option<Vec<meadow_seq::Label>> = made
+            .iter()
+            .map(|v| {
+                whole
+                    .defs
+                    .iter()
+                    .position(|d| d.var == *v)
+                    .map(|i| meadow_seq::Label(i as u32))
+            })
+            .collect();
+        let Some(labels) = labels else {
+            timed(|| "a macro's entry went missing".to_string());
+            return None;
+        };
+        let lowered = meadow_seq::lower_program(&whole, meadow_compiler::OptLevel::O1);
+        static IMAGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!("meadow-macros-{}", std::process::id()));
+        let path = dir.join(format!(
+            "macros-{}.image",
+            IMAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let config = meadow_llvm::Config {
+            stack: meadow_llvm::Stack::Growable,
+            ..crate::aot::config()
+        };
+        let written = std::fs::create_dir_all(&dir)
+            .map_err(|e| e.to_string())
+            .and_then(|()| crate::aot::write_image_with(&path, lowered.program, labels, config));
+        if let Err(why) = written {
+            timed(|| format!("the back end cannot compile the macros: {why}"));
+            return None;
+        }
+        let entries = macros.iter().enumerate().map(|(i, v)| (*v, i)).collect();
+        Some(Arc::new(Image {
+            path,
+            entries,
+            vm: RefCell::new(None),
+        }))
     }
 
     /// Run the macro whose image entry is `entry` on `given`, the call as
-    /// text: what it wrote.
-    fn run_on_glade(
-        &self,
-        image: &Image,
-        entry: meadow_bytecode::Pc,
-        given: String,
-    ) -> Result<String, Failure> {
-        let out = Arc::new(std::sync::Mutex::new(String::new()));
-        let mut vm = meadow_glade::Vm::new(&image.code);
-        let mut given = Some(given);
-        vm.io.input = Some(Box::new(move || given.take()));
-        let written = out.clone();
-        vm.io.output = Some(Box::new(move |s: &str| {
-            written
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push_str(s)
-        }));
-        // A bytecode instruction is a smaller step than the CEK machine's: the
-        // same budget, in its units.
-        vm.run(entry, self.fuel.saturating_mul(STEPS_PER_CEK_STEP))
-            .map_err(|e| Failure::from(e.msg))?;
-        let text = out.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Ok(text)
+    /// text, on the VM the image has -- or a new one, if there is none yet,
+    /// or the last call ended it: what it wrote.
+    fn run_on_vm(&self, image: &Image, entry: usize, given: String) -> Result<String, Failure> {
+        let mut vm = image.vm.borrow_mut();
+        if vm.is_none() {
+            *vm =
+                Some(crate::served::Served::start(&image.path, false, &[]).map_err(Failure::from)?);
+        }
+        let s = vm.as_mut().expect("started");
+        // The call is one line, however many it holds, as `serve` reads it.
+        match s.run(
+            Some(entry),
+            Some(&[given.as_str()]),
+            Some(budget(self.fuel)),
+        ) {
+            Ok((_, written)) => Ok(written.unwrap_or_default()),
+            Err(ended) => {
+                let said = s.said();
+                *vm = None;
+                Err(Failure::from(match ended {
+                    crate::served::Ended::TimedOut => format!(
+                        "the macro did not finish within {:?}; `MEADOW_MACRO_FUEL` gives \
+                         it more",
+                        budget(self.fuel)
+                    ),
+                    _ if !said.trim().is_empty() => said.trim().to_string(),
+                    other => other.said(),
+                }))
+            }
+        }
     }
 
     /// The variable a package exports under `name`.
@@ -464,7 +516,7 @@ impl Runner for Macros<'_> {
             .exported(package, name)
             .ok_or_else(|| format!("`{package}` does not export `{name}`"))?;
         let started = std::time::Instant::now();
-        let mut engine = "glade";
+        let mut engine = "vm";
         let (out, read) = match self.image().and_then(|image| {
             image
                 .entries
@@ -475,7 +527,7 @@ impl Runner for Macros<'_> {
             Some((image, entry)) => {
                 let mut given = String::new();
                 write_wire(&call_wire(scope, input), &mut given);
-                let said = self.run_on_glade(&image, entry, given)?;
+                let said = self.run_on_vm(&image, entry, given)?;
                 let wire = read_wire(&said, &mut 0).ok_or("the macro did not answer")?;
                 outcome(&wire, at)?
             }
@@ -578,9 +630,12 @@ fn timed(said: impl FnOnce() -> String) {
     }
 }
 
-/// How many bytecode instructions a CEK machine's step is worth, for a macro's
-/// budget: a machine instruction does less than one of its steps.
-const STEPS_PER_CEK_STEP: u64 = 4;
+/// How long a macro may run on the VM, for a budget of `fuel` of the CEK
+/// machine's steps: about what the CEK machine would take for them, and a
+/// second at least.
+fn budget(fuel: u64) -> std::time::Duration {
+    std::time::Duration::from_millis((fuel / 5_000).max(1_000))
+}
 
 // --- the call and its answer, as text ---------------------------------------------------
 //

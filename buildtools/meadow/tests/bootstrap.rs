@@ -74,7 +74,7 @@ fn meadowboot_exe() -> PathBuf {
                 "MeadowBoot did not build:\n{}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            dir.join("target/release/native/silo")
+            dir.join("target/release/native/glade")
                 .join(format!("MeadowBoot{}", std::env::consts::EXE_SUFFIX))
         })
         .clone()
@@ -460,7 +460,7 @@ fn escape(s: &str) -> String {
 
 #[test]
 fn every_source_lexes_as_meadow_lexer_lexes_it() {
-    let files = sources(&["lib", "examples", "benches", "bootstrap", "glade", "silo"]);
+    let files = sources(&["lib", "examples", "benches", "bootstrap", "glade"]);
     assert!(files.len() > 50, "only {} sources found", files.len());
     let theirs = per_file("lex", &files);
     let bad = differences(&theirs, |p| {
@@ -1073,7 +1073,7 @@ impl Tree<'_> {
 
 #[test]
 fn every_source_parses_as_meadow_parser_parses_it() {
-    let files = sources(&["lib", "examples", "benches", "bootstrap", "glade", "silo"]);
+    let files = sources(&["lib", "examples", "benches", "bootstrap", "glade"]);
     assert!(files.len() > 50, "only {} sources found", files.len());
     let theirs = per_file("parse", &files);
     let bad = differences(&theirs, |p| {
@@ -1223,7 +1223,7 @@ fn grouped(text: &str, table: &HashMap<InternedString, hir::Fixity>) -> String {
 
 #[test]
 fn every_source_groups_its_operators_as_meadow_rename_groups_them() {
-    let files = sources(&["lib", "examples", "benches", "bootstrap", "glade", "silo"]);
+    let files = sources(&["lib", "examples", "benches", "bootstrap", "glade"]);
     let std = repo().join("lib").join("Std");
     let theirs = per_file("fixity", &files);
     let lib = declared_in(&HashMap::new(), &std);
@@ -1492,7 +1492,7 @@ fn inferred_recording(
 #[test]
 fn every_source_infers_as_meadow_infer_infers_it() {
     let _one_at_a_time = expansions_turn();
-    let files = sources(&["lib", "examples", "benches", "bootstrap", "glade", "silo"]);
+    let files = sources(&["lib", "examples", "benches", "bootstrap", "glade"]);
     // This compiler first, keeping what its macros expanded to, which
     // MeadowBoot is then given -- the standard library's too.
     let rust_started = std::time::Instant::now();
@@ -1798,7 +1798,7 @@ fn rename_dump() {
 #[test]
 fn every_source_renames_as_meadow_rename_renames_it() {
     let _one_at_a_time = expansions_turn();
-    let files = sources(&["lib", "examples", "benches", "bootstrap", "glade", "silo"]);
+    let files = sources(&["lib", "examples", "benches", "bootstrap", "glade"]);
     // This compiler first, keeping what its macros expanded to, which
     // MeadowBoot is then given.
     let rust_started = std::time::Instant::now();
@@ -1852,16 +1852,16 @@ fn every_source_renames_as_meadow_rename_renames_it() {
 
 // --- evaluating: the CEK machine ------------------------------------------------
 
-/// The programs `glade/tests/differential.rs` checks every back end with: the
-/// string literal given to each `agree(…)` there. Read from that file, so a
-/// case added there is one here.
-fn glade_programs() -> Vec<String> {
+/// The programs `buildtools/meadow/tests/differential.rs` checks every back
+/// end with: the string literal given to each `agree(…)` there. Read from
+/// that file, so a case added there is one here.
+fn differential_programs() -> Vec<String> {
     // Read as the compiler reads a Rust file: a checkout on Windows has
     // `\r\n` line endings, and a `\r` left in a case's text -- before the
     // newline a `\` continues a string over, say -- makes it a different
     // program, or none.
-    let text = std::fs::read_to_string(repo().join("glade/tests/differential.rs"))
-        .expect("the glade cases")
+    let text = std::fs::read_to_string(repo().join("buildtools/meadow/tests/differential.rs"))
+        .expect("the differential cases")
         .replace("\r\n", "\n");
     let mut out = Vec::new();
     let mut rest = text.as_str();
@@ -1953,6 +1953,7 @@ fn compiled(src: &str) -> Result<core::Program, String> {
         ctor_fields: pkg.ctor_fields.clone(),
         variants: pkg.variants.clone(),
         origins: Default::default(),
+        migrations: Default::default(),
     })
 }
 
@@ -2366,7 +2367,7 @@ def result = (f 8, f 7, f 40, g (3, 10), g (3, 1))
 /// the Rust CEK machine answers for it: the file to run, and the answer.
 fn run_cases(dir: &Path) -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
-    let glade = glade_programs();
+    let glade = differential_programs();
     let theirs = glade.len();
     let programs: Vec<String> = glade.into_iter().chain(trait_programs()).collect();
     for (i, src) in programs.iter().enumerate() {
@@ -3381,7 +3382,7 @@ fn a_function_meadowboot_exports_is_called_from_c() {
     } else {
         "libLib.so"
     };
-    let library = lib.join("target/debug/native/silo").join(name);
+    let library = lib.join("target/debug/native/glade").join(name);
     assert!(
         library.exists(),
         "no library at {}:\n{}{}",
@@ -3516,7 +3517,7 @@ fn a_command_takes_what_meadow_s_takes() {
         .filter_map(|l| l.split_whitespace().next().map(str::to_string))
         .filter(|c| c != "help")
         .collect();
-    assert!(commands.len() >= 14, "{commands:?}");
+    assert!(commands.len() >= 13, "{commands:?}");
     assert_eq!(
         flags_in(&top),
         flags_in(&help_of(&boot, &["--help"])),
@@ -3783,7 +3784,7 @@ fn every_glade_case_evaluates_as_the_cek_machine_evaluates_it() {
     std::fs::create_dir_all(&dir).expect("a scratch directory");
     let mut files = Vec::new();
     let mut wants = std::collections::HashMap::new();
-    for (i, src) in glade_programs().iter().enumerate() {
+    for (i, src) in differential_programs().iter().enumerate() {
         let p = match compiled(src) {
             Ok(p) => p,
             Err(e) => {

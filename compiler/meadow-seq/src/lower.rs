@@ -147,7 +147,9 @@
 //! is bound. Liveness here ignores descriptors; `meadow_axcut::describe` then adds
 //! each one to every environment holding a value it describes.
 
-use crate::{Block, Def, Extern, Label, NO_DESC, Name, Program, Rep, Role, Statement, Tag};
+use crate::{
+    Block, Def, Extern, Label, Migration, NO_DESC, Name, Program, Rep, Role, Statement, Tag,
+};
 use meadow_core as core;
 use meadow_core::{OptLevel, Pat, Term, Var};
 use meadow_hir::VarId;
@@ -198,6 +200,18 @@ impl Timing {
 /// Fresh names continue above the highest [`VarId`] the front end used, so an
 /// invented name can never collide with a real one.
 pub fn lower_program(program: &core::Program, opt: OptLevel) -> Lowered {
+    lower_program_with(program, opt, false)
+}
+
+/// [`lower_program`], for a program that may take a new build of itself
+/// while it runs, when `reloadable`: its definitions, constructors and
+/// effects written with the versions of the types they carry (see
+/// `meadow_core::versions`), in [`Program::types`] and
+/// [`Program::ctor_types`] and its effects' evidence keys. Silo's
+/// interpreter loads a new build by these, and refuses one that has none.
+/// Without it, nothing is versioned and nothing is written down: what a
+/// program built to run as it is, natively above all, has no use for.
+pub fn lower_program_with(program: &core::Program, opt: OptLevel, reloadable: bool) -> Lowered {
     // AxCut is untyped. Core's type abstractions and applications go first,
     // in one pass, so that nothing below has to see through one — see
     // [`core::erase`].
@@ -293,8 +307,14 @@ pub fn lower_program(program: &core::Program, opt: OptLevel) -> Lowered {
     for (i, d) in program.defs.iter().enumerate() {
         globals.insert(d.var, (Label(i as u32), Vec::new()));
     }
+    let versions = if reloadable {
+        timing.pass("versions", || core::versions::Versions::of(program))
+    } else {
+        core::versions::Versions::default()
+    };
 
     let mut lower = Lower {
+        versions: versions.clone(),
         module: InternedString::default(),
         next_name: max_var(program) + 1,
         next_label: program.defs.len() as u32,
@@ -544,6 +564,82 @@ pub fn lower_program(program: &core::Program, opt: OptLevel) -> Lowered {
         "definitions needing descriptors they are not passed: {unmet:?}"
     );
 
+    // Each definition's type, which its direct entry point has too -- but a
+    // local function's, lifted out of the definition it was written in: it
+    // is that definition's code, and has no version of its own. Only for a
+    // program that may be reloaded.
+    let mut types = HashMap::new();
+    for (i, d) in program.defs.iter().enumerate() {
+        if !reloadable || core::lift::is_lifted(program, d) {
+            continue;
+        }
+        let sig = InternedString::from(core::signature(&d.poly, &versions).as_str());
+        types.insert(Label(i as u32), sig);
+        if let Some(&(worker, _)) = lower.workers.get(&d.var) {
+            types.insert(worker, sig);
+        }
+    }
+    // Each constructor as its type's version: a value made by one build's is
+    // told from another's by its tag.
+    let ctor_types = program
+        .variants
+        .iter()
+        .filter(|_| reloadable)
+        .flat_map(|(ty, vs)| vs.iter().map(move |v| (ty, v)))
+        .map(|(ty, v)| {
+            let version = versions.types.get(ty).map_or("", String::as_str);
+            let sig = core::variant_signature(v);
+            (
+                v.name,
+                InternedString::from(format!("{ty}#{version}{sig}").as_str()),
+            )
+        })
+        .collect();
+
+    // Each `@migrate(C)` function, with what it takes: a reload checks the
+    // old `C` had those fields, and calls it on each old `C` new code meets.
+    let migrations = program
+        .migrations
+        .iter()
+        .filter(|_| reloadable)
+        .filter_map(|(var, ctor)| {
+            let i = program.defs.iter().position(|d| d.var == *var)?;
+            // Its parameters, however curried, and what it answers.
+            let mut params = Vec::new();
+            let mut ty = &program.defs[i].poly.ty;
+            while let core::Ty::Fun(ps, ret, _) = ty {
+                params.extend(ps.iter().cloned());
+                ty = ret;
+            }
+            let full = match ty {
+                core::Ty::Con(t, _) => program
+                    .variants
+                    .get(t)
+                    .into_iter()
+                    .flatten()
+                    .find(|v| core::spelling(&v.name) == core::spelling(ctor))
+                    .map(|v| v.name),
+                _ => None,
+            };
+            let fields = core::variant_signature(&meadow_infer::VariantSig {
+                name: *ctor,
+                fields: params,
+                labels: None,
+            });
+            // Its direct entry point, which takes the fields: the
+            // definition's own block answers the function as a value.
+            let label = lower
+                .workers
+                .get(var)
+                .map_or(Label(i as u32), |&(worker, _)| worker);
+            Some(Migration {
+                label,
+                ctor: full.unwrap_or(*ctor),
+                fields: InternedString::from(fields.as_str()),
+            })
+        })
+        .collect();
+
     timing.since("lower", lowering);
     Lowered {
         program: Program {
@@ -568,6 +664,9 @@ pub fn lower_program(program: &core::Program, opt: OptLevel) -> Lowered {
             results: lower.results,
             threads: lower.threads,
             pure: lower.pure,
+            types,
+            ctor_types,
+            migrations,
         },
         unsupported: lower.unsupported,
     }
@@ -638,6 +737,9 @@ struct Lower {
     continuations: HashSet<Name>,
     /// See [`Program::frames`].
     frames: HashSet<Name>,
+    /// The versions of the program's types and effects, when it is built to
+    /// take a new build of itself: what its effects' evidence keys carry.
+    versions: core::versions::Versions,
     /// The name holding the evidence -- the handlers in scope -- where lowering
     /// has got to. See the module docs.
     ev: Name,
@@ -690,10 +792,9 @@ const EV: &str = core::roles::evidence::ENTRY;
 /// a reference, whatever it holds.
 pub const EV_NONE: &str = core::roles::evidence::NONE;
 
-/// The records a runtime builds by their constructor's name: `Fs.metadata`'s
-/// `FileMeta`, a name the language knows (`meadow_rename`'s
-/// `LANGUAGE_NAMES`).
-pub const RUNTIME_RECORDS: &[&str] = &["FileMeta.FileMeta"];
+/// The records a runtime builds by their constructor's name: see
+/// `meadow_rt::roles::RECORDS`.
+pub const RUNTIME_RECORDS: &[&str] = meadow_rt::roles::RECORDS;
 
 /// Meadow's constructor for each role a runtime builds or recognizes by
 /// itself (`meadow_rt::roles`): what a native answers (`Result.Ok`,
@@ -3112,9 +3213,15 @@ impl Lower {
 
     // --- effects ----------------------------------------------------------
 
-    /// The evidence key of an operation.
-    fn key(effect: InternedString, op: InternedString) -> InternedString {
-        InternedString::from(format!("{effect}.{op}").as_str())
+    /// The evidence key of an operation: with its effect's version, where it
+    /// has one, so that a handler of another build's version of the effect
+    /// is not what it finds (see `meadow_core::versions`).
+    fn key(&self, effect: InternedString, op: InternedString) -> InternedString {
+        let key = match self.versions.effects.get(&effect) {
+            Some(v) => format!("{effect}#{v}.{op}"),
+            None => format!("{effect}.{op}"),
+        };
+        InternedString::from(key.as_str())
     }
 
     /// `perform effect.op av` answering `k`, with evidence `ev`.
@@ -3136,7 +3243,7 @@ impl Lower {
         let label = self.fresh_label();
         let (e, a, kk) = (self.fresh_ref(), self.fresh_typed(arg_ty), self.fresh_ref());
         let params = vec![e, a, kk];
-        let key = core::Lit::Sym(Self::key(effect, op));
+        let key = core::Lit::Sym(self.key(effect, op));
         let mut arms = Vec::new();
         for (ctor, tail) in [(EV, false), (EV_TAIL, true)] {
             let ekey = self.fresh_as(Rep::Str);
@@ -3445,7 +3552,7 @@ impl Lower {
 
             let key = self.fresh_as(Rep::Str);
             let before = bind(&mut cur, key);
-            steps.push((Step::Key(key, Self::key(c.effect, c.op)), before));
+            steps.push((Step::Key(key, self.key(c.effect, c.op)), before));
 
             let entry = self.fresh_ref();
             let before = bind(&mut cur, entry);

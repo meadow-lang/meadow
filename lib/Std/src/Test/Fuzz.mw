@@ -91,23 +91,27 @@ use Std.Maybe.Maybe.*
     (prop : String -> () ! { Gen, Test, Test, Process | e })
     : () ! { Test, Process | e } =
   -- From nothing: what an earlier run reached is no news to this one.
-  guided c words prop 0 corpus (covered True)
+  let from = covered True in
+  guided c words prop 0 corpus
 
 -- The cases from `n` on: `kept` are the examples so far, the newest first
--- after the first of them, and `most` how much of the program had been
--- reached when the last was kept.
-fun guided (c : Config) (words : [String]) prop (n : Int) (kept : [String]) (most : Int) =
+-- after the first of them. A case is kept when the property, run on it,
+-- reached somewhere new -- the property, and not the making of the input,
+-- whose own code reaches new places as its draws vary, and which would keep
+-- inputs for nothing the property did. So the same inputs are kept on every
+-- engine, however each numbers the places it notes.
+fun guided (c : Config) (words : [String]) prop (n : Int) (kept : [String]) =
   if n >= c.runs then ()
   else
     match drawing [] True (seed (c.seed + n * 7919)) (\() ->
       let input = steered kept words in
-      (input, failure (\() -> prop input))) with
-    | ((input, (True, why)), used) ->
+      let before = covered False in
+      let result = failure (\() -> prop input) in
+      (input, result, covered False > before)) with
+    | ((input, (True, why), _), used) ->
         failing c (\() -> once kept words prop) n used "${why}\n  for ${show input}"
-    | ((input, _), _) ->
-        let now = covered False in
-        if now > most then guided c words prop (n + 1) (V.pushFront kept input) now
-        else guided c words prop (n + 1) kept most
+    | ((input, _, True), _) -> guided c words prop (n + 1) (V.pushFront kept input)
+    | _ -> guided c words prop (n + 1) kept
 
 -- One case as `guided` runs it, failing as `fuzz` fails: what a failing
 -- case is run again as while it is made smaller, with the examples as they

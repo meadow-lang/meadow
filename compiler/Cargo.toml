@@ -22,10 +22,9 @@ meadow-scc = { path = "meadow-scc" }
 meadow-seq = { path = "meadow-seq" }
 meadow-axcut = { path = "meadow-axcut" }
 meadow-cut = { path = "meadow-cut" }
-meadow-bytecode = { path = "meadow-bytecode" }
-meadow-codegen = { path = "meadow-codegen" }
 meadow-core = { path = "meadow-core" }
 meadow-rt = { path = "meadow-rt" }
+meadow-lir = { path = "meadow-lir" }
 num-bigint = "0.4"
 num-traits = "0.2"
 ariadne = "0.6.0"

@@ -209,9 +209,8 @@ fn a_manifest_chooses_the_backend() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A profile chooses the runtime -- Glade or Silo -- and the runtime's flags;
-/// Silo is compiled ahead of time by what it is, whatever a backend says, and
-/// does not give way to Glade's JIT.
+/// A profile chooses the runtime's flags; the runtime is one, by either of
+/// its names, and how it runs a program is the backend's.
 #[test]
 fn a_manifest_chooses_the_runtime_and_its_flags() {
     use meadow::aot::Runtime;
@@ -239,30 +238,31 @@ fn a_manifest_chooses_the_runtime_and_its_flags() {
 
     let debug = Resolved::resolve(Profile::Debug, &dir, ProfileConfig::default());
     assert_eq!(debug.runtime, Runtime::Glade);
-    assert!(
-        debug.native(),
-        "`aot = true` is Glade compiled ahead of time"
-    );
+    assert!(debug.native(), "`aot = true` is compiled ahead of time");
     assert_eq!(debug.threads, Some(2));
     assert_eq!(debug.options.cfg.backend, "aot");
 
     let release = Resolved::resolve(Profile::Release, &dir, ProfileConfig::default());
-    assert_eq!(release.runtime, Runtime::Silo);
+    assert_eq!(release.runtime, Runtime::Glade);
     assert!(release.native());
     assert!(release.leaks);
     assert_eq!(
         release.target.map(|t| t.to_string()),
         Some("aarch64".into())
     );
-    assert_eq!(release.options.cfg.backend, "silo", "what `@cfg` sees");
-    assert_eq!(release.fallback(), None, "Silo is not Glade's JIT");
+    assert_eq!(release.options.cfg.backend, "aot", "what `@cfg` sees");
+    assert_eq!(
+        release.fallback().map(|r| r.backend),
+        Some(meadow::Backend::Jit),
+        "the profile's own backend gives way to the JIT"
+    );
 
     // The command line beats the manifest.
     let flagged = Resolved::resolve(
         Profile::Release,
         &dir,
         ProfileConfig {
-            runtime: Some(Runtime::Glade),
+            runtime: Runtime::named("glade"),
             ..ProfileConfig::default()
         },
     );

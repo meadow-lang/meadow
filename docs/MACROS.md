@@ -302,7 +302,7 @@ changing a macro invalidates everything that used it.
 ## 9. Procedural macros
 
 A procedural macro is an ordinary Meadow function, `TokenStream -> TokenStream`,
-compiled to bytecode and **run on the VM during compilation**. There is no
+lowered to an image and **run on the VM during compilation**. There is no
 dynamic library, no ABI between compiler and macro, and no bridge crate: the
 compiler already contains a machine that runs Meadow.
 
@@ -314,7 +314,7 @@ Three things follow from that, and they are the reason to do it this way:
 - **So it is deterministic, and its output is cacheable** on the tokens it was
   given. Impure procedural macros are a standing source of stale-cache bugs
   elsewhere; here the type system rules them out.
-- **There is no host/target split.** Bytecode runs anywhere, so cross-compiling
+- **There is no host/target split.** An image runs wherever the VM does, so cross-compiling
   a program does not mean building its macros twice.
 
 A proc macro lives in a package of its own, as it does in Rust, which with
@@ -358,11 +358,11 @@ makes the answers cacheable, and they are cached, on exactly the tokens it was
 given. It runs with a step budget (`MEADOW_MACRO_FUEL` to change it), so a macro
 that does not stop fails the build rather than hanging it.
 
-It runs on Glade's bytecode machine. Every macro a build can call is compiled
+It runs on the VM. Every macro a build can call is compiled
 into one image the first time one is called -- each behind
 `Std.Macro.Serve.serve`, which reads the call on its input and writes the answer
 on its output, as text -- and each call runs its macro's entry in it. A package
-the bytecode back end cannot translate has its macros run by the CEK machine, as
+the back end cannot lower has its macros run by the CEK machine, as
 they all once were: the same answers, a good deal more slowly.
 `MEADOW_MACRO_TIMES=1` says, for every call, which ran it and how long it took.
 

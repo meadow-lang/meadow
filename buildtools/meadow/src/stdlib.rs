@@ -58,7 +58,10 @@ pub const MODULES: &[(&str, &str)] = &[
     ("Char", include_str!("../../../lib/Std/src/Char.mw")),
     ("Result", include_str!("../../../lib/Std/src/Result.mw")),
     ("Num.Bits", include_str!("../../../lib/Std/src/Num/Bits.mw")),
-    ("Num.Float", include_str!("../../../lib/Std/src/Num/Float.mw")),
+    (
+        "Num.Float",
+        include_str!("../../../lib/Std/src/Num/Float.mw"),
+    ),
     ("Bytes", include_str!("../../../lib/Std/src/Bytes.mw")),
     ("Yield", include_str!("../../../lib/Std/src/Yield.mw")),
     (
@@ -613,7 +616,9 @@ fn bundle(name: InternedString, subs: Vec<CompiledPackage>) -> CompiledPackage {
         bindings,
         embedded,
         fixities,
-        // A library has no entry point, and `Std` least of all.
+        // A library has no entry point, and `Std` least of all; nor anything
+        // a reload migrates.
+        migrations: Vec::new(),
         entry: None,
         value_entry: None,
         modules,

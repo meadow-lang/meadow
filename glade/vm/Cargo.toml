@@ -1,0 +1,35 @@
+[package]
+name = "meadow-glade-vm"
+description = "Glade's VM: a program of AxCut run on the runtime without compiling it ahead of time -- interpreted, with a JIT, counted or traced as the program is built for. What a debug build runs on."
+version = "0.5.0"
+edition = "2024"
+
+[[bin]]
+name = "meadow-glade-vm"
+path = "src/main.rs"
+
+[features]
+# The interpreter for programs built for Glade's object layout: see
+# `meadow-glade`'s feature of the same name.
+glade-layout = ["meadow-glade/glade-layout"]
+
+[dependencies]
+meadow-glade = { path = ".." }
+meadow-axcut = { path = "../../compiler/meadow-axcut" }
+meadow-rt = { path = "../../compiler/meadow-rt" }
+meadow-intern = { path = "../../compiler/meadow-intern" }
+# Executable memory for the JIT: see `src/interp/jit.rs`.
+meadow-exec = { path = "../../compiler/meadow-exec" }
+# The JIT's second tier: a definition lowered as for an executable, to the
+# LIR, and compiled by Cranelift (`src/interp/tier2.rs`).
+meadow-llvm = { path = "../../compiler/meadow-llvm" }
+meadow-lir = { path = "../../compiler/meadow-lir" }
+cranelift-codegen = "=0.136.2"
+cranelift-frontend = "=0.136.2"
+cranelift-jit = "=0.136.2"
+cranelift-module = "=0.136.2"
+cranelift-native = "=0.136.2"
+# Argument lists and frames' captures without a heap allocation each.
+smallvec = { version = "1.13", features = ["union"] }
+# The protocol a debugger drives the VM by: see `src/interp/debug.rs`.
+serde_json = "1"

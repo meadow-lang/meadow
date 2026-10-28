@@ -119,7 +119,7 @@ pub type Tag = u32;
 /// known when the program is compiled: a value whose type is a type variable,
 /// whose representation is whatever the variable is instantiated to -- which
 /// the variable's *descriptor* says, at run time (`meadow_core::desc`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Rep {
     /// A heap object: data, a closure or continuation, an array, a record, a
     /// `BigInt`, a `Ref` -- anything the collector follows.
@@ -162,20 +162,23 @@ impl Rep {
 }
 
 /// A top-level block, reachable by [`Statement::Jump`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct Label(pub u32);
 
 /// A block: parameter names, and a body that runs with those names bound.
 ///
 /// The parameters are the shape the environment must have on entry. A caller
 /// arranges it with [`Statement::Substitute`] and then jumps.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct Block {
     pub params: Vec<Name>,
     pub body: Statement,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Statement {
     /// `substitute [x, y, …] in block` — rebuild the environment from the named
     /// values, in that order, and run the block.
@@ -278,7 +281,7 @@ pub enum Statement {
 
     /// Not in the paper. Reaching one is a runtime error, and it exists so that
     /// an untranslatable term is loud rather than silently missing.
-    Error(&'static str),
+    Error(#[serde(deserialize_with = "leaked")] &'static str),
 
     /// Not in the paper either: `s`, which a person wrote at `loc`. It does
     /// nothing. Code generation reads it to say which source position the
@@ -296,13 +299,13 @@ pub enum Statement {
 /// the labels in the order a record keeps them -- the interned names' -- and
 /// how many labels there are. A back end that lays a record out in that order
 /// reads the field there, rather than searching the labels at run time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Place {
     pub at: u32,
     pub of: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Extern {
     /// Produce a constant. One continuation, which binds it.
     Lit(meadow_rt::Lit),
@@ -359,7 +362,8 @@ pub enum Extern {
 }
 
 /// A labelled block in the program table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct Def {
     pub label: Label,
     pub name: InternedString,
@@ -370,10 +374,27 @@ pub struct Def {
     pub block: Block,
 }
 
+/// A `@migrate(C)` function: what a reload calls on a value of an earlier
+/// build's constructor `C`, with that value's fields, for the value of this
+/// build's type it answers to stand in for it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Migration {
+    /// The function's direct entry point, which takes the fields and then
+    /// its continuation.
+    pub label: Label,
+    /// The constructor, as [`Program::tags`] names it: of the type the
+    /// function answers -- or, where that type has none of that name, the
+    /// name as written, which a reload refuses.
+    pub ctor: InternedString,
+    /// What the function takes, written as [`Program::ctor_types`] writes a
+    /// constructor's fields: what the old constructor's must have been.
+    pub fields: InternedString,
+}
+
 /// A block C may call, by the name it calls it: what a library built of the
 /// program exports. The block takes `params` and then the continuation it
 /// answers through, and answers `result`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Export {
     pub name: String,
     pub label: Label,
@@ -381,7 +402,8 @@ pub struct Export {
     pub result: Rep,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
 pub struct Program {
     /// What C may call, where the program is built as a library.
     pub exports: Vec<Export>,
@@ -440,6 +462,21 @@ pub struct Program {
     /// block's caller goes on, and so may borrow what the block borrowed: see
     /// `meadow_llvm::linear`.
     pub pure: std::collections::HashSet<Label>,
+    /// The type of each definition made from one a person wrote, as
+    /// `meadow_core::signature` writes it: what tells one build's version of
+    /// a definition from another's where how it is represented does not --
+    /// for Silo's interpreter, loading a new build into a running program.
+    /// Empty where a front end does not say.
+    #[serde(default)]
+    pub types: std::collections::HashMap<Label, InternedString>,
+    /// What each constructor's fields are, as `meadow_core::variant_signature`
+    /// writes it: what a reload refuses to change under values already made.
+    #[serde(default)]
+    pub ctor_types: std::collections::HashMap<InternedString, InternedString>,
+    /// The `@migrate` functions, for a program that may be loaded into one
+    /// running an earlier build of it.
+    #[serde(default)]
+    pub migrations: Vec<Migration>,
 }
 
 impl Program {
@@ -458,7 +495,16 @@ impl Program {
 
 pub mod describe;
 
+/// AxCut with every share, erase and reuse written down: what an engine that
+/// counts references runs (`docs/RUNTIME-MERGE.md`, the memory pass).
+pub mod linear;
+
 pub mod machine;
+
+/// A program as a file, for an engine that runs in a process of its own:
+/// Silo's interpreter (`glade/vm`).
+pub mod config;
+pub mod image;
 
 mod print;
 pub use print::Listing;
@@ -498,7 +544,7 @@ pub fn commutes(p: Prim) -> bool {
 ///
 /// `fib` retires two `move` instructions in every call, a quarter of
 /// everything it runs, and they are all one shape: a continuation captures the
-/// names the frame will not need again, and `meadow_codegen` gives the next
+/// names the frame will not need again, and a code generator gives the next
 /// value the lowest register *no name is sitting in* -- so the dead names hold
 /// the low registers, the live values are pushed above them, and the
 /// `substitute` before the call has to move them back down.
@@ -507,7 +553,7 @@ pub fn commutes(p: Prim) -> bool {
 /// is not written, because two other things assume an environment never
 /// shrinks:
 ///
-/// * `meadow_codegen` enters a block by zipping its parameters against the
+/// * a code generator enters a block by zipping its parameters against the
 ///   registers of the environment, so a shorter environment is a block entered
 ///   with the wrong arity. Leaving the dead name in and reusing its register is
 ///   worse: the GC map at the next safepoint would still say a reference lives
@@ -750,4 +796,12 @@ mod still_used_tests {
         assert!(!at_jump.contains(&n(2)));
         assert_eq!(at_jump.len(), 3, "only what the jump carries");
     }
+}
+
+/// A `&'static str` read back from a program's file: leaked, since the
+/// message lives as long as the program does: a `Statement::Error`'s, and a
+/// `linear::L::Error`'s.
+pub(crate) fn leaked<'de, D: serde::Deserializer<'de>>(d: D) -> Result<&'static str, D::Error> {
+    let s: String = serde::Deserialize::deserialize(d)?;
+    Ok(Box::leak(s.into_boxed_str()))
 }

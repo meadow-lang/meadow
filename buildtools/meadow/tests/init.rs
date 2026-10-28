@@ -237,7 +237,7 @@ fn an_existing_gitignore_gains_the_line_and_keeps_the_rest() {
 }
 
 /// `meadow run` leaves the image it ran in the package's own `target`
-/// directory, and that image is the program: loaded back, it runs the same.
+/// directory, and that image is the program: run again, it does the same.
 #[test]
 fn running_a_package_writes_its_image_under_target() {
     let dir = scratch("target");
@@ -257,12 +257,24 @@ fn running_a_package_writes_its_image_under_target() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let image = meadow::artifacts::image_path(&made.root, meadow::Profile::Debug, &made.name);
-    let bytes = std::fs::read(&image).expect("the image is written");
-    let program = meadow_bytecode::image::decode(&bytes).expect("and decodes");
     assert_eq!(
-        meadow_glade::run(&program, u64::MAX).map_err(|e| e.msg),
-        Ok("()".into())
+        String::from_utf8_lossy(&out.stdout),
+        "42
+"
+    );
+    let image = meadow::artifacts::native_dir(&made.root, meadow::Profile::Debug)
+        .join("glade")
+        .join(format!("{}.image", made.name));
+    assert!(image.exists(), "the image is written");
+    let again = std::process::Command::new(env!("CARGO_BIN_EXE_meadow"))
+        .arg("exec")
+        .arg(&image)
+        .output()
+        .expect("the meadow binary runs");
+    assert_eq!(
+        String::from_utf8_lossy(&again.stdout),
+        "42
+"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

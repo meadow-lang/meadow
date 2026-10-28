@@ -13,13 +13,10 @@ meadow-lsp = { path = "meadow-lsp" }
 meadow = { path = "meadow" }
 meadow-compiler = { path = "../compiler/meadow-compiler" }
 meadow-eval = { path = "../eval" }
-meadow-glade = { path = "../glade" }
 meadow-seq = { path = "../compiler/meadow-seq" }
 meadow-cut = { path = "../compiler/meadow-cut" }
 meadow-axcut = { path = "../compiler/meadow-axcut" }
-meadow-codegen = { path = "../compiler/meadow-codegen" }
 meadow-llvm = { path = "../compiler/meadow-llvm" }
-meadow-bytecode = { path = "../compiler/meadow-bytecode" }
 
 # The `meadow` binary is an interpreter: its inner loop wants cross-crate
 # inlining, and the instruction dispatch wants to be one function rather than
@@ -29,16 +26,12 @@ meadow-bytecode = { path = "../compiler/meadow-bytecode" }
 lto = true
 codegen-units = 1
 
-# A debug build of `meadow` still *runs programs*, and the tests run the whole
-# standard library through every machine several times over. Unoptimized, the
-# machines are some thirty times slower, and `tests/vm.rs` alone took eleven
-# minutes on a fast machine -- and past CI's 45-minute limit on a Windows
-# runner, which looked like a hang and was not one. So the crates that execute
-# programs are optimized in every profile; debug assertions stay on, and
-# everything else -- the compiler, the tools, the tests -- stays quick to build.
-[profile.dev.package.meadow-glade]
-opt-level = 2
-
+# A debug build of `meadow` still *runs programs* -- the CEK machine, the
+# AxCut machine -- and the tests run the whole standard library through them.
+# Unoptimized, the machines are some thirty times slower, past CI's limits on
+# a Windows runner. So the crates that execute programs are optimized in
+# every profile; debug assertions stay on, and everything else -- the
+# compiler, the tools, the tests -- stays quick to build.
 [profile.dev.package.meadow-eval]
 opt-level = 2
 

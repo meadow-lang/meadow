@@ -14,10 +14,10 @@ on:
       - "buildtools/meadow/src/aot.rs"
       - "buildtools/meadow/src/cut.rs"
       - "bootstrap/src/Main.mw"
-      - "silo/**"
+      - "glade/**"
       - "compiler/meadow-llvm/**"
       - "compiler/meadow-rt/**"
-      - "scripts/silo-runtime.sh"
+      - "scripts/glade-runtime.sh"
       - ".github/workflows/ios.yml"
 
 jobs:
@@ -36,8 +36,8 @@ jobs:
 
       - name: Build Silo's runtime for iOS
         run: |
-          scripts/silo-runtime.sh aarch64-apple-ios-sim
-          scripts/silo-runtime.sh aarch64-apple-ios
+          scripts/glade-runtime.sh aarch64-apple-ios-sim
+          scripts/glade-runtime.sh aarch64-apple-ios
 
       - name: Build MeadowBoot
         run: buildtools/target/release/meadow build --release bootstrap
@@ -45,7 +45,7 @@ jobs:
       - name: Build a program, a library and its host for iOS
         run: |
           meadow="$PWD/buildtools/target/release/meadow"
-          boot="$PWD/bootstrap/target/release/native/silo/MeadowBoot"
+          boot="$PWD/bootstrap/target/release/native/glade/MeadowBoot"
           mkdir -p "$RUNNER_TEMP/Hello/src" "$RUNNER_TEMP/Lib/src" out/sim out/device
           printf '[package]\nname = "Hello"\nversion = "0.1.0"\n' > "$RUNNER_TEMP/Hello/Meadow.toml"
           cat > "$RUNNER_TEMP/Hello/src/Main.mw" <<'EOF'
@@ -92,10 +92,10 @@ jobs:
               d=device sdk=iphoneos clang=arm64-apple-ios15.0
             fi
             "$meadow" build --release --runtime silo --target $t "$RUNNER_TEMP/Hello"
-            cp "$RUNNER_TEMP/Hello/target/release/native/$t/silo/Hello" out/$d/
+            cp "$RUNNER_TEMP/Hello/target/release/native/$t/glade/Hello" out/$d/
             MEADOWBOOT_STD="$PWD/lib/Std" MEADOW="$meadow" \
               "$boot" build --release --target $t "$RUNNER_TEMP/Lib"
-            cp "$RUNNER_TEMP/Lib/target/release/native/$t/silo/libLib.a" out/$d/
+            cp "$RUNNER_TEMP/Lib/target/release/native/$t/glade/libLib.a" out/$d/
             xcrun --sdk $sdk clang --target=$clang -isysroot "$(xcrun --sdk $sdk --show-sdk-path)" \
               "$RUNNER_TEMP/host.c" out/$d/libLib.a -o out/$d/host -Wl,-dead_strip \
               -liconv -framework Security -framework CoreFoundation

@@ -34,7 +34,7 @@ and they use two different parts of Idyll.
   Idyll's `docs/LOW.md`). Every module is proved memory-safe: indices in
   bounds, buffers live, writes disjoint where they must be. The proofs are
   erased before code is made, so the C has no checks they paid for. This
-  half replaces `silo/`, `silo/vm/`, `compiler/meadow-rt` and what Glade
+  half replaces `glade/`, `glade/vm/`, `compiler/meadow-rt` and what Glade
   still contributes. Today that is Rust, with a large `unsafe` core and no
   proofs.
 - **The compiler and the tools are written in high-level Idyll.** This
@@ -132,7 +132,7 @@ that keeps every test passing.
   across the seam but those functions and the layout. The layout description
   (`meadow_rt::layout`) is the first thing written in Idyll. It becomes the
   one source both sides are generated from.
-- **A mixed library.** Through the transition, `libmeadow_silo` holds both
+- **A mixed library.** Through the transition, `libmeadow_glade` holds both
   kinds of module: the Rust ones, and C compiled from Idyll. The runtime's
   fingerprint covers the Idyll sources as it covers the Rust ones.
 - **The gates.** A replacement lands only when all of these hold:
@@ -162,8 +162,8 @@ Each step has a *done when*. Steps MI-1 to MI-3 wait on Idyll's extensions
 | **MI-3** | Tracing: marking and sweeping, proved to free only what no root reaches, and to keep the heap well formed (every reference field of a live block points to a live block or is an immediate). | `trace::collect` is Idyll; the gates hold under `tracing` |
 | **MI-4** | The young generation: the copier, proved to rewrite every reference to a block it moves, with the barrier's obligation stated as the store's precondition. | `trace::minor` and the barrier are Idyll; the gates hold under `generational` with the smallest nursery |
 | **MI-5** | Counting: share, erase, reuse, lazy freeing and the cycle collector. Each operation is proved to keep the count equal to the references it accounts for, given what the memory pass guarantees: that each name is consumed once. | `heap.rs` and `cycles.rs` are Idyll; the gates hold under `rc`, and the leak check reports nothing |
-| **MI-6** | The rest of the runtime: stack segments and the scheduler (on the trusted stack switch and atomics), regions, parcels, STM, the primitives and printing, big integers. | `silo/src` has no Rust left |
-| **MI-7** | The VM and the JIT: the interpreter's loop in low-level Idyll, and the JIT's encoder in high-level Idyll, proved against a decoder of the same instructions. | `silo/vm` has no Rust left; the VM's speed holds (PERF-3) |
+| **MI-6** | The rest of the runtime: stack segments and the scheduler (on the trusted stack switch and atomics), regions, parcels, STM, the primitives and printing, big integers. | `glade/src` has no Rust left |
+| **MI-7** | The VM and the JIT: the interpreter's loop in low-level Idyll, and the JIT's encoder in high-level Idyll, proved against a decoder of the same instructions. | `glade/vm` has no Rust left; the VM's speed holds (PERF-3) |
 | **MI-8** | The compiler, ported pass by pass from MeadowBoot, each checked against the Rust compiler as MeadowBoot's are. The memory pass is written so that its output is linear by Idyll's grades, which the type checker then proves. | `meadow` builds itself with no Rust in it |
 | **MI-9** | Retire the Rust: the bootstrap chain below, and Glade's and Silo's crates removed. | a release builds from Idyll and C alone |
 

@@ -209,7 +209,7 @@ fn a_condition_that_cannot_fuse_still_branches() {
 /// Floats and `BigInt`s compare too, and their comparisons are on the fused
 /// list — which the runtime relies on for a reason that has nothing to do with
 /// the answer: it keeps the result in a register the collector does not scan, so
-/// a fused primitive must not allocate. See `meadow_glade::vm::TEMP`.
+/// a fused primitive must not allocate.
 #[test]
 fn fusing_covers_the_other_numeric_types() {
     is(

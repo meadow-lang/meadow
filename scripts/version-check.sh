@@ -18,8 +18,8 @@ want="${1:?usage: version-check.sh vX.Y.Z [ROOT]}"
 want="${want#v}"
 cd "${2:-$(dirname "$0")/..}"
 
-for manifest in compiler/Cargo.toml eval/Cargo.toml glade/Cargo.toml \
-  silo/Cargo.toml buildtools/Cargo.toml installer/Cargo.toml \
+for manifest in compiler/Cargo.toml eval/Cargo.toml \
+  glade/Cargo.toml buildtools/Cargo.toml installer/Cargo.toml \
   lib/Std/Meadow.toml; do
   got=$(grep -m1 '^version = ' "$manifest" | sed 's/.*"\(.*\)".*/\1/')
   if [ "$got" != "$want" ]; then

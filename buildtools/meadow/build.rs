@@ -1,21 +1,19 @@
-//! The runtime libraries -- Glade's and Silo's -- built for the target this
-//! `meadow` is, and put where `src/aot.rs` embeds them, so that a release
-//! build makes native executables on either runtime with nothing installed
-//! beside the binary.
+//! The runtime -- its library, which an executable links against, and its VM,
+//! which runs an image -- built for the target this `meadow` is, and put
+//! where `src/aot.rs` embeds them, so that a release build of `meadow` runs
+//! and links programs with nothing installed beside the binary.
 //!
 //! Only for a release build of `meadow`, or when `MEADOW_EMBED_RUNTIME=1`
-//! asks: each library is a release build of its runtime (`glade/`, `silo/`)
-//! with link-time optimization, which is minutes, not seconds, and a debug
-//! `meadow` in a checkout finds the ones `cargo build --release` leaves in
-//! those directories instead. `MEADOW_EMBED_RUNTIME=0` leaves them out of a
-//! release build too.
+//! asks: each is a release build of the runtime (`glade/`) with link-time
+//! optimization, which is minutes, not seconds, and a debug `meadow` in a
+//! checkout finds the ones `cargo build --release` leaves there instead.
+//! `MEADOW_EMBED_RUNTIME=0` leaves them out of a release build too.
 //!
 //! Each is built by a `cargo` of its own, in a target directory of its own,
-//! from the same sources as this binary's code generators -- so its
-//! fingerprint (see `glade/build.rs`, `silo/build.rs`) is the one the program
-//! it links refers to. A failure to build one is a warning, not an error:
-//! `meadow` still works, and says where else a runtime library can come from
-//! when it wants one.
+//! from the same sources as this binary's code generator -- so the library's
+//! fingerprint (see `glade/build.rs`) is the one the program it links refers
+//! to. A failure to build one is a warning, not an error: `meadow` still
+//! works, and says where else the runtime can come from when it wants it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -56,48 +54,52 @@ fn main() {
     let here = Path::new(env!("CARGO_MANIFEST_DIR"));
     let root = here.join("../..");
     let compiler = root.join("compiler");
-    // Each runtime: its crate, what is embedded as, and every input its
-    // library -- and so its fingerprint -- depends on.
-    let runtimes = [
-        (
-            "glade",
-            "runtime",
-            vec![
-                root.join("glade/src"),
-                root.join("glade/build.rs"),
-                root.join("glade/Cargo.toml"),
-                compiler.join("meadow-bytecode"),
-                compiler.join("meadow-rt"),
-                compiler.join("meadow-intern"),
-                compiler.join("meadow-span"),
-            ],
-        ),
-        (
-            "silo",
-            "runtime-silo",
-            vec![
-                root.join("silo/src"),
-                root.join("silo/build.rs"),
-                root.join("silo/Cargo.toml"),
-                root.join("glade/fingerprint.rs"),
-                compiler.join("meadow-llvm/src"),
-                compiler.join("meadow-rt"),
-                compiler.join("meadow-intern"),
-                compiler.join("meadow-span"),
-            ],
-        ),
+    // The library, and every input it -- and so its fingerprint -- depends on.
+    let library = vec![
+        root.join("glade/src"),
+        root.join("glade/build.rs"),
+        root.join("glade/Cargo.toml"),
+        root.join("compiler/fingerprint.rs"),
+        compiler.join("meadow-llvm/src"),
+        compiler.join("meadow-rt"),
+        compiler.join("meadow-intern"),
+        compiler.join("meadow-span"),
     ];
-    for (name, file, inputs) in runtimes {
+    // The VM: the library's sources, its own, and its JIT's.
+    let mut vm = library.clone();
+    vm.extend([
+        root.join("glade/vm/src"),
+        root.join("glade/vm/Cargo.toml"),
+        compiler.join("meadow-axcut"),
+        compiler.join("meadow-exec"),
+        compiler.join("meadow-lir"),
+    ]);
+    for (what, file, inputs) in [
+        (Part::Library, "runtime-library", library),
+        (Part::Vm, "vm", vm),
+    ] {
         for input in &inputs {
             println!("cargo:rerun-if-changed={}", input.display());
         }
         let bytes = match wanted() {
-            true => build(&out, name).unwrap_or_else(|e| {
-                println!("cargo:warning=no {name} runtime library built into meadow: {e}");
+            true => build(&out, what).unwrap_or_else(|e| {
+                println!(
+                    "cargo:warning=no runtime {} built into meadow: {e}",
+                    what.name()
+                );
                 Vec::new()
             }),
             false => Vec::new(),
         };
+        if what == Part::Vm {
+            // What the VM is extracted under: a directory of its own for each.
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in &bytes {
+                h ^= u64::from(*b);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+            println!("cargo:rustc-env=MEADOW_EMBEDDED_VM={h:016x}");
+        }
         // Unchanged contents leave the file alone, so nothing recompiles for it.
         let embedded = out.join(file);
         if std::fs::read(&embedded).ok().as_deref() != Some(&bytes[..]) {
@@ -213,17 +215,38 @@ fn wanted() -> bool {
     }
 }
 
-/// Build runtime `name`'s library -- `glade` or `silo` -- and answer its
-/// bytes.
-fn build(out: &Path, name: &str) -> Result<Vec<u8>, String> {
+/// What of the runtime is embedded.
+#[derive(Clone, Copy, PartialEq)]
+enum Part {
+    /// The static library an executable links against.
+    Library,
+    /// The VM, which runs an image.
+    Vm,
+}
+
+impl Part {
+    fn name(self) -> &'static str {
+        match self {
+            Part::Library => "library",
+            Part::Vm => "VM",
+        }
+    }
+}
+
+/// Build `what` of the runtime, and answer its bytes.
+fn build(out: &Path, what: Part) -> Result<Vec<u8>, String> {
     let here = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let krate = here.join("../..").join(name);
+    let krate = here.join("../../glade");
     let target = std::env::var("TARGET").map_err(|e| e.to_string())?;
     let dir = target_dir(out);
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut cmd = Command::new(cargo);
-    cmd.args(["build", "--release", "--lib", "--target", &target])
-        .arg("--manifest-path")
+    cmd.args(["build", "--release", "--target", &target]);
+    match what {
+        Part::Library => cmd.args(["-p", "meadow-glade", "--lib"]),
+        Part::Vm => cmd.args(["-p", "meadow-glade-vm", "--bin", "meadow-glade-vm"]),
+    };
+    cmd.arg("--manifest-path")
         .arg(krate.join("Cargo.toml"))
         .arg("--target-dir")
         .arg(&dir);
@@ -249,16 +272,18 @@ fn build(out: &Path, name: &str) -> Result<Vec<u8>, String> {
         let lines: Vec<&str> = said.lines().collect();
         let tail = lines[lines.len().saturating_sub(15)..].join("\ncargo:warning=  ");
         return Err(format!(
-            "`cargo build` in {name} failed ({}):\ncargo:warning=  {tail}",
+            "`cargo build` of the runtime {} failed ({}):\ncargo:warning=  {tail}",
+            what.name(),
             built.status
         ));
     }
-    let lib = if target.contains("windows-msvc") {
-        format!("meadow_{name}.lib")
-    } else {
-        format!("libmeadow_{name}.a")
+    let file = match what {
+        Part::Library if target.contains("windows-msvc") => "meadow_glade.lib",
+        Part::Library => "libmeadow_glade.a",
+        Part::Vm if target.contains("windows") => "meadow-glade-vm.exe",
+        Part::Vm => "meadow-glade-vm",
     };
-    let path = dir.join(&target).join("release").join(lib);
+    let path = dir.join(&target).join("release").join(file);
     std::fs::read(&path).map_err(|e| format!("could not read {}: {e}", path.display()))
 }
 
@@ -271,6 +296,6 @@ fn target_dir(out: &Path) -> PathBuf {
         (Some(b), Some(target)) if b.file_name().is_some_and(|n| n == "build") => {
             target.join("meadow-runtime")
         }
-        _ => out.join("glade"),
+        _ => out.join("runtime"),
     }
 }

@@ -1,155 +1,583 @@
-//! The scheduler: green threads, each with a heap of its own, run M:N on a pool
-//! of OS threads.
+//! **Green threads, channels and transactions**, M:N over OS threads. See
+//! `docs/RUNTIME.md`, "Threads".
 //!
-//! # What a green thread is
+//! A thread is a coroutine -- a stack segment, as a `handle` is -- with a
+//! context of its own (`crate::ctx`): its own heap, so counting needs no
+//! atomics, and what crosses between threads is copied ([`Parcel`]). A worker
+//! per core takes ready threads off one queue and runs each until it waits: on
+//! a thread it awaits, on an empty channel, in a transaction's `retry`, or by
+//! yielding. `main` is a thread too, and the program ends when it does;
+//! threads still running then are stopped. A thread that neither waits nor
+//! finishes gives way at a safe point once its turn is up, so one that never
+//! waits cannot keep a core to itself.
 //!
-//! A [`Vm`]: a register file, a program counter and a heap.
-//! Its call stack is the frame stack, which is chunks of that heap and not the
-//! OS thread's stack, so that is all of it -- a thread that is not
-//! running is a value that can be put in a queue, and any OS thread can pick
-//! it up and carry on. The OS threads are workers and nothing else; a program
-//! never sees one.
+//! None of this is here for a program that cannot spawn: it runs on the
+//! thread that called it, with no scheduler, no workers and no safe points
+//! (`crate::ctx`, and `meadow_llvm::emit`).
 //!
-//! # The rule: a heap belongs to one thread
+//! A thread that waits says why in its context and suspends -- every segment
+//! of it, out to the worker, as performing an operation further out does
+//! ([`crate::segments`]). The worker files it, under the scheduler's lock, with
+//! what it waits on, or puts it straight back if that is already there: no
+//! wake-up can fall between the thread deciding to wait and its waiting.
 //!
-//! Only the OS thread currently running a green thread touches that thread's
-//! heap. Values reach another thread in three ways -- the function it is
-//! spawned with, a message on a channel, the result `await` returns -- and each
-//! is exported to a [`Parcel`] by the thread that has the value, and imported by
-//! the thread that receives it, when it next runs. A parcel waiting in a channel
-//! belongs to no heap at all. So there is no shared mutable memory between
-//! threads, no locking in the machine, and each heap is collected on its own
-//! with nothing else stopping.
-//!
-//! # Work stealing
-//!
-//! Every worker has a run queue of its own. A thread it spawns, a thread it
-//! wakes -- by sending to a channel someone waits on, or by finishing a thread
-//! someone awaits -- and a thread of its own that used up its slice all go on
-//! *its* queue, so a thread keeps to the core it is on and its heap stays in
-//! that core's cache. A worker with nothing to do takes half of another
-//! worker's queue: work spreads to idle cores, and only to idle cores.
-//!
-//! A thread woken by a message or a result goes one better: into the worker's
-//! *next* slot, which is not stealable and runs as soon as the current thread
-//! stops. A send and the receive it answers then happen on one core, back to
-//! back, the way a pipeline wants -- where waking a sleeping core to carry every
-//! message across would cost more than the message. A worker is woken to steal
-//! only when a queue holds more than its owner will run next.
-//!
-//! One shared queue remains for fairness: a worker looks at it first every
-//! [`GLOBAL_EVERY`] turns. The locks are per queue, per channel and per thread
-//! handle, so workers that are not touching the same things do not wait on each
-//! other.
-//!
-//! # How a thread operation happens
-//!
-//! A primitive cannot carry one out: the channels and the other threads are
-//! here. It leaves a [`Request`] in the machine and returns, and the worker
-//! running the machine does what was asked, then either carries on with the
-//! same thread -- a send, a spawn, a new channel -- or parks it with whatever
-//! it is waiting for: a receive on an empty channel, an `await` on a thread
-//! still running. Whoever wakes it attaches the answer as a [`Wake`], and it is
-//! delivered into the thread's registers when it runs again.
-//!
-//! # Fairness, deadlock and the end
-//!
-//! A thread runs for [`SLICE`] instructions and then goes to the back of its
-//! worker's queue, so a loop that never waits cannot starve the others. The
-//! program ends when its first thread -- `main` -- does, as in Go; threads still
-//! running then are dropped.
-//!
-//! Only a running thread can wake a waiting one. So the scheduler counts the
-//! threads that are running or queued, and if that count reaches zero with
-//! `main` unfinished, every thread is waiting on another and none ever will
-//! stop: a deadlock, reported as an error.
+//! A transaction keeps its writes in a log, one level per `orElse`, and
+//! reads a `TVar` only if nothing has written it since the transaction began.
+//! Its commit checks that everything it read is as it was, and publishes its
+//! writes, under the lock; either may find a conflict, and the transaction
+//! runs again.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
-use std::time::Duration;
+use crate::ctx::{self, Ctx, Request, Txn, Wake};
+use crate::heap::{self, Word};
+use crate::parcel::Parcel;
+use crate::segments::{self, Down, SendSegment, Up};
+use crate::value::{self, Val};
+use corosensei::stack::DefaultStack;
+use corosensei::{Coroutine, CoroutineResult, Yielder};
+use meadow_rt::{Prim, desc};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 
-use meadow_bytecode::{Pc, Program, Reg};
+/// A thread's stack: reserved, and committed as it is touched.
+const THREAD: usize = 256 << 20;
+/// `main`'s: non-tail recursion over a long list is ordinary Meadow.
+const MAIN: usize = 1 << 30;
 
-use crate::heap::{Heap, Kind, Parcel, THREAD_INITIAL};
-use crate::vm::{Error, Request, Vm};
-
-/// Instructions a thread runs before another gets a turn.
-pub const SLICE: u64 = 2048;
-
-/// A worker looks at the shared queue before its own every this many turns, so
-/// what is there is never starved by a busy local queue.
-pub const GLOBAL_EVERY: u64 = 61;
-
-/// How a run ended, and what the collectors did along the way.
-pub struct Outcome {
-    /// The main thread's result, rendered, or why it failed.
-    pub result: Result<String, Error>,
-    pub stats: Stats,
-    /// Every thread's samples, merged. `None` unless the run was sampled.
-    pub profile: Option<crate::profile::Profile>,
+/// A thread that is not running.
+struct Green {
+    ctx: Box<Ctx>,
+    co: SendSegment,
 }
 
-/// The collectors' work, summed over every thread that finished.
-#[derive(Debug, Clone, Default)]
-pub struct Stats {
-    pub threads: u64,
-    pub collections: u64,
-    pub allocated: u64,
-    pub copied: u64,
-    pub gc_nanos: u64,
-    /// The main thread's heap and regions when it finished.
-    pub heap_slots: usize,
-    pub region_slots: usize,
-    /// Threads taken from another worker's queue.
-    pub stolen: u64,
-    pub pauses: crate::pauses::Pauses,
-    /// What each instruction allocated, summed over every thread. Only under
-    /// `--features profile-alloc` -- see [`crate::profile::Sites`].
-    #[cfg(feature = "profile-alloc")]
-    pub sites: crate::profile::Sites,
-    /// How many of each instruction the run retired.
-    #[cfg(feature = "profile-alloc")]
-    pub ops: crate::profile::Ops,
-    /// Where each `invoke` went and which way each tag test did.
-    #[cfg(feature = "profile-alloc")]
-    pub feedback: crate::profile::Feedback,
-    /// Slots promoted to old generations, marking cycles, and time spent
-    /// marking on any thread.
-    pub promoted: u64,
-    pub cycles: u64,
-    pub mark_nanos: u64,
-    /// Slots and blocks evacuated out of sparse old blocks.
-    pub evacuated: u64,
-    pub evacuated_blocks: u64,
-    /// The main thread's old generation when it finished: slots in its blocks,
-    /// and slots its last marking cycle found alive. The difference is what
-    /// fragmentation and the headroom before the next cycle cost.
-    pub old_slots: usize,
-    pub old_live: usize,
+#[derive(Default)]
+struct Task {
+    outcome: Option<Result<Arc<Parcel>, String>>,
+    waiters: Vec<Box<Green>>,
+    /// Nothing can `await` it any more -- every `Task` of it has gone -- so
+    /// what it answers is not kept: see [`held`].
+    nobody: bool,
 }
 
-impl Stats {
-    fn add(&mut self, heap: &Heap) {
-        self.threads += 1;
-        self.collections += heap.collections;
-        self.allocated += heap.allocated;
-        self.copied += heap.copied;
-        self.gc_nanos += heap.gc_nanos;
-        self.pauses.merge(&heap.pauses);
-        self.promoted += heap.promoted;
-        self.cycles += heap.cycles;
-        self.mark_nanos += heap.mark_nanos;
-        self.evacuated += heap.evacuated;
-        self.evacuated_blocks += heap.evacuated_blocks;
-        #[cfg(feature = "profile-alloc")]
-        self.sites.merge(&heap.sites);
+// --- who can still await a thread ------------------------------------------
+//
+// What a thread answered is kept for `await`, and may be awaited more than
+// once, so it is kept while anything could ask: while there is a `Task` of
+// the thread in some heap, or in a parcel on its way to one. Kept for good,
+// as it was, a thread's answer -- and every compact region in it -- outlived
+// the program: a compiler that asked each file's tree of a thread held every
+// tree it had ever made.
+//
+// The count has a lock of its own, taken alone: a `Task` is erased, and a
+// parcel dropped, from places that hold the scheduler's. When it reaches
+// nothing the thread is put on a list, and the scheduler lets go of its
+// answer where it next takes its own lock afresh ([`forget`]).
+//
+// A `Task` in a heap that goes whole -- its thread ended still holding it --
+// is never counted off, and its thread's answer stays, as before.
+
+static HANDLES: Mutex<Option<HashMap<u32, usize>>> = Mutex::new(None);
+static FORGOTTEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+// The same for a `TVar`, by its cell's address: while there is a handle to
+// it -- in a heap, in a parcel, or inside a region, where a `TVar`'s value
+// may hold others -- its value is kept, and when the last has gone the value
+// is let go of, and its region with it. The cell itself stays: a transaction
+// under way may still have its address.
+static VARS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+static FORGOTTEN_VARS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// Whether that list has anything on it: read where a heap asks the system
+/// for more, so that a thread working on alone -- no other is scheduled, and
+/// the scheduler does not look -- still lets go of what it can before it
+/// takes more.
+static VARS_WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a `TVar` nothing can reach is waiting to let its value go.
+#[inline]
+pub fn vars_waiting() -> bool {
+    VARS_WAITING.load(Ordering::Relaxed)
+}
+
+/// One more handle to the `TVar` whose cell is at `at`.
+pub fn held_var(at: usize) {
+    let mut h = VARS.lock().unwrap_or_else(|p| p.into_inner());
+    *h.get_or_insert_with(HashMap::new).entry(at).or_default() += 1;
+}
+
+/// One fewer.
+pub fn let_go_var(at: usize) {
+    let last = {
+        let mut h = VARS.lock().unwrap_or_else(|p| p.into_inner());
+        let h = h.get_or_insert_with(HashMap::new);
+        match h.get_mut(&at) {
+            Some(n) if *n > 1 => {
+                *n -= 1;
+                false
+            }
+            Some(_) => {
+                h.remove(&at);
+                true
+            }
+            None => false,
+        }
+    };
+    if last {
+        FORGOTTEN_VARS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(at);
+        VARS_WAITING.store(true, Ordering::Relaxed);
     }
 }
 
-/// How many OS threads run green threads: `MEADOW_THREADS` if it is set, or one
-/// per core.
-pub fn workers() -> usize {
+/// Let go of the values of the `TVar`s nothing can reach. Takes no lock but
+/// each cell's own, so it may be called from wherever no cell's is held.
+pub fn forget_vars() {
+    // A value let go of may hold the last handles to other `TVar`s, which
+    // puts them on the list in turn: until it is empty.
+    loop {
+        VARS_WAITING.store(false, Ordering::Relaxed);
+        let vars = std::mem::take(&mut *FORGOTTEN_VARS.lock().unwrap_or_else(|p| p.into_inner()));
+        if vars.is_empty() {
+            break;
+        }
+        for at in vars {
+            // Safety: a cell's address, and a cell lives for the whole run.
+            let cell = unsafe { &*(at as *const TVar) };
+            let was = {
+                let mut state = cell.state.lock().unwrap_or_else(|p| p.into_inner());
+                std::mem::replace(&mut state.0, Held::Imm(0, desc::INT))
+            };
+            drop(was);
+        }
+    }
+}
+
+/// One more `Task` of thread `tid`: made by `spawn`, copied into a parcel,
+/// or arrived out of one.
+pub fn held(tid: u32) {
+    let mut h = HANDLES.lock().unwrap_or_else(|p| p.into_inner());
+    *h.get_or_insert_with(HashMap::new).entry(tid).or_default() += 1;
+}
+
+/// One fewer: a `Task` erased, or a parcel holding one dropped.
+pub fn let_go(tid: u32) {
+    let last = {
+        let mut h = HANDLES.lock().unwrap_or_else(|p| p.into_inner());
+        let h = h.get_or_insert_with(HashMap::new);
+        match h.get_mut(&tid) {
+            Some(n) if *n > 1 => {
+                *n -= 1;
+                false
+            }
+            Some(_) => {
+                h.remove(&tid);
+                true
+            }
+            None => false,
+        }
+    };
+    if last {
+        FORGOTTEN
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(tid);
+    }
+}
+
+/// Let go of what the threads nobody can await answered. Called with the
+/// scheduler's lock not held: the answers are dropped once it is released.
+pub fn forget() {
+    forget_vars();
+    let gone = std::mem::take(&mut *FORGOTTEN.lock().unwrap_or_else(|p| p.into_inner()));
+    if gone.is_empty() {
+        return;
+    }
+    let answers: Vec<_> = {
+        let mut w = world();
+        gone.iter()
+            .filter_map(|t| {
+                let task = w.tasks.get_mut(*t as usize)?;
+                task.nobody = true;
+                task.outcome.take()
+            })
+            .collect()
+    };
+    drop(answers);
+}
+
+/// A channel: what has been sent and not yet taken, and the threads waiting
+/// to take something.
+///
+/// A lock of its own, not the scheduler's: a send and a receive that pass
+/// each other touch this and nothing else, and channels that are busy at the
+/// same time never meet. Taken before the scheduler's lock, never after --
+/// which is the whole of the ordering that keeps the two apart.
+#[derive(Default)]
+struct Chan {
+    state: Mutex<ChanState>,
+}
+
+#[derive(Default)]
+struct ChanState {
+    messages: VecDeque<Parcel>,
+    receivers: VecDeque<Box<Green>>,
+}
+
+/// The channel a handle names: its block holds the address, as a `TVar`'s
+/// does. One lives as long as the program.
+fn chan(v: Val, op: &str) -> &'static Chan {
+    let at = match v {
+        Val::Ref(w) if heap::is_block(w) && heap::kind(w) == heap::CHANNEL => heap::field(w, 0),
+        other => {
+            let (w, d) = other.bits();
+            crate::fail(&format!(
+                "{op}: expected a channel, got {}",
+                crate::show::show(w, d)
+            ))
+        }
+    };
+    // Safety: the address of a channel made by `ChannelNew`, which lives for
+    // the whole run.
+    unsafe { &*(at as *const Chan) }
+}
+
+fn chan_state(c: &Chan) -> std::sync::MutexGuard<'_, ChanState> {
+    c.state.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// What a `TVar` holds: a value that is a word and nothing more -- an `Int`,
+/// a `Bool` -- kept as it is, and anything else in a compact region, where
+/// every thread reads it in place. So what a region cannot hold -- a value
+/// reaching a function, a `Ref`, a mutable array or a continuation -- a `TVar`
+/// cannot either, as on the bytecode runtime.
+///
+/// Reading a `TVar` that holds a large map costs a pointer, not a copy of the
+/// map -- as it did on the bytecode runtime, whose `stm` module this follows. A
+/// `TVar` used to hold a parcel, and every read copied all of it into the
+/// reader's heap and every write all of it out: a query database keeping its
+/// answers in one `TVar` spent nine tenths of its time copying them.
+#[derive(Clone)]
+enum Held {
+    Imm(Word, i64),
+    Shared(Arc<InRegion>),
+}
+
+/// A value inside a region, and a reference to the region for as long as a
+/// `TVar` or a transaction holds it.
+struct InRegion {
+    region: *const crate::region::Region,
+    word: Word,
+    desc: i64,
+    /// Words the region held when it was last started afresh -- about what a
+    /// copy of the value costs, for deciding when it has grown too much.
+    fresh: usize,
+}
+
+// Safety: a region is closed and immutable once published, and its count is
+// atomic: see `crate::region`.
+unsafe impl Send for InRegion {}
+unsafe impl Sync for InRegion {}
+
+impl Drop for InRegion {
+    fn drop(&mut self) {
+        // Safety: the reference this holds, given up.
+        unsafe { crate::region::release(self.region) };
+    }
+}
+
+/// Words below which a region is always added to rather than started afresh:
+/// a small value's region is cheap to keep, and a fresh copy of it is too.
+const REGION_FLOOR: usize = 1 << 12;
+
+impl Held {
+    /// `v` to hold, in place of `was`. A write copies the new value into the
+    /// region the old one is in, so whatever the two have in common -- a map
+    /// with one entry more shares all the rest -- is not copied again. That
+    /// region only grows, so once it has grown to four times a fresh copy a
+    /// write starts a new one, and the old is freed when nothing reads it.
+    fn of(v: Val, was: Option<&Held>) -> Held {
+        let (w, d) = v.bits();
+        if d != desc::REF || !heap::is_block(w) {
+            return Held::Imm(w, d);
+        }
+        let grown = |s: &InRegion| {
+            // Safety: `s` holds a reference to its region.
+            let words = unsafe { crate::region::words(s.region) };
+            words > 4 * s.fresh.max(REGION_FLOOR)
+        };
+        let into = match was {
+            Some(Held::Shared(s)) if !grown(s) => Some((s.region, s.fresh)),
+            _ => None,
+        };
+        // Safety: `was` holds a reference to the region added to.
+        match unsafe { crate::region::share_into(into.map(|i| i.0), w, d) } {
+            Ok((region, word)) => {
+                let fresh = match into {
+                    Some((_, f)) => f,
+                    // Safety: the reference `share_into` answered.
+                    None => unsafe { crate::region::words(region) },
+                };
+                Held::Shared(Arc::new(InRegion {
+                    region,
+                    word,
+                    desc: d,
+                    fresh,
+                }))
+            }
+            Err(why) => {
+                let what = why.strip_prefix("a compact cannot hold ").unwrap_or(&why);
+                crate::fail(&meadow_rt::stm::unstorable(what))
+            }
+        }
+    }
+
+    /// The value, in the running thread's heap and owned by the caller.
+    fn open(&self) -> (Word, i64) {
+        match self {
+            Held::Imm(w, d) => (*w, *d),
+            Held::Shared(s) => {
+                // Safety: `s` holds a reference to the region; the caller
+                // gets one of its own, which erasing the value gives up.
+                unsafe { crate::region::retain(s.region) };
+                (s.word, s.desc)
+            }
+        }
+    }
+}
+
+/// A `TVar`: what it holds, the clock when it was last written, and the
+/// threads waiting in `retry` for it to be written (keys of the scheduler's
+/// `waiting`).
+///
+/// A lock of its own, rather than one lock over all of them: a transaction
+/// holds it for as long as a word takes to copy, and threads touching
+/// different `TVar`s never meet. What touches several locks them in address
+/// order, so two of them cannot hold each other up.
+///
+/// One lives as long as the program: a `TVar` is a handle any thread may
+/// hold, and nothing says when the last of them is gone.
+struct TVar {
+    state: Mutex<(Held, u64)>,
+    waiters: Mutex<Vec<u64>>,
+}
+
+/// Counts commits that wrote something: what a `TVar`'s version is, and what
+/// a transaction remembers as its beginning.
+static CLOCK: AtomicU64 = AtomicU64::new(0);
+/// Numbers `TVar`s and channels, for printing.
+static NEXT_TVAR: AtomicU64 = AtomicU64::new(0);
+static NEXT_CHAN: AtomicU64 = AtomicU64::new(0);
+
+/// The cell a handle names. The block holds its address, so reading or
+/// writing one is no lookup at all -- and a handle copied to another thread
+/// carries the address, which is the same everywhere.
+fn cell(v: Val, op: &str) -> &'static TVar {
+    let at = match v {
+        Val::Ref(w) if heap::is_block(w) && heap::kind(w) == heap::TVAR => heap::field(w, 0),
+        other => {
+            let (w, d) = other.bits();
+            crate::fail(&format!(
+                "{op}: expected a TVar, got {}",
+                crate::show::show(w, d)
+            ))
+        }
+    };
+    // Safety: the address of a cell that lives for the whole run, put in the
+    // block by `StmNew`.
+    unsafe { &*(at as *const TVar) }
+}
+
+fn at(c: &TVar) -> usize {
+    c as *const TVar as usize
+}
+
+/// Lock `cells`, each once, in address order: two transactions locking any of
+/// the same cells take them in the same order, so neither waits on the other.
+/// Answers the cells locked, in that order, with their state.
+fn lock_all<'a>(cells: &[&'a TVar]) -> (Vec<usize>, Vec<std::sync::MutexGuard<'a, (Held, u64)>>) {
+    let mut order: Vec<&'a TVar> = cells.to_vec();
+    order.sort_unstable_by_key(|c| at(c));
+    order.dedup_by_key(|c| at(c));
+    let ats = order.iter().map(|c| at(c)).collect();
+    let held = order
+        .into_iter()
+        .map(|c| c.state.lock().unwrap_or_else(|p| p.into_inner()))
+        .collect();
+    (ats, held)
+}
+
+#[derive(Default)]
+struct World {
+    ready: VecDeque<Box<Green>>,
+    tasks: Vec<Task>,
+    /// Threads waiting in `retry`, by a number each `TVar` they read lists.
+    waiting: HashMap<u64, Box<Green>>,
+    next_wait: u64,
+    /// Threads being run by a worker now.
+    running: usize,
+    /// Threads waiting on a call into the world: not deadlocked, whatever
+    /// else is waiting.
+    calls: usize,
+    /// Whether the workers have started.
+    started: bool,
+    /// Whether `main` has finished: the program is over, and the workers
+    /// stop wherever the threads they are running have got to.
+    done: bool,
+    /// What `main` answered, and its context, for [`main`] to take.
+    answer: Option<(Box<Ctx>, Word)>,
+}
+
+static WORLD: LazyLock<Mutex<World>> = LazyLock::new(|| Mutex::new(World::default()));
+static CHANGED: Condvar = Condvar::new();
+/// Told when `main` has finished, for the thread waiting on it.
+static FINISHED: Condvar = Condvar::new();
+
+fn world() -> MutexGuard<'static, World> {
+    WORLD.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+unsafe extern "C" {
+    /// Call the function value `f` with `arg`, under `ev`, and answer what it
+    /// returns natively: defined by the emitted module.
+    fn meadow_apply(f: Word, arg: Word, ev: Word) -> Word;
+}
+
+/// No handlers: what a thread starts with.
+fn no_evidence() -> Word {
+    heap::immediate(u64::from(value::tag(meadow_rt::roles::evidence::NONE)))
+}
+
+fn cx() -> &'static mut Ctx {
+    // Safety: the running thread's context, used by this OS thread alone
+    // while the thread runs. Read afresh each time: see `crate::ctx`.
+    unsafe { &mut *ctx::get() }
+}
+
+/// Stacks of threads that have finished, kept to start another with:
+/// reserving one and setting its guard pages is what a `spawn` would
+/// otherwise spend most of its time on.
+static SPARE: Mutex<Vec<DefaultStack>> = Mutex::new(Vec::new());
+
+fn spare() -> MutexGuard<'static, Vec<DefaultStack>> {
+    SPARE.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+fn coroutine(size: usize, body: impl FnOnce() -> Word + 'static) -> SendSegment {
+    let kept = (size == THREAD).then(|| spare().pop()).flatten();
+    let stack = kept.unwrap_or_else(|| {
+        DefaultStack::new(size)
+            .unwrap_or_else(|e| crate::fail(&format!("could not make a thread's stack: {e}")))
+    });
+    let limit = crate::stack::limit_of(&stack);
+    SendSegment(Coroutine::with_stack(
+        stack,
+        move |y: &Yielder<Down, Up>, _: Down| {
+            crate::stack::set_limit(limit);
+            segments::enter_thread(y);
+            let v = body();
+            segments::leave_thread();
+            v
+        },
+    ))
+}
+
+/// Keep a finished thread's stack to start another with, if there is room:
+/// twice a worker each, so that a burst of threads does not hold a great deal
+/// of address space for the rest of the run.
+fn keep_stack(co: SendSegment) {
+    let mut spare = spare();
+    if spare.len() < 2 * workers() {
+        spare.push(co.0.into_stack());
+    }
+}
+
+/// Run `entry` as the program's `main` thread, with the scheduler; answer
+/// `main`'s context and what it returned, in that context's heap.
+pub fn main(entry: impl FnOnce() -> Word + 'static) -> (Box<Ctx>, Word) {
+    let co = coroutine(MAIN, entry);
+    let mut w = world();
+    w.tasks.push(Task::default());
+    w.ready.push_back(Box::new(Green {
+        ctx: Ctx::new(0),
+        co,
+    }));
+    start_workers(&mut w);
+    // This thread waits rather than running threads itself: whichever worker
+    // `main` finishes on, the program is over then, and a worker still inside
+    // a thread that never waits must not hold the answer up.
+    while w.answer.is_none() {
+        w = FINISHED.wait(w).unwrap_or_else(|p| p.into_inner());
+    }
+    w.answer.take().expect("main finished")
+}
+
+/// A worker: run ready threads until `main` has finished.
+fn work() {
+    loop {
+        forget();
+        let mut g = {
+            let mut w = world();
+            loop {
+                if w.done {
+                    return;
+                }
+                if let Some(g) = w.ready.pop_front() {
+                    w.running += 1;
+                    break g;
+                }
+                if w.running == 0 && w.calls == 0 {
+                    crate::fail(meadow_rt::thread::DEADLOCK)
+                }
+                w = CHANGED.wait(w).unwrap_or_else(|p| p.into_inner());
+            }
+        };
+        ctx::set(&mut *g.ctx);
+        let went = g.co.0.resume(Down::Wake);
+        match went {
+            CoroutineResult::Return(v) if g.ctx.tid == 0 => {
+                ctx::set(std::ptr::null_mut());
+                let mut w = world();
+                w.running -= 1;
+                w.done = true;
+                w.answer = Some((g.ctx, v));
+                CHANGED.notify_all();
+                FINISHED.notify_all();
+                return;
+            }
+            CoroutineResult::Return(v) => {
+                ctx::set(std::ptr::null_mut());
+                // Safety: what a thread's body returns -- see `ThreadSpawn`.
+                let out = *unsafe { Box::from_raw(v as *mut Result<Parcel, String>) };
+                let tid = g.ctx.tid;
+                keep_stack(g.co);
+                drop(g.ctx);
+                let mut w = world();
+                w.running -= 1;
+                finish(&mut w, tid, out);
+            }
+            CoroutineResult::Yield(Up::Park) => {
+                let request = g.ctx.request.take();
+                ctx::set(std::ptr::null_mut());
+                // Not under the scheduler's lock: filing may have to take a
+                // channel's or a `TVar`'s, and those come first.
+                file(g, request);
+                let mut w = world();
+                w.running -= 1;
+                CHANGED.notify_all();
+            }
+            CoroutineResult::Yield(Up::Detach { .. }) => segments::escaped(),
+        }
+    }
+}
+
+/// How many OS threads run green threads: `MEADOW_THREADS` if it is set, or
+/// one per core -- as the bytecode runtime read it.
+fn workers() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(count_workers)
+}
+
+fn count_workers() -> usize {
     std::env::var("MEADOW_THREADS")
         .ok()
         .and_then(|n| n.parse::<usize>().ok())
@@ -157,879 +585,696 @@ pub fn workers() -> usize {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
 }
 
-/// Run `program` from `entry` as its main thread, with [`workers`] OS threads,
-/// until it finishes or `fuel` instructions have run across every thread.
-pub fn run(program: &Program, entry: Pc, fuel: u64) -> Outcome {
-    run_with(program, entry, fuel, workers())
+/// Start the workers and the timer, once: the thread that called [`main`]
+/// waits for the answer instead of running threads itself.
+fn start_workers(w: &mut World) {
+    if w.started {
+        return;
+    }
+    w.started = true;
+    STARTED.store(true, Ordering::SeqCst);
+    for i in 0..workers() {
+        let _ = std::thread::Builder::new()
+            .name(format!("meadow worker {i}"))
+            .stack_size(8 << 20)
+            .spawn(work);
+    }
+    let _ = std::thread::Builder::new()
+        .name("meadow timer".into())
+        .spawn(tick);
 }
 
-/// [`run`], with the number of OS threads given.
-pub fn run_with(program: &Program, entry: Pc, fuel: u64, workers: usize) -> Outcome {
-    run_native(program, None, entry, fuel, workers)
+/// How long a thread may keep a worker while others wait.
+const SLICE: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// The flag the emitted code reads at its safe points: see
+/// `meadow_llvm::emit::safe_point`. Set only while a thread is waiting for a
+/// core, so that a program whose threads are all running reads a byte and
+/// carries on.
+#[unsafe(no_mangle)]
+pub static meadow_preempt: AtomicU8 = AtomicU8::new(0);
+
+/// The timer: while the program runs, ask the running threads to give way
+/// whenever another is ready and waiting for a core.
+fn tick() {
+    loop {
+        std::thread::sleep(SLICE);
+        let w = world();
+        if w.done {
+            return;
+        }
+        if !w.ready.is_empty() {
+            meadow_preempt.store(1, Ordering::Relaxed);
+        }
+    }
 }
 
-/// How often to sample a run, and how deep -- see [`crate::profile`].
+/// A safe point, with the flag set: the thread has had its turn. It goes to
+/// the back of the queue, and the next one runs.
 ///
-/// Every green thread gets its own [`crate::profile::Profile`], because every
-/// green thread is its own machine with its own stack of continuations, and a
-/// run's profile is all of them merged.
-#[derive(Debug, Clone, Copy)]
-pub struct Sampling {
-    /// Block entries between samples for a profile of work, or `None` for a
-    /// profile of time -- see [`crate::profile::When`] by way of
-    /// [`crate::profile::Ticker`].
-    pub every: Option<u64>,
-    /// Samples a second, when `every` is `None`.
-    pub hz: u64,
-    pub depth: usize,
+/// The flag is cleared here rather than by the timer, so that one thread
+/// giving way answers one timer tick: the others carry on until the next.
+#[unsafe(no_mangle)]
+pub extern "C" fn meadow_preempted() {
+    meadow_preempt.store(0, Ordering::Relaxed);
+    // Nothing waiting, or nowhere to suspend to (the runtime's own calls into
+    // the program, which run to the end): carry on.
+    if world().ready.is_empty() || segments::innermost().is_none() {
+        return;
+    }
+    park(Request::Yield);
 }
 
-/// [`run_with`], with native code for some or all of the program's blocks --
-/// every thread runs it where there is some, and the bytecode where not.
-pub fn run_native(
-    program: &Program,
-    native: Option<&crate::jit::Native>,
-    entry: Pc,
-    fuel: u64,
-    workers: usize,
-) -> Outcome {
-    run_sampled(program, native, entry, fuel, workers, None)
+fn wake(w: &mut World, mut g: Box<Green>, with: Wake) {
+    g.ctx.wake = with;
+    w.ready.push_back(g);
+    CHANGED.notify_one();
 }
 
-/// Where a run's output goes instead of the process's: what `print` writes on
-/// any of its threads, a piece at a time. Shared, because every green thread
-/// of the run writes to the one place.
-pub type Sink = Arc<dyn Fn(&str) + Send + Sync>;
-
-/// [`run_native`], with what the program prints handed to `sink` rather than
-/// written out -- which is what lets many runs share a process without
-/// sharing a terminal: a test runner running tests side by side.
-pub fn run_captured(
-    program: &Program,
-    native: Option<&crate::jit::Native>,
-    entry: Pc,
-    fuel: u64,
-    workers: usize,
-    sink: Sink,
-) -> Outcome {
-    run_all(program, native, entry, fuel, workers, None, Some(sink))
+/// Thread `tid` is done: keep its outcome for `await`, and wake whoever
+/// awaits it.
+fn finish(w: &mut World, tid: usize, out: Result<Parcel, String>) {
+    let out = out.map(Arc::new);
+    let waiters = std::mem::take(&mut w.tasks[tid].waiters);
+    if !w.tasks[tid].nobody {
+        w.tasks[tid].outcome = Some(out.clone());
+    }
+    for g in waiters {
+        let with = match &out {
+            Ok(p) => Wake::Value((**p).clone()),
+            Err(m) => Wake::Fail(m.clone()),
+        };
+        wake(w, g, with);
+    }
+    CHANGED.notify_all();
 }
 
-/// [`run_native`], sampled.
-pub fn run_sampled(
-    program: &Program,
-    native: Option<&crate::jit::Native>,
-    entry: Pc,
-    fuel: u64,
-    workers: usize,
-    sampling: Option<Sampling>,
-) -> Outcome {
-    run_all(program, native, entry, fuel, workers, sampling, None)
-}
-
-/// A machine's output, sent to `sink`.
-fn capture(vm: &mut Vm, sink: &Option<Sink>) {
-    if let Some(sink) = sink {
-        let sink = sink.clone();
-        vm.io.output = Some(Box::new(move |s| sink(s)));
+/// A thread stopped to wait for `request`: put it where what it waits for
+/// will find it -- or back to run, if that is already there.
+fn file(mut g: Box<Green>, request: Option<Request>) {
+    match request {
+        None | Some(Request::Yield) => ready(g, Wake::Nothing),
+        Some(Request::Await(t)) => {
+            let mut w = world();
+            match &w.tasks[t].outcome {
+                Some(Ok(p)) => {
+                    let p = (**p).clone();
+                    wake(&mut w, g, Wake::Value(p));
+                }
+                Some(Err(m)) => {
+                    let m = m.clone();
+                    wake(&mut w, g, Wake::Fail(m));
+                }
+                None => w.tasks[t].waiters.push(g),
+            }
+        }
+        Some(Request::Receive(c)) => {
+            // Safety: the address of a channel that lives for the whole run.
+            let c = unsafe { &*(c as *const Chan) };
+            let mut state = chan_state(c);
+            match state.messages.pop_front() {
+                Some(p) => {
+                    drop(state);
+                    ready(g, Wake::Value(p));
+                }
+                None => state.receivers.push_back(g),
+            }
+        }
+        Some(Request::Wait(reads)) => {
+            // The cells this read are locked while it is checked and the
+            // thread written down, so a commit either changes one of them
+            // before the check or finds the thread among the waiters.
+            let cells: Vec<&TVar> = reads
+                .iter()
+                // Safety: addresses of cells that live for the whole run.
+                .map(|(id, _)| unsafe { &*(*id as *const TVar) })
+                .collect();
+            let (ats, held) = lock_all(&cells);
+            let changed = reads
+                .iter()
+                .any(|(id, seen)| held[ats.binary_search(id).expect("locked")].1 != *seen);
+            if changed {
+                drop(held);
+                ready(g, Wake::Nothing);
+                return;
+            }
+            let mut w = world();
+            let key = w.next_wait;
+            w.next_wait += 1;
+            for c in &cells {
+                c.waiters
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(key);
+            }
+            drop(held);
+            w.waiting.insert(key, g);
+        }
+        Some(Request::Block(call)) => {
+            // Counted before the worker counts the thread out: see `work`.
+            world().calls += 1;
+            let mut io = io();
+            io.calls.push_back((g, call));
+            if io.calls.len() > io.idle {
+                // Every I/O thread is busy waiting on a call of its own.
+                drop(io);
+                let _ = std::thread::Builder::new()
+                    .name("meadow io".into())
+                    .spawn(io_thread);
+            } else {
+                IO_READY.notify_one();
+            }
+        }
+        Some(Request::Failed(msg)) => {
+            let tid = g.ctx.tid;
+            // Never resumed, and not unwound.
+            // Safety: nothing will resume it.
+            unsafe { g.co.0.force_reset() };
+            keep_stack(g.co);
+            drop(g.ctx);
+            let mut w = world();
+            finish(&mut w, tid, Err(msg));
+        }
     }
 }
 
-fn run_all(
-    program: &Program,
-    native: Option<&crate::jit::Native>,
-    entry: Pc,
-    fuel: u64,
-    workers: usize,
-    sampling: Option<Sampling>,
-    sink: Option<Sink>,
-) -> Outcome {
-    let workers = workers.max(1);
-    // One clock for the run. Every machine samples on it, so a thread that is
-    // running contributes a sample per tick and a thread that is waiting
-    // contributes none -- which is what makes the counts come out proportional
-    // to processor time.
-    let ticker = sampling
-        .filter(|s| s.every.is_none())
-        .map(|s| crate::profile::Ticker::at(s.hz));
-    let world = Arc::new(crate::stm::World::default());
-    let mut main = Box::new(Fiber {
-        vm: Vm::new(program),
-        task: 0,
-        wake: Wake::Entry(entry),
-    });
-    main.vm.scheduled = true;
-    main.vm.world = Some(world.clone());
-    main.vm.use_native(native);
-    capture(&mut main.vm, &sink);
-    if let Some(s) = sampling {
-        main.vm.profile = Some(Box::new(match (&ticker, s.every) {
-            (Some(t), _) => t.profile(s.depth),
-            (None, every) => crate::profile::Profile::new(every.unwrap_or(1), s.depth),
-        }));
-    }
-    let shared = Shared {
-        program,
-        native,
-        fuel,
-        steps: AtomicU64::new(0),
-        locals: (0..workers).map(|_| Mutex::new(VecDeque::new())).collect(),
-        global: Mutex::new(VecDeque::new()),
-        channels: RwLock::new(Vec::new()),
-        tasks: RwLock::new(vec![Arc::new(Mutex::new(Task::default()))]),
-        world,
-        stm_waiters: Mutex::new(std::collections::HashMap::new()),
-        active: AtomicUsize::new(1),
-        sleeping: AtomicUsize::new(0),
-        sleep: Mutex::new(()),
-        wake: Condvar::new(),
-        done: AtomicBool::new(false),
-        finished: Mutex::new(None),
-        started: AtomicBool::new(false),
-        stats: Mutex::new(Stats::default()),
-        sampling,
-        ticker,
-        profile: Mutex::new(None),
-        sink,
-        waits: Arc::new(meadow_rt::net::Waits::default()),
-        io: Mutex::new(IoQueue::default()),
-        io_ready: Condvar::new(),
-        io_pending: AtomicUsize::new(0),
-    };
-    lock(&shared.locals[0]).push_back(main);
-    // The calling thread is worker 0. The others start with the first `spawn`,
-    // so a program that never spawns never makes an OS thread.
-    std::thread::scope(|scope| Worker::new(0, &shared).run(scope));
-    let result = lock(&shared.finished).take().unwrap_or_else(|| {
-        Err(Error {
-            msg: "the scheduler stopped".into(),
-        })
-    });
-    let stats = lock(&shared.stats).clone();
-    let profile = lock(&shared.profile).take();
-    Outcome {
-        result,
-        stats,
-        profile,
-    }
-}
+// --- calls into the world ----------------------------------------------------
+//
+// A socket's accept or read waits on the world, and a worker that made it
+// would wait with it: enough of them -- a server's connections, each reading
+// -- and no worker is left to run the thread that would answer. So a thread
+// on the scheduler hands such a call to an I/O thread and parks; the I/O
+// thread makes it and puts the thread back to run. One is started whenever a
+// call finds none waiting for one, so no call waits for another's.
 
-/// A green thread, and what it gets when it next runs.
-struct Fiber<'p> {
-    vm: Vm<'p>,
-    /// Its number, which is where `await` finds its result. `0` is `main`.
-    task: u32,
-    wake: Wake,
-}
-
-/// What a thread is given when it runs again.
-enum Wake {
-    /// Nothing: carry on from where it stopped.
-    Go,
-    /// Start at a definition -- the main thread.
-    Entry(Pc),
-    /// Start by calling a function with `()` -- a spawned thread.
-    Start(Parcel, meadow_rt::desc::Desc),
-    /// The answer to what it was waiting for, into a register.
-    Deliver(Reg, Parcel),
-    /// A new channel or thread handle, into a register.
-    Handle(Reg, Kind, u32),
-    /// What a call into the world answered, into a register.
-    Built(Reg, crate::native::Build),
-    /// An immediate -- a commit's `Bool`, a wait's `()` -- into a register.
-    Set(Reg, crate::value::Value),
-    /// What it was waiting for failed, with this message: the thread it
-    /// awaited did.
-    Fail(String),
-}
+/// Whether the scheduler is running: without it, a call is made in place.
+static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Default)]
-struct Task<'p> {
-    /// Its result exported for whoever awaits it -- any number of times, so
-    /// kept -- or the message it failed with.
-    outcome: Option<Result<Parcel, String>>,
-    waiters: Vec<(Box<Fiber<'p>>, Reg)>,
-}
-
-#[derive(Default)]
-struct Channel<'p> {
-    messages: VecDeque<Parcel>,
-    receivers: VecDeque<(Box<Fiber<'p>>, Reg)>,
-}
-
-type Queue<'p> = Mutex<VecDeque<Box<Fiber<'p>>>>;
-
-/// A thread parked by `retry`: shared between every `TVar` it waits on, and
-/// taken out by whichever is written first.
-type WaitSlot<'p> = Arc<Mutex<Option<(Box<Fiber<'p>>, Reg)>>>;
-
-struct Shared<'p> {
-    /// Where the run's output goes, if not to the process's -- see [`Sink`].
-    sink: Option<Sink>,
-    program: &'p Program,
-    native: Option<&'p crate::jit::Native<'p>>,
-    fuel: u64,
-    steps: AtomicU64,
-    /// One run queue per worker, stealable by the others.
-    locals: Vec<Queue<'p>>,
-    /// The queue every worker looks at now and then.
-    global: Queue<'p>,
-    channels: RwLock<Vec<Arc<Mutex<Channel<'p>>>>>,
-    tasks: RwLock<Vec<Arc<Mutex<Task<'p>>>>>,
-    /// Every `TVar`, and the threads waiting on each. A commit publishes its
-    /// writes first and then looks here; a thread checks nothing it read has
-    /// changed and parks itself, under this same lock -- so no write can fall
-    /// between the check and the parking.
-    world: Arc<crate::stm::World>,
-    stm_waiters: Mutex<std::collections::HashMap<u32, Vec<WaitSlot<'p>>>>,
-    /// Threads running or queued. Waiting ones are not counted -- see the
-    /// module docs on deadlock.
-    active: AtomicUsize,
-    /// Workers asleep, and what wakes them.
-    sleeping: AtomicUsize,
-    sleep: Mutex<()>,
-    wake: Condvar,
-    done: AtomicBool,
-    finished: Mutex<Option<Result<String, Error>>>,
-    /// Have the workers past the first been started?
-    started: AtomicBool,
-    stats: Mutex<Stats>,
-    /// What a new thread's machine is given, and where every finished thread's
-    /// samples are added up.
-    sampling: Option<Sampling>,
-    /// The run's clock, when it is being profiled for time. Held here so it
-    /// outlives every thread that samples on it, and stops when the run does.
-    ticker: Option<crate::profile::Ticker>,
-    profile: Mutex<Option<crate::profile::Profile>>,
-    /// The socket calls the run's threads are waiting in, stopped when it ends.
-    waits: Arc<meadow_rt::net::Waits>,
-    /// Threads waiting on a call into the world (`Request::Block`), each for
-    /// an I/O thread to make it.
-    io: Mutex<IoQueue<'p>>,
-    io_ready: Condvar,
-    /// Calls made or to be made: a thread waiting on one is not deadlocked,
-    /// whatever else is waiting.
-    io_pending: AtomicUsize,
-}
-
-#[derive(Default)]
-struct IoQueue<'p> {
-    calls: VecDeque<(Box<Fiber<'p>>, crate::vm::Work, Reg)>,
+struct IoQueue {
+    calls: VecDeque<(Box<Green>, Box<dyn FnOnce() + Send>)>,
     /// I/O threads waiting for a call.
     idle: usize,
 }
 
-/// A lock, carrying on past a panic elsewhere: the data behind these locks is
-/// queues and counters, which a panicking worker leaves consistent.
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|p| p.into_inner())
+static IO: LazyLock<Mutex<IoQueue>> = LazyLock::new(|| Mutex::new(IoQueue::default()));
+static IO_READY: Condvar = Condvar::new();
+
+fn io() -> MutexGuard<'static, IoQueue> {
+    IO.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-impl<'p> Shared<'p> {
-    fn channel(&self, id: u32) -> Option<Arc<Mutex<Channel<'p>>>> {
-        self.channels
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(id as usize)
-            .cloned()
-    }
-
-    fn task(&self, id: u32) -> Option<Arc<Mutex<Task<'p>>>> {
-        self.tasks
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(id as usize)
-            .cloned()
-    }
-
-    /// End the run with `result`, unless something already has.
-    fn finish(&self, result: Result<String, Error>) {
-        let mut finished = lock(&self.finished);
-        if finished.is_none() {
-            *finished = Some(result);
-        }
-        drop(finished);
-        self.done.store(true, Ordering::SeqCst);
-        // A thread waiting on a socket -- a server's, accepting -- would keep
-        // its worker, and so the run, from ever ending.
-        self.waits.stop();
-        {
-            let _io = lock(&self.io);
-            self.io_ready.notify_all();
-        }
-        let _guard = lock(&self.sleep);
-        self.wake.notify_all();
-    }
-
-    /// A thread stopped counting as active: it finished, or it is waiting now.
-    /// Called with whatever it waits on still locked, so nothing can wake it
-    /// before it is counted out.
-    fn release(&self) {
-        // A call into the world counts until its thread is active again,
-        // and it is counted active before the call stops counting: so this
-        // never sees neither.
-        if self.active.fetch_sub(1, Ordering::SeqCst) == 1
-            && self.io_pending.load(Ordering::SeqCst) == 0
-        {
-            // Nothing running and nothing queued: nobody is left who could
-            // wake a waiting thread.
-            self.finish(Err(Error {
-                msg: meadow_rt::thread::DEADLOCK.into(),
-            }));
-        }
-    }
-
-    /// Wake a sleeping worker, if there is one, to look for work.
-    fn nudge(&self) {
-        if self.sleeping.load(Ordering::SeqCst) > 0 {
-            let _guard = lock(&self.sleep);
-            self.wake.notify_one();
-        }
-    }
-
-    /// Is there anything in any queue?
-    fn any_work(&self) -> bool {
-        !lock(&self.global).is_empty() || self.locals.iter().any(|q| !lock(q).is_empty())
-    }
-}
-
-/// Ends the run if the worker holding it panics.
-///
-/// A panic is the runtime's own bug -- a program's failures are `Err`s -- but it
-/// must not hang the run. The panicking worker's thread dies with it, still
-/// counted as active, so without this the other workers would wait for it
-/// forever and the scope would wait for them. Stopping everyone lets the scope
-/// finish, and it passes the panic on.
-struct StopOnPanic<'s, 'p>(&'s Shared<'p>);
-
-impl Drop for StopOnPanic<'_, '_> {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            self.0.finish(Err(Error {
-                msg: "the runtime panicked".into(),
-            }));
-        }
-    }
-}
-
-/// The worker's socket calls as the run's (`meadow_rt::net::Waits`), until
-/// it stops.
-struct JoinWaits;
-
-impl JoinWaits {
-    fn new(waits: &Arc<meadow_rt::net::Waits>) -> Self {
-        meadow_rt::net::join(waits);
-        JoinWaits
-    }
-}
-
-impl Drop for JoinWaits {
-    fn drop(&mut self) {
-        meadow_rt::net::leave();
-    }
-}
-
-/// One OS thread's view of the scheduler.
-struct Worker<'s, 'p> {
-    index: usize,
-    shared: &'s Shared<'p>,
-    /// The thread to run as soon as the current one stops: the last one this
-    /// worker woke. Only this worker sees it, so it cannot be stolen.
-    next: Option<Box<Fiber<'p>>>,
-    turns: u64,
-    /// Where the next search for a victim starts, varied so that idle workers
-    /// do not all pile onto the same one.
-    rng: u64,
-}
-
-/// Why a thread stopped running.
-enum Stop {
-    Halted(crate::value::Value),
-    Failed(Error),
-    Requested(Request),
-    Preempted,
-    OutOfFuel,
-}
-
-impl<'s, 'p: 's> Worker<'s, 'p> {
-    fn new(index: usize, shared: &'s Shared<'p>) -> Self {
-        Worker {
-            index,
-            shared,
-            next: None,
-            turns: 0,
-            rng: 0x9E37_79B9_7F4A_7C15 ^ (index as u64 + 1),
-        }
-    }
-
-    /// Take a thread, run it until it stops, deal with why, repeat.
-    fn run(mut self, scope: &'s std::thread::Scope<'s, '_>) {
-        let sh = self.shared;
-        let _stop_everyone = StopOnPanic(sh);
-        let _waits = JoinWaits::new(&sh.waits);
-        loop {
-            if sh.done.load(Ordering::SeqCst) {
-                return;
-            }
-            let Some(mut fiber) = self.find() else {
-                self.idle();
-                continue;
-            };
-            // Run it for as long as it keeps going. A request that does not make
-            // it wait comes straight back here.
-            loop {
-                let stop = run_slice(sh, &mut fiber);
-                match self.settle(scope, fiber, stop) {
-                    Some(f) => fiber = f,
-                    None => break,
-                }
-            }
-        }
-    }
-
-    /// The next thread to run: this worker's own, the shared queue's, or
-    /// another worker's.
-    fn find(&mut self) -> Option<Box<Fiber<'p>>> {
-        let sh = self.shared;
-        self.turns += 1;
-        if let Some(f) = self.next.take() {
-            return Some(f);
-        }
-        if self.turns % GLOBAL_EVERY == 0 {
-            if let Some(f) = lock(&sh.global).pop_front() {
-                return Some(f);
-            }
-        }
-        if let Some(f) = lock(&sh.locals[self.index]).pop_front() {
-            return Some(f);
-        }
-        if let Some(f) = lock(&sh.global).pop_front() {
-            return Some(f);
-        }
-        self.steal()
-    }
-
-    /// Take half of some other worker's queue, from the end it runs last.
-    fn steal(&mut self) -> Option<Box<Fiber<'p>>> {
-        let sh = self.shared;
-        let n = sh.locals.len();
-        if n == 1 {
-            return None;
-        }
-        // xorshift: enough to spread the victims, and no dependency.
-        self.rng ^= self.rng << 13;
-        self.rng ^= self.rng >> 7;
-        self.rng ^= self.rng << 17;
-        let start = (self.rng % n as u64) as usize;
-        for k in 0..n {
-            let victim = (start + k) % n;
-            if victim == self.index {
-                continue;
-            }
-            let mut taken = {
-                let mut q = lock(&sh.locals[victim]);
-                let half = q.len().div_ceil(2);
-                let at = q.len() - half;
-                q.split_off(at)
-            };
-            if let Some(first) = taken.pop_front() {
-                if !taken.is_empty() {
-                    lock(&sh.locals[self.index]).extend(taken);
-                }
-                lock(&sh.stats).stolen += 1;
-                return Some(first);
-            }
-        }
-        None
-    }
-
-    /// Nothing to do: sleep until woken, or briefly, in case.
-    fn idle(&self) {
-        let sh = self.shared;
-        let guard = lock(&sh.sleep);
-        // Counted as asleep *before* the last look, so a thread queued after
-        // that look finds `sleeping` set and wakes this worker.
-        sh.sleeping.fetch_add(1, Ordering::SeqCst);
-        if !sh.done.load(Ordering::SeqCst) && !sh.any_work() {
-            let _ = sh.wake.wait_timeout(guard, Duration::from_millis(50));
-        }
-        sh.sleeping.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    /// Put a new thread on this worker's queue, counted as active, where an
-    /// idle worker may take it.
-    fn schedule(&self, fiber: Box<Fiber<'p>>) {
-        self.shared.active.fetch_add(1, Ordering::SeqCst);
-        self.requeue(fiber);
-    }
-
-    /// Run a thread this worker just woke as soon as the current one stops,
-    /// counted as active. Whatever held the slot before goes on the queue.
-    fn schedule_next(&mut self, fiber: Box<Fiber<'p>>) {
-        self.shared.active.fetch_add(1, Ordering::SeqCst);
-        if let Some(bumped) = self.next.replace(fiber) {
-            self.requeue(bumped);
-        }
-    }
-
-    /// Put an already active thread back on this worker's queue, and wake a
-    /// worker to take it if this one has more than it can run.
-    fn requeue(&self, fiber: Box<Fiber<'p>>) {
-        let waiting = {
-            let mut q = lock(&self.shared.locals[self.index]);
-            q.push_back(fiber);
-            q.len()
-        };
-        if waiting > 1 || self.next.is_some() {
-            self.shared.nudge();
-        }
-    }
-
-    /// Start the other workers, the first time a thread is spawned.
-    fn start_workers(&self, scope: &'s std::thread::Scope<'s, '_>) {
-        let sh = self.shared;
-        if sh.started.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        for index in 1..sh.locals.len() {
-            scope.spawn(move || Worker::new(index, sh).run(scope));
-        }
-    }
-
-    /// Take a finished thread's samples into the run's.
-    ///
-    /// Every thread that stops for good, not only `main`: a green thread is its
-    /// own machine with its own chain of continuations, so a run's profile is
-    /// all of them. Missing this is how a profile of a program that does its
-    /// work on spawned threads comes back empty.
-    fn collect(sh: &Shared<'p>, fiber: &mut Fiber<'p>) {
-        #[cfg(feature = "profile-alloc")]
-        {
-            let mut stats = lock(&sh.stats);
-            stats.ops.merge(&fiber.vm.ops);
-            stats.feedback.merge(&fiber.vm.feedback);
-        }
-        let Some(p) = fiber.vm.profile.take() else {
-            return;
-        };
-        let mut into = lock(&sh.profile);
-        match &mut *into {
-            Some(all) => all.merge(&p),
-            None => *into = Some(*p),
-        }
-    }
-
-    /// Act on why a thread stopped. `Some` hands it back to keep running.
-    fn settle(
-        &mut self,
-        scope: &'s std::thread::Scope<'s, '_>,
-        mut fiber: Box<Fiber<'p>>,
-        stop: Stop,
-    ) -> Option<Box<Fiber<'p>>> {
-        let sh = self.shared;
-        match stop {
-            Stop::Preempted => {
-                self.requeue(fiber);
-                None
-            }
-            Stop::OutOfFuel => {
-                sh.finish(Err(Error {
-                    msg: format!("ran for {} instructions without finishing", sh.fuel),
-                }));
-                None
-            }
-            Stop::Halted(v) => {
-                Self::collect(sh, &mut fiber);
-                if fiber.task == 0 {
-                    let shown = fiber.vm.show(v);
-                    {
-                        let mut stats = lock(&sh.stats);
-                        stats.add(&fiber.vm.heap);
-                        stats.heap_slots = fiber.vm.heap.capacity();
-                        stats.region_slots = fiber.vm.heap.region_slots();
-                        stats.old_slots = fiber.vm.heap.old_slots();
-                        stats.old_live = fiber.vm.heap.old_live();
-                    }
-                    sh.finish(Ok(shown));
-                } else {
-                    // Exported with the thread's own heap, which goes away with it.
-                    let outcome = fiber
-                        .vm
-                        .heap
-                        .export(v)
-                        .map_err(|why| meadow_rt::thread::unsendable(why.describe()));
-                    lock(&sh.stats).add(&fiber.vm.heap);
-                    self.complete(fiber.task, outcome);
-                    sh.release();
-                }
-                None
-            }
-            Stop::Failed(e) => {
-                Self::collect(sh, &mut fiber);
-                lock(&sh.stats).add(&fiber.vm.heap);
-                if fiber.task == 0 {
-                    sh.finish(Err(e));
-                } else {
-                    self.complete(fiber.task, Err(e.msg));
-                    sh.release();
-                }
-                None
-            }
-            Stop::Requested(request) => match request {
-                Request::Block { job, dst } => {
-                    // Counted as pending before the thread is counted out --
-                    // see `Shared::release`.
-                    sh.io_pending.fetch_add(1, Ordering::SeqCst);
-                    let more = {
-                        let mut io = lock(&sh.io);
-                        io.calls.push_back((fiber, job.0, dst));
-                        io.calls.len() > io.idle
-                    };
-                    if more {
-                        // Every I/O thread is busy waiting on a call of its own.
-                        scope.spawn(move || io_thread(sh));
-                    } else {
-                        sh.io_ready.notify_one();
-                    }
-                    sh.release();
-                    None
-                }
-                Request::Spawn { body, answer, dst } => {
-                    let mut child = Box::new(Fiber {
-                        vm: Vm::with_heap(sh.program, Heap::with_capacity(THREAD_INITIAL)),
-                        task: 0,
-                        wake: Wake::Start(body, answer),
-                    });
-                    child.vm.scheduled = true;
-                    child.vm.use_native(sh.native);
-                    child.vm.world = Some(sh.world.clone());
-                    capture(&mut child.vm, &sh.sink);
-                    if let Some(s) = sh.sampling {
-                        child.vm.profile = Some(Box::new(match (&sh.ticker, s.every) {
-                            (Some(t), _) => t.profile(s.depth),
-                            (None, every) => {
-                                crate::profile::Profile::new(every.unwrap_or(1), s.depth)
-                            }
-                        }));
-                    }
-                    let id = {
-                        let mut tasks = sh.tasks.write().unwrap_or_else(|p| p.into_inner());
-                        tasks.push(Arc::new(Mutex::new(Task::default())));
-                        (tasks.len() - 1) as u32
-                    };
-                    child.task = id;
-                    self.start_workers(scope);
-                    self.schedule(child);
-                    fiber.wake = Wake::Handle(dst, Kind::Task, id);
-                    Some(fiber)
-                }
-                Request::Await { task, dst } => {
-                    let Some(slot) = sh.task(task) else {
-                        fiber.wake = Wake::Fail(format!("await: there is no thread {task}"));
-                        return Some(fiber);
-                    };
-                    let mut t = lock(&slot);
-                    match &t.outcome {
-                        Some(Ok(p)) => {
-                            fiber.wake = Wake::Deliver(dst, p.clone());
-                            Some(fiber)
-                        }
-                        Some(Err(msg)) => {
-                            fiber.wake = Wake::Fail(msg.clone());
-                            Some(fiber)
-                        }
-                        None => {
-                            t.waiters.push((fiber, dst));
-                            sh.release();
-                            None
-                        }
-                    }
-                }
-                Request::Yield => {
-                    self.requeue(fiber);
-                    None
-                }
-                Request::NewChannel { dst } => {
-                    let id = {
-                        let mut channels = sh.channels.write().unwrap_or_else(|p| p.into_inner());
-                        channels.push(Arc::new(Mutex::new(Channel::default())));
-                        (channels.len() - 1) as u32
-                    };
-                    fiber.wake = Wake::Handle(dst, Kind::Channel, id);
-                    Some(fiber)
-                }
-                Request::Send { channel, message } => {
-                    let Some(slot) = sh.channel(channel) else {
-                        fiber.wake = Wake::Fail(format!("send: there is no channel {channel}"));
-                        return Some(fiber);
-                    };
-                    let receiver = {
-                        let mut ch = lock(&slot);
-                        match ch.receivers.pop_front() {
-                            Some(r) => Some((r, message)),
-                            None => {
-                                ch.messages.push_back(message);
-                                None
-                            }
-                        }
-                    };
-                    if let Some(((mut r, dst), message)) = receiver {
-                        r.wake = Wake::Deliver(dst, message);
-                        self.schedule_next(r);
-                    }
-                    Some(fiber)
-                }
-                Request::StmWake { written, dst } => {
-                    let mut woken = Vec::new();
-                    {
-                        let mut waiters = lock(&sh.stm_waiters);
-                        for id in written {
-                            for slot in waiters.remove(&id).unwrap_or_default() {
-                                if let Some(w) = lock(&slot).take() {
-                                    sh.world.wait_ends();
-                                    woken.push(w);
-                                }
-                            }
-                        }
-                    }
-                    for (mut w, wdst) in woken {
-                        w.wake = Wake::Set(wdst, crate::value::Value::Unit);
-                        self.schedule_next(w);
-                    }
-                    fiber.wake = Wake::Set(dst, crate::value::Value::Bool(true));
-                    Some(fiber)
-                }
-                Request::StmWait { dst } => {
-                    let Some(txn) = fiber.vm.txn.take() else {
-                        fiber.wake = Wake::Fail(meadow_rt::stm::outside("retry"));
-                        return Some(fiber);
-                    };
-                    // Counted before the check -- see `World::wait_begins`.
-                    sh.world.wait_begins();
-                    let mut waiters = lock(&sh.stm_waiters);
-                    if sh.world.changed(&txn.reads) {
-                        drop(waiters);
-                        sh.world.wait_ends();
-                        fiber.wake = Wake::Set(dst, crate::value::Value::Unit);
-                        return Some(fiber);
-                    }
-                    let slot: WaitSlot<'p> = Arc::new(Mutex::new(Some((fiber, dst))));
-                    for (id, _) in &txn.reads {
-                        let list = waiters.entry(*id).or_default();
-                        list.retain(|w| lock(w).is_some());
-                        list.push(slot.clone());
-                    }
-                    // Counted out while still holding the lock a commit needs
-                    // to wake it -- see `Shared::release`.
-                    sh.release();
-                    None
-                }
-                Request::Receive { channel, dst } => {
-                    let Some(slot) = sh.channel(channel) else {
-                        fiber.wake = Wake::Fail(format!("receive: there is no channel {channel}"));
-                        return Some(fiber);
-                    };
-                    let mut ch = lock(&slot);
-                    match ch.messages.pop_front() {
-                        Some(message) => {
-                            fiber.wake = Wake::Deliver(dst, message);
-                            Some(fiber)
-                        }
-                        None => {
-                            ch.receivers.push_back((fiber, dst));
-                            sh.release();
-                            None
-                        }
-                    }
-                }
-            },
-        }
-    }
-
-    /// Record a spawned thread's result, and put whoever awaits it on this
-    /// worker's queue.
-    fn complete(&mut self, task: u32, outcome: Result<Parcel, String>) {
-        let Some(slot) = self.shared.task(task) else {
-            return;
-        };
-        let waiters = {
-            let mut t = lock(&slot);
-            t.outcome = Some(outcome.clone());
-            std::mem::take(&mut t.waiters)
-        };
-        for (mut w, dst) in waiters {
-            w.wake = match &outcome {
-                Ok(p) => Wake::Deliver(dst, p.clone()),
-                Err(msg) => Wake::Fail(msg.clone()),
-            };
-            self.schedule_next(w);
-        }
-    }
-}
-
-/// Make the calls into the world that threads wait on, one at a time, each
-/// thread's answer handed back to the workers to run it again; until the run
-/// ends. One is started whenever a call finds none of them waiting for one,
-/// so a thread never waits for another's call.
-fn io_thread(sh: &Shared) {
-    let _waits = JoinWaits::new(&sh.waits);
+fn io_thread() {
     loop {
-        let (mut fiber, work, dst) = {
-            let mut io = lock(&sh.io);
+        let (g, call) = {
+            let mut io = io();
             loop {
-                if sh.done.load(Ordering::SeqCst) {
-                    return;
-                }
-                if let Some(call) = io.calls.pop_front() {
-                    break call;
+                if let Some(c) = io.calls.pop_front() {
+                    break c;
                 }
                 io.idle += 1;
-                io = sh.io_ready.wait(io).unwrap_or_else(|p| p.into_inner());
+                io = IO_READY.wait(io).unwrap_or_else(|p| p.into_inner());
                 io.idle -= 1;
             }
         };
-        fiber.wake = Wake::Built(dst, work());
-        sh.active.fetch_add(1, Ordering::SeqCst);
-        lock(&sh.global).push_back(fiber);
-        sh.io_pending.fetch_sub(1, Ordering::SeqCst);
-        sh.nudge();
+        call();
+        let mut w = world();
+        w.calls -= 1;
+        wake(&mut w, g, Wake::Nothing);
     }
 }
 
-/// Deliver what the thread was woken with, then run it for a slice.
-fn run_slice(sh: &Shared, fiber: &mut Fiber) -> Stop {
-    let vm = &mut fiber.vm;
-    match std::mem::replace(&mut fiber.wake, Wake::Go) {
-        Wake::Go => {}
-        Wake::Entry(pc) => vm.start(pc),
-        Wake::Start(body, answer) => {
-            if let Err(e) = vm.start_call(&body, answer) {
-                return Stop::Failed(e);
+/// `work`'s answer: made by an I/O thread while this thread waits, where it
+/// is one of the scheduler's, or here and now.
+pub fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    if !STARTED.load(Ordering::SeqCst) || !ctx::present() || segments::innermost().is_none() {
+        return work();
+    }
+    let slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
+    let into = slot.clone();
+    let woken = park(Request::Block(Box::new(move || {
+        let answer = work();
+        *into.lock().unwrap_or_else(|p| p.into_inner()) = Some(answer);
+    })));
+    let _ = delivered(woken);
+    let answer = slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+    answer.unwrap_or_else(|| crate::fail("a call into the world came back without its answer"))
+}
+
+/// Put a thread back on the queue, with what it was woken with: the
+/// scheduler's lock taken here and nowhere above it.
+fn ready(g: Box<Green>, with: Wake) {
+    let mut w = world();
+    wake(&mut w, g, with);
+}
+
+/// Suspend the running thread -- every segment of it -- having said why in
+/// its context; answer what it is woken with.
+fn park(request: Request) -> Wake {
+    cx().request = Some(request);
+    // A program that starts no thread runs without the scheduler, on no
+    // thread of its own: one that waits waits for what no other thread can
+    // do, as the scheduler would find with every thread waiting.
+    let Some(y) = segments::innermost() else {
+        crate::fail(meadow_rt::thread::DEADLOCK)
+    };
+    match segments::suspend(y, Up::Park) {
+        Down::Wake => std::mem::replace(&mut cx().wake, Wake::Nothing),
+        Down::Start | Down::Resume(_) => unreachable!("a parked thread is woken"),
+    }
+}
+
+/// A failure in a thread other than `main` fails that thread: `await` fails
+/// with the same message, and nothing else is affected; so does one in a call
+/// C made into a library, which ends that call ([`export_run`]). Answers
+/// whether it was one; for `main`, or outside every thread, the program stops.
+pub fn fail_thread(msg: &str) -> bool {
+    if !ctx::present() || (cx().tid == 0 && !cx().guarded) || segments::innermost().is_none() {
+        return false;
+    }
+    loop {
+        park(Request::Failed(msg.to_string()));
+    }
+}
+
+fn handle(v: Val, kind: u64, what: &str, op: &str) -> usize {
+    match v {
+        Val::Ref(w) if heap::is_block(w) && heap::kind(w) == kind => heap::meta(w) as usize,
+        other => {
+            let (w, d) = other.bits();
+            crate::fail(&format!(
+                "{op}: expected {what}, got {}",
+                crate::show::show(w, d)
+            ))
+        }
+    }
+}
+
+fn outside(op: &str) -> ! {
+    crate::fail(&meadow_rt::stm::outside(op))
+}
+
+fn parcel(v: Val) -> Parcel {
+    let (w, d) = v.bits();
+    Parcel::of(w, d).unwrap_or_else(|e| crate::fail(&e))
+}
+
+/// What a waiting operation was woken with, as a value in this heap.
+fn delivered(wake: Wake) -> Word {
+    match wake {
+        Wake::Value(p) => p.open(),
+        Wake::Fail(m) => crate::fail(&m),
+        Wake::Nothing => 0,
+    }
+}
+
+/// The thread and transaction primitives. Arguments are borrowed, the
+/// result owned.
+pub fn prim(p: Prim, args: &[Val]) -> Word {
+    use Prim::*;
+    let arg = |i: usize| args[i];
+    match p {
+        ThreadSpawn => {
+            let body = parcel(arg(0));
+            let answer = match args.get(1) {
+                Some(Val::Int(d)) => *d,
+                _ => desc::ANY,
+            };
+            let tid = {
+                let mut w = world();
+                w.tasks.push(Task::default());
+                w.tasks.len() - 1
+            };
+            let co = coroutine(THREAD, move || {
+                let f = body.open();
+                // Safety: a function value of the emitted module, owned by
+                // the call.
+                let v = unsafe { meadow_apply(f, 0, no_evidence()) };
+                let out = Parcel::of(v, answer);
+                heap::erase(v, answer);
+                heap::finish();
+                Box::into_raw(Box::new(out)) as Word
+            });
+            let mut w = world();
+            let g = Box::new(Green {
+                ctx: Ctx::new(tid),
+                co,
+            });
+            wake(&mut w, g, Wake::Nothing);
+            held(tid as u32);
+            heap::build(heap::TASK, tid as u32, &[0], &[desc::INT])
+        }
+        ThreadAwait => {
+            let t = handle(arg(0), heap::TASK, "a thread", "await");
+            let ready = {
+                let w = world();
+                match w.tasks.get(t).map(|t| &t.outcome) {
+                    None => Some(Wake::Fail(format!("await: there is no thread {t}"))),
+                    Some(Some(Ok(p))) => Some(Wake::Value((**p).clone())),
+                    Some(Some(Err(m))) => Some(Wake::Fail(m.clone())),
+                    Some(None) => None,
+                }
+            };
+            delivered(ready.unwrap_or_else(|| park(Request::Await(t))))
+        }
+        ThreadYield => {
+            park(Request::Yield);
+            0
+        }
+        ChannelNew => {
+            let c: &'static Chan = Box::leak(Box::new(Chan::default()));
+            let id = NEXT_CHAN.fetch_add(1, Ordering::Relaxed) as u32;
+            heap::build(heap::CHANNEL, id, &[c as *const Chan as Word], &[desc::INT])
+        }
+        ChannelSend => {
+            let c = chan(arg(0), "send");
+            let message = parcel(arg(1));
+            // The channel's lock, and the scheduler's only if somebody was
+            // waiting -- and never both at once.
+            let waiting = {
+                let mut state = chan_state(c);
+                match state.receivers.pop_front() {
+                    Some(g) => Some(g),
+                    None => {
+                        state.messages.push_back(message);
+                        return 0;
+                    }
+                }
+            };
+            if let Some(g) = waiting {
+                ready(g, Wake::Value(message));
+            }
+            0
+        }
+        ChannelReceive => {
+            let c = chan(arg(0), "receive");
+            let got = chan_state(c).messages.pop_front();
+            match got {
+                Some(p) => p.open(),
+                None => delivered(park(Request::Receive(c as *const Chan as usize))),
             }
         }
-        Wake::Deliver(dst, parcel) => vm.deliver_parcel(dst, &parcel),
-        Wake::Handle(dst, kind, id) => vm.deliver_handle(dst, kind, id),
-        Wake::Set(dst, v) => vm.set(dst, v),
-        Wake::Built(dst, b) => {
-            let v = vm.build(b);
-            vm.set(dst, v);
+
+        StmNew => {
+            // The cell lives for the whole run; the handle carries its
+            // address, so no thread has to look it up.
+            let held = Held::of(arg(0), None);
+            let cell: &'static TVar = Box::leak(Box::new(TVar {
+                state: Mutex::new((held, 0)),
+                waiters: Mutex::new(Vec::new()),
+            }));
+            let id = NEXT_TVAR.fetch_add(1, Ordering::Relaxed) as u32;
+            held_var(at(cell));
+            heap::build(heap::TVAR, id, &[at(cell) as Word], &[desc::INT])
         }
-        Wake::Fail(msg) => return Stop::Failed(Error { msg }),
-    }
-    for n in 0..SLICE {
-        match vm.advance() {
-            Err(e) => return Stop::Failed(e),
-            Ok(Some(v)) => return Stop::Halted(v),
-            Ok(None) => {
-                if let Some(r) = vm.request.take() {
-                    sh.steps.fetch_add(n + 1, Ordering::Relaxed);
-                    return Stop::Requested(r);
+        StmRead => {
+            let c = cell(arg(0), "readTVar");
+            let Some(txn) = cx().txn.as_mut() else {
+                outside("readTVar")
+            };
+            let written = txn
+                .writes
+                .iter()
+                .rev()
+                .flat_map(|level| level.iter().rev())
+                .find(|(t, _, _)| *t == at(c))
+                .map(|(_, x, d)| (*x, *d));
+            if let Some((x, d)) = written {
+                heap::share(x, d);
+                return value::data(
+                    crate::show::role(meadow_rt::roles::Role::Some),
+                    &[value::val(x, d)],
+                );
+            }
+            let start = txn.start;
+            let seen = {
+                let state = c.state.lock().unwrap_or_else(|p| p.into_inner());
+                (state.1 <= start).then(|| (state.0.clone(), state.1))
+            };
+            // Written since this transaction began: it runs again.
+            let Some((held, version)) = seen else {
+                return value::data(crate::show::role(meadow_rt::roles::Role::None), &[]);
+            };
+            let txn = cx().txn.as_mut().expect("a transaction");
+            if !txn.reads.iter().any(|(t, _)| *t == at(c)) {
+                txn.reads.push((at(c), version));
+            }
+            let (x, d) = held.open();
+            value::data(
+                crate::show::role(meadow_rt::roles::Role::Some),
+                &[value::val(x, d)],
+            )
+        }
+        StmWrite => {
+            let c = cell(arg(0), "writeTVar");
+            let (x, d) = arg(1).bits();
+            let Some(level) = cx().txn.as_mut().and_then(|t| t.writes.last_mut()) else {
+                outside("writeTVar")
+            };
+            heap::share(x, d);
+            let old = match level.iter_mut().find(|(t, _, _)| *t == at(c)) {
+                Some(slot) => Some(std::mem::replace(slot, (at(c), x, d))),
+                None => {
+                    level.push((at(c), x, d));
+                    None
+                }
+            };
+            if let Some((_, ox, od)) = old {
+                heap::erase(ox, od);
+            }
+            0
+        }
+        StmBegin => {
+            let start = CLOCK.load(Ordering::Acquire);
+            let last = cx().txn.replace(Txn {
+                start,
+                reads: Vec::new(),
+                writes: vec![Vec::new()],
+            });
+            if let Some(t) = last {
+                drop_writes(t.writes);
+            }
+            0
+        }
+        StmNest => {
+            let Some(t) = cx().txn.as_mut() else {
+                outside("orElse")
+            };
+            t.writes.push(Vec::new());
+            0
+        }
+        StmMerge => {
+            let Some(t) = cx().txn.as_mut() else {
+                outside("orElse")
+            };
+            let (Some(top), true) = (t.writes.pop(), !t.writes.is_empty()) else {
+                outside("orElse")
+            };
+            let below = t.writes.last_mut().expect("a level below");
+            let mut replaced = Vec::new();
+            for (id, x, d) in top {
+                match below.iter_mut().find(|(t, _, _)| *t == id) {
+                    Some(slot) => replaced.push(std::mem::replace(slot, (id, x, d))),
+                    None => below.push((id, x, d)),
                 }
             }
+            drop_writes(vec![replaced]);
+            0
+        }
+        StmRollback => {
+            let Some(top) = cx().txn.as_mut().and_then(|t| t.writes.pop()) else {
+                outside("orElse")
+            };
+            drop_writes(vec![top]);
+            0
+        }
+        StmCommit => {
+            let Some(txn) = cx().txn.take() else {
+                outside("atomically")
+            };
+            // The last write to each, lifted out of this thread's heap before
+            // anything is locked -- into the region of the value it replaces,
+            // looked at under the cell's lock and let go at once. Another
+            // commit may replace that value meanwhile; then this one conflicts,
+            // or its value went into a region that is no longer the latest,
+            // which costs sharing and nothing else.
+            let mut writes: Vec<(usize, Word, i64)> = Vec::new();
+            for level in &txn.writes {
+                for &(id, x, d) in level {
+                    match writes.iter_mut().find(|(t, _, _)| *t == id) {
+                        Some(slot) => *slot = (id, x, d),
+                        None => writes.push((id, x, d)),
+                    }
+                }
+            }
+            let last: Vec<(usize, Held)> = writes
+                .into_iter()
+                .map(|(id, x, d)| {
+                    // Safety: the address of a cell that lives for the whole run.
+                    let c = unsafe { &*(id as *const TVar) };
+                    let was = c.state.lock().unwrap_or_else(|p| p.into_inner()).0.clone();
+                    (id, Held::of(value::val(x, d), Some(&was)))
+                })
+                .collect();
+            // What it read must be as it was, and what it wrote goes out, as
+            // one step: the cells it touched are locked for it, in address
+            // order, and nothing else can be committing them meanwhile.
+            let touched: Vec<&TVar> = txn
+                .reads
+                .iter()
+                .map(|(id, _)| *id)
+                .chain(last.iter().map(|(id, _)| *id))
+                // Safety: addresses of cells that live for the whole run.
+                .map(|id| unsafe { &*(id as *const TVar) })
+                .collect();
+            let (ats, mut held) = lock_all(&touched);
+            let slot = |id: usize| ats.binary_search(&id).expect("locked");
+            let valid = txn
+                .reads
+                .iter()
+                .all(|(id, seen)| held[slot(*id)].1 == *seen);
+            let mut keys = Vec::new();
+            if valid && !last.is_empty() {
+                let now = CLOCK.fetch_add(1, Ordering::AcqRel) + 1;
+                for (id, value) in last {
+                    let state = &mut held[slot(id)];
+                    **state = (value, now);
+                }
+            }
+            drop(held);
+            if valid {
+                for c in &touched {
+                    let mut waiters = c.waiters.lock().unwrap_or_else(|p| p.into_inner());
+                    keys.append(&mut waiters);
+                }
+            }
+            wake_waiting(keys);
+            drop_writes(txn.writes);
+            u64::from(valid)
+        }
+        StmWait => {
+            let Some(txn) = cx().txn.take() else {
+                outside("retry")
+            };
+            drop_writes(txn.writes);
+            if txn.reads.is_empty() {
+                crate::fail("deadlock: a transaction retried having read nothing")
+            }
+            park(Request::Wait(txn.reads));
+            0
+        }
+        _ => unreachable!("{p:?} is not a thread primitive"),
+    }
+}
+
+/// Wake the threads whose `retry` was waiting on a `TVar` just written.
+fn wake_waiting(keys: Vec<u64>) {
+    if keys.is_empty() {
+        return;
+    }
+    let mut w = world();
+    for k in keys {
+        if let Some(g) = w.waiting.remove(&k) {
+            wake(&mut w, g, Wake::Nothing);
         }
     }
-    if sh.steps.fetch_add(SLICE, Ordering::Relaxed) + SLICE > sh.fuel {
-        return Stop::OutOfFuel;
+}
+
+fn drop_writes(levels: Vec<Vec<(usize, Word, i64)>>) {
+    for (_, x, d) in levels.into_iter().flatten() {
+        heap::erase(x, d);
     }
-    Stop::Preempted
+}
+
+// --- calls C makes into a library ------------------------------------------
+
+thread_local! {
+    /// Stacks of calls into the library that have finished, to run the next
+    /// on.
+    static EXPORT_STACKS: std::cell::RefCell<Vec<DefaultStack>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// What the last call into the library that failed on this OS thread
+    /// failed with, until `Std.Ffi.failure` asks.
+    static FAILURE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `body` of `env` -- a call C made into a library, its arguments in
+/// `env` -- on a segment of its own, so that a failure in it ends the call
+/// rather than the process: as a thread's does, it parks the segment, which
+/// is let go without unwinding. Answers 0 when it returned, and 1 when it
+/// failed, its message said on stderr and kept for [`take_failure`]. What the
+/// call's frames held is given up; the context is as it was before the call.
+pub fn export_run(body: extern "C" fn(*mut std::ffi::c_void), env: *mut std::ffi::c_void) -> i32 {
+    let c = cx();
+    let depth = c.running.len();
+    let shadow = crate::shadow::head();
+    let in_txn = c.txn.is_some();
+    let guarded = std::mem::replace(&mut c.guarded, true);
+    let stack = EXPORT_STACKS
+        .with(|s| s.borrow_mut().pop())
+        .unwrap_or_else(|| {
+            DefaultStack::new(THREAD).unwrap_or_else(|e| {
+                crate::fail(&format!(
+                    "could not make a stack for a call into the library: {e}"
+                ))
+            })
+        });
+    let env = env as usize;
+    let outside = crate::stack::limit();
+    let limit = crate::stack::limit_of(&stack);
+    let mut co: segments::Segment =
+        Coroutine::with_stack(stack, move |y: &Yielder<Down, Up>, _: Down| {
+            crate::stack::set_limit(limit);
+            segments::enter_thread(y);
+            body(env as *mut std::ffi::c_void);
+            segments::leave_thread();
+            0
+        });
+    let resumed = co.resume(Down::Start);
+    crate::stack::set_limit(outside);
+    let failed = match resumed {
+        CoroutineResult::Return(_) => None,
+        CoroutineResult::Yield(up) => {
+            let why = match (up, cx().request.take()) {
+                (Up::Park, Some(Request::Failed(m))) => m,
+                (Up::Park, _) => "a thread waited in a call C made into a library, where there                                   is no scheduler to run another"
+                    .to_string(),
+                (Up::Detach { .. }, _) => "an effect was performed after its handler had                                            finished, in a call C made into a library"
+                    .to_string(),
+            };
+            // Never resumed, and not unwound.
+            // Safety: nothing will resume it.
+            unsafe { co.force_reset() };
+            Some(why)
+        }
+    };
+    EXPORT_STACKS.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.len() < 2 {
+            s.push(co.into_stack());
+        }
+    });
+    let c = cx();
+    c.running.truncate(depth);
+    c.guarded = guarded;
+    if !in_txn {
+        c.txn = None;
+    }
+    crate::shadow::set(shadow);
+    match failed {
+        None => 0,
+        Some(why) => {
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            eprintln!("{why}");
+            FAILURE.with(|f| *f.borrow_mut() = Some(why));
+            1
+        }
+    }
+}
+
+/// What the last call into the library that failed on this OS thread failed
+/// with, once: see [`export_run`].
+pub fn take_failure() -> Option<String> {
+    FAILURE.with(|f| f.borrow_mut().take())
 }

@@ -291,7 +291,7 @@ fn every_member_builds_with_the_root_profiles() {
     assert!(ok, "{output}");
     assert!(output.contains(r#"(42, "b x2", "shop")"#), "{output}");
     assert!(output.contains("warning: the `[profile]` sections of `App` are ignored"));
-    assert!(root.join("target/debug/bytecode/App.mbc").is_file());
+    assert!(root.join("target/debug/native/glade/App.image").is_file());
     assert!(!root.join("app/target").exists());
 }
 

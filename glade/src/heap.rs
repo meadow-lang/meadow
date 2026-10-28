@@ -1,546 +1,335 @@
-//! The heap: a nursery, an old generation marked while the program runs, and
-//! the regions it refers to.
+//! **Blocks, counted by reference**, the AxCut paper's way (`docs/RUNTIME.md`).
 //!
-//! Every green thread has a heap of its own, so everything here is one
-//! thread's business, and a pause stops only that thread. What this module is
-//! built around is keeping those pauses short however much the thread keeps
-//! alive -- well under a millisecond -- rather than making the total time spent
-//! collecting as small as it can be.
+//! A reference is a word: `0` is nothing, an odd word is an object with no
+//! block (a nullary constructor, a closure with no captures), and any other
+//! word is the address of a block, laid out as [`LAYOUT`] says: Silo's
+//! layout, or with the `glade-layout` feature Glade's, which has no count and
+//! is only traced (`meadow_rt::layout`).
 //!
-//! # The nursery
+//! What the paper does, and so what this does:
 //!
-//! New objects are bumped into the nursery, and when it fills it is collected
-//! the Cheney way: the roots are copied into the other half, the copies are
-//! scanned as a queue and what they reach copied after them, and what is left
-//! behind is garbage in bulk. That costs what survives, and almost nothing
-//! does. What has survived one nursery collection already is **promoted** into
-//! the old generation at the next, so nothing is copied back and forth for long,
-//! and the nursery has a fixed largest size -- [`GcConfig::nursery`] -- so a
-//! nursery collection has a fixed longest pause.
+//! - **share** adds one to the count;
+//! - **erase** takes one from it, or -- if it was the last -- puts the block on
+//!   the list of blocks _pending_, fields and all, without looking inside;
+//! - **clean**: a block whose fields were moved out by the last reference
+//!   loading them (the paper's `release`) is reusable at once;
+//! - **acquire** takes a clean block of the size wanted, or fresh memory --
+//!   and first erases some of what is pending, a bounded amount, so that no
+//!   operation ever walks a structure and garbage never waits for long.
 //!
-//! Until a heap fills its largest nursery, nothing is promoted and the nursery
-//! just grows: most green threads never keep enough alive to need an old
-//! generation at all, and pay nothing for one.
-//!
-//! # The old generation
-//!
-//! Immix blocks and lines -- see [`crate::old`] -- where objects do not move
-//! while a cycle marks. It is collected by marking what is reachable, on another OS thread while the
-//! program runs -- see [`crate::mark`] -- and then treating every line nothing
-//! marked as free. A cycle costs the program two pauses: one to empty the
-//! nursery and hand the roots to the marker, and one when marking is done, to
-//! adopt its result. Neither does work that grows with the old generation.
-//!
-//! A cycle begins when the old generation has grown by as much as the last
-//! cycle found alive (or [`GcConfig::min_trigger`], if that is more): memory
-//! is traded for fewer cycles, and a program that keeps more alive is marked
-//! less often for it.
-//!
-//! Between cycles, the sparsest blocks are **evacuated** a block or two per
-//! pause: their survivors copied somewhere denser and the blocks given back.
-//! Finding every pointer to a moved object without tracing the heap takes
-//! lists the marker and the barriers keep -- see [`crate::evacuate`].
-//! [`GcConfig::evacuate`] turns it off: less memory given back, and a slightly
-//! shorter tail of pauses.
-//!
-//! # The remembered set
-//!
-//! A nursery collection does not look at the old generation, so it has to be
-//! told where the old generation points into the nursery: those fields are its
-//! remembered set, and it treats them as roots. Such a pointer can only be made
-//! three ways -- promoting an object whose field points at something that stays
-//! young, allocating a large object straight into the old generation, and
-//! overwriting a field of a `Ref`, a mutable array or a resumption -- and each
-//! of those checks and records. Data in Meadow is immutable, so the barrier on
-//! an ordinary field write, which a generational collector for Java pays on
-//! every assignment, is not there at all.
-//!
-//! # The rule the rest of the runtime has to obey
-//!
-//! Objects in the nursery move. An [`Addr`] held anywhere the collector cannot
-//! see becomes wrong the moment a collection happens -- so the VM never holds
-//! one across an allocation. It calls [`crate::Vm::ensure`] first, with room
-//! for everything an operation will build, and only then reads its arguments
-//! out of registers. Registers are roots; Rust locals are not.
-//!
-//! # Layout
-//!
-//! Every slot is one word. An object is a header, then its fields, each the
-//! bits of a value and nothing else; what each field holds is a descriptor in
-//! the header -- see [`crate::object`]:
-//!
-//! ```text
-//!   addr        kind, len, and for an array its one descriptor
-//!   addr+1      meta, and the first fields' descriptors
-//!   ...         more descriptors, for a wide object
-//!   addr+h      field 0
-//!   ...
-//! ```
-//!
-//! `meta` is per-kind: a constructor tag, a method table, a sign. A collector
-//! finds addresses by descriptor, the same way for every kind, so there are no
-//! per-kind tracing rules. What this module hands out and takes in is still a
-//! [`Value`], which is a field's word and its descriptor together.
-//!
-//! An address says where it points by its range: below [`OLD_BASE`] the
-//! nursery, below [`REGION_BASE`] the old generation, and above that a region.
-//!
-//! # Compact regions
-//!
-//! `compact` moves a structure out of the heap into a **region** -- see
-//! [`crate::region`] -- which no heap owns and no collector copies or scans. A
-//! heap only refers to the regions it has addresses into: an address into one,
-//! or a [`Kind::Compact`] handle naming it, found while collecting keeps the
-//! heap's reference, and a region a whole collection did not reach is let go.
-//! A region several heaps refer to is read by all of them, with no copying,
-//! which is what lets compacted data, and a `TVar`'s value, be shared between
-//! threads. With an old generation in use, only a finished marking cycle has
-//! seen everything, so only that lets a region go.
-//!
-//! # The other collector
-//!
-//! [`Collector::Copying`] is the nursery alone, growing without limit and
-//! never promoting: one Cheney semispace collector, as this heap was before it
-//! had generations. It is there to compare against.
+//! The paper has one size of block and chains a bigger object through its last
+//! field; Meadow has arrays and strings, which want indexing, so blocks come in
+//! a size class per word count, with anything bigger allocated on its own.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, Instant};
+/// The layout all of this is: `meadow_rt::layout::SILO`, or with the
+/// `glade-layout` feature `meadow_rt::layout::GLADE`, which the emitted code
+/// and the interpreter read too. The constants below are its, by the names
+/// this module has always given them.
+#[cfg(not(feature = "glade-layout"))]
+pub const LAYOUT: meadow_rt::layout::Layout = meadow_rt::layout::SILO;
+#[cfg(feature = "glade-layout")]
+pub const LAYOUT: meadow_rt::layout::Layout = meadow_rt::layout::GLADE;
 
-use crate::evacuate::Evacuation;
-use crate::mark;
-use crate::object::{self, Head, forward, forwarded, write_header};
-use crate::old::{self, OLD_BASE, Old};
-use crate::region::{Block, Region};
-use crate::value::{Addr, Value, Word};
-use meadow_rt::desc;
+/// The header word the cycle collector's bits are in: the kind's.
+pub const FLAGS: usize = LAYOUT.flags_word();
 
-pub use crate::region::REGION_BASE;
+/// What word 1's low byte says a block is.
+pub const DATA: u64 = LAYOUT.kinds.data;
+pub const CLOSURE: u64 = LAYOUT.kinds.closure;
+pub const STRING: u64 = LAYOUT.kinds.string;
+pub const ARRAY: u64 = LAYOUT.kinds.array;
+pub const BIGINT: u64 = LAYOUT.kinds.bigint;
+pub const CELL: u64 = LAYOUT.kinds.cell;
+pub const RECORD: u64 = LAYOUT.kinds.record;
+pub const MUT_ARRAY: u64 = LAYOUT.kinds.mut_array;
+/// A resumption's one-shot flag.
+pub const ONCE: u64 = LAYOUT.kinds.once;
+pub const COMPACT: u64 = LAYOUT.kinds.compact;
+pub const CHANNEL: u64 = LAYOUT.kinds.channel;
+pub const TASK: u64 = LAYOUT.kinds.task;
+pub const TVAR: u64 = LAYOUT.kinds.tvar;
+/// A suspended stack segment: see `crate::segments`.
+pub const STACK: u64 = LAYOUT.kinds.stack;
+/// What a compact's values live in: see `crate::prims`, `Compact`.
+pub const REGION: u64 = LAYOUT.kinds.region;
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|p| p.into_inner())
+pub const DESC_SHIFT: u32 = LAYOUT.elem_desc.shift;
+pub const UNIFORM: u64 = LAYOUT.uniform.bits_in_place();
+
+/// What the cycle collector keeps in the kind's word ([`FLAGS`]), where a
+/// fresh block has zeroes:
+/// a colour, whether the block is waiting in the candidate buffer, and
+/// whether it died while it was waiting. See [`crate::cycles`].
+pub const COLOUR_SHIFT: u32 = LAYOUT.colour.shift;
+pub const BLACK: u64 = 0;
+pub const GRAY: u64 = 1;
+pub const WHITE: u64 = 2;
+pub const PURPLE: u64 = 3;
+const BUFFERED: u64 = LAYOUT.buffered.bits_in_place();
+/// Its count reached zero while it was a candidate: the memory is held back
+/// until the collector has finished with it.
+const DEAD: u64 = LAYOUT.dead.bits_in_place();
+/// Its fields were moved out before it died, so there is nothing in it to
+/// erase -- see [`clean`].
+const MOVED: u64 = LAYOUT.moved.bits_in_place();
+/// The count a block inside a compact region is given on top of the
+/// references it has. It does two things at once, and [`crate::region`] has
+/// both: it puts the count out of reach of zero, so such a block is never
+/// freed on its own and never looks unique to the code that loads its fields;
+/// and it puts the count somewhere no ordinary block's ever is, so a share or
+/// an erase can tell it is touching a region from the count it has loaded
+/// anyway.
+pub const STICKY: u32 = LAYOUT.sticky as u32;
+
+/// A mark this big is a block inside a compact region and nothing else. Under
+/// counting the mark is the count, and this is half the bias, so no amount of
+/// drift in either direction is mistaken either way; `meadow_llvm::emit`'s
+/// helpers test the same number inline. A layout with no count gives a
+/// region's block this mark, and nothing else has it.
+pub const REGION_FLOOR: u32 = LAYOUT.region_floor as u32;
+
+/// Is `v` a block inside a compact region? Ask only of a word a descriptor
+/// says is a reference: an `Int` that happens to be even is not an address.
+#[inline]
+pub fn in_region(v: Word) -> bool {
+    is_block(v) && mark(v) >= REGION_FLOOR
 }
 
-/// Bytes one slot takes -- what `compactSize` multiplies by. The other engines
-/// estimate with `meadow_core::compact::SLOT_BYTES`, which a test holds equal.
-pub const SLOT_BYTES: usize = std::mem::size_of::<Word>();
-
-// --- configuration ---------------------------------------------------------------
-
-/// Which collector heaps use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Collector {
-    /// A nursery, and an old generation marked concurrently. The default.
-    Generational,
-    /// One semispace, copied whole at every collection.
-    Copying,
+/// Make the block at `v`, a copy just made in a region, a region's block.
+pub fn set_in_region(v: Word) {
+    set_mark(v, LAYOUT.sticky as u32);
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct GcConfig {
-    pub collector: Collector,
-    /// The nursery's largest size, in slots: what bounds a nursery pause.
-    ///
-    /// The default, 2 MiB, is a measured compromise and not an obvious number.
-    /// A nursery collection costs what *survives* it, so a bigger nursery buys
-    /// throughput -- fewer collections -- and spends tail latency, and past a
-    /// point it spends throughput too, because a long-lived object sitting in a
-    /// large nursery is copied again at every collection instead of being
-    /// promoted out of it. On `benches/Latency` and `benchmarks/binarytrees`:
-    ///
-    /// ```text
-    ///   nursery   Latency p99   over 1 ms   binarytrees   copied
-    ///    256 KiB       115 us           0        3.72 s   926 MiB
-    ///      2 MiB       459 us           0        2.75 s     -
-    ///      8 MiB      1.31 ms           0        2.14 s   450 MiB
-    ///     32 MiB      5.24 ms          79        3.40 s   5.3 GiB
-    /// ```
-    ///
-    /// 2 MiB is the largest that keeps every pause well under a millisecond,
-    /// which is the property `docs/RUNTIME.md` claims. `MEADOW_GC_NURSERY`
-    /// moves it, in slots, for a program that would rather have the throughput.
-    pub nursery: usize,
-    /// OS threads marking old generations. With 0, each heap marks a slice at
-    /// a time on its own thread, during nursery collections.
-    pub mark_threads: usize,
-    /// Old-generation slots allocated before a heap's first marking cycle.
-    pub min_trigger: usize,
-    /// After every marking cycle, check that it marked everything reachable.
-    /// Slow: a whole trace in the pause. For tests.
-    pub verify: bool,
-    /// The most fields a pause reads marking, besides the time limit. For
-    /// tests, to make marking take many collections.
-    pub mark_slice: usize,
-    /// Whether sparse old blocks are evacuated -- see [`crate::evacuate`].
-    pub evacuate: bool,
+/// Its kind is one a cycle can contain: a `Ref` or a mutable array, which is
+/// where a store into a block that already exists can happen. Set where the
+/// block is built and never changed, so that the emitted counting helper can
+/// ask this and the colour in one test -- `meadow_llvm::emit::helpers`, which
+/// has the constant, must agree with these bits.
+pub const MUTABLE: u64 = LAYOUT.mutable.bits_in_place();
+
+/// Everything in word 1 that is one heap's collector talking to itself: the
+/// colour, whether the block is waiting in that heap's candidate list, and
+/// whether it died while it waited. A block copied into another heap
+/// ([`crate::parcel`]) keeps none of it. [`MUTABLE`] is not here: that is
+/// about the kind, which the copy keeps.
+pub const MARKS: u64 = (3 << COLOUR_SHIFT) | BUFFERED | DEAD | MOVED | DEFERRED;
+
+/// Waiting in the oversized list for a walk with no budget (see
+/// [`Heap::set_oversized`]): until then, a walk from another candidate that
+/// reaches it goes no further in and takes it for alive -- which can only put
+/// off freeing a cycle through it, never free what is not garbage. Without
+/// this, one big table a program reads over and over is walked in part at
+/// every run, from whatever candidate reaches it.
+pub const DEFERRED: u64 = LAYOUT.deferred.bits_in_place();
+
+pub fn deferred(v: Word) -> bool {
+    word(v, FLAGS) & DEFERRED != 0
 }
 
-impl GcConfig {
-    /// The defaults, as `MEADOW_GC` (`generational` or `copying`),
-    /// `MEADOW_GC_NURSERY`, `MEADOW_GC_MARK_THREADS`, `MEADOW_GC_TRIGGER` (in
-    /// slots), `MEADOW_GC_EVACUATE` (`0` for off) and `MEADOW_GC_VERIFY` change
-    /// them.
-    pub fn from_env() -> GcConfig {
-        let num = |name: &str| {
-            std::env::var(name)
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-        };
-        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-        GcConfig {
-            collector: match std::env::var("MEADOW_GC").as_deref() {
-                Ok("copying") => Collector::Copying,
-                _ => Collector::Generational,
-            },
-            nursery: num("MEADOW_GC_NURSERY").unwrap_or(1 << 18).max(64),
-            mark_threads: num("MEADOW_GC_MARK_THREADS").unwrap_or((cores / 4).max(1)),
-            min_trigger: num("MEADOW_GC_TRIGGER").unwrap_or(1 << 18),
-            verify: std::env::var_os("MEADOW_GC_VERIFY").is_some(),
-            mark_slice: usize::MAX,
-            evacuate: std::env::var("MEADOW_GC_EVACUATE").as_deref() != Ok("0"),
-        }
+/// The [`MUTABLE`] bit, for a block of this kind.
+const fn mutable(kind: u64) -> u64 {
+    if kind == CELL || kind == MUT_ARRAY {
+        MUTABLE
+    } else {
+        0
     }
 }
 
-static CONFIG: OnceLock<GcConfig> = OnceLock::new();
-
-/// Set how heaps made from now on collect. Only before the first heap is made:
-/// false, and nothing changed, after.
-pub fn configure(config: GcConfig) -> bool {
-    CONFIG.set(config).is_ok()
-}
-
-/// How heaps collect: what [`configure`] set, or [`GcConfig::from_env`].
-pub fn config() -> GcConfig {
-    *CONFIG.get_or_init(GcConfig::from_env)
-}
-
-/// Overwrites logged before they are handed to the marker regardless of
-/// whether a collection has come.
-const SATB_FLUSH: usize = 4096;
-
-/// How long a pause may spend marking, when there is no marking thread or the
-/// one there is has fallen behind.
-const ASSIST: Duration = Duration::from_micros(200);
-
-/// How much a pause may spend evacuating sparse old blocks: a time, and slots
-/// copied.
-const EVACUATE: (Duration, usize) = (Duration::from_micros(25), 1 << 11);
-
-/// Blocks looked at, per nursery collection, for ones to give back.
-const RELEASE_BUDGET: usize = 64;
-
-/// How many slots a fresh heap starts with. It doubles whenever a collection
-/// leaves it more than half full.
-const INITIAL: usize = 1 << 16;
-
-/// How many a green thread's heap starts with. A thread may be one of very many,
-/// so it starts small and grows like any other heap.
-pub const THREAD_INITIAL: usize = 1 << 10;
-
-// --- values that cannot go somewhere ------------------------------------------
-
-/// Why a value cannot go into a region.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Uncompactable {
-    Ref,
-    MutArray,
-    Function,
-}
-
-impl Uncompactable {
-    pub fn describe(self) -> &'static str {
-        match self {
-            Uncompactable::Ref => "a Ref",
-            Uncompactable::MutArray => "a mutable array",
-            Uncompactable::Function => "a function",
-        }
+/// The [`MUTABLE`] bit, for a uniform block of this kind whose words are all
+/// described by `d`. A mutable array of numbers is mutable, but can hold no
+/// reference, and so can be part of no cycle: it is never a candidate, and a
+/// program that keeps its tables in such arrays -- a parser's, a compiler's --
+/// does not have the collector walk them every time one is let go of.
+fn mutable_holding(kind: u64, d: i64) -> u64 {
+    if d == meadow_rt::desc::REF || d == meadow_rt::desc::ANY {
+        mutable(kind)
+    } else {
+        0
     }
 }
 
-/// Why a value cannot be passed to another thread -- see `meadow_core::thread`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Unsendable {
-    Ref,
-    MutArray,
-    Continuation,
-}
+/// A mutable array has had a block stored in it that a cycle could run
+/// through -- not a string, a big integer, a number: set where an element is
+/// written, and never cleared. One that has only ever held leaves has nothing
+/// for the cycle collector to walk, however long it is; which is what a
+/// program's column of ten thousand names is, taken and let go of at every
+/// read of it and so a candidate again after every run.
+pub const CYCLABLE: u64 = LAYOUT.cyclable.bits_in_place();
 
-impl Unsendable {
-    pub fn describe(self) -> &'static str {
-        match self {
-            Unsendable::Ref => "a Ref",
-            Unsendable::MutArray => "a mutable array",
-            Unsendable::Continuation => "a continuation",
-        }
+/// `x`, described by `d`, is being stored in the mutable array at `arr`.
+#[inline]
+pub fn note_stored(arr: Word, x: Word, d: i64) {
+    crate::trace::remember(arr, x, d);
+    if (d == meadow_rt::desc::REF || d == meadow_rt::desc::ANY)
+        && is_block(x)
+        && crate::cycles::may_cycle(x)
+    {
+        set_word(arr, FLAGS, word(arr, FLAGS) | CYCLABLE);
     }
 }
 
-/// A value lifted out of one heap, to be put into another: the objects it
-/// reaches, laid out as they will be, with addresses counted from the start
-/// of the parcel. Holds nothing that belongs to a heap, so it can travel
-/// between OS threads. What it reaches in shared regions stays where it is,
-/// its addresses unchanged, and the parcel holds those regions alive.
-#[derive(Clone)]
-pub struct Parcel {
-    slots: Vec<Word>,
-    root: Value,
-    regions: Vec<Arc<Region>>,
-}
-
-impl std::fmt::Debug for Parcel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Parcel({} slots, {} regions)",
-            self.slots.len(),
-            self.regions.len()
-        )
+/// Whether the block at `v` can point at anything a cycle could run through:
+/// a mutable array only if something that could ever was stored in it.
+pub fn may_hold_cycles(v: Word) -> bool {
+    if kind(v) == MUT_ARRAY && uniform(v) {
+        word(v, FLAGS) & CYCLABLE != 0
+    } else {
+        holds_refs(v)
     }
 }
 
-impl Parcel {
-    /// Slots it takes in the heap it is imported into.
-    pub fn len(&self) -> usize {
-        self.slots.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.slots.is_empty()
+/// Whether the block at `v` can hold a reference at all: not a uniform one
+/// whose words are all described as something else.
+pub fn holds_refs(v: Word) -> bool {
+    !uniform(v) || {
+        let d = LAYOUT.elem_desc.get(word(v, LAYOUT.elem_desc.word)) as i64;
+        d == meadow_rt::desc::REF || d == meadow_rt::desc::ANY
     }
 }
 
-/// A region a heap has addresses into.
-struct Adopted {
-    region: Arc<Region>,
-    /// How many of its blocks this heap has in [`Heap::blocks`]. A region only
-    /// grows, and what an address reached when it arrived was in these.
-    blocks: usize,
-    marked: bool,
+pub fn colour(v: Word) -> u64 {
+    (word(v, FLAGS) >> COLOUR_SHIFT) & 3
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Kind {
-    /// A constructor. `meta` is its tag; a tuple is the constructor `#tuple`.
-    Data,
-    /// The builtin `Array`.
-    Array,
-    /// Fields as `[label, value, label, value, …]`, sorted by label.
-    ///
-    /// Sorted, not in the order they were written, so that two records with the
-    /// same fields compare and print alike however they were built — the same
-    /// reason the CEK machine keeps them in a `BTreeMap`.
-    Record,
-    /// A closure, a continuation or a handler — the IR does not distinguish
-    /// them. `meta` is the method table; the fields are the captures.
-    Closure,
-    /// A mutable cell: one field, and a value with identity.
-    Ref,
-    /// A mutable array, from `stNewArray`: its elements, written in place. The
-    /// other value with identity.
-    MutArray,
-    /// `meta` is the sign (0 zero, 1 plus, 2 minus); the fields are base-2^32
-    /// digits, least significant first, held as `Int`s.
-    BigInt,
-    /// A resumption's one-shot flag: `[taken]`. The resumption itself is a
-    /// closure capturing it first -- see `meadow_seq`'s lowering -- so a
-    /// resumption refused passage to another thread or into a region is refused
-    /// as a continuation.
-    Resume,
-    /// A handle on a compact region: `meta` is the region, the one field is the
-    /// value compacted into it. What keeps a region alive when the value itself
-    /// is an immediate and points nowhere.
-    Compact,
-    /// A channel between green threads: `meta` is its number in the scheduler,
-    /// and there are no fields. The channel itself lives outside every heap.
-    Channel,
-    /// A green thread, as `threadSpawn` answers it: `meta` is its number.
-    Task,
-    /// A `TVar`: `meta` is its number in the run's [`crate::stm::World`].
-    TVar,
-    /// A `String`: `meta` is its length in bytes, and the fields are its UTF-8
-    /// bytes packed eight to a word, little-endian, with the last word's spare
-    /// bytes zero -- so two strings are equal exactly when their words are.
-    /// Uniform, and never an address, so a collector copies one without
-    /// looking inside.
-    Str,
-    /// An `Array` of `UInt8`, a byte to an element: laid out as [`Kind::Str`]
-    /// is, `meta` its length. An array is kept this way whenever it has
-    /// elements and they are bytes -- see [`Heap::alloc_array`] -- and
-    /// everything that reads an array reads either.
-    Bytes,
-    /// A function's continuation, on the thread's frame stack rather than in
-    /// the heap: laid out as a [`Kind::Closure`] -- `meta` the method table,
-    /// the fields the captures -- so that invoking it is invoking a closure,
-    /// plus popping it and everything above it. Only [`Heap::push_frame`]
-    /// makes one, and only in a chunk the old generation holds in state
-    /// `STACK`.
-    Frame,
-    /// A stack segment a general handler clause cut off: `[top, fsp]`, the
-    /// segment's top chunk and where its frames end, both as `Int`s. What a
-    /// resumption holds instead of the continuation itself, and puts back
-    /// exactly once -- see [`Heap::detach`] and [`Heap::reattach`].
-    Stack,
+pub fn set_colour(v: Word, c: u64) {
+    let w = word(v, FLAGS) & !(3 << COLOUR_SHIFT);
+    set_word(v, FLAGS, w | (c << COLOUR_SHIFT));
 }
 
-impl Kind {
-    const ALL: [Kind; 16] = [
-        Kind::Data,
-        Kind::Array,
-        Kind::Record,
-        Kind::Closure,
-        Kind::Ref,
-        Kind::MutArray,
-        Kind::BigInt,
-        Kind::Resume,
-        Kind::Compact,
-        Kind::Channel,
-        Kind::Task,
-        Kind::TVar,
-        Kind::Str,
-        Kind::Bytes,
-        Kind::Frame,
-        Kind::Stack,
-    ];
-
-    /// The kind a header's first byte names.
-    pub fn from_byte(b: u8) -> Kind {
-        Kind::try_from_byte(b).unwrap_or_else(|| panic!("{b} is not a kind of object"))
-    }
-
-    pub fn try_from_byte(b: u8) -> Option<Kind> {
-        Kind::ALL.get(b as usize).copied()
-    }
-
-    /// Does every field hold the same representation, so that one descriptor
-    /// describes them all? An array's elements, a `BigInt`'s digits.
-    /// Is this one of the two ways an `Array` is kept?
-    pub fn is_array(self) -> bool {
-        matches!(self, Kind::Array | Kind::Bytes)
-    }
-
-    pub fn is_uniform(self) -> bool {
-        matches!(
-            self,
-            Kind::Array | Kind::MutArray | Kind::BigInt | Kind::Str | Kind::Bytes
-        )
-    }
+pub fn buffered(v: Word) -> bool {
+    word(v, FLAGS) & BUFFERED != 0
 }
 
-/// `repr(C)`, with what native code allocating in the nursery reads and writes
-/// first -- see [`crate::codegen::layout`].
-#[repr(C)]
+pub fn set_buffered(v: Word, yes: bool) {
+    let w = word(v, FLAGS) & !BUFFERED;
+    set_word(v, FLAGS, if yes { w | BUFFERED } else { w });
+}
+
+pub fn dead(v: Word) -> bool {
+    word(v, FLAGS) & DEAD != 0
+}
+
+/// Keep `v` for the cycle collector: see [`Heap::candidate`].
+pub fn keep_candidate(v: Word) {
+    with(|h| h.candidate(v));
+}
+
+/// Word counts with a size class of their own; bigger blocks are allocated
+/// alone and freed at once when clean.
+const CLASSES: usize = 128;
+/// Memory taken from the system at a time for the size classes, in words: the
+/// first chunk is small -- a thread may allocate almost nothing -- and each
+/// after it twice the last, up to this.
+const CHUNK: usize = 1 << 17;
+const FIRST_CHUNK: usize = 1 << 10;
+/// Fields erased per step of the pending work.
+const STEP: usize = 64;
+/// The smallest heap, in blocks, that a doubling is measured from: below it a
+/// doubling means nothing and the cycle collector would run constantly.
+const FLOOR: usize = 4096;
+
+pub type Word = u64;
+
+/// A heap: one per green thread (`crate::ctx`), freed with it.
 pub struct Heap {
-    /// `space`'s slots and length, kept equal to it for native code, which
-    /// cannot look inside a `Vec`: see [`Heap::sync`].
-    pub(crate) base: *mut Word,
-    pub(crate) cap: usize,
-    pub(crate) top: usize,
-    pub allocated: u64,
-    /// Region slots written since the last collection. Regions are only freed
-    /// by collecting, so a program that compacts in a loop and allocates little
-    /// else needs this to ask for a collection now and then.
-    pub(crate) region_growth: usize,
-    /// Where native code reads a heap word: `table[a >> 30][(a >> 13) &
-    /// 0x1FFFF][a & 8191]`, in slots.
-    ///
-    /// Two entries, one per generation, because the two are laid out
-    /// differently and an expansion has no branch to tell them apart with. The
-    /// nursery is one flat array, so its table is `base`, `base + BLOCK`, …;
-    /// the old generation is separate blocks, so its table is theirs. A heap
-    /// word therefore costs three dependent loads in native code against one
-    /// through `Heap::slot` and about fifty through the interpreter.
-    ///
-    /// Kept by [`Heap::sync`], which every path that can move the nursery or
-    /// change the old generation's blocks already calls.
-    pub(crate) tables: [*const *mut Word; 2],
-    /// The frame stack's top and the end of its current chunk, in slots: where
-    /// native code pushes a frame. See [`Heap::push_frame`].
-    pub(crate) fsp: Addr,
-    pub(crate) flim: Addr,
-    /// The current chunk of the frame stack, `0` before the first frame, and
-    /// its first slot as a machine address: a frame in it is at
-    /// `fbase + (a - fcur) * 8`, one load rather than the block table's three.
-    pub(crate) fcur: Addr,
-    pub(crate) fbase: *mut Word,
-    /// Chunks entered so far: the serial the next one gets.
-    chunk_serial: u32,
-    /// The nursery's half of `tables`, which this owns.
-    nursery_blocks: Vec<*mut Word>,
-    /// Chunks that were popped, kept for the next push rather than given
-    /// back: a `handle` in a loop enters and leaves one at every iteration.
-    free_chunks: Vec<Addr>,
-    /// Stack segments cut off by a general handler clause and not yet put
-    /// back, each with the marking epoch it was cut in. Their frames are roots
-    /// until the object naming them dies -- see [`Heap::finish_cycle`].
-    detached: Vec<Detached>,
-    /// Chunks of the live stack, below the current one, found at a nursery
-    /// collection to hold nothing young -- which, since only the current chunk
-    /// is ever pushed into or popped from, they go on holding nothing young
-    /// until they are the current chunk again. A nursery collection skips
-    /// them: without this it walks every frame of the stack every time, and a
-    /// deep recursion that allocates is quadratic. (GHC does the same with a
-    /// dirty bit per stack chunk.) See [`Heap::minor`].
-    clean_chunks: std::collections::HashSet<Addr>,
-    config: GcConfig,
-    /// The nursery, and its other half for collecting into.
-    space: Vec<Word>,
-    other: Vec<Word>,
-    /// Nursery objects below this have survived a collection already.
-    aged: usize,
-    /// Whether survivors are promoted: once the nursery is as big as it gets.
-    promoting: bool,
-    old: Old,
-    /// Old slots that may hold a nursery address, each once.
-    remembered: Vec<Addr>,
-    /// Old values overwritten while marking, not yet handed to the marker.
-    satb: Vec<Addr>,
-    /// Sparse old blocks being emptied, and the pointers into them.
-    evac: Evacuation,
-    marking: Option<Arc<mark::Job>>,
-    /// Held to overwrite an old object's field while marking; see
-    /// [`crate::mark`].
-    mutation: Arc<Mutex<()>>,
-    /// Nursery collections so far -- and, in `allocated`, slots allocated in
-    /// total: the two numbers worth knowing when a program is unexpectedly
-    /// slow.
-    pub collections: u64,
-    /// Slots copied within the nursery, and promoted out of it, in total.
-    pub copied: u64,
-    pub promoted: u64,
-    /// Marking cycles begun, and time spent marking, on any thread.
-    pub cycles: u64,
-    pub mark_nanos: u64,
-    /// Slots and blocks evacuated out of sparse old blocks.
-    pub evacuated: u64,
-    pub evacuated_blocks: u64,
-    /// Time the program was stopped for the collector, in total and pause by
-    /// pause.
-    pub gc_nanos: u64,
-    pub pauses: crate::pauses::Pauses,
-    /// The blocks of every region this heap refers to, sorted by base address:
-    /// where a region address is looked up.
-    blocks: Vec<Arc<Block>>,
-    /// Those regions, by id.
-    regions: HashMap<u32, Adopted>,
-    /// The instruction the machine is carrying out, so that an allocation can
-    /// be charged to it. Kept by [`crate::Vm`], which is the only thing that
-    /// knows -- the heap is handed sizes, not program counters.
-    ///
-    /// Last, with `sites`, and that matters: native code reaches `base`, `cap`,
-    /// `top`, `allocated` and `region_growth` by fixed offsets from the start
-    /// of this struct (see [`crate::codegen::layout`]), so a field added ahead
-    /// of them moves them. `the_layout_is_where_the_machine_is` says so.
-    #[cfg(feature = "profile-alloc")]
-    pub at: meadow_bytecode::Pc,
-    /// What each instruction has allocated. See [`crate::profile::Sites`].
-    #[cfg(feature = "profile-alloc")]
-    pub sites: crate::profile::Sites,
+    /// The clean blocks of each size class: the first, whose word 0 is the
+    /// next, and so on to a null. A list through the blocks themselves is a
+    /// load and a store to take one or give one back, and never grows.
+    clean: [*mut Word; CLASSES],
+    /// Blocks whose last reference was erased, and how far into their fields
+    /// erasing has got.
+    pending: Vec<(*mut Word, usize)>,
+    chunk: *mut Word,
+    left: usize,
+    /// Blocks acquired and not yet clean: what a leak check counts.
+    live: isize,
+    /// Blocks acquired at all: what a block built in one the program already
+    /// had -- reuse, see `meadow-llvm`'s `linear` -- saves.
+    acquired: u64,
+    /// Which, when a leak check asks: see [`tracking`].
+    blocks: Option<std::collections::HashSet<usize>>,
+    /// Blocks whose count went down without reaching zero: where the cycle
+    /// collector looks. Empty for a program that cannot make a cycle.
+    candidates: Vec<Word>,
+    /// Candidates whose walk was too long to do inside a pause: kept until
+    /// the heap has grown enough that a long pause beats holding the memory.
+    /// See [`crate::cycles::BUDGET`].
+    oversized: Vec<Word>,
+    /// How many blocks must be live before that is worth doing, or
+    /// `usize::MAX` for "nothing is waiting".
+    oversized_mark: usize,
+    /// Live blocks at which the cycle collector has something to do, which is
+    /// the only thing [`acquire`] asks about: one load and one compare on the
+    /// path every allocation takes. It is `usize::MAX` -- never -- unless
+    /// there is a candidate waiting, `0` once there are [`crate::cycles::
+    /// TRIGGER`] of them, and otherwise a doubling of the heap away, which is
+    /// what makes a program that ties a handful of very large knots collect
+    /// them as it goes rather than waiting for candidates it will never have.
+    run_at: usize,
+    /// Whether the collector is working through the candidates it has: once
+    /// it starts it keeps going, a bounded run per allocation, until the
+    /// buffer is empty. Draining a run at a time is what keeps a pause short
+    /// without letting cyclic garbage pile up -- the program runs between one
+    /// run and the next, since that is where allocation happens.
+    draining: bool,
+    /// How many candidates must gather before the collector runs: [`crate::
+    /// cycles::TRIGGER`] to begin with, and more while its runs find nothing
+    /// -- see [`Heap::paced`].
+    trigger: usize,
+    /// Runs in a row that walked from a candidate and freed nothing.
+    futile: u32,
+    /// Blocks the collector has freed, for its tally.
+    freed: u64,
+    /// The memory it has: chunks, and blocks too big for a size class --
+    /// what dropping it gives back.
+    chunks: Vec<(*mut Word, usize)>,
+    large: crate::ctx::ByAddress<usize>,
+    /// Under `MEADOW_SILO_MEMORY`: the words in this heap's blocks that are
+    /// in use.
+    held: usize,
+    /// Under `MEADOW_SILO_PRIMS`: how many blocks of each kind this heap has
+    /// erased, by what makes them -- a constructor, a closure's code.
+    erased: Option<std::collections::HashMap<(u64, u32), u64>>,
+    /// Where a traced program's blocks come from: see [`crate::trace`]. Made
+    /// at its first allocation; never, for a program that counts.
+    space: Option<Box<crate::trace::Space>>,
 }
 
-// `base` points into the heap's own `space`, which moves with it.
-unsafe impl Send for Heap {}
+impl Heap {
+    pub fn new() -> Heap {
+        Heap {
+            clean: [std::ptr::null_mut(); CLASSES],
+            pending: Vec::new(),
+            chunk: std::ptr::null_mut(),
+            left: 0,
+            live: 0,
+            acquired: 0,
+            blocks: tracking().then(std::collections::HashSet::new),
+            candidates: Vec::new(),
+            oversized: Vec::new(),
+            oversized_mark: usize::MAX,
+            run_at: usize::MAX,
+            draining: false,
+            trigger: crate::cycles::TRIGGER,
+            futile: 0,
+            freed: 0,
+            chunks: Vec::new(),
+            large: crate::ctx::ByAddress::default(),
+            held: 0,
+            erased: crate::prims::counting().then(std::collections::HashMap::new),
+            space: None,
+        }
+    }
+
+    /// The traced program's memory, if it has allocated any.
+    pub fn space(&self) -> Option<&crate::trace::Space> {
+        self.space.as_deref()
+    }
+
+    pub fn space_mut(&mut self) -> Option<&mut crate::trace::Space> {
+        self.space.as_deref_mut()
+    }
+}
 
 impl Default for Heap {
     fn default() -> Heap {
@@ -548,3064 +337,1189 @@ impl Default for Heap {
     }
 }
 
-/// An object's words, in order: see [`Heap::words_in`].
-pub enum Words<'h> {
-    /// A nursery object, read as the run of memory it is.
-    Slice(std::slice::Iter<'h, Word>),
-    /// Anywhere else, a slot at a time.
-    Slots { heap: &'h Heap, at: Addr, end: Addr },
+/// Under `MEADOW_SILO_PRIMS`: of the blocks let go of whole -- the last
+/// reference dropped by code that had not taken the block apart -- one in
+/// every [`EVERY`], by what the block was and which function of the program
+/// dropped it.
+static DROPPED: std::sync::Mutex<Option<std::collections::HashMap<(u64, u32, String), u64>>> =
+    std::sync::Mutex::new(None);
+static DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const EVERY: u64 = 1024;
+
+#[cold]
+fn dropped(v: Word) {
+    let n = DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n % EVERY != 0 {
+        return;
+    }
+    // The innermost frame that is the program's own code: emitted functions
+    // are named `mw.` and then what they are.
+    let trace = std::backtrace::Backtrace::force_capture().to_string();
+    let who = trace
+        .lines()
+        .filter_map(|l| l.trim().split_once(": ").map(|(_, name)| name))
+        .find(|name| name.starts_with("mw."))
+        .unwrap_or("the runtime")
+        .to_string();
+    let mut all = DROPPED.lock().unwrap_or_else(|e| e.into_inner());
+    *all.get_or_insert_with(std::collections::HashMap::new)
+        .entry((kind(v), meta(v), who))
+        .or_default() += EVERY;
 }
 
-impl Iterator for Words<'_> {
-    type Item = Word;
+/// Under `MEADOW_SILO_PRIMS`: of the arrays made, one in every [`EVERY`], by
+/// how long it was made (up to eight, then "more") and which function of the
+/// program made it.
+static MADE: std::sync::Mutex<Option<std::collections::HashMap<(usize, String), u64>>> =
+    std::sync::Mutex::new(None);
+static MAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-    #[inline]
-    fn next(&mut self) -> Option<Word> {
-        match self {
-            Words::Slice(it) => it.next().copied(),
-            Words::Slots { heap, at, end } => {
-                if at < end {
-                    let w = heap.slot(*at);
-                    *at += 1;
-                    Some(w)
-                } else {
-                    None
-                }
+#[cold]
+fn made(n: usize) {
+    let k = MAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if k % EVERY != 0 {
+        return;
+    }
+    let trace = std::backtrace::Backtrace::force_capture().to_string();
+    let who = trace
+        .lines()
+        .filter_map(|l| l.trim().split_once(": ").map(|(_, name)| name))
+        .find(|name| name.starts_with("mw."))
+        .unwrap_or("the runtime")
+        .to_string();
+    let mut all = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    *all.get_or_insert_with(std::collections::HashMap::new)
+        .entry((n.min(9), who))
+        .or_default() += EVERY;
+}
+
+/// The arrays made, as sampled: how long, by whom, and about how many.
+pub fn made_by() -> (u64, Vec<((usize, String), u64)>) {
+    let all = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<((usize, String), u64)> =
+        all.iter().flatten().map(|(k, n)| (k.clone(), *n)).collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    (MAKES.load(std::sync::atomic::Ordering::Relaxed), out)
+}
+
+/// The blocks dropped whole, as sampled: what each was, who dropped it, and
+/// about how many, most first.
+pub fn dropped_by() -> Vec<((u64, u32, String), u64)> {
+    let all = DROPPED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<((u64, u32, String), u64)> =
+        all.iter().flatten().map(|(k, n)| (k.clone(), *n)).collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out
+}
+
+/// Under `MEADOW_SILO_LEAKS`: the blocks threads ended still holding, by
+/// kind and what made them, over every thread that has ended.
+static ENDED_WITH: std::sync::Mutex<Option<std::collections::HashMap<(u64, u32), u64>>> =
+    std::sync::Mutex::new(None);
+
+/// What threads that have ended were still holding, most first.
+pub fn ended_with() -> Vec<((u64, u32), u64)> {
+    let all = ENDED_WITH.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<((u64, u32), u64)> = all.iter().flatten().map(|(k, n)| (*k, *n)).collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out
+}
+
+/// What every heap that has gone erased, by kind: see [`Heap::erased`].
+static ERASED: std::sync::Mutex<Option<std::collections::HashMap<(u64, u32), u64>>> =
+    std::sync::Mutex::new(None);
+
+/// The blocks erased so far, by kind and what made them, most first: the
+/// running thread's and every finished one's.
+pub fn erased() -> Vec<((u64, u32), u64)> {
+    with(|h| h.tell());
+    let all = ERASED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<((u64, u32), u64)> = all.iter().flatten().map(|(k, n)| (*k, *n)).collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out
+}
+
+impl Heap {
+    /// This heap's counts into the program's.
+    fn tell(&mut self) {
+        if let Some(mine) = &mut self.erased {
+            let mut all = ERASED.lock().unwrap_or_else(|e| e.into_inner());
+            let all = all.get_or_insert_with(std::collections::HashMap::new);
+            for (k, n) in mine.drain() {
+                *all.entry(k).or_default() += n;
             }
         }
     }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = match self {
-            Words::Slice(it) => it.len(),
-            Words::Slots { at, end, .. } => end.saturating_sub(*at) as usize,
-        };
-        (n, Some(n))
-    }
 }
-
-impl ExactSizeIterator for Words<'_> {}
 
 impl Drop for Heap {
     fn drop(&mut self) {
-        if let Some(job) = &self.marking {
-            job.cancel();
+        self.tell();
+        // Under the leak check: what this heap's thread ended still holding,
+        // by kind -- blocks that go with the heap unerased, and so without
+        // giving up what they held outside it.
+        if let Some(blocks) = &self.blocks {
+            if !blocks.is_empty() {
+                let mut all = ENDED_WITH.lock().unwrap_or_else(|e| e.into_inner());
+                let all = all.get_or_insert_with(std::collections::HashMap::new);
+                for b in blocks {
+                    let v = *b as Word;
+                    let key = (
+                        kind(v),
+                        if kind(v) == DATA || kind(v) == CLOSURE {
+                            meta(v)
+                        } else {
+                            0
+                        },
+                    );
+                    *all.entry(key).or_default() += 1;
+                }
+            }
+        }
+        // What this heap still held goes with it.
+        crate::memory::LIVE.fetch_sub(self.held, std::sync::atomic::Ordering::Relaxed);
+        let words = |n: usize| std::alloc::Layout::array::<Word>(n).expect("a block fits memory");
+        for (p, n) in self.chunks.drain(..) {
+            crate::memory::HEAPS.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+            // Safety: allocated with this layout in `take`.
+            unsafe { std::alloc::dealloc(p as *mut u8, words(n)) };
+        }
+        for (p, n) in self.large.drain() {
+            crate::memory::HEAPS.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+            // Safety: likewise.
+            unsafe { std::alloc::dealloc(p as *mut u8, words(n)) };
         }
     }
 }
 
-impl Heap {
-    pub fn new() -> Heap {
-        Heap::with_capacity(INITIAL)
-    }
+fn with<T>(f: impl FnOnce(&mut Heap) -> T) -> T {
+    with_in(crate::ctx::get(), f)
+}
 
-    /// A heap of `slots` to begin with.
-    pub fn with_capacity(slots: usize) -> Heap {
-        Heap::with_config(slots, config())
-    }
+/// `f` of the heap of context `c`: the running thread's, which emitted code
+/// hands the runtime's hottest entries rather than have them look it up.
+#[inline(always)]
+fn with_in<T>(c: *mut crate::ctx::Ctx, f: impl FnOnce(&mut Heap) -> T) -> T {
+    // Safety: the running green thread's heap, and nothing here re-enters
+    // it while it is borrowed -- erasing pushes onto `pending` rather than
+    // recursing.
+    f(unsafe { &mut (*c).heap })
+}
 
-    pub fn with_config(slots: usize, config: GcConfig) -> Heap {
-        let slots = match config.collector {
-            Collector::Copying => slots,
-            Collector::Generational => slots.min(config.nursery),
-        };
-        let mut heap = Heap {
-            base: std::ptr::null_mut(),
-            cap: 0,
-            config,
-            space: vec![0; slots.max(64)],
-            other: Vec::new(),
-            top: 0,
-            aged: 0,
-            promoting: false,
-            old: Old::default(),
-            remembered: Vec::new(),
-            satb: Vec::new(),
-            evac: Evacuation::default(),
-            marking: None,
-            mutation: Arc::new(Mutex::new(())),
-            collections: 0,
-            allocated: 0,
-            copied: 0,
-            promoted: 0,
-            cycles: 0,
-            mark_nanos: 0,
-            evacuated: 0,
-            evacuated_blocks: 0,
-            gc_nanos: 0,
-            pauses: Default::default(),
-            blocks: Vec::new(),
-            regions: HashMap::new(),
-            #[cfg(feature = "profile-alloc")]
-            at: 0,
-            #[cfg(feature = "profile-alloc")]
-            sites: crate::profile::Sites::default(),
-            region_growth: 0,
-            tables: [std::ptr::null(); 2],
-            fsp: 0,
-            flim: 0,
-            fcur: 0,
-            fbase: std::ptr::null_mut(),
-            chunk_serial: 0,
-            nursery_blocks: Vec::new(),
-            free_chunks: Vec::new(),
-            detached: Vec::new(),
-            clean_chunks: std::collections::HashSet::new(),
-        };
-        heap.sync();
-        heap
-    }
+/// Is `v` the address of a block?
+#[inline]
+pub fn is_block(v: Word) -> bool {
+    LAYOUT.is_block(v)
+}
 
-    /// Bring native code's view of the nursery up to date, after `space` may
-    /// have moved or grown.
-    #[inline]
-    fn sync(&mut self) {
-        self.base = self.space.as_mut_ptr();
-        self.cap = self.space.len();
-        // The nursery a block at a time, so that native code can read it with
-        // the same three loads it reads the old generation with. Rebuilt whole
-        // rather than patched: it is one entry per 64 KiB, so a 2 MiB nursery
-        // is thirty-two of them.
-        let blocks = self.cap.div_ceil(old::BLOCK);
-        self.nursery_blocks.clear();
-        self.nursery_blocks.reserve(blocks + 1);
-        for i in 0..blocks {
-            // Safety: `i * BLOCK <= cap`, so this is inside `space` or one
-            // past its end, which is what a table entry for the last partial
-            // block has to be.
-            self.nursery_blocks
-                .push(unsafe { self.base.add(i * old::BLOCK) });
-        }
-        // An empty nursery still needs an entry: address 0 is in block 0.
-        if self.nursery_blocks.is_empty() {
-            self.nursery_blocks.push(self.base);
-        }
-        self.publish_tables();
-    }
+/// Is `v` a value with no block: a constructor with no fields, a closure
+/// with no captures?
+#[inline]
+pub fn is_immediate(v: Word) -> bool {
+    v & LAYOUT.imm_mask == LAYOUT.imm_tag
+}
 
-    /// Make [`Heap::tables`] current.
-    ///
-    /// The old generation's half is a `Vec` that reallocates as blocks are
-    /// added, and blocks are added by promotion, by a large allocation and by
-    /// evacuation -- none of which move the nursery, so none of which reach
-    /// [`Heap::sync`]. Native code reads the table's address from here at every
-    /// access, so what has to hold is only that this is called before control
-    /// returns to native code. There is exactly one way back in --
-    /// `crate::abi::exec`, which every instruction the interpreter runs for
-    /// native code goes through -- and one way in to begin with, so both call
-    /// this, and no path that changes the blocks has to remember to. The bug
-    /// this closes was a `wordfreq` reading a freed table entry and crashing on
-    /// the address it found there.
-    pub(crate) fn publish_tables(&mut self) {
-        self.tables = [self.nursery_blocks.as_ptr(), self.old.bases_ptr()];
-        self.publish_chunk();
-    }
+/// The value with no block that carries `payload` -- a tag, a method base.
+#[inline]
+pub const fn immediate(payload: u64) -> Word {
+    LAYOUT.immediate(payload)
+}
 
-    /// Make `fbase` the current chunk's: after anything that changes which
-    /// chunk is current, or where the blocks are.
-    fn publish_chunk(&mut self) {
-        self.fbase = if self.fcur == 0 {
-            std::ptr::null_mut()
+/// What the value with no block `v` carries.
+#[inline]
+pub const fn payload(v: Word) -> u64 {
+    LAYOUT.payload(v)
+}
+
+/// The tag of a constructor, or the method base of a closure, whether it has
+/// a block or not: what a `switch` and an `invoke` read.
+#[inline]
+pub fn meta_of(v: Word) -> u32 {
+    if is_immediate(v) {
+        payload(v) as u32
+    } else {
+        meta(v)
+    }
+}
+
+#[inline]
+fn ptr(v: Word) -> *mut Word {
+    v as *mut Word
+}
+
+/// Word `i` of the block at `v`.
+#[inline]
+pub fn word(v: Word, i: usize) -> Word {
+    // Safety: callers ask for words inside a live block.
+    unsafe { *ptr(v).add(i) }
+}
+
+#[inline]
+pub fn set_word(v: Word, i: usize, w: Word) {
+    // Safety: as `word`.
+    unsafe { *ptr(v).add(i) = w }
+}
+
+pub fn len(v: Word) -> usize {
+    LAYOUT.len.get(word(v, LAYOUT.len.word)) as usize
+}
+
+pub fn kind(v: Word) -> u64 {
+    LAYOUT.kind.get(word(v, LAYOUT.kind.word))
+}
+
+pub fn meta(v: Word) -> u32 {
+    LAYOUT.meta.get(word(v, LAYOUT.meta.word)) as u32
+}
+
+pub(crate) fn uniform(v: Word) -> bool {
+    LAYOUT.uniform.get(word(v, LAYOUT.uniform.word)) != 0
+}
+
+/// The references to `v` besides one. Only a layout that counts has them.
+#[inline]
+pub fn count(v: Word) -> u32 {
+    debug_assert!(LAYOUT.counted, "the count of a block of a layout with none");
+    LAYOUT.count.get(word(v, LAYOUT.count.word)) as u32
+}
+
+#[inline]
+pub fn set_count(v: Word, rc: u32) {
+    let at = LAYOUT.count.word;
+    set_word(v, at, LAYOUT.count.set(word(v, at), u64::from(rc)));
+}
+
+/// The number of the collection that last marked `v` (see
+/// [`crate::trace`]): its count, under a layout that has one.
+#[inline]
+pub fn mark(v: Word) -> u32 {
+    LAYOUT.mark.get(word(v, LAYOUT.mark.word)) as u32
+}
+
+#[inline]
+pub fn set_mark(v: Word, m: u32) {
+    let at = LAYOUT.mark.word;
+    set_word(v, at, LAYOUT.mark.set(word(v, at), u64::from(m)));
+}
+
+/// Where the block at `v` went, if it moved (see [`crate::trace`]).
+#[inline]
+pub fn forwarded(v: Word) -> Option<Word> {
+    let f = LAYOUT.forward;
+    (f.get(word(v, f.word)) == LAYOUT.forwarded).then(|| word(v, LAYOUT.forward_to))
+}
+
+/// Say that the block at `v` moved to `to`.
+#[inline]
+pub fn set_forwarded(v: Word, to: Word) {
+    let f = LAYOUT.forward;
+    set_word(v, f.word, f.set(word(v, f.word), LAYOUT.forwarded));
+    set_word(v, LAYOUT.forward_to, to);
+}
+
+/// Copy the header of the block at `from` into the new block at `to`, of
+/// another heap or a region: its length, kind, `meta` and what else its
+/// header words hold, but none of what one heap's collectors keep -- no
+/// count beyond the one, no mark, none of the cycle collector's bits
+/// ([`MARKS`]).
+pub fn copy_header(from: Word, to: Word) {
+    for i in 0..LAYOUT.header_words {
+        set_word(to, i, word(from, i));
+    }
+    set_word(to, FLAGS, word(to, FLAGS) & !MARKS);
+    set_count(to, 0);
+    set_mark(to, 0);
+}
+
+/// Where a uniform block's elements begin -- an array's, a big integer's
+/// limbs: right after its header, with no descriptors before them.
+pub const ELEMS: usize = LAYOUT.first_field(0, true);
+
+/// Set `v`'s length to `n`, keeping the rest of its header.
+pub fn set_len(v: Word, n: usize) {
+    let at = LAYOUT.len.word;
+    set_word(v, at, LAYOUT.len.set(word(v, at), n as u64));
+}
+
+/// Set the `meta` of the block at `v` -- a constructor's tag, a segment's
+/// number -- keeping the rest of its header.
+pub fn set_meta(v: Word, m: u32) {
+    let at = LAYOUT.meta.word;
+    set_word(v, at, LAYOUT.meta.set(word(v, at), u64::from(m)));
+}
+
+/// Set the one descriptor of the uniform block at `v`'s elements.
+pub fn set_elem_desc(v: Word, d: i64) {
+    let at = LAYOUT.elem_desc.word;
+    set_word(v, at, LAYOUT.elem_desc.set(word(v, at), d as u64));
+}
+
+/// Where the fields start.
+pub fn first_field(v: Word) -> usize {
+    LAYOUT.first_field(len(v), uniform(v))
+}
+
+/// Words the block takes.
+pub fn size(v: Word) -> usize {
+    first_field(v)
+        + if kind(v) == ARRAY {
+            array_room(len(v))
         } else {
-            self.old.base_ptr(self.fcur)
-        };
-    }
-
-    /// Has enough gone into regions since the last collection that dead ones
-    /// should be looked for, even though the nursery has room?
-    pub fn wants_collection(&self) -> bool {
-        self.region_growth > self.space.len() || self.overdue()
-    }
-
-    /// Has the old generation outrun its marking so far that the next
-    /// collection has to finish a whole cycle, pause or not?
-    ///
-    /// Marking runs beside the program, and what is allocated while a cycle
-    /// marks is kept until the next one. A program making objects too large
-    /// for the nursery -- each goes straight to the old generation -- can make
-    /// them faster than a cycle frees them, and used to run the generation out
-    /// of addresses and abort with most of it garbage. A long pause is the
-    /// better answer.
-    pub fn overdue(&self) -> bool {
-        if self.config.collector != Collector::Generational || self.old.is_empty() {
-            return false;
+            len(v)
         }
-        let live = self.old.live as usize;
-        let trigger = (2 * live).max(self.config.min_trigger);
-        self.old.half_full() || self.old.allocated as usize > 4 * trigger
-    }
+}
 
-    /// Slots held by live regions, in total.
-    pub fn region_slots(&self) -> usize {
-        self.regions.values().map(|r| r.region.used()).sum()
+/// The element slots an array of `n` elements is given: `n` for a small one,
+/// and for a bigger one the next of 12, 16, 24, 32, 48, ... -- each a power of
+/// two or three quarters of one -- so that at most a third is spare.
+///
+/// The room is a function of the length and nothing else, so no block records
+/// it: [`size`] works it out, as the allocator's free path needs. It is what
+/// makes `arrayPush` constant time on an array nobody else holds -- the element
+/// goes into the room while there is some (`meadow_array_push`), and only
+/// crossing to the next size copies.
+pub fn array_room(n: usize) -> usize {
+    if n <= 8 {
+        return n;
     }
+    let p = n.next_power_of_two();
+    let q = p / 4 * 3;
+    if q >= n { q } else { p }
+}
 
-    /// Slots in use: the nursery's, and the old generation's as of the last
-    /// cycle plus what has been allocated since.
-    pub fn used(&self) -> usize {
-        self.top + (self.old.live + self.old.allocated) as usize
+/// Field `i`'s descriptor.
+pub fn field_desc(v: Word, i: usize) -> i64 {
+    if uniform(v) {
+        LAYOUT.elem_desc.get(word(v, LAYOUT.elem_desc.word)) as i64
+    } else {
+        let (at, shift) = LAYOUT.desc_at(i);
+        ((word(v, at) >> shift) & LAYOUT.desc_mask()) as i64
     }
+}
 
-    /// Slots there are, in the nursery and the old generation.
-    pub fn capacity(&self) -> usize {
-        self.space.len() + self.old.capacity()
+pub fn field(v: Word, i: usize) -> Word {
+    word(v, first_field(v) + i)
+}
+
+/// Write field `i` of the non-uniform block at `v`, and its descriptor --
+/// noted, where blocks move, if `v` is older than `x` (`crate::trace`).
+pub fn set_field(v: Word, i: usize, x: Word, d: i64) {
+    crate::trace::remember(v, x, d);
+    set_word(v, first_field(v) + i, x);
+    if !uniform(v) {
+        let (at, shift) = LAYOUT.desc_at(i);
+        let mask = LAYOUT.desc_mask();
+        let w = (word(v, at) & !(mask << shift)) | (((d as u64) & mask) << shift);
+        set_word(v, at, w);
     }
+}
 
-    /// Slots in the old generation's blocks.
-    pub fn old_slots(&self) -> usize {
-        self.old.capacity()
+/// `n` references more to `v`, described by `d`: one count written, unless
+/// the block is in a region, which counts each.
+pub fn share_n(v: Word, d: i64, n: usize) {
+    if n == 0 || d != meadow_rt::desc::REF || !is_block(v) || crate::trace::on() {
+        return;
     }
-
-    /// Slots the last marking cycle found alive in the old generation.
-    pub fn old_live(&self) -> usize {
-        self.old.live as usize
-    }
-
-    /// Is there room for `slots` in the nursery? What decides whether an
-    /// allocation has to collect first.
-    pub fn room_for(&self, slots: usize) -> bool {
-        self.top + slots <= self.space.len()
-    }
-
-    /// Make sure `slots` can be allocated without collecting.
-    ///
-    /// For what a collection cannot help with: one object larger than the
-    /// whole nursery, which a program building a big array does routinely.
-    /// The copying collector grows its one space; a generational heap grows its
-    /// nursery as far as it may, and past that allocates in the old generation.
-    pub fn reserve(&mut self, slots: usize) {
-        if self.top + slots <= self.space.len() {
-            return;
+    if in_region(v) {
+        for _ in 0..n {
+            share(v, d);
         }
-        let limit = match self.config.collector {
-            Collector::Copying => OLD_BASE as usize,
-            Collector::Generational => self.config.nursery,
-        };
-        if self.top + slots > limit {
-            match self.config.collector {
-                Collector::Copying => panic!("the heap has used up its address space"),
-                Collector::Generational => {
-                    self.promoting = true;
-                    return;
-                }
+    } else {
+        // Safety: a live block's count.
+        let rc = unsafe { &mut *(v as *mut u32) };
+        *rc += n as u32;
+    }
+}
+
+/// One reference more to `v`, described by `d`.
+#[inline]
+pub fn share(v: Word, d: i64) {
+    // Traced, nothing is counted: see `crate::trace`.
+    if d == meadow_rt::desc::REF && is_block(v) && !crate::trace::on() {
+        // Safety: a live block's count.
+        let rc = unsafe { &mut *(v as *mut u32) };
+        *rc += 1;
+        if *rc > REGION_FLOOR {
+            // One more reference into the region this block is in, which is
+            // what keeps the region alive: see [`crate::region`].
+            // Safety: the count says it is in one.
+            unsafe { crate::region::shared(v) };
+        }
+    }
+}
+
+/// One reference fewer.
+#[inline]
+pub fn erase(v: Word, d: i64) {
+    if d == meadow_rt::desc::REF && is_block(v) && !crate::trace::on() {
+        // Safety: a live block's count.
+        let rc = unsafe { &mut *(v as *mut u32) };
+        if *rc == 0 {
+            died(v);
+        } else {
+            let region = *rc > REGION_FLOOR;
+            *rc -= 1;
+            if region {
+                // Safety: the count says it is in a region. The region cannot
+                // go under us: this is one of its own references.
+                unsafe { crate::region::erased(v) };
+            } else if crate::cycles::possible() {
+                crate::cycles::meadow_candidate(v);
             }
         }
-        let mut size = self.space.len();
-        while self.top + slots > size {
-            size = (size * 2).max(64);
-        }
-        self.space.resize(size.min(limit), 0);
-        self.sync();
     }
+}
 
-    /// Allocate. The caller must have checked [`Heap::room_for`], or
-    /// [`Heap::reserve`]d — this is the bump, and it is the reason allocation is
-    /// cheap enough not to think about.
-    #[inline]
-    /// Is this heap checking its own work -- `MEADOW_GC_VERIFY`?
-    pub(crate) fn verifying(&self) -> bool {
-        self.config.verify
+/// The last reference to `v` is gone: its fields are erased and its memory
+/// comes back. A block waiting in the candidate buffer is only marked, since
+/// the collector still has a pointer to it -- see [`Heap::free_dead`].
+#[inline]
+fn died(v: Word) {
+    died_in(crate::ctx::get(), v);
+}
+
+/// [`died`], in context `c`'s heap.
+#[inline]
+pub fn died_in(c: *mut crate::ctx::Ctx, v: Word) {
+    if crate::trace::on() {
+        return;
     }
-
-    /// Slots an object of `kind` with `len` fields takes.
-    pub fn size_of(kind: Kind, len: usize) -> usize {
-        meadow_rt::compact::object_slots(kind.is_uniform(), len)
+    if crate::prims::counting() {
+        dropped(v);
     }
-
-    pub fn alloc(&mut self, kind: Kind, meta: u32, fields: &[Value]) -> Addr {
-        let at = self.top;
-        let header = meadow_rt::compact::header_slots(kind.is_uniform(), fields.len());
-        let size = header + fields.len();
-        if at + size > self.space.len() {
-            return self.alloc_old(kind, meta, fields);
-        }
-        let space = &mut self.space;
-        write_header(kind, meta, fields.iter().map(|v| v.desc()), |k, w| {
-            space[at + k] = w
-        });
-        for (i, v) in fields.iter().enumerate() {
-            space[at + header + i] = v.bits();
-        }
-        self.top += size;
-        self.allocated += size as u64;
-        #[cfg(feature = "profile-alloc")]
-        self.sites.note(self.at, size);
-        at as Addr
+    if crate::cycles::possible() && buffered(v) {
+        // Black and dead: what the collector must not mistake for a
+        // candidate with a reference left, since the count it reads is the
+        // references besides one.
+        set_word(v, FLAGS, (word(v, FLAGS) | DEAD) & !(3 << COLOUR_SHIFT));
+        return;
     }
+    with_in(c, |h| h.pending.push((ptr(v), 0)));
+}
 
-    /// Allocate an object of `len` fields, field `i` the word `word(i)` of
-    /// descriptor `desc(i)`: [`Heap::alloc`] for a caller holding words, which
-    /// need not be made values first.
-    pub fn alloc_described(
-        &mut self,
-        kind: Kind,
-        meta: u32,
-        len: usize,
-        word: impl Fn(usize) -> Word,
-        desc: impl Fn(usize) -> desc::Desc,
-    ) -> Addr {
-        let at = self.top;
-        let header = meadow_rt::compact::header_slots(kind.is_uniform(), len);
-        let size = header + len;
-        if at + size > self.space.len() {
-            let fields: Vec<Value> = (0..len)
-                .map(|i| Value::from_bits(word(i), desc(i)))
-                .collect();
-            return self.alloc_old(kind, meta, &fields);
-        }
-        let space = &mut self.space;
-        write_header(kind, meta, (0..len).map(&desc), |k, w| space[at + k] = w);
-        for i in 0..len {
-            space[at + header + i] = word(i);
-        }
-        self.top += size;
-        self.allocated += size as u64;
-        #[cfg(feature = "profile-alloc")]
-        self.sites.note(self.at, size);
-        at as Addr
+/// A block of `words` words, count 0, the rest for the caller to write: what
+/// the runtime's own allocations go through, in a counted program or a
+/// traced one.
+pub fn acquire(words: usize) -> Word {
+    let c = crate::ctx::get();
+    if crate::trace::on() {
+        acquire_traced(c, words)
+    } else {
+        acquire_in(c, words)
     }
+}
 
-    /// An object that does not fit in the nursery, in the old generation.
-    #[cold]
-    fn alloc_old(&mut self, kind: Kind, meta: u32, fields: &[Value]) -> Addr {
-        let size = Heap::size_of(kind, fields.len());
-        if self.config.collector == Collector::Copying {
-            self.reserve(size);
-            return self.alloc(kind, meta, fields);
+/// [`acquire`] under tracing, from context `c`'s: what a traced program's
+/// code allocates through (`meadow_acquire_traced`), apart from counting's,
+/// whose path every allocation of a counted program takes and which is as it
+/// was before tracing was there.
+pub fn acquire_traced(c: *mut crate::ctx::Ctx, words: usize) -> Word {
+    with_in(c, |h| {
+        h.space
+            .get_or_insert_with(|| Box::new(crate::trace::Space::new()))
+            .take(words)
+    })
+}
+
+/// [`acquire`] in a counted program, from context `c`'s heap.
+pub fn acquire_in(c: *mut crate::ctx::Ctx, words: usize) -> Word {
+    with_in(c, |h| {
+        // Work off what is pending: one step always, more while nothing clean
+        // of this size is to be had.
+        h.step();
+        let want = words < CLASSES;
+        while want && h.clean[words].is_null() && !h.pending.is_empty() {
+            h.step();
         }
-        self.promoting = true;
-        let at = self.old.alloc(size, self.marking.is_some());
-        let old = &self.old;
-        write_header(kind, meta, fields.iter().map(|v| v.desc()), |k, w| {
-            old.put(at + k as Addr, w)
-        });
-        let header = (size - fields.len()) as Addr;
-        for (i, v) in fields.iter().enumerate() {
-            self.init_old(at + header + i as Addr, *v);
-        }
-        self.allocated += size as u64;
-        at
-    }
-
-    /// Write a field of an old object nothing else has seen yet: no marker can
-    /// be reading it, and it held nothing to log.
-    fn init_old(&mut self, s: Addr, v: Value) {
-        self.old.put_field(s, v.bits(), v.addr().is_some());
-        self.barriers(s, v);
-    }
-
-    /// Old slot `s` has just been given `v`: remember it if it points into the
-    /// nursery, and record it if it points into a block chosen for evacuation.
-    #[inline]
-    fn barriers(&mut self, s: Addr, v: Value) {
-        if let Value::Obj(x) = v {
-            if x < OLD_BASE {
-                if self.old.remember(s) {
-                    self.remembered.push(s);
-                }
+        // A program that cannot make a cycle never sets this, so what it pays
+        // for the collector is this compare and nothing else.
+        if h.live as usize >= h.run_at {
+            h.draining = true;
+            if h.oversized_due() {
+                crate::cycles::collect_oversized(h);
             } else {
-                self.evac.note(&self.old, s, x);
+                crate::cycles::collect(h);
             }
         }
-    }
-
-    /// The slot at `a`, in the nursery, the old generation or a region.
-    #[inline(always)]
-    /// Is `a` somewhere an object could be?
-    ///
-    /// For [`crate::profile`], which follows a chain of continuations and must
-    /// never fault while doing it: a profile that can bring down the program it
-    /// is watching is worse than no profile. Conservative -- it says only that
-    /// reading the header will not go outside the heap, not that anybody put an
-    /// object there.
-    pub fn holds_object(&self, a: Addr) -> bool {
-        if a < OLD_BASE {
-            let i = a as usize;
-            // In the part of the nursery that has been allocated, and starting
-            // with a byte that names a kind. Both are needed: a chain of
-            // continuations ends at something that is not one, and what that
-            // something is depends on where the chain was walked from.
-            return i + 1 < self.top && Kind::try_from_byte(self.space[i] as u8).is_some();
+        h.live += 1;
+        h.acquired += 1;
+        let p = h.take(words);
+        if let Some(b) = &mut h.blocks {
+            b.insert(p as usize);
         }
-        if a < REGION_BASE {
-            return self.old.is_object(a);
+        p
+    })
+}
+
+/// Is the leak check on? `MEADOW_SILO_LEAKS`.
+pub fn tracking() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MEADOW_SILO_LEAKS").is_some())
+}
+
+impl Heap {
+    fn take(&mut self, words: usize) -> Word {
+        let h = self;
+        if crate::memory::on() {
+            h.held += words;
+            crate::memory::LIVE.fetch_add(words, std::sync::atomic::Ordering::Relaxed);
         }
-        false
+        let want = words < CLASSES;
+        if !want {
+            let layout = std::alloc::Layout::array::<Word>(words).expect("a block fits memory");
+            // Safety: a non-zero size.
+            let p = unsafe { std::alloc::alloc(layout) } as *mut Word;
+            if p.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            crate::memory::HEAPS.fetch_add(words, std::sync::atomic::Ordering::Relaxed);
+            h.large.insert(p as usize, words);
+            return p as Word;
+        }
+        let p = h.clean[words];
+        if !p.is_null() {
+            // Safety: a clean block, whose word 0 is the next.
+            h.clean[words] = unsafe { *p } as *mut Word;
+            return p as Word;
+        }
+        if h.left < words {
+            // Before more is asked of the system: what can be given back.
+            if crate::sched::vars_waiting() {
+                crate::sched::forget_vars();
+            }
+            let size = h
+                .chunks
+                .last()
+                .map_or(FIRST_CHUNK, |(_, n)| (2 * n).min(CHUNK));
+            let layout = std::alloc::Layout::array::<Word>(size).expect("a chunk fits memory");
+            // Safety: a non-zero size.
+            let p = unsafe { std::alloc::alloc(layout) } as *mut Word;
+            if p.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            crate::memory::HEAPS.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+            h.chunks.push((p, size));
+            h.chunk = p;
+            h.left = size;
+        }
+        let p = h.chunk;
+        // Safety: inside the chunk, which has `left` words from `chunk`.
+        h.chunk = unsafe { p.add(words) };
+        h.left -= words;
+        p as Word
     }
+}
 
-    /// The heap word at slot `a`, wherever it lives.
-    ///
-    /// For [`crate::codegen::thin`], whose steps address the heap as the array
-    /// of words the machine holds it as.
-    pub fn word_at(&self, a: Addr) -> Word {
-        self.slot(a)
-    }
+// --- MEADOW_SILO_POISON -------------------------------------------------------
+//
+// For a block used after it was freed. Every freed block is filled with
+// junk and never handed out again, and at exit each one written to since is
+// said; `collector` in the variable keeps only what the cycle collector
+// frees, to tell its mistakes from counting's, and `ptr` makes the junk an
+// address nothing is mapped at, so that a reference read out of a freed
+// block faults where it is followed -- and on Windows the fault is said, with
+// its address in the executable, for `llvm-symbolizer` (a build with `-g`,
+// through `MEADOW_CLANG`). It found the collector freeing what a later run
+// would still walk: `cycles::collect_white`.
 
-    /// Where slot `a` is in memory: what native code's `Locate` step finds
-    /// through the block tables, for the thin machine to find the same way.
-    /// Not for a region, whose blocks are found by search.
-    pub(crate) fn machine_addr(&self, a: Addr) -> *mut Word {
-        if a < OLD_BASE {
-            self.space.as_ptr().wrapping_add(a as usize) as *mut Word
+fn poisoning() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MEADOW_SILO_POISON").is_some())
+}
+
+fn poison_says(what: &str) -> bool {
+    std::env::var("MEADOW_SILO_POISON").is_ok_and(|v| v.split(',').any(|p| p == what))
+}
+
+fn poison_collector_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| poison_says("collector"))
+}
+
+/// What a freed block is filled with: odd, so no block and no small number;
+/// or, with `ptr`, even, and an address nothing is mapped at.
+fn poison() -> Word {
+    static P: std::sync::OnceLock<Word> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        if poison_says("ptr") {
+            0x0000_7ead_beef_0000
         } else {
-            self.old.base_ptr(a).wrapping_add(old::offset_of(a))
+            0xdead_beef_dead_beef
         }
+    })
+}
+
+/// Every block freed under poisoning: where, and how many words.
+static QUARANTINE: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+fn quarantine(p: *mut Word, words: usize) {
+    for i in 0..words {
+        // Safety: the block's own words, which nothing should read any more.
+        unsafe { *p.add(i) = poison() };
     }
+    QUARANTINE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((p as usize, words));
+}
 
-    /// Set the `meta` of the object at `a`, keeping the rest of its header.
-    /// For a handler's target `Ref`, whose `meta` is otherwise unused: the tag
-    /// of the chunk its `handle` entered.
-    pub fn set_meta(&mut self, a: Addr, meta: u32) {
-        let w = self.slot(a + 1) & !0xFFFF_FFFF | meta as Word;
-        if a < OLD_BASE {
-            self.space[a as usize + 1] = w;
-        } else {
-            let _held = self.marking.is_some().then(|| lock(&self.mutation));
-            self.old.put(a + 1, w);
-        }
+/// Under poisoning, at exit: each freed block written to since, and each
+/// freed twice.
+pub fn quarantined() {
+    if !poisoning() {
+        return;
     }
-
-    /// Write the heap word at slot `a`, and **nothing else**: no descriptor,
-    /// no pointer bit, no remembered set, no snapshot barrier.
-    ///
-    /// This is what a [`crate::codegen::thin::Step::Store`] means, and it is
-    /// only safe because an expansion that uses one has guarded that none of
-    /// those is needed -- the object is a uniform array whose elements are not
-    /// references, so its descriptor cannot change, nothing in it is ever
-    /// followed by the collector, and no field of it can hold a young address.
-    /// Anything else goes through [`Heap::set_field_of`].
-    pub(crate) fn put_word_at(&mut self, a: Addr, w: Word) {
-        if a < OLD_BASE {
-            self.space[a as usize] = w;
-        } else {
-            debug_assert!(a < REGION_BASE, "a region is immutable");
-            self.old.put(a, w);
-        }
-    }
-
-    fn slot(&self, a: Addr) -> Word {
-        if a < OLD_BASE {
-            self.space[a as usize]
-        } else if a < REGION_BASE {
-            self.old.get(a)
-        } else {
-            self.blocks[Self::find_block(&self.blocks, a)].get(a)
-        }
-    }
-
-    fn find_block(blocks: &[Arc<Block>], a: Addr) -> usize {
-        let i = blocks.partition_point(|b| b.base <= a);
-        debug_assert!(i > 0, "{a} is below every region block this heap knows");
-        i - 1
-    }
-
-    #[inline(always)]
-    /// An object's header.
-    ///
-    /// Cheap for a nursery object -- two slot reads -- and not at all cheap for
-    /// an old one, where every slot read is a block lookup. A caller that needs
-    /// the kind, then the length, then a field should read this once and use
-    /// [`Heap::field_of`] and [`Heap::set_field_of`], rather than three
-    /// accessors that each read it again. See `prims.rs`.
-    pub fn head(&self, a: Addr) -> Head {
-        // The nursery, where nearly every object read is, with one test.
-        if a < OLD_BASE {
-            let i = a as usize;
-            return Head::read(self.space[i], self.space[i + 1]);
-        }
-        Head::read(self.slot(a), self.slot(a + 1))
-    }
-
-    /// Field `i`'s descriptor, in the object at `a` whose header is `h`.
-    #[inline]
-    fn desc(&self, a: Addr, h: &Head, i: usize) -> desc::Desc {
-        h.desc(i, |k| self.slot(a + k as Addr))
-    }
-
-    /// Is there an object at `a`? For a debugger reading an address it cannot
-    /// vouch for; the machine itself never needs to ask. Exact in the nursery,
-    /// which is walked to find out; elsewhere, whether a header could be there.
-    pub fn is_object(&self, a: Addr) -> bool {
-        if a < OLD_BASE {
-            return self.nursery_objects().any(|at| at == a);
-        }
-        if a < REGION_BASE {
-            return self.old.is_object(a);
-        }
-        let i = self.blocks.partition_point(|b| b.base <= a);
-        if i == 0 {
-            return false;
-        }
-        let b = &self.blocks[i - 1];
-        (a - b.base) + 1 < b.cap as Addr && Kind::try_from_byte(b.get(a) as u8).is_some()
-    }
-
-    /// Where every object in the nursery starts, in order.
-    fn nursery_objects(&self) -> impl Iterator<Item = Addr> + '_ {
-        let mut at = 0usize;
-        std::iter::from_fn(move || {
-            (at < self.top).then(|| {
-                let here = at;
-                at += Head::read(self.space[at], self.space[at + 1]).size();
-                here as Addr
-            })
-        })
-    }
-
-    /// Is `a` an address in a compact region?
-    pub fn in_region(&self, a: Addr) -> bool {
-        a >= REGION_BASE
-    }
-
-    pub fn kind(&self, a: Addr) -> Kind {
-        self.head(a).kind
-    }
-
-    pub fn len(&self, a: Addr) -> usize {
-        self.head(a).len as usize
-    }
-
-    pub fn meta(&self, a: Addr) -> u32 {
-        self.head(a).meta
-    }
-
-    pub fn field(&self, a: Addr, i: usize) -> Value {
-        self.field_of(a, &self.head(a), i)
-    }
-
-    /// [`Heap::field`], for a caller that has already read the header.
-    pub fn field_of(&self, a: Addr, h: &Head, i: usize) -> Value {
-        debug_assert!(
-            i < h.len as usize,
-            "field {i} of a {:?} of {}",
-            h.kind,
-            h.len
-        );
-        let w = self.slot(a + (h.header() + i) as Addr);
-        Value::from_bits(w, self.desc(a, h, i))
-    }
-
-    /// What an array's elements are: the one descriptor a uniform object
-    /// has for all of them.
-    pub fn element_desc(&self, a: Addr) -> desc::Desc {
-        let h = self.head(a);
-        debug_assert!(
-            h.kind.is_uniform(),
-            "a {:?} has no one element descriptor",
-            h.kind
-        );
-        self.desc(a, &h, 0)
-    }
-
-    /// Every field's word, in order, without saying what they are.
-    pub fn words(&self, a: Addr) -> Words<'_> {
-        self.words_in(a, 0, usize::MAX)
-    }
-
-    /// The fields of the object at `a`, in place -- when it is in the nursery,
-    /// which is where nearly every object a program is computing with lives.
-    /// `None` in the old generation or a region, where the slots are not one
-    /// run of memory to borrow.
-    #[inline]
-    pub fn nursery_words(&self, a: Addr) -> Option<&[Word]> {
-        if a >= OLD_BASE {
-            return None;
-        }
-        let h = self.head(a);
-        let base = a as usize + h.header();
-        self.space.get(base..base + h.len as usize)
-    }
-
-    // --- strings and bytes -------------------------------------------------------
-    //
-    // A string and a byte array are laid out alike: bytes packed eight to a
-    // word, the length in `meta`. What reads one reads the other.
-
-    /// Slots `len` packed bytes take.
-    pub fn packed_slots(len: usize) -> usize {
-        Heap::size_of(Kind::Str, len.div_ceil(8))
-    }
-
-    /// A string holding `bytes`, which must be UTF-8 -- see [`Kind::Str`].
-    pub fn alloc_str(&mut self, bytes: &[u8]) -> Addr {
-        self.alloc_packed(Kind::Str, bytes)
-    }
-
-    /// `bytes` as an `Array` of `UInt8` -- see [`Kind::Bytes`]. Empty, it is an
-    /// ordinary empty array, which is what every empty array is.
-    pub fn alloc_bytes(&mut self, bytes: &[u8]) -> Addr {
-        if bytes.is_empty() {
-            return self.alloc(Kind::Array, 0, &[]);
-        }
-        self.alloc_packed(Kind::Bytes, bytes)
-    }
-
-    fn alloc_packed(&mut self, kind: Kind, bytes: &[u8]) -> Addr {
-        let words = bytes.len().div_ceil(8);
-        let word = |i: usize| {
-            let chunk = &bytes[8 * i..bytes.len().min(8 * i + 8)];
-            let mut w = [0u8; 8];
-            w[..chunk.len()].copy_from_slice(chunk);
-            Word::from_le_bytes(w)
-        };
-        self.alloc_described(kind, bytes.len() as u32, words, word, |_| desc::INT)
-    }
-
-    // --- arrays, either way they are kept -------------------------------------------
-
-    /// Slots an array of `n` elements described by `d` takes.
-    pub fn array_slots(n: usize, d: desc::Desc) -> usize {
-        if n > 0 && d == Heap::BYTE {
-            Heap::packed_slots(n)
-        } else {
-            Heap::size_of(Kind::Array, n)
-        }
-    }
-
-    /// The descriptor of a `UInt8`, whose arrays are packed.
-    pub const BYTE: desc::Desc = desc::WORD + 3;
-
-    /// An array of `words`, each described by `d`: packed, if they are bytes.
-    pub fn alloc_array(&mut self, words: &[Word], d: desc::Desc) -> Addr {
-        if !words.is_empty() && d == Heap::BYTE {
-            let bytes: Vec<u8> = words.iter().map(|w| *w as u8).collect();
-            return self.alloc_packed(Kind::Bytes, &bytes);
-        }
-        self.alloc_described(Kind::Array, 0, words.len(), |i| words[i], |_| d)
-    }
-
-    /// How many elements the array at `a` has.
-    pub fn array_len(&self, a: Addr) -> usize {
-        let h = self.head(a);
-        match h.kind {
-            Kind::Bytes => h.meta as usize,
-            _ => h.len as usize,
-        }
-    }
-
-    /// What every element of the array at `a` is.
-    pub fn array_desc(&self, a: Addr) -> desc::Desc {
-        match self.kind(a) {
-            Kind::Bytes => Heap::BYTE,
-            _ => self.element_desc(a),
-        }
-    }
-
-    /// Element `i` of the array at `a`, which has one, as a word.
-    pub fn array_word(&self, a: Addr, i: usize) -> Word {
-        match self.kind(a) {
-            Kind::Bytes => self.packed_byte(a, i) as Word,
-            _ => self.field_word(a, i),
-        }
-    }
-
-    /// Element `i` of the array at `a`, which has one.
-    pub fn array_value(&self, a: Addr, i: usize) -> Value {
-        match self.kind(a) {
-            Kind::Bytes => Value::Word(meadow_rt::num::Width::U8, self.packed_byte(a, i) as u64),
-            _ => self.field(a, i),
-        }
-    }
-
-    /// Elements `from..to` of the array at `a`, as words.
-    pub fn array_words(&self, a: Addr, from: usize, to: usize) -> Vec<Word> {
-        match self.kind(a) {
-            Kind::Bytes => self
-                .packed_bytes_in(a, from, to)
-                .into_iter()
-                .map(Word::from)
-                .collect(),
-            _ => self.words_in(a, from, to).collect(),
-        }
-    }
-
-    /// Every element of the array at `a`.
-    pub fn array_values(&self, a: Addr) -> Vec<Value> {
-        (0..self.array_len(a))
-            .map(|i| self.array_value(a, i))
-            .collect()
-    }
-
-    /// The length in bytes of the string or byte array at `a`.
-    pub fn packed_len(&self, a: Addr) -> usize {
-        self.head(a).meta as usize
-    }
-
-    /// Byte `i` of the string or byte array at `a`, which has one.
-    pub fn packed_byte(&self, a: Addr, i: usize) -> u8 {
-        let h = self.head(a);
-        debug_assert!(i < h.meta as usize, "byte {i} of a string of {}", h.meta);
-        let w = self.slot(a + (h.header() + i / 8) as Addr);
-        (w >> (8 * (i % 8))) as u8
-    }
-
-    /// Bytes `from..to` of the string at `a`, copied out.
-    pub fn packed_bytes_in(&self, a: Addr, from: usize, to: usize) -> Vec<u8> {
-        let h = self.head(a);
-        let to = to.min(h.meta as usize);
-        let from = from.min(to);
-        let base = a + h.header() as Addr;
-        let mut out = Vec::with_capacity(to - from);
-        let mut i = from;
-        while i < to {
-            let w = self.slot(base + (i / 8) as Addr).to_le_bytes();
-            let k = i % 8;
-            let take = (8 - k).min(to - i);
-            out.extend_from_slice(&w[k..k + take]);
-            i += take;
-        }
-        out
-    }
-
-    /// All of the string at `a`'s bytes.
-    pub fn packed_bytes(&self, a: Addr) -> Vec<u8> {
-        self.packed_bytes_in(a, 0, usize::MAX)
-    }
-
-    /// Whether the strings at `a` and `b` hold the same bytes.
-    pub fn packed_eq(&self, a: Addr, b: Addr) -> bool {
-        let (ha, hb) = (self.head(a), self.head(b));
-        ha.meta == hb.meta
-            && self
-                .words_in(a, 0, ha.len as usize)
-                .eq(self.words_in(b, 0, hb.len as usize))
-    }
-
-    /// Fields `from..to` of `a`'s words. Not `words(a).skip(from)`, which
-    /// reads every field before `from` to throw it away -- and made slicing a
-    /// long array cost its whole length each time.
-    ///
-    /// A nursery object is read as the slice it is. Going through `slot` for
-    /// each word -- a range test and a bounds check apiece -- was 44% of adding
-    /// two large `BigInt`s, and it is the same loop string comparison runs.
-    pub fn words_in(&self, a: Addr, from: usize, to: usize) -> Words<'_> {
-        let h = self.head(a);
-        let to = to.min(h.len as usize);
-        let from = from.min(to);
-        if a < OLD_BASE {
-            let base = a as usize + h.header();
-            if let Some(slice) = self.space.get(base + from..base + to) {
-                return Words::Slice(slice.iter());
-            }
-        }
-        let base = a + h.header() as Addr;
-        Words::Slots {
-            heap: self,
-            at: base + from as Addr,
-            end: base + to as Addr,
-        }
-    }
-
-    /// Field `i`'s word, without saying what it is.
-    #[inline]
-    pub fn field_word(&self, a: Addr, i: usize) -> Word {
-        let h = self.head(a);
-        self.slot(a + (h.header() + i) as Addr)
-    }
-
-    /// Overwrite a field. Only a `Ref`, a mutable array or a resumption is
-    /// ever written after it is made, and this is where the barriers are: an
-    /// old object's field that now points into the nursery is remembered, and
-    /// while marking, the value it held is logged.
-    ///
-    /// A field of an array, whose one descriptor describes every element, keeps
-    /// its representation; any other can change it -- a `()` placeholder
-    /// replaced by an object -- and its descriptor changes with it, under the
-    /// same lock the marker reads a mutable object's descriptors under.
-    pub fn set_field(&mut self, a: Addr, i: usize, v: Value) {
-        self.set_field_of(a, &self.head(a), i, v)
-    }
-
-    /// [`Heap::set_field`], for a caller that has already read the header.
-    pub fn set_field_of(&mut self, a: Addr, h: &Head, i: usize, v: Value) {
-        let h = *h;
-        let s = a + (h.header() + i) as Addr;
-        let was = self.desc(a, &h, i);
-        assert!(
-            was == v.desc() || !h.kind.is_uniform(),
-            "a {:?} of {} given {}",
-            h.kind,
-            desc::name(was),
-            v.kind()
-        );
-        if a < OLD_BASE {
-            self.space[s as usize] = v.bits();
-            if was != v.desc() {
-                let (k, w) = object::with_desc(i, v.desc(), |k| self.space[a as usize + k]);
-                self.space[a as usize + k] = w;
-            }
-            return;
-        }
-        debug_assert!(a < REGION_BASE, "a region is immutable");
-        let _held = self.marking.is_some().then(|| lock(&self.mutation));
-        if self.marking.is_some() && was == desc::REF {
-            let x = self.old.get(s) as Addr;
-            if x >= OLD_BASE {
-                self.satb.push(x);
-            }
-        }
-        self.old.put_field(s, v.bits(), v.addr().is_some());
-        if was != v.desc() {
-            let (k, w) = object::with_desc(i, v.desc(), |k| self.old.get(a + k as Addr));
-            self.old.put(a + k as Addr, w);
-        }
-        drop(_held);
-        self.barriers(s, v);
-        if self.satb.len() >= SATB_FLUSH {
-            self.flush_satb();
-        }
-    }
-
-    /// Every field, as a fresh `Vec` — for the places that want to read an
-    /// object and then allocate, which cannot hold heap references across the
-    /// allocation.
-    pub fn fields(&self, a: Addr) -> Vec<Value> {
-        let h = self.head(a);
-        let base = a + h.header() as Addr;
-        (0..h.len as usize)
-            .map(|i| Value::from_bits(self.slot(base + i as Addr), self.desc(a, &h, i)))
-            .collect()
-    }
-
-    // --- collecting -----------------------------------------------------------------
-
-    /// Collect, rewriting `roots` in place.
-    ///
-    /// The caller passes every address it can still reach — registers, the
-    /// handler stack — and reads them back changed. Anything not in `roots` is
-    /// garbage by definition, including addresses sitting in Rust locals, which
-    /// is why the VM allocates only at points where it holds none.
-    ///
-    /// This is a nursery collection, and whatever the old generation's marking
-    /// needs from a pause: to begin, to be helped along, or to finish.
-    pub fn collect(&mut self, roots: &mut [Value]) {
-        let started = Instant::now();
-        self.collections += 1;
-        let marked = self.marking.is_some();
-        if marked {
-            self.advance(roots);
-        }
-        // Finishing a cycle has a pause's work already; moving waits a pause.
-        let finished = marked && self.marking.is_none();
-        let begin = self.marking.is_none() && !self.old.is_empty() && self.wants_cycle();
-        self.minor(roots, begin);
-        if begin {
-            self.begin_cycle(roots);
-        } else if self.marking.is_none() && self.promoting {
-            if !finished {
-                self.evacuate(roots, Some(EVACUATE));
-            }
-            self.old.release(RELEASE_BUDGET);
-        }
-        if self.promoting && self.config.mark_threads > 0 {
-            mark::tend_spares(self.config.mark_threads);
-        }
-        self.region_growth = 0;
-        let took = started.elapsed().as_nanos() as u64;
-        self.gc_nanos += took;
-        self.pauses.record(took);
-    }
-
-    /// Collect everything now: finish the cycle in progress, if there is one,
-    /// then run a whole cycle, marking on this thread. A long pause, for tests
-    /// and for a program that has just let go of a great deal.
-    pub fn collect_all(&mut self, roots: &mut [Value]) {
-        while let Some(job) = self.marking.clone() {
-            self.flush_satb();
-            job.step(Duration::MAX, usize::MAX);
-            if job.is_done() {
-                self.finish_cycle(roots);
-            }
-        }
-        self.minor(roots, !self.old.is_empty());
-        if !self.old.is_empty() {
-            self.begin_cycle(roots);
-            let job = self.marking.clone().expect("a cycle just begun");
-            while !job.is_done() {
-                job.step(Duration::MAX, usize::MAX);
-            }
-            self.finish_cycle(roots);
-        }
-        self.evacuate(roots, None);
-    }
-
-    /// Move survivors out of sparse old blocks, within `budget` -- see
-    /// [`crate::evacuate`]. Only between cycles, with the nursery collected.
-    fn evacuate(&mut self, roots: &mut [Value], budget: Option<(Duration, usize)>) {
-        if !self.config.evacuate || self.marking.is_some() || !self.evac.has_pending() {
-            return;
-        }
-        let frames = frame_slots(&self.old, self.fcur, self.fsp, &self.detached);
-        self.evac.evacuate(
-            &mut self.old,
-            &mut self.space[..self.top],
-            roots,
-            &frames,
-            &mut self.remembered,
-            budget,
-        );
-        self.evacuated = self.evac.moved;
-        self.evacuated_blocks = self.evac.blocks;
-        if self.config.verify {
-            self.verify_addresses(roots);
-        }
-    }
-
-    /// Has the old generation grown enough since the last cycle to mark it
-    /// again?
-    fn wants_cycle(&self) -> bool {
-        let live = self.old.live as usize;
-        let growth = live.max(self.config.min_trigger.saturating_sub(live));
-        self.old.allocated as usize >= growth || self.region_growth > self.space.len()
-    }
-
-    /// While marking: hand over the log, help if the marker is behind or there
-    /// is none, and finish if it is done.
-    fn advance(&mut self, roots: &mut [Value]) {
-        let job = self.marking.clone().expect("marking");
-        self.flush_satb();
-        let live = self.old.live as usize;
-        let trigger = (2 * live).max(self.config.min_trigger);
-        let behind = self.old.allocated as usize > 2 * trigger;
-        if self.config.mark_threads == 0 || behind {
-            job.step(ASSIST, self.config.mark_slice);
-        }
-        if job.is_done() {
-            self.finish_cycle(roots);
-        }
-    }
-
-    fn flush_satb(&mut self) {
-        if let Some(job) = &self.marking
-            && !self.satb.is_empty()
-        {
-            job.push(&self.satb);
-            self.satb.clear();
-            if self.config.mark_threads > 0 {
-                mark::submit(job, self.config.mark_threads);
-            }
-        }
-    }
-
-    /// The nursery is empty: start marking from `roots`.
-    fn begin_cycle(&mut self, roots: &[Value]) {
-        debug_assert_eq!(self.top, 0, "a cycle begins with the nursery empty");
-        let epoch = self
-            .old
-            .epoch()
-            .checked_add(1)
-            .expect("marking cycles have run out of epochs");
-        self.old.begin(epoch);
-        self.evac.begin(&self.old);
-        for r in self.regions.values_mut() {
-            r.marked = false;
-        }
-        let job = mark::Job::new(
-            epoch,
-            self.old.blocks.clone(),
-            self.blocks.clone(),
-            self.mutation.clone(),
-        );
-        let mut grey = Vec::new();
-        for r in roots {
-            if let Value::Obj(x) = *r {
-                if x >= REGION_BASE {
-                    self.mark_region_at(x);
-                } else {
-                    debug_assert!(x >= OLD_BASE, "a root in the emptied nursery");
-                    grey.push(x);
-                }
-            }
-        }
-        // The frames, live and detached alike, exactly as the registers: what
-        // they reach is in the snapshot. A segment detached after this is
-        // black, and one put back is live -- neither needs the marker to look.
-        let slots = frame_slots(&self.old, self.fcur, self.fsp, &self.detached);
-        for slot in slots {
-            let x = self.old.get(slot) as Addr;
-            if x >= REGION_BASE {
-                self.mark_region_at(x);
-            } else if x >= OLD_BASE {
-                grey.push(x);
-            }
-        }
-        job.push(&grey);
-        if self.config.mark_threads > 0 {
-            mark::submit(&job, self.config.mark_threads);
-        }
-        self.marking = Some(job);
-        self.cycles += 1;
-    }
-
-    /// Marking is done: adopt what it found.
-    fn finish_cycle(&mut self, roots: &[Value]) {
-        let job = self.marking.take().expect("marking");
-        job.cancel();
-        for id in job.found() {
-            if let Some(r) = self.regions.get_mut(&id) {
-                r.marked = true;
-            }
-        }
-        if self.config.verify {
-            self.verify(roots, job.epoch);
-        }
-        self.old.finish(job.marked());
-        if self.config.evacuate {
-            self.evac.finish(&self.old);
-        }
-        self.mark_nanos += job.nanos();
-
-        let unreached: Vec<u32> = self
-            .regions
-            .iter()
-            .filter(|(_, r)| !r.marked)
-            .map(|(id, _)| *id)
+    let q = QUARANTINE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut written = 0;
+    let mut seen = std::collections::HashSet::new();
+    let mut twice = 0;
+    for &(p, words) in q.iter() {
+        twice += usize::from(!seen.insert(p));
+        let p = p as *const Word;
+        // Safety: never handed out again under poisoning.
+        let changed: Vec<(usize, Word)> = (0..words)
+            .map(|i| (i, unsafe { *p.add(i) }))
+            .filter(|(_, w)| *w != poison())
             .collect();
-        for id in unreached {
-            self.free_region(id);
-        }
-        // A detached segment nothing named any more is dead, chunks and all.
-        // One cut after the cycle began is black: it stays whatever the marker
-        // saw. The marker only reads the old generation, so it can only judge a
-        // segment whose object is there and was there unmarked: one whose
-        // object is still young -- or not yet made -- is the nursery
-        // collection's to judge, and one whose object was promoted while the
-        // cycle ran was allocated marked, which the marker never reads. Freeing
-        // either left a resumption with nothing to put back ("continuation
-        // resumed more than once").
-        let named = job.stacks();
-        let old = &self.old;
-        let mut dead = Vec::new();
-        self.detached.retain(|d| {
-            let young = d.obj < OLD_BASE;
-            let promoted =
-                d.obj >= OLD_BASE && d.obj < REGION_BASE && old.is_marked(d.obj, job.epoch);
-            let keep = d.epoch >= job.epoch || named.contains(&d.top) || young || promoted;
-            if !keep {
-                dead.push(d.top);
-            }
-            keep
-        });
-        for top in dead {
-            self.free_segment(top);
-        }
-        // A remembered field in a line the cycle freed belongs to a dead
-        // object, and the line may be allocated into: forget it.
-        let old = &self.old;
-        self.remembered.retain(|s| {
-            let keep = old.line_live(*s);
-            if !keep {
-                old.forget(*s);
-            }
-            keep
-        });
-    }
-
-    /// Mark the region holding address `a`.
-    fn mark_region_at(&mut self, a: Addr) {
-        let id = self.blocks[Self::find_block(&self.blocks, a)].region;
-        if let Some(r) = self.regions.get_mut(&id) {
-            r.marked = true;
-        }
-    }
-
-    /// Collect the nursery: copy what survives within it, or promote it, and
-    /// with `promote_all` promote everything, leaving it empty.
-    fn minor(&mut self, roots: &mut [Value], promote_all: bool) {
-        let mut to = std::mem::take(&mut self.other);
-        // As long as the from-space, and deliberately *not* zeroed. Every slot
-        // below `top` is written by the copy below, and nothing reads above it:
-        // `nursery_objects` and the verifier both stop at `top`, allocation
-        // writes every slot it bumps past, and `alloc_packed` zeroes its own
-        // padding word rather than trusting the heap to be clear.
-        //
-        // Zeroing it cost a memset of the whole nursery on every collection, so
-        // a pause cost what the nursery *is* rather than what survived it --
-        // which is the wrong scaling for a copying collector, and what stopped
-        // the nursery being made bigger for throughput.
-        //
-        // The length has to match the from-space exactly, not merely be enough:
-        // `Minor::forward` decides whether to promote by `to.len()`, so a to-space
-        // left over from a larger nursery would quietly promote less.
-        let want = self.space.len();
-        if to.len() < want {
-            to.resize(want, 0);
-        } else {
-            // No write: `truncate` on a `Copy` element only moves the length.
-            to.truncate(want);
-        }
-        // With nothing in the old generation, this collection sees everything,
-        // and can tell which regions nothing reaches.
-        let whole = self.old.is_empty() && self.marking.is_none();
-        if whole {
-            for r in self.regions.values_mut() {
-                r.marked = false;
-            }
-        }
-        let mut gc = Minor {
-            from: &mut self.space,
-            to: &mut to,
-            top: 0,
-            aged: self.aged,
-            promote: self.promoting || promote_all,
-            promote_all,
-            black: self.marking.is_some(),
-            old: &mut self.old,
-            promoted: Vec::new(),
-            remembered: Vec::new(),
-            evac: &mut self.evac,
-            blocks: &self.blocks,
-            regions: &mut self.regions,
-            whole,
-            copied: 0,
-            promoted_slots: 0,
-        };
-
-        for r in roots.iter_mut() {
-            if let Value::Obj(a) = *r {
-                *r = Value::Obj(gc.forward(a));
-            }
-        }
-        // Every frame on the stack, and on every detached segment, is a root:
-        // its references into the nursery move with what they point at.
-        //
-        // A chunk at a time, skipping the ones known to hold nothing young
-        // (see `clean_chunks`) -- except when this collection is the whole,
-        // which also marks the regions frames point into and has to see them
-        // all. A chunk that is not the current one and comes out of its scan
-        // with nothing young in it is clean from now on: a survivor can stay
-        // young for one collection, so that is not always the first scan.
-        let scan = |gc: &mut Minor, chunk: Addr, end: Addr| -> bool {
-            let mut young = false;
-            let mut slots = Vec::new();
-            chunk_slots(gc.old, chunk, end, &mut slots);
-            for slot in slots {
-                let x = gc.old.get(slot) as Addr;
-                // Into the nursery: moved with what it points at. Into a
-                // region: what keeps the region alive, when this collection
-                // is the whole.
-                if x < OLD_BASE || x >= REGION_BASE {
-                    let n = gc.forward(x);
-                    gc.old.put(slot, n as Word);
-                    young |= n < OLD_BASE;
-                }
-            }
-            young
-        };
-        for (chunk, end) in chunk_chain(gc.old, self.fcur, self.fsp) {
-            let current = chunk == self.fcur;
-            if !whole && !current && self.clean_chunks.contains(&chunk) {
-                continue;
-            }
-            let young = scan(&mut gc, chunk, end);
-            if !current && !young {
-                self.clean_chunks.insert(chunk);
-            }
-        }
-        for d in self.detached.iter_mut() {
-            if !whole && d.clean {
-                continue;
-            }
-            let mut young = false;
-            for (chunk, end) in chunk_chain(gc.old, d.top, d.end) {
-                young |= scan(&mut gc, chunk, end);
-            }
-            d.clean = !young;
-        }
-
-        {
-            // A remembered field may be in an object the marker is reading.
-            let _held = gc.black.then(|| lock(&self.mutation));
-            for s in std::mem::take(&mut self.remembered) {
-                let x = gc.old.get(s) as Addr;
-                if gc.old.is_pointer(s) && x < OLD_BASE {
-                    let n = gc.forward(x);
-                    gc.old.put_field(s, n as Word, true);
-                    if n < OLD_BASE {
-                        gc.remembered.push(s);
-                    } else {
-                        gc.old.forget(s);
-                    }
-                } else {
-                    gc.old.forget(s);
-                }
-            }
-        }
-
-        // To-space is its own queue; promoted objects wait on a stack.
-        let mut scan = 0usize;
-        loop {
-            if scan < gc.top {
-                let h = Head::read(gc.to[scan], gc.to[scan + 1]);
-                let base = scan + h.header();
-                if h.may_point() {
-                    for i in 0..h.len as usize {
-                        if h.desc(i, |k| gc.to[scan + k]) == desc::REF {
-                            let n = gc.forward(gc.to[base + i] as Addr);
-                            gc.to[base + i] = n as Word;
-                        }
-                    }
-                }
-                scan += h.size();
-            } else if let Some(p) = gc.promoted.pop() {
-                let h = Head::read(gc.old.get(p), gc.old.get(p + 1));
-                let base = p + h.header() as Addr;
-                for i in 0..h.len as usize {
-                    if h.desc(i, |k| gc.old.get(p + k as Addr)) != desc::REF {
-                        continue;
-                    }
-                    let s = base + i as Addr;
-                    let a = gc.old.get(s) as Addr;
-                    let n = gc.forward(a);
-                    if a < OLD_BASE {
-                        gc.old.put_field(s, n as Word, true);
-                    }
-                    if n < OLD_BASE {
-                        if gc.old.remember(s) {
-                            gc.remembered.push(s);
-                        }
-                    } else {
-                        gc.evac.note(gc.old, s, n);
-                    }
-                }
-            } else {
-                break;
-            }
-        }
-
-        let top = gc.top;
-        let (copied, promoted) = (gc.copied, gc.promoted_slots);
-        self.remembered = gc.remembered;
-        self.other = std::mem::replace(&mut self.space, to);
-        self.sync();
-        self.top = top;
-        self.aged = top;
-        // A segment whose naming object was young and did not survive is dead
-        // now, not at the end of some later marking cycle: a transaction that
-        // retries cuts one off every attempt, and waiting for the marker to
-        // free them left a chunk to allocate per attempt. One whose object
-        // moved is followed; one whose object was promoted is the marker's.
-        let from = &self.other;
-        let mut dead = Vec::new();
-        for d in &mut self.detached {
-            if d.obj != 0 && d.obj < OLD_BASE {
-                match object::forwarded(from[d.obj as usize]) {
-                    Some(n) => d.obj = n,
-                    None => dead.push(d.top),
-                }
-            }
-        }
-        if !dead.is_empty() {
-            self.detached.retain(|d| !dead.contains(&d.top));
-            for top in dead {
-                self.free_segment(top);
-            }
-        }
-        self.copied += copied as u64;
-        self.promoted += promoted as u64;
-
-        if whole {
-            // A region nothing reached is no longer this heap's business. It
-            // is freed, all at once, when nothing else refers to it either.
-            let unreached: Vec<u32> = self
-                .regions
-                .iter()
-                .filter(|(_, r)| !r.marked)
-                .map(|(id, _)| *id)
-                .collect();
-            for id in unreached {
-                self.free_region(id);
-            }
-        }
-
-        // More than half full after collecting means the next collection would
-        // come almost immediately. Grow instead, so collection stays amortised
-        // -- or, at the nursery's largest, start promoting.
-        if self.top * 2 > self.space.len() {
-            let bigger = (self.space.len() * 2).max(64);
-            match self.config.collector {
-                Collector::Copying => {
-                    assert!(
-                        bigger <= OLD_BASE as usize,
-                        "the heap has used up its address space"
-                    );
-                    self.space.resize(bigger, 0);
-                    self.sync();
-                }
-                Collector::Generational if bigger <= self.config.nursery => {
-                    self.space.resize(bigger, 0);
-                    self.sync();
-                }
-                Collector::Generational => self.promoting = true,
+        if !changed.is_empty() {
+            written += 1;
+            if written <= 20 {
+                eprintln!("aot: freed block {p:p} of {words} words written since: {changed:x?}");
             }
         }
     }
+    eprintln!(
+        "aot: {} blocks freed; {written} written to after, {twice} freed twice",
+        q.len()
+    );
+}
 
-    /// Check that every address reachable from `roots` is an object where it
-    /// should be: what moving objects has to leave true.
-    fn verify_addresses(&self, roots: &[Value]) {
-        let mut seen = std::collections::HashSet::new();
-        let young: std::collections::HashSet<Addr> = self.nursery_objects().collect();
-        let mut stack: Vec<Addr> = roots.iter().filter_map(|r| r.addr()).collect();
-        while let Some(a) = stack.pop() {
-            if a >= REGION_BASE || !seen.insert(a) {
-                continue;
-            }
-            // A frame is in a stack chunk, which holds no objects as the old
-            // generation counts them: it is pushed and popped, not allocated.
-            // What it holds is checked like anything else.
-            assert!(
-                if a < OLD_BASE {
-                    young.contains(&a)
-                } else {
-                    self.old.is_object(a) || self.old.in_stack(a)
-                },
-                "{a} is reachable but is not an object: a pointer was not moved"
-            );
-            for i in 0..self.len(a) {
-                if let Value::Obj(x) = self.field(a, i) {
-                    stack.push(x);
-                }
-            }
-        }
+/// Under poisoning, on Windows: an access violation said before the process
+/// goes -- where, the offset into the executable, and the address touched.
+pub fn catch_faults() {
+    if !poisoning() {
+        return;
     }
-
-    /// Check that every old object reachable from `roots` is marked in `epoch`
-    /// with its lines stamped, and every region reachable is marked: what a
-    /// cycle has to have done before its result is adopted.
-    fn verify(&self, roots: &[Value], epoch: u32) {
-        let mut seen = std::collections::HashSet::new();
-        let mut stack: Vec<Addr> = roots.iter().filter_map(|r| r.addr()).collect();
-        while let Some(a) = stack.pop() {
-            if a >= REGION_BASE {
-                let id = self.blocks[Self::find_block(&self.blocks, a)].region;
-                assert!(
-                    self.regions.get(&id).is_some_and(|r| r.marked),
-                    "region {id} is reachable but was not marked"
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct Record {
+            code: u32,
+            flags: u32,
+            next: *mut Record,
+            address: *mut std::ffi::c_void,
+            count: u32,
+            info: [usize; 15],
+        }
+        #[repr(C)]
+        struct Pointers {
+            record: *mut Record,
+            context: *mut std::ffi::c_void,
+        }
+        unsafe extern "system" {
+            fn AddVectoredExceptionHandler(
+                first: u32,
+                handler: extern "system" fn(*mut Pointers) -> i32,
+            ) -> *mut std::ffi::c_void;
+            fn GetModuleHandleW(name: *const u16) -> *mut std::ffi::c_void;
+        }
+        extern "system" fn said(p: *mut Pointers) -> i32 {
+            // Safety: what Windows hands a vectored handler.
+            let r = unsafe { &*(*p).record };
+            if r.code == 0xc000_0005 {
+                let base = unsafe { GetModuleHandleW(std::ptr::null()) } as usize;
+                eprintln!(
+                    "aot: access violation at {:p} (offset {:#x} in the executable), {} {:#x}",
+                    r.address,
+                    (r.address as usize).wrapping_sub(base),
+                    if r.info[0] == 1 { "writing" } else { "reading" },
+                    r.info[1]
                 );
-                continue;
+                std::process::exit(99);
             }
-            if !seen.insert(a) {
-                continue;
-            }
-            let h = self.head(a);
-            let (kind, len, meta) = (h.kind, h.len, h.meta);
-            // A frame is in a stack chunk, which the marker leaves alone: the
-            // frame stack is a root, and a chunk is freed as one with its
-            // segment (see `finish_cycle`), not line by line. What the frame
-            // holds is checked like anything else.
-            if a >= OLD_BASE && !self.old.in_stack(a) {
-                assert!(
-                    self.old.is_marked(a, epoch),
-                    "old object {a} ({kind:?}) is reachable but was not marked"
-                );
-                for s in a..a + h.size() as Addr {
-                    let b = &self.old.blocks[old::block_of(s)];
-                    assert_eq!(
-                        b.line(old::offset_of(s) / old::LINE),
-                        epoch,
-                        "a line of old object {a} was not stamped"
-                    );
-                }
-            }
-            if kind == Kind::Compact {
-                assert!(
-                    self.regions.get(&meta).is_some_and(|r| r.marked),
-                    "compact handle {a}'s region {meta} was not marked"
-                );
-            }
-            for i in 0..len as usize {
-                if let Value::Obj(x) = self.field(a, i) {
-                    stack.push(x);
-                }
-            }
+            0
         }
+        // Safety: a handler that lives as long as the process.
+        unsafe { AddVectoredExceptionHandler(1, said) };
     }
+}
 
-    // --- passing values between heaps ----------------------------------------
+/// The block at `v` is done with: its fields were moved out, or erased.
+pub fn clean(v: Word) {
+    clean_in(crate::ctx::get(), v);
+}
 
-    /// Lift `v` and everything it reaches out of this heap. The heap is only
-    /// read. Sharing inside `v` survives. What is in a shared region is not
-    /// copied: the parcel keeps the address, and holds the region.
-    pub fn export(&self, v: Value) -> Result<Parcel, Unsendable> {
-        let mut parcel = Parcel {
-            slots: Vec::new(),
-            root: v,
-            regions: Vec::new(),
-        };
-        let Value::Obj(a) = v else {
-            return Ok(parcel);
-        };
-        let mut copies: HashMap<Addr, Addr> = HashMap::new();
-        parcel.root = Value::Obj(self.export_object(a, &mut parcel, &mut copies)?);
-        // The parcel is its own queue, as to-space is for the collector.
-        let mut scan = 0usize;
-        while scan < parcel.slots.len() {
-            let h = Head::read(parcel.slots[scan], parcel.slots[scan + 1]);
-            for f in 0..h.len as usize {
-                if h.desc(f, |k| parcel.slots[scan + k]) == desc::REF {
-                    let at = scan + h.header() + f;
-                    let to =
-                        self.export_object(parcel.slots[at] as Addr, &mut parcel, &mut copies)?;
-                    parcel.slots[at] = to as Word;
-                }
-            }
-            scan += h.size();
-        }
-        Ok(parcel)
+/// [`clean`], into context `c`'s heap.
+pub fn clean_in(c: *mut crate::ctx::Ctx, v: Word) {
+    // Traced, a block is freed by the sweep and nothing else.
+    if crate::trace::on() {
+        return;
     }
-
-    fn export_object(
-        &self,
-        a: Addr,
-        parcel: &mut Parcel,
-        copies: &mut HashMap<Addr, Addr>,
-    ) -> Result<Addr, Unsendable> {
-        if a >= REGION_BASE {
-            let id = self.blocks[Self::find_block(&self.blocks, a)].region;
-            self.carry(parcel, id);
-            return Ok(a);
-        }
-        if let Some(&c) = copies.get(&a) {
-            return Ok(c);
-        }
-        let h = self.head(a);
-        match h.kind {
-            Kind::Ref => return Err(Unsendable::Ref),
-            Kind::MutArray => return Err(Unsendable::MutArray),
-            Kind::Resume | Kind::Frame | Kind::Stack => return Err(Unsendable::Continuation),
-            Kind::Compact => self.carry(parcel, h.meta),
-            _ => {}
-        }
-        // Copied word for word: the header's descriptors say what the fields
-        // are wherever the words go.
-        let at = parcel.slots.len() as Addr;
-        parcel
-            .slots
-            .extend((0..h.size()).map(|k| self.slot(a + k as Addr)));
-        copies.insert(a, at);
-        Ok(at)
+    if crate::cycles::possible() && buffered(v) {
+        // Waiting in the candidate buffer: hold the memory back, and
+        // remember that there is nothing left inside to erase.
+        set_word(
+            v,
+            FLAGS,
+            (word(v, FLAGS) | DEAD | MOVED) & !(3 << COLOUR_SHIFT),
+        );
+        return;
     }
+    let words = size(v);
+    with_in(c, |h| h.clean_block(ptr(v), words));
+}
 
-    /// Make the parcel hold region `id`, once.
-    fn carry(&self, parcel: &mut Parcel, id: u32) {
-        if parcel.regions.iter().any(|r| r.id == id) {
+impl Heap {
+    /// Keep `v` for the cycle collector to look at, unless it is kept
+    /// already. See [`crate::cycles`].
+    pub(crate) fn candidate(&mut self, v: Word) {
+        if colour(v) == PURPLE {
             return;
         }
-        if let Some(r) = self.regions.get(&id) {
-            parcel.regions.push(r.region.clone());
+        set_colour(v, PURPLE);
+        if !buffered(v) {
+            set_buffered(v, true);
+            self.candidates.push(v);
+            self.schedule();
         }
     }
 
-    /// Rebuild a parcel in this heap. The caller must have [`Heap::reserve`]d
-    /// [`Parcel::len`] slots, as for any allocation.
-    pub fn import(&mut self, p: &Parcel) -> Value {
-        for r in &p.regions {
-            self.adopt(r);
-        }
-        if !self.room_for(p.slots.len()) {
-            return self.import_scattered(p);
-        }
-        let base = self.top as Addr;
-        let rebase = |x: Addr| if x < REGION_BASE { x + base } else { x };
-        let into = &mut self.space[self.top..self.top + p.slots.len()];
-        into.copy_from_slice(&p.slots);
-        let mut at = 0;
-        while at < into.len() {
-            let h = Head::read(into[at], into[at + 1]);
-            for f in 0..h.len as usize {
-                if h.desc(f, |k| into[at + k]) == desc::REF {
-                    let s = at + h.header() + f;
-                    into[s] = rebase(into[s] as Addr) as Word;
-                }
-            }
-            at += h.size();
-        }
-        self.top += p.slots.len();
-        self.allocated += p.slots.len() as u64;
-        match p.root {
-            Value::Obj(x) => Value::Obj(rebase(x)),
-            v => v,
+    /// A candidate has just been buffered: bring the next run no further off
+    /// than it already was. Never further -- a mark that moved with the heap
+    /// would never be reached.
+    fn schedule(&mut self) {
+        if self.candidates.len() >= self.trigger {
+            self.run_at = 0;
+        } else if self.run_at == usize::MAX {
+            self.run_at = (2 * self.live.max(0) as usize).max(FLOOR);
         }
     }
 
-    /// A parcel too big for the nursery, rebuilt an object at a time wherever
-    /// each fits: made first, then its fields filled in with where the
-    /// objects they point at went.
-    fn import_scattered(&mut self, p: &Parcel) -> Value {
-        let mut at = vec![0 as Addr; p.slots.len()];
-        let heads: Vec<(usize, Head)> = {
-            let mut heads = Vec::new();
-            let mut i = 0;
-            while i < p.slots.len() {
-                let h = Head::read(p.slots[i], p.slots[i + 1]);
-                heads.push((i, h));
-                i += h.size();
-            }
-            heads
-        };
-        // Each object made first, holding what the parcel's fields hold, so
-        // that its descriptors are the parcel's; then its addresses fixed.
-        for &(i, h) in &heads {
-            let fields: Vec<Value> = (0..h.len as usize)
-                .map(|f| {
-                    let d = h.desc(f, |k| p.slots[i + k]);
-                    let w = p.slots[i + h.header() + f];
-                    // Not yet an address in this heap: nothing to trace.
-                    if d == desc::REF {
-                        Value::Obj(0)
-                    } else {
-                        Value::from_bits(w, d)
-                    }
-                })
-                .collect();
-            at[i] = self.alloc(h.kind, h.meta, &fields);
+    /// A run has just finished: when the next one is due, from what it left.
+    /// Once the collector is going it keeps going -- the next allocation
+    /// starts another run -- until there is nothing buffered; then it waits
+    /// for a doubling of the heap, or for [`crate::cycles::TRIGGER`]
+    /// candidates, whichever comes first. See [`Heap::run_at`].
+    pub(crate) fn reschedule(&mut self) {
+        if self.candidates.is_empty() {
+            self.draining = false;
         }
-        let rebase = |v: Value| match v {
-            Value::Obj(x) if x < REGION_BASE => Value::Obj(at[x as usize]),
-            v => v,
-        };
-        for &(i, h) in &heads {
-            let header = h.header() as Addr;
-            for f in 0..h.len as usize {
-                if h.desc(f, |k| p.slots[i + k]) != desc::REF {
-                    continue;
-                }
-                let v = rebase(Value::Obj(p.slots[i + h.header() + f] as Addr));
-                let s = at[i] + header + f as Addr;
-                if s < OLD_BASE {
-                    self.space[s as usize] = v.bits();
-                } else {
-                    self.init_old(s, v);
-                }
-            }
-        }
-        rebase(p.root)
-    }
-
-    // --- compact regions ----------------------------------------------------
-
-    /// Refer to `region`: from now on its addresses can be read here. Also how
-    /// a heap learns of blocks a region grew since it last looked.
-    pub fn adopt(&mut self, region: &Arc<Region>) {
-        let contents = region.lock();
-        let known = self.regions.get(&region.id).map_or(0, |r| r.blocks);
-        for b in &contents.blocks[known.min(contents.blocks.len())..] {
-            let at = self.blocks.partition_point(|x| x.base < b.base);
-            self.blocks.insert(at, b.clone());
-        }
-        let blocks = contents.blocks.len().max(known);
-        drop(contents);
-        // A region adopted while a cycle marks was not in its snapshot, so
-        // the cycle cannot tell whether it is reachable: it is kept.
-        let marking = self.marking.is_some();
-        self.regions
-            .entry(region.id)
-            .and_modify(|r| {
-                r.blocks = blocks;
-                r.marked |= marking;
-            })
-            .or_insert(Adopted {
-                region: region.clone(),
-                blocks,
-                marked: marking,
-            });
-    }
-
-    /// A new, empty region, referred to by this heap.
-    pub fn new_region(&mut self) -> u32 {
-        let region = Region::new();
-        self.adopt(&region);
-        region.id
-    }
-
-    /// The region `id`, if this heap refers to it.
-    pub fn region(&self, id: u32) -> Option<&Arc<Region>> {
-        self.regions.get(&id).map(|r| &r.region)
-    }
-
-    /// Slots in use by region `id`.
-    pub fn region_used(&self, id: u32) -> usize {
-        self.regions.get(&id).map_or(0, |r| r.region.used())
-    }
-
-    /// Stop referring to region `id`.
-    pub fn free_region(&mut self, id: u32) {
-        if self.regions.remove(&id).is_some() {
-            self.blocks.retain(|b| b.region != id);
-        }
-    }
-
-    /// Copy `v`, and everything it reaches, into region `id`, and answer the
-    /// copy. What is already in `id` is shared rather than copied again, and
-    /// sharing inside `v` survives: each object is copied once. What is in
-    /// another region is copied too, so a region never points outside itself.
-    ///
-    /// Iterative, as the collector is: the objects just appended to the region
-    /// are the queue. If `v` reaches something that cannot be compacted, the
-    /// region is put back exactly as it was.
-    pub fn compact_into(&mut self, id: u32, v: Value) -> Result<Value, Uncompactable> {
-        let region = self
-            .region(id)
-            .expect("a region this heap refers to")
-            .clone();
-        let mut contents = region.lock();
-        let end = contents.end();
-        let before = contents.used;
-        let result = self.copy_into(&mut contents, id, v, end);
-        if result.is_err() {
-            contents.truncate(end);
-        }
-        self.region_growth += contents.used - before;
-        drop(contents);
-        self.adopt(&region);
-        result
-    }
-
-    fn copy_into(
-        &self,
-        contents: &mut crate::region::Contents,
-        id: u32,
-        v: Value,
-        end: crate::region::End,
-    ) -> Result<Value, Uncompactable> {
-        let mut copies: HashMap<Addr, Addr> = HashMap::new();
-        let root = match v {
-            Value::Obj(a) => Value::Obj(self.copy_object(contents, id, a, &mut copies)?),
-            other => other,
-        };
-        // Walk what was appended, fixing each field to the copy of what it
-        // points at. Copies made on the way are appended, and walked in turn.
-        let mut cursor = contents.cursor(end);
-        while let Some((at, h)) = contents.next(&mut cursor) {
-            let block = contents.block_of(at).expect("an appended object").clone();
-            for f in 0..h.len as usize {
-                if h.desc(f, |k| block.get(at + k as Addr)) == desc::REF {
-                    let a = block.get(at + (h.header() + f) as Addr) as Addr;
-                    let to = self.copy_object(contents, id, a, &mut copies)?;
-                    contents.set_field(at, f, Value::Obj(to));
-                }
-            }
-        }
-        Ok(root)
-    }
-
-    /// The copy of object `a` in region `id`, making it if there is none yet.
-    /// Its fields are copied as they are, to be fixed by the walk.
-    fn copy_object(
-        &self,
-        contents: &mut crate::region::Contents,
-        id: u32,
-        a: Addr,
-        copies: &mut HashMap<Addr, Addr>,
-    ) -> Result<Addr, Uncompactable> {
-        if a >= REGION_BASE {
-            // In this region already, published or appended just now.
-            if contents.block_of(a).is_some() {
-                return Ok(a);
-            }
-        }
-        if let Some(&c) = copies.get(&a) {
-            return Ok(c);
-        }
-        let Head { kind, meta, .. } = self.head(a);
-        let meta = match kind {
-            Kind::Ref => return Err(Uncompactable::Ref),
-            Kind::MutArray => return Err(Uncompactable::MutArray),
-            Kind::Closure | Kind::Resume | Kind::Frame | Kind::Stack => {
-                return Err(Uncompactable::Function);
-            }
-            // A handle inside a compacted value now names the region it is in,
-            // since that is where its contents are copied.
-            Kind::Compact => id,
-            _ => meta,
-        };
-        let fields = self.fields(a);
-        let c = contents.alloc(kind, meta, &fields);
-        copies.insert(a, c);
-        Ok(c)
-    }
-}
-
-/// A nursery collection in progress.
-
-/// A stack segment cut off by a general handler clause: see [`Heap::detach`].
-struct Detached {
-    /// Its top chunk, which names the rest through the chunk headers.
-    top: Addr,
-    /// Where the top chunk's frames end.
-    end: Addr,
-    /// The marking epoch it was cut in.
-    epoch: u32,
-    /// The [`Kind::Stack`] object naming it, once made -- `0` until then. While
-    /// young, whether it survives a nursery collection says whether the
-    /// segment is still wanted; once old, the marker says.
-    obj: Addr,
-    /// Found at a nursery collection to hold nothing young. Nothing pushes
-    /// into a segment while it is off the stack, so it stays that way.
-    clean: bool,
-}
-
-/// Slots in the header of a frame-stack chunk: the chunk below it in its
-/// chain (`0` at the bottom), where that chunk's frames end, and the serial
-/// number the chunk was entered with -- what tells a handler's chunk from a
-/// later chunk that reused the same block.
-const CHUNK_HEADER: Addr = 3;
-
-/// How a `handle` names its chunk, in its target `Ref`'s `meta`: the block
-/// number in the low 17 bits, the low 15 bits of the serial above.
-const TAG_BLOCK_BITS: u32 = 17;
-
-/// Every slot of every frame that is a root -- on the live chain from `fcur`
-/// up to `fsp`, and on each detached segment -- that holds a reference.
-fn frame_slots(old: &Old, fcur: Addr, fsp: Addr, detached: &[Detached]) -> Vec<Addr> {
-    let mut out = Vec::new();
-    for (chunk, end) in chunk_chain(old, fcur, fsp) {
-        chunk_slots(old, chunk, end, &mut out);
-    }
-    for d in detached {
-        for (chunk, end) in chunk_chain(old, d.top, d.end) {
-            chunk_slots(old, chunk, end, &mut out);
-        }
-    }
-    out
-}
-
-/// The chunks of a chain from `top` down, each with where its frames end:
-/// `end` for the top one, and for each below it what the chunk above recorded
-/// when it was entered.
-fn chunk_chain(old: &Old, top: Addr, end: Addr) -> Vec<(Addr, Addr)> {
-    let mut out = Vec::new();
-    let (mut chunk, mut end) = (top, end);
-    while chunk != 0 {
-        out.push((chunk, end));
-        end = old.get(chunk + 1) as Addr;
-        chunk = old.get(chunk) as Addr;
-    }
-    out
-}
-
-/// Every slot holding a reference in the frames of `chunk`, up to `end`.
-fn chunk_slots(old: &Old, chunk: Addr, end: Addr, out: &mut Vec<Addr>) {
-    let mut a = chunk + CHUNK_HEADER;
-    while a < end {
-        let h = Head::read(old.get(a), old.get(a + 1));
-        debug_assert_eq!(h.kind, Kind::Frame, "a frame stack holds frames");
-        let header = h.header();
-        for i in 0..h.len as usize {
-            if h.desc(i, |k| old.get(a + k as Addr)) == desc::REF {
-                out.push(a + (header + i) as Addr);
-            }
-        }
-        a += h.size() as Addr;
-    }
-}
-
-/// # The frame stack
-///
-/// A function's continuation used to be a heap object: four words allocated
-/// per non-tail call, and collected later. It is a frame now: the same object,
-/// [`Kind::Frame`], written into a per-thread stack of 64 KiB **chunks** and
-/// reclaimed by moving the stack pointer back when a function returns through
-/// it. The chunks are old-generation blocks in state `STACK`, so their
-/// addresses are ordinary old addresses -- the interpreter, the collector's
-/// tables and native code's block-table walk all reach a frame the way they
-/// reach any old object -- and the allocator, the evacuator and the marker
-/// leave them alone by their state.
-///
-/// A chunk's first two slots say which chunk is below it in its chain and
-/// where that chunk's frames end. A new chunk is linked in when the current
-/// one overflows, so a deep recursion grows a chain and never copies a frame;
-/// and every `handle` enters a chunk of its own, so that a general clause can
-/// cut off everything the handled body pushed by unlinking at a chunk boundary
-/// -- O(1), no copying -- which is what one-shot resumption is. That is the
-/// design of GHC's stack chunks and of OCaml 5's fibers, and it is why the
-/// stack is chunked rather than contiguous.
-///
-/// Frames are roots: at every nursery collection and at the start of every
-/// marking cycle the heap walks every frame on the live chain and on every
-/// detached segment, so the marker never has to read a frame while the program
-/// pushes and pops them.
-impl Heap {
-    /// A chunk to push frames into, from the popped ones first.
-    fn new_chunk(&mut self) -> Addr {
-        self.free_chunks
-            .pop()
-            .unwrap_or_else(|| self.old.stack_block())
-    }
-
-    /// Start a chunk on top of the current one -- what a push does when its
-    /// chunk is full, and what [`meadow_core::Prim::Enter`] does at every
-    /// `handle`, so that the handler's own chunk is a boundary a general
-    /// clause can cut at. Answers the chunk's tag, for the handle's target.
-    ///
-    /// Every `handle`, even one whose chunk would sit empty: two handlers
-    /// sharing a chunk would share a boundary, and the inner one's clause
-    /// performing to the outer would cut off the outer's frames with its own.
-    pub fn enter_frames(&mut self) -> u32 {
-        let base = self.new_chunk();
-        self.chunk_serial = self.chunk_serial.wrapping_add(1);
-        self.old.put(base, self.fcur as Word);
-        self.old.put(base + 1, self.fsp as Word);
-        self.old.put(base + 2, self.chunk_serial as Word);
-        self.fcur = base;
-        self.fsp = base + CHUNK_HEADER;
-        self.flim = base + old::BLOCK as Addr;
-        self.publish_chunk();
-        (self.chunk_serial & ((1 << (32 - TAG_BLOCK_BITS)) - 1)) << TAG_BLOCK_BITS
-            | old::block_of(base) as u32
-    }
-
-    /// Push a frame with method table `meta` and `n` captures, each `word(j)`
-    /// described by `desc(j)`, and answer its address.
-    pub fn push_frame(
-        &mut self,
-        meta: u32,
-        n: usize,
-        word: impl Fn(usize) -> Word,
-        desc: impl Fn(usize) -> desc::Desc,
-    ) -> Addr {
-        let size = Heap::size_of(Kind::Frame, n) as Addr;
-        if self.fcur == 0 || self.fsp + size > self.flim {
-            self.enter_frames();
-        }
-        let a = self.fsp;
-        let old = &self.old;
-        object::write_header(Kind::Frame, meta, (0..n).map(&desc), |k, w| {
-            old.put(a + k as Addr, w)
-        });
-        let header = meadow_rt::compact::header_slots(false, n) as Addr;
-        for j in 0..n {
-            old.put(a + header + j as Addr, word(j));
-        }
-        self.fsp += size;
-        a
-    }
-
-    /// Return through the frame at `a`: it and everything above it are gone.
-    /// Chunks emptied on the way are kept for the next push.
-    pub fn pop_to(&mut self, a: Addr) {
-        debug_assert!(
-            self.old.in_stack(a),
-            "returning through {a}, which is not a frame"
-        );
-        while !(self.fcur..self.flim).contains(&a) {
-            let below = self.old.get(self.fcur) as Addr;
-            let below_fsp = self.old.get(self.fcur + 1) as Addr;
-            assert_ne!(
-                below, 0,
-                "returning through a frame that is not on the stack"
-            );
-            self.clean_chunks.remove(&self.fcur);
-            self.free_chunks.push(self.fcur);
-            self.fcur = below;
-            self.flim = below + old::BLOCK as Addr;
-            self.fsp = below_fsp;
-            // The current chunk is pushed into, so it is never clean.
-            self.clean_chunks.remove(&below);
-            self.publish_chunk();
-        }
-        self.fsp = a;
-    }
-
-    /// Cut off the handler's chunk -- the one `tag` names, entered at its
-    /// `handle` -- and every chunk above it, and answer the segment as its top
-    /// chunk and where its frames end. The program goes on below the cut, on
-    /// the chunk the handler's own continuation is in.
-    ///
-    /// `None` when that chunk is no longer on the stack: the handler has
-    /// returned, and what is performing to it is a closure that escaped its
-    /// `handle` and kept the evidence. There is nothing to return into. The
-    /// serial in the tag is what tells that from a later chunk in the same
-    /// block.
-    pub fn detach(&mut self, tag: u32) -> Option<(Addr, Addr)> {
-        let block = (tag & ((1 << TAG_BLOCK_BITS) - 1)) as usize;
-        let serial = tag >> TAG_BLOCK_BITS;
-        let base = OLD_BASE + (block * old::BLOCK) as Addr;
-        if self.fcur == 0
-            || !self.old.in_stack(base)
-            || self.old.get(base + 2) as u32 & ((1 << (32 - TAG_BLOCK_BITS)) - 1) != serial
-        {
-            return None;
-        }
-        let (top, top_fsp) = (self.fcur, self.fsp);
-        let mut lowest = self.fcur;
-        let mut cut = Vec::new();
-        loop {
-            let below = self.old.get(lowest) as Addr;
-            let below_fsp = self.old.get(lowest + 1) as Addr;
-            let bottom = lowest == base;
-            if !bottom && below == 0 {
-                return None;
-            }
-            cut.push(lowest);
-            if bottom {
-                // What is cut off is the segment's to account for from here
-                // (`Detached::clean`), and the chunk under it is current.
-                for c in &cut {
-                    self.clean_chunks.remove(c);
-                }
-                self.clean_chunks.remove(&below);
-                self.old.put(lowest, 0);
-                self.fcur = below;
-                self.flim = if below == 0 {
-                    0
-                } else {
-                    below + old::BLOCK as Addr
-                };
-                self.fsp = below_fsp;
-                self.publish_chunk();
-                break;
-            }
-            lowest = below;
-        }
-        // The segment's end is kept beside it, not in a chunk header: the top
-        // chunk's second slot says where the chunk *below* it ends, which a
-        // segment of more than one chunk -- any `handle` inside a `handle` --
-        // still needs, for the collector's walk and for the pop back into it.
-        self.detached.push(Detached {
-            top,
-            end: top_fsp,
-            epoch: self.old.epoch(),
-            obj: 0,
-            clean: false,
-        });
-        Some((top, top_fsp))
-    }
-
-    /// The object made to name the segment `top`: see [`Detached::obj`].
-    pub fn name_segment(&mut self, top: Addr, obj: Addr) {
-        if let Some(d) = self.detached.iter_mut().find(|d| d.top == top) {
-            d.obj = obj;
-        }
-    }
-
-    /// Give a whole segment's chunks back for the next push.
-    fn free_segment(&mut self, top: Addr) {
-        let mut chunk = top;
-        while chunk != 0 {
-            let below = self.old.get(chunk) as Addr;
-            self.free_chunks.push(chunk);
-            chunk = below;
-        }
-    }
-
-    /// Put a detached segment back on top of the stack. `false` if it has been
-    /// put back already: a resumption runs once.
-    pub fn reattach(&mut self, top: Addr, top_fsp: Addr) -> bool {
-        let Some(i) = self.detached.iter().position(|d| d.top == top) else {
-            return false;
-        };
-        let segment = self.detached.swap_remove(i);
-        let mut bottom = top;
-        while self.old.get(bottom) as Addr != 0 {
-            bottom = self.old.get(bottom) as Addr;
-            // Below the top of a segment found clean: clean still, on the
-            // stack as off it. The top becomes the current chunk.
-            if segment.clean {
-                self.clean_chunks.insert(bottom);
-            }
-        }
-        self.old.put(bottom, self.fcur as Word);
-        self.old.put(bottom + 1, self.fsp as Word);
-        self.fcur = top;
-        self.flim = top + old::BLOCK as Addr;
-        self.fsp = top_fsp;
-        self.publish_chunk();
-        true
-    }
-
-    /// Whether `a` is a frame on this heap's stack.
-    pub fn is_frame(&self, a: Addr) -> bool {
-        self.old.in_stack(a)
-    }
-}
-
-struct Minor<'h> {
-    from: &'h mut Vec<Word>,
-    to: &'h mut Vec<Word>,
-    top: usize,
-    /// Nursery objects below this are old enough to promote.
-    aged: usize,
-    promote: bool,
-    promote_all: bool,
-    /// Whether a cycle is marking, so what is promoted is marked as it is.
-    black: bool,
-    old: &'h mut Old,
-    /// Promoted objects whose fields are still to be forwarded.
-    promoted: Vec<Addr>,
-    /// The remembered set as it will be after.
-    remembered: Vec<Addr>,
-    /// For recording promoted fields that point into blocks to be evacuated.
-    evac: &'h mut Evacuation,
-    blocks: &'h [Arc<Block>],
-    regions: &'h mut HashMap<u32, Adopted>,
-    /// Whether this collection sees everything, and so marks regions.
-    whole: bool,
-    copied: usize,
-    promoted_slots: usize,
-}
-
-impl Minor<'_> {
-    /// Where nursery object `a` is now: copied within the nursery, or promoted,
-    /// the first time it is asked for, and the same place every time after.
-    /// An old address stays put; a region address stays put and, if this
-    /// collection sees everything, marks its region.
-    fn forward(&mut self, a: Addr) -> Addr {
-        if a >= REGION_BASE {
-            if self.whole {
-                let region = self.blocks[Heap::find_block(self.blocks, a)].region;
-                self.mark(region);
-            }
-            return a;
-        }
-        if a >= OLD_BASE {
-            return a;
-        }
-        let a = a as usize;
-        // Already moved: every other reference to it lands here and shares.
-        if let Some(n) = forwarded(self.from[a]) {
-            return n;
-        }
-        let h = Head::read(self.from[a], self.from[a + 1]);
-        if self.whole && h.kind == Kind::Compact {
-            self.mark(h.meta);
-        }
-        let size = h.size();
-        let promote =
-            self.promote && (self.promote_all || a < self.aged || self.top + size > self.to.len());
-        let at = if promote {
-            let at = self.old.alloc(size, self.black);
-            let header = h.header();
-            for k in 0..header {
-                self.old.put(at + k as Addr, self.from[a + k]);
-            }
-            for i in 0..h.len as usize {
-                let pointer = h.desc(i, |k| self.from[a + k]) == desc::REF;
-                self.old.put_field(
-                    at + (header + i) as Addr,
-                    self.from[a + header + i],
-                    pointer,
-                );
-            }
-            self.promoted.push(at);
-            self.promoted_slots += size;
-            at
+        let want = if self.candidates.is_empty() {
+            usize::MAX
+        } else if self.draining || self.candidates.len() >= self.trigger {
+            0
         } else {
-            let at = self.top;
-            self.to[at..at + size].copy_from_slice(&self.from[a..a + size]);
-            self.top += size;
-            self.copied += size;
-            at as Addr
+            (2 * self.live.max(0) as usize).max(FLOOR)
         };
-        self.from[a] = forward(at);
-        at
+        self.run_at = want.min(self.oversized_mark);
     }
 
-    fn mark(&mut self, region: u32) {
-        if let Some(r) = self.regions.get_mut(&region) {
-            r.marked = true;
+    /// A run has just finished, having walked from `walked` candidates and
+    /// freed `freed` blocks of garbage: how many candidates the next round of
+    /// runs waits for.
+    ///
+    /// A program that makes candidates by the million and cycles never -- an
+    /// interpreter, whose every scope is a map of cells shared with the
+    /// scopes made from it -- would otherwise spend most of its time here:
+    /// each candidate walked is everything its cell reaches, and proves
+    /// nothing. So while the runs free nothing the collector waits for twice
+    /// as many candidates as before, up to [`crate::cycles::TRIGGER_MOST`],
+    /// and by then most of them have died where they waited and are freed
+    /// without a walk. The first run that does free a cycle puts it back. A
+    /// doubling of the heap still starts a run whatever this says, so what
+    /// waiting costs is bounded as it always was.
+    pub(crate) fn paced(&mut self, walked: usize, freed: u64) {
+        if freed > 0 {
+            self.trigger = crate::cycles::TRIGGER;
+            self.futile = 0;
+        } else if walked > 0 {
+            self.futile += 1;
+            if self.futile >= crate::cycles::FUTILE {
+                self.futile = 0;
+                self.trigger = (self.trigger * 2).min(crate::cycles::TRIGGER_MOST);
+            }
+        }
+    }
+
+    pub(crate) fn has_candidates(&self) -> bool {
+        !self.candidates.is_empty()
+    }
+
+    /// Up to `n` candidates, for a run of the collector: see [`crate::cycles`].
+    /// What is left waits for the next run, still buffered.
+    pub(crate) fn take_candidates(&mut self, n: usize) -> Vec<Word> {
+        if self.candidates.len() <= n {
+            return std::mem::take(&mut self.candidates);
+        }
+        self.candidates.split_off(self.candidates.len() - n)
+    }
+
+    /// Candidates a run did not get to: they are still buffered, so they go
+    /// straight back to wait for the next one.
+    pub(crate) fn return_candidates(&mut self, vs: &[Word]) {
+        self.candidates.extend_from_slice(vs);
+    }
+
+    /// `v` reaches more than a run may walk. Keep it, and remember how big
+    /// the heap may get before walking it anyway -- a doubling, so that the
+    /// one long pause it costs is paid over as much allocation as it saves.
+    pub(crate) fn set_oversized(&mut self, v: Word) {
+        set_word(v, FLAGS, word(v, FLAGS) | DEFERRED);
+        self.oversized.push(v);
+        if self.oversized_mark == usize::MAX {
+            self.oversized_mark = (2 * self.live.max(0) as usize).max(FLOOR);
+        }
+    }
+
+    /// Has the heap grown enough to be worth that pause?
+    pub(crate) fn oversized_due(&self) -> bool {
+        self.live as usize >= self.oversized_mark
+    }
+
+    /// Look at them after all, with no budget: the candidates waiting go back
+    /// on the end of the list, and this says how many.
+    pub(crate) fn retry_oversized(&mut self) -> usize {
+        self.oversized_mark = usize::MAX;
+        let waiting = std::mem::take(&mut self.oversized);
+        for &v in &waiting {
+            set_word(v, FLAGS, word(v, FLAGS) & !DEFERRED);
+        }
+        self.candidates.extend_from_slice(&waiting);
+        waiting.len()
+    }
+
+    /// A block that died while it was a candidate, now that the collector has
+    /// finished with it: erase what is in it, if anything, and take the
+    /// memory back.
+    pub(crate) fn free_dead(&mut self, v: Word) {
+        let moved = word(v, FLAGS) & MOVED != 0;
+        set_word(v, FLAGS, word(v, FLAGS) & !(DEAD | MOVED));
+        if moved {
+            let words = size(v);
+            self.clean_block(ptr(v), words);
+        } else {
+            self.pending.push((ptr(v), 0));
+        }
+    }
+
+    /// One reference fewer to the block at `x`, from inside the collector,
+    /// which has this heap in hand already: `erase`, without looking the heap
+    /// up again. For a leaf -- a string, a big integer, a compact -- which is
+    /// never a candidate.
+    pub(crate) fn let_go(&mut self, x: Word) {
+        // Safety: a live block's count.
+        let rc = unsafe { &mut *(x as *mut u32) };
+        if *rc == 0 {
+            self.pending.push((ptr(x), 0));
+        } else {
+            let region = *rc > REGION_FLOOR;
+            *rc -= 1;
+            if region {
+                // Safety: the count says it is in a region.
+                unsafe { crate::region::erased(x) };
+            }
+        }
+    }
+
+    /// How many blocks the collector has freed from this heap.
+    pub(crate) fn freed(&self) -> u64 {
+        self.freed
+    }
+
+    /// A block the collector found in a garbage cycle. Its edges are
+    /// accounted for already -- the mark pass took them away and the scan
+    /// pass did not put them back -- so only the memory comes back here.
+    /// A block of a garbage cycle that is waiting in the candidate buffer:
+    /// collected, its edges gone with the rest of the cycle's, and its memory
+    /// held back until its turn frees it -- dead, with nothing left in it to
+    /// erase. See `cycles::collect_white`.
+    pub(crate) fn hold_collected(&mut self, v: Word) {
+        self.freed += 1;
+        set_word(
+            v,
+            FLAGS,
+            (word(v, FLAGS) | DEAD | MOVED) & !(3 << COLOUR_SHIFT),
+        );
+    }
+
+    /// Under `MEADOW_SILO_LEAKS`, after a run of the collector: no candidate
+    /// still waiting is white. One that is was left, proved garbage, for a
+    /// later run to collect, still pointing at what this one freed.
+    pub(crate) fn check_none_white(&self) {
+        for &v in self.candidates.iter().chain(&self.oversized) {
+            if !dead(v) && colour(v) == WHITE {
+                crate::fail("the cycle collector left a garbage block waiting for a later run");
+            }
+        }
+    }
+
+    pub(crate) fn free_cycle(&mut self, v: Word) {
+        self.freed += 1;
+        let words = size(v);
+        self.clean_block(ptr(v), words);
+    }
+
+    fn clean_block(&mut self, p: *mut Word, words: usize) {
+        self.live -= 1;
+        if poisoning() && (!poison_collector_only() || crate::cycles::running()) {
+            quarantine(p, words);
+            return;
+        }
+        if crate::memory::on() {
+            self.held = self.held.saturating_sub(words);
+            crate::memory::LIVE.fetch_sub(words, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(b) = &mut self.blocks {
+            b.remove(&(p as usize));
+        }
+        if words >= CLASSES {
+            let layout = std::alloc::Layout::array::<Word>(words).expect("a block fits memory");
+            self.large.remove(&(p as usize));
+            crate::memory::HEAPS.fetch_sub(words, std::sync::atomic::Ordering::Relaxed);
+            // Safety: allocated alone, with this layout, in `acquire`.
+            unsafe { std::alloc::dealloc(p as *mut u8, layout) };
+            return;
+        }
+        // Safety: a block of `words` words, which nothing reads any more.
+        unsafe { *p = self.clean[words] as Word };
+        self.clean[words] = p;
+    }
+
+    /// Erase up to [`STEP`] fields of the block pending longest.
+    fn step(&mut self) {
+        let Some((p, from)) = self.pending.pop() else {
+            return;
+        };
+        let v = p as Word;
+        let n = len(v);
+        let to = (from + STEP).min(n);
+        let first = first_field(v);
+        let refs = kind(v) != STRING && kind(v) != BIGINT;
+        let cycles = crate::cycles::possible();
+        if refs {
+            for i in from..to {
+                let d = field_desc(v, i);
+                let x = word(v, first + i);
+                if d == meadow_rt::desc::REF && is_block(x) {
+                    // Safety: a live block's count.
+                    let rc = unsafe { &mut *(x as *mut u32) };
+                    if *rc == 0 {
+                        if cycles && buffered(x) {
+                            set_word(x, FLAGS, word(x, FLAGS) | DEAD);
+                        } else {
+                            self.pending.push((ptr(x), 0));
+                        }
+                    } else {
+                        let region = *rc > REGION_FLOOR;
+                        *rc -= 1;
+                        if region {
+                            // Safety: the count says it is inside a region.
+                            unsafe { crate::region::erased(x) };
+                        } else if cycles && matches!(kind(x), CELL | MUT_ARRAY) {
+                            self.candidate(x);
+                        }
+                    }
+                }
+            }
+        }
+        if to < n && refs {
+            self.pending.push((p, to));
+        } else {
+            // A continuation nobody can resume now: its segments go.
+            if kind(v) == STACK {
+                crate::segments::discard(meta(v));
+            }
+            // One fewer that could await the thread: see `crate::sched::held`.
+            if kind(v) == TASK {
+                crate::sched::let_go(meta(v));
+            }
+            if kind(v) == TVAR {
+                crate::sched::let_go_var(field(v, 0) as usize);
+            }
+            // The last reference to a compact: its region loses the one this
+            // block held, and goes with it if that was the last. Everything
+            // inside it is freed there, all at once, and never here.
+            if kind(v) == COMPACT {
+                // Safety: a `Compact` block whose fields are still in it.
+                unsafe { crate::region::forget(v) };
+            }
+            if let Some(erased) = &mut self.erased {
+                *erased.entry((kind(v), meta(v))).or_default() += 1;
+            }
+            let words = size(v);
+            self.clean_block(p, words);
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The copying collector: one space, and every collection sees everything,
-    /// which is what the tests of it below count on.
-    fn heap() -> Heap {
-        Heap::with_config(
-            INITIAL,
-            GcConfig {
-                collector: Collector::Copying,
-                ..config()
-            },
-        )
-    }
-
-    #[test]
-    fn allocation_is_a_bump_and_reading_back_works() {
-        let mut h = heap();
-        let a = h.alloc(Kind::Data, 7, &[Value::Int(1), Value::Int(2)]);
-        assert_eq!(h.kind(a), Kind::Data);
-        assert_eq!(h.meta(a), 7);
-        assert_eq!(h.len(a), 2);
-        assert_eq!(h.field(a, 1), Value::Int(2));
-        assert_eq!(h.used(), 4, "two words of header, and the fields");
-    }
-
-    #[test]
-    fn collecting_keeps_what_is_rooted_and_drops_the_rest() {
-        let mut h = heap();
-        let keep = h.alloc(Kind::Data, 1, &[Value::Int(42)]);
-        let _drop = h.alloc(Kind::Data, 2, &[Value::Int(99)]);
-        assert_eq!(h.used(), 6);
-
-        let mut roots = [Value::Obj(keep)];
-        h.collect(&mut roots);
-
-        assert_eq!(h.used(), 3, "only the rooted object survived");
-        let a = roots[0].addr().expect("still an object");
-        assert_eq!(h.meta(a), 1);
-        assert_eq!(h.field(a, 0), Value::Int(42));
-    }
-
-    #[test]
-    fn sharing_survives_and_a_cycle_terminates() {
-        let mut h = heap();
-        let shared = h.alloc(Kind::Data, 1, &[Value::Int(1)]);
-        let a = h.alloc(Kind::Data, 2, &[Value::Obj(shared)]);
-        let b = h.alloc(Kind::Data, 3, &[Value::Obj(shared)]);
-        // A cycle: `a` points at itself through a mutable field. Reference
-        // counting could never free this; a copying collector does not care.
-        let cyc = h.alloc(Kind::Ref, 0, &[Value::Unit]);
-        h.set_field(cyc, 0, Value::Obj(cyc));
-
-        let mut roots = [Value::Obj(a), Value::Obj(b), Value::Obj(cyc)];
-        h.collect(&mut roots);
-
-        let (a, b, cyc) = (
-            roots[0].addr().unwrap(),
-            roots[1].addr().unwrap(),
-            roots[2].addr().unwrap(),
-        );
-        assert_eq!(
-            h.field(a, 0),
-            h.field(b, 0),
-            "one copy of the shared object, not two"
-        );
-        assert_eq!(
-            h.field(cyc, 0),
-            Value::Obj(cyc),
-            "the cycle came back intact"
-        );
-    }
-
-    #[test]
-    fn a_long_chain_collects_without_recursing() {
-        // 200_000 deep. Cheney scans the copied region as a queue, so this costs
-        // no stack at all — which is exactly what the `Rc` version could not do
-        // when it came to dropping one of these.
-        let mut h = heap();
-        let mut cur = h.alloc(Kind::Data, 0, &[]);
-        for i in 0..200_000 {
-            if !h.room_for(3) {
-                let mut roots = [Value::Obj(cur)];
-                h.collect(&mut roots);
-                cur = roots[0].addr().unwrap();
-            }
-            cur = h.alloc(Kind::Data, 1, &[Value::Int(i), Value::Obj(cur)]);
+/// Look for every cycle there is now, and erase everything pending: what is
+/// live after this is what the program really holds. See [`crate::cycles`].
+pub fn settle() {
+    with(|h| crate::cycles::collect_all(h));
+    with(|h| {
+        while !h.pending.is_empty() {
+            h.step();
         }
-        let mut roots = [Value::Obj(cur)];
-        h.collect(&mut roots);
+    });
+    // Erasing what a cycle held can make candidates of its own.
+    with(|h| crate::cycles::collect_all(h));
+}
 
-        // Walk it to be sure every link came through.
-        let mut n = 0;
-        let mut at = roots[0].addr().unwrap();
-        while h.len(at) == 2 {
-            n += 1;
-            at = h.field(at, 1).addr().unwrap();
+/// Erase everything this thread has let go of, which is ending: its heap
+/// goes all at once, but what its dead blocks hold outside it -- a reference
+/// into a compact's region -- is given up only by erasing them. Left, each
+/// such region outlived the program.
+///
+/// That is the blocks waiting to be erased, and also the ones that died
+/// while the cycle collector had them down as candidates: those are only
+/// marked, for the collector to free when it next runs -- which, for a
+/// thread that ends first, was never. A `Ref` written under a handler is
+/// one, and what a query's thread keeps its answers in.
+pub fn finish() {
+    settle();
+    with(|h| {
+        while !h.pending.is_empty() {
+            h.step();
         }
-        assert_eq!(n, 200_000);
-    }
+    });
+}
 
-    /// A `Cons`-like chain of `n` cells, newest first.
-    fn chain(h: &mut Heap, n: i64) -> Value {
-        let mut cur = Value::Obj(h.alloc(Kind::Data, 0, &[]));
-        for i in 0..n {
-            if !h.room_for(3) {
-                let mut roots = [cur];
-                h.collect(&mut roots);
-                cur = roots[0];
-            }
-            cur = Value::Obj(h.alloc(Kind::Data, 1, &[Value::Int(i), cur]));
+/// Blocks acquired on this thread so far.
+pub fn acquired() -> u64 {
+    with(|h| h.acquired)
+}
+
+/// Blocks acquired and not yet clean, on this thread -- after everything
+/// pending has been erased.
+pub fn live() -> isize {
+    with(|h| {
+        while !h.pending.is_empty() {
+            h.step();
         }
-        cur
-    }
+        h.live
+    })
+}
 
-    fn chain_len(h: &Heap, mut v: Value) -> usize {
-        let mut n = 0;
-        while let Value::Obj(a) = v {
-            if h.len(a) == 0 {
-                break;
-            }
-            n += 1;
-            v = h.field(a, 1);
+// --- building -------------------------------------------------------------
+
+/// A non-uniform block of `kind` and `meta` holding `fields`, described by
+/// `descs`. No fields is no block.
+pub fn build(kind: u64, meta: u32, fields: &[Word], descs: &[i64]) -> Word {
+    let n = fields.len();
+    if n == 0 {
+        return immediate(u64::from(meta));
+    }
+    let first = LAYOUT.first_field(n, false);
+    let v = acquire(first + n);
+    let mut head = LAYOUT.header(kind, n as u64, u64::from(meta));
+    head[FLAGS] |= mutable(kind);
+    LAYOUT.pack_descs(descs, |w, bits| {
+        if w < LAYOUT.header_words {
+            head[w] |= bits;
+        } else {
+            set_word(v, w, bits);
         }
-        n
+    });
+    for (i, h) in head.iter().enumerate() {
+        set_word(v, i, *h);
     }
-
-    #[test]
-    fn the_engines_estimate_compact_size_with_the_real_slot() {
-        assert_eq!(SLOT_BYTES, meadow_rt::compact::SLOT_BYTES);
+    for (i, x) in fields.iter().enumerate() {
+        set_word(v, first + i, *x);
     }
+    v
+}
 
-    #[test]
-    fn a_compacted_value_is_neither_copied_nor_scanned() {
-        let mut h = heap();
-        let big = chain(&mut h, 50_000);
-        let region = h.new_region();
-        let root = h.compact_into(region, big).unwrap();
-        assert!(h.in_region(root.addr().unwrap()));
-        assert_eq!(h.region_used(region), 2 + 50_000 * 4);
-
-        let handle = h.alloc(Kind::Compact, region, &[root]);
-        let mut roots = [Value::Obj(handle)];
-        let copied = h.copied;
-        h.collect(&mut roots);
-        // Only the handle came across; the chain stayed where it was.
-        assert_eq!(h.copied - copied, 3);
-        assert_eq!(h.used(), 3);
-        let root = h.field(roots[0].addr().unwrap(), 0);
-        assert_eq!(chain_len(&h, root), 50_000);
+/// A uniform block of `kind` and `meta` of `n` words, every one described by
+/// `d`, the words for the caller to write.
+pub fn build_uniform(kind: u64, meta: u32, n: usize, d: i64) -> Word {
+    if kind == ARRAY && crate::prims::counting() {
+        made(n);
     }
-
-    #[test]
-    fn an_address_into_a_region_keeps_it_alive_without_the_handle() {
-        let mut h = heap();
-        let big = chain(&mut h, 100);
-        let region = h.new_region();
-        let root = h.compact_into(region, big).unwrap();
-        // A semispace object pointing into the region, and no handle at all.
-        let holder = h.alloc(Kind::Data, 9, &[root]);
-        let mut roots = [Value::Obj(holder)];
-        h.collect(&mut roots);
-        assert_eq!(h.region_used(region), 2 + 100 * 4);
-        let root = h.field(roots[0].addr().unwrap(), 0);
-        assert_eq!(chain_len(&h, root), 100);
+    let v = acquire(ELEMS + if kind == ARRAY { array_room(n) } else { n });
+    let mut head = LAYOUT.header(kind, n as u64, u64::from(meta));
+    head[FLAGS] |= mutable_holding(kind, d);
+    let e = LAYOUT.elem_desc;
+    head[e.word] |= e.put(d as u64);
+    head[LAYOUT.uniform.word] |= UNIFORM;
+    for (i, h) in head.iter().enumerate() {
+        set_word(v, i, *h);
     }
+    v
+}
 
-    #[test]
-    fn an_unreachable_region_is_freed_at_the_next_collection() {
-        let mut h = heap();
-        let big = chain(&mut h, 1000);
-        let region = h.new_region();
-        h.compact_into(region, big).unwrap();
-        assert!(h.region_slots() > 0);
-        h.collect(&mut []);
-        assert_eq!(h.region_slots(), 0);
-        assert!(h.blocks.is_empty(), "its blocks went with it");
-        // Nothing else refers to it, so it is gone: its addresses are free for
-        // the next region.
-        assert!(h.region(region).is_none());
+/// A string of `bytes`, eight to a word.
+pub fn string(bytes: &[u8]) -> Word {
+    let n = bytes.len().div_ceil(8);
+    let v = build_uniform(STRING, bytes.len() as u32, n, meadow_rt::desc::INT);
+    for i in 0..n {
+        let chunk = &bytes[8 * i..bytes.len().min(8 * i + 8)];
+        let mut w = [0u8; 8];
+        w[..chunk.len()].copy_from_slice(chunk);
+        set_word(v, ELEMS + i, Word::from_le_bytes(w));
     }
+    v
+}
 
-    #[test]
-    fn sharing_inside_a_compacted_value_survives() {
-        let mut h = heap();
-        let shared = h.alloc(Kind::Data, 1, &[Value::Int(7)]);
-        let pair = h.alloc(Kind::Data, 2, &[Value::Obj(shared), Value::Obj(shared)]);
-        let region = h.new_region();
-        let root = h
-            .compact_into(region, Value::Obj(pair))
-            .unwrap()
-            .addr()
-            .unwrap();
-        assert_eq!(h.field(root, 0), h.field(root, 1), "one copy, not two");
-        assert_eq!(h.region_used(region), 4 + 3);
-    }
+/// The bytes of the string at `v`, copied out.
+pub fn bytes(v: Word) -> Vec<u8> {
+    str_bytes(v).to_vec()
+}
 
-    #[test]
-    fn adding_to_a_region_shares_what_is_already_there() {
-        let mut h = heap();
-        let big = chain(&mut h, 1000);
-        let region = h.new_region();
-        let root = h.compact_into(region, big).unwrap();
-        let before = h.region_used(region);
-        // A new cell on top of the compacted chain: only the cell is copied.
-        let longer = h.alloc(Kind::Data, 1, &[Value::Int(-1), root]);
-        let root2 = h.compact_into(region, Value::Obj(longer)).unwrap();
-        assert_eq!(h.region_used(region), before + 4);
-        assert_eq!(chain_len(&h, root2), 1001);
-    }
+/// The bytes of the string at `v`, where they are: eight to a word,
+/// little-endian, from word 2 -- which is to say one run of bytes in memory.
+/// Valid as long as the string is.
+pub fn str_bytes<'a>(v: Word) -> &'a [u8] {
+    // Safety: a live string block, whose words from 2 hold `meta` bytes.
+    unsafe { std::slice::from_raw_parts((v as *const u8).add(16), meta(v) as usize) }
+}
 
-    #[test]
-    fn a_mutable_cell_is_refused_and_leaves_the_region_as_it_was() {
-        let mut h = heap();
-        let ok = chain(&mut h, 10);
-        let region = h.new_region();
-        h.compact_into(region, ok).unwrap();
-        let before = h.region_used(region);
-
-        let cell = h.alloc(Kind::Ref, 0, &[Value::Int(1)]);
-        let bad = h.alloc(Kind::Data, 1, &[Value::Int(0), Value::Obj(cell)]);
-        assert_eq!(
-            h.compact_into(region, Value::Obj(bad)),
-            Err(Uncompactable::Ref)
-        );
-        assert_eq!(h.region_used(region), before);
-        let f = h.alloc(Kind::Closure, 0, &[]);
-        assert_eq!(
-            h.compact_into(region, Value::Obj(f)),
-            Err(Uncompactable::Function)
-        );
-    }
-
-    #[test]
-    fn a_region_spans_blocks_and_scans_across_them() {
-        // Bigger than the first block, so the copy has to continue its scan in
-        // the next one.
-        let mut h = heap();
-        let big = chain(&mut h, crate::region::FIRST_BLOCK as i64);
-        let region = h.new_region();
-        let root = h.compact_into(region, big).unwrap();
-        assert!(h.region(region).unwrap().lock().blocks.len() > 1);
-        assert_eq!(chain_len(&h, root), crate::region::FIRST_BLOCK);
-        // Everything in it points inside it.
-        let mut v = root;
-        while let Value::Obj(a) = v {
-            assert!(h.in_region(a));
-            if h.len(a) == 0 {
-                break;
-            }
-            v = h.field(a, 1);
+/// The blocks reachable from `roots`.
+pub fn reachable(roots: &[(Word, i64)]) -> std::collections::HashSet<usize> {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack: Vec<(Word, i64)> = roots.to_vec();
+    while let Some((w, d)) = stack.pop() {
+        if d != meadow_rt::desc::REF || !is_block(w) || !seen.insert(w as usize) {
+            continue;
         }
-    }
-
-    #[test]
-    fn a_region_is_shared_between_heaps_without_copying() {
-        let mut a = heap();
-        let big = chain(&mut a, 10_000);
-        let region = a.new_region();
-        let root = a.compact_into(region, big).unwrap();
-        let handle = a.alloc(Kind::Compact, region, &[root]);
-
-        // Across to another heap: the handle is copied, the chain is not.
-        let parcel = a.export(Value::Obj(handle)).unwrap();
-        assert_eq!(parcel.len(), 3, "one handle object; the region stays put");
-        let mut b = heap();
-        b.reserve(parcel.len());
-        let got = b.import(&parcel);
-        drop(parcel);
-        let inner = b.field(got.addr().unwrap(), 0);
-        assert_eq!(inner, root, "the same address, in both heaps");
-
-        // The heap that made it lets go; the other still reads it.
-        let weak = std::sync::Arc::downgrade(a.region(region).unwrap());
-        a.collect(&mut []);
-        assert!(a.region(region).is_none());
-        assert_eq!(chain_len(&b, inner), 10_000);
-
-        // And when the last heap lets go, the region is freed.
-        let mut roots = [got];
-        b.collect(&mut roots);
-        assert!(weak.upgrade().is_some(), "still reachable from b");
-        b.collect(&mut []);
-        assert!(weak.upgrade().is_none(), "nobody refers to it any more");
-    }
-
-    #[test]
-    fn a_region_can_grow_while_another_heap_reads_it() {
-        let mut a = heap();
-        let first = chain(&mut a, 100);
-        let region = a.new_region();
-        let root = a.compact_into(region, first).unwrap();
-        let mut b = heap();
-        b.adopt(a.region(region).unwrap());
-
-        // `a` appends far past the first block; `b` keeps reading what it had.
-        let more = chain(&mut a, (crate::region::FIRST_BLOCK * 3) as i64);
-        let root2 = a.compact_into(region, more).unwrap();
-        assert_eq!(chain_len(&b, root), 100);
-        // `b` learns of the new blocks when it adopts the region again.
-        b.adopt(a.region(region).unwrap());
-        assert_eq!(chain_len(&b, root2), crate::region::FIRST_BLOCK * 3);
-    }
-
-    #[test]
-    fn the_heap_grows_rather_than_collecting_forever() {
-        let mut h = heap();
-        let before = h.capacity();
-        // Keep everything alive, so collection can never reclaim anything.
-        let mut live = Vec::new();
-        while h.capacity() == before {
-            if !h.room_for(2) {
-                let mut roots: Vec<Value> = live.clone();
-                h.collect(&mut roots);
-                live = roots;
-            }
-            live.push(Value::Obj(h.alloc(Kind::Data, 0, &[Value::Int(0)])));
-        }
-        assert!(h.capacity() > before, "a full heap has to grow");
-    }
-
-    // --- the generational collector -------------------------------------------
-
-    /// A generational heap with a nursery of `nursery` slots, marking on its
-    /// own thread at most `slice` fields per pause, and checking every cycle.
-    fn generational(nursery: usize, slice: usize, threads: usize) -> Heap {
-        Heap::with_config(
-            nursery,
-            GcConfig {
-                collector: Collector::Generational,
-                nursery,
-                mark_threads: threads,
-                min_trigger: 1024,
-                verify: true,
-                mark_slice: slice,
-                evacuate: true,
-            },
-        )
-    }
-
-    /// Allocate as the VM does: collect first if there is no room, with every
-    /// live value in `roots`, and read what to allocate from there after.
-    fn alloc_rooted(
-        h: &mut Heap,
-        roots: &mut [Value],
-        kind: Kind,
-        meta: u32,
-        fields: &[usize],
-    ) -> Value {
-        if !h.room_for(1 + fields.len()) {
-            h.collect(roots);
-            h.reserve(1 + fields.len());
-        }
-        let fields: Vec<Value> = fields.iter().map(|i| roots[*i]).collect();
-        Value::Obj(h.alloc(kind, meta, &fields))
-    }
-
-    /// A chain of `n` cells counting down to 0, built with its head rooted.
-    fn rooted_chain(h: &mut Heap, roots: &mut Vec<Value>, n: i64) -> Value {
-        roots.push(Value::Unit);
-        let head = roots.len() - 1;
-        roots[head] = alloc_rooted(h, roots, Kind::Data, 0, &[]);
-        for i in 0..n {
-            roots.push(Value::Int(i));
-            let k = roots.len() - 1;
-            let cell = alloc_rooted(h, roots, Kind::Data, 1, &[k, head]);
-            roots.pop();
-            roots[head] = cell;
-        }
-        roots.pop().expect("the head")
-    }
-
-    /// Is `v` a whole chain, counting down from `n - 1`?
-    fn well_formed(h: &Heap, mut v: Value, n: i64) -> bool {
-        let mut expect = n - 1;
-        while let Value::Obj(a) = v {
-            if h.len(a) == 0 {
-                return expect == -1;
-            }
-            if h.field(a, 0) != Value::Int(expect) {
-                return false;
-            }
-            expect -= 1;
-            v = h.field(a, 1);
-        }
-        false
-    }
-
-    fn churn(h: &mut Heap, roots: &mut [Value], cells: usize) {
-        for i in 0..cells {
-            if !h.room_for(3) {
-                h.collect(roots);
-            }
-            h.alloc(Kind::Data, 1, &[Value::Int(i as i64), Value::Unit]);
-        }
-    }
-
-    #[test]
-    fn what_survives_twice_is_promoted_and_stays_whole() {
-        let mut h = generational(1024, usize::MAX, 0);
-        let mut roots = Vec::new();
-        let c = rooted_chain(&mut h, &mut roots, 2000);
-        roots.push(c);
-        for _ in 0..3 {
-            h.collect(&mut roots);
-        }
-        assert!(roots[0].addr().unwrap() >= OLD_BASE, "promoted");
-        assert!(h.promoted > 0);
-        assert_eq!(h.used() - h.top, (h.old.live + h.old.allocated) as usize);
-        assert!(well_formed(&h, roots[0], 2000));
-    }
-
-    #[test]
-    fn a_young_object_only_an_old_ref_holds_survives() {
-        let mut h = generational(1024, usize::MAX, 0);
-        let mut roots = vec![Value::Unit];
-        roots[0] = alloc_rooted(&mut h, &mut roots, Kind::Ref, 0, &[0]);
-        h.promoting = true;
-        h.collect(&mut roots);
-        h.collect(&mut roots);
-        let r = roots[0].addr().unwrap();
-        assert!(r >= OLD_BASE);
-        let young = h.alloc(Kind::Data, 5, &[Value::Int(7)]);
-        h.set_field(r, 0, Value::Obj(young));
-        assert_eq!(h.remembered.len(), 1);
-        churn(&mut h, &mut roots, 20_000);
-        let v = h.field(roots[0].addr().unwrap(), 0).addr().unwrap();
-        assert_eq!((h.meta(v), h.field(v, 0)), (5, Value::Int(7)));
-        assert!(v >= OLD_BASE, "promoted in time");
-        assert!(h.remembered.is_empty(), "nothing old points young any more");
-    }
-
-    #[test]
-    fn a_cycle_frees_what_died_and_keeps_what_did_not() {
-        let mut h = generational(1024, usize::MAX, 0);
-        let mut roots = Vec::new();
-        let big = rooted_chain(&mut h, &mut roots, 50_000);
-        roots.push(big);
-        h.collect_all(&mut roots);
-        let alive = h.old.live;
-        assert!(alive >= 150_000);
-        // Let it go, keep a small one.
-        roots.clear();
-        let small = rooted_chain(&mut h, &mut roots, 100);
-        roots.push(small);
-        h.collect_all(&mut roots);
-        assert!(
-            h.old.live < alive / 100,
-            "{} of {alive} still counted",
-            h.old.live
-        );
-        assert!(well_formed(&h, roots[0], 100));
-        // Its lines are allocated into again rather than new blocks made.
-        let blocks = h.old.real_blocks;
-        let again = rooted_chain(&mut h, &mut roots, 20_000);
-        roots.push(again);
-        assert!(
-            h.old.real_blocks <= blocks,
-            "{} blocks, from {blocks}",
-            h.old.real_blocks
-        );
-        assert!(well_formed(&h, roots[1], 20_000));
-    }
-
-    #[test]
-    fn empty_blocks_are_given_back() {
-        let mut h = generational(1024, usize::MAX, 0);
-        let mut roots = Vec::new();
-        let big = rooted_chain(&mut h, &mut roots, 200_000);
-        roots.push(big);
-        h.collect_all(&mut roots);
-        let before = h.old.real_blocks;
-        roots.clear();
-        h.collect_all(&mut roots);
-        churn(&mut h, &mut roots, 200_000);
-        assert!(
-            h.old.real_blocks < before / 4,
-            "{} of {before} blocks kept",
-            h.old.real_blocks
-        );
-    }
-
-    /// Refs rewired at random while a cycle marks a few fields per pause: the
-    /// marker keeps losing paths to overwrites, and has to find them in the
-    /// log. `verify` checks every cycle, and the chains are checked whole.
-    fn rewire(h: &mut Heap, steps: usize, refs: usize, longest: u64) {
-        let mut roots = vec![Value::Unit; refs];
-        for i in 0..refs {
-            roots[i] = alloc_rooted(h, &mut roots, Kind::Ref, 0, &[refs - 1]);
-            h.set_field(roots[i].addr().unwrap(), 0, Value::Unit);
-        }
-        // What each ref holds: the length of its chain, or none.
-        let mut lens: Vec<Option<i64>> = vec![None; refs];
-        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
-        let mut next = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
-        for _ in 0..steps {
-            let a = (next() % refs as u64) as usize;
-            let b = (next() % refs as u64) as usize;
-            match next() % 4 {
-                0 => {
-                    let n = (next() % longest) as i64;
-                    let c = rooted_chain(h, &mut roots, n);
-                    h.set_field(roots[a].addr().unwrap(), 0, c);
-                    lens[a] = Some(n);
-                }
-                1 => {
-                    let (ra, rb) = (roots[a].addr().unwrap(), roots[b].addr().unwrap());
-                    let (va, vb) = (h.field(ra, 0), h.field(rb, 0));
-                    h.set_field(ra, 0, vb);
-                    h.set_field(rb, 0, va);
-                    lens.swap(a, b);
-                }
-                2 => {
-                    // Held only by a register for a while.
-                    let ra = roots[a].addr().unwrap();
-                    roots.push(h.field(ra, 0));
-                    h.set_field(ra, 0, Value::Unit);
-                    churn(h, &mut roots, 64);
-                    let v = roots.pop().unwrap();
-                    h.set_field(roots[b].addr().unwrap(), 0, v);
-                    lens[b] = lens[a].take();
-                }
-                _ => churn(h, &mut roots, 32),
-            }
-        }
-        h.collect_all(&mut roots);
-        for (i, len) in lens.iter().enumerate() {
-            let v = h.field(roots[i].addr().unwrap(), 0);
-            match len {
-                Some(n) => assert!(well_formed(h, v, *n), "ref {i}'s chain of {n} is broken"),
-                None => assert_eq!(v, Value::Unit),
-            }
-        }
-        assert!(h.cycles > 3, "only {} cycles ran", h.cycles);
-    }
-
-    #[test]
-    fn overwrites_while_marking_a_little_at_a_time_lose_nothing() {
-        let mut h = generational(512, 16, 0);
-        rewire(&mut h, 30_000, 48, 40);
-    }
-
-    #[test]
-    fn overwrites_while_marking_concurrently_lose_nothing() {
-        let mut h = generational(512, usize::MAX, 2);
-        rewire(&mut h, 60_000, 48, 40);
-    }
-
-    #[test]
-    fn a_region_only_an_old_object_reaches_lives_until_it_does_not() {
-        let mut h = generational(1024, usize::MAX, 0);
-        let mut roots = Vec::new();
-        let c = rooted_chain(&mut h, &mut roots, 100);
-        let region = h.new_region();
-        roots.push(h.compact_into(region, c).unwrap());
-        let holder = alloc_rooted(&mut h, &mut roots, Kind::Ref, 0, &[0]);
-        roots[0] = holder;
-        h.promoting = true;
-        h.collect(&mut roots);
-        h.collect(&mut roots);
-        assert!(roots[0].addr().unwrap() >= OLD_BASE);
-        h.collect_all(&mut roots);
-        h.collect_all(&mut roots);
-        assert!(h.region(region).is_some(), "still reachable");
-        let inner = h.field(roots[0].addr().unwrap(), 0);
-        assert_eq!(chain_len(&h, inner), 100);
-        h.set_field(roots[0].addr().unwrap(), 0, Value::Unit);
-        h.collect_all(&mut roots);
-        assert!(h.region(region).is_none(), "let go once nothing reaches it");
-    }
-
-    #[test]
-    fn a_parcel_bigger_than_the_nursery_is_rebuilt_in_pieces() {
-        let mut a = heap();
-        let big = chain(&mut a, 5000);
-        let parcel = a.export(big).unwrap();
-        let mut b = generational(256, usize::MAX, 0);
-        b.reserve(parcel.len());
-        let mut roots = vec![b.import(&parcel)];
-        assert!(well_formed(&b, roots[0], 5000));
-        churn(&mut b, &mut roots, 10_000);
-        b.collect_all(&mut roots);
-        assert!(well_formed(&b, roots[0], 5000));
-    }
-
-    #[test]
-    fn an_array_bigger_than_a_block_of_young_objects() {
-        let mut h = generational(1024, usize::MAX, 0);
-        let n = old::BLOCK + 100;
-        let mut roots = Vec::new();
-        h.reserve(1 + n);
-        let young = h.alloc(Kind::Data, 9, &[Value::Int(42)]);
-        let fields = vec![Value::Obj(young); n];
-        let arr = h.alloc(Kind::Array, 0, &fields);
-        assert!(arr >= OLD_BASE, "too big for the nursery");
-        roots.push(Value::Obj(arr));
-        churn(&mut h, &mut roots, 50_000);
-        h.collect_all(&mut roots);
-        churn(&mut h, &mut roots, 50_000);
-        let arr = roots[0].addr().unwrap();
-        let first = h.field(arr, 0);
-        assert_eq!(h.field(arr, n - 1), first, "one object, shared");
-        assert_eq!(h.field(first.addr().unwrap(), 0), Value::Int(42));
-    }
-
-    // --- evacuation ---------------------------------------------------------------
-
-    /// Eight chains built a cell of each at a time, so they lie interleaved in
-    /// the old generation, and seven of them dropped: every block left an
-    /// eighth full.
-    fn sparse(h: &mut Heap, cells: i64) -> Vec<Value> {
-        let mut roots = vec![Value::Unit; 8];
-        for j in 0..8 {
-            roots[j] = alloc_rooted(h, &mut roots, Kind::Data, 0, &[]);
-        }
-        for k in 0..cells {
-            for j in 0..8 {
-                roots.push(Value::Int(k));
-                let at = roots.len() - 1;
-                let cell = alloc_rooted(h, &mut roots, Kind::Data, 1, &[at, j]);
-                roots.pop();
-                roots[j] = cell;
-            }
-        }
-        roots.truncate(1);
-        roots
-    }
-
-    #[test]
-    fn sparse_blocks_are_emptied_and_given_back() {
-        let mut h = generational(1024, usize::MAX, 0);
-        let mut roots = sparse(&mut h, 40_000);
-        // The first cycle finds the blocks sparse and chooses them; the second
-        // records every pointer into them, and then they move.
-        h.collect_all(&mut roots);
-        let before = h.old.real_blocks;
-        // Each cycle moves up to an eighth of what is alive.
-        for _ in 0..8 {
-            h.collect_all(&mut roots);
-            h.old.release(usize::MAX);
-        }
-        assert!(h.evacuated_blocks > 0, "nothing was evacuated");
-        assert!(
-            h.old.real_blocks * 2 < before,
-            "{} blocks from {before}",
-            h.old.real_blocks
-        );
-        assert!(well_formed(&h, roots[0], 40_000));
-        // And it all still holds together through more cycles.
-        churn(&mut h, &mut roots, 100_000);
-        h.collect_all(&mut roots);
-        assert!(well_formed(&h, roots[0], 40_000));
-    }
-
-    #[test]
-    fn evacuation_a_little_per_pause_while_the_program_runs() {
-        let mut h = generational(1024, usize::MAX, 0);
-        let mut roots = sparse(&mut h, 40_000);
-        h.collect_all(&mut roots);
-        // The second cycle, and the moves after it, happen in ordinary pauses:
-        // with pointers into the moving blocks from the nursery and a `Ref`.
-        let r = alloc_rooted(&mut h, &mut roots, Kind::Ref, 0, &[0]);
-        roots.push(r);
-        let cycles = h.cycles;
-        let mut pauses = 0;
-        while h.evacuated_blocks == 0 || h.evac.has_pending() {
-            roots.push(Value::Unit);
-            let n = roots.len() - 1;
-            roots[n] = alloc_rooted(&mut h, &mut roots, Kind::Data, 2, &[0]);
-            let holder = roots.pop().unwrap();
-            h.set_field(roots[1].addr().unwrap(), 0, holder);
-            if h.cycles == cycles {
-                // Ask for the second cycle, as enough promotion would.
-                h.old.allocated += 1 << 20;
-            }
-            churn(&mut h, &mut roots, 2_000);
-            pauses += 1;
-            assert!(pauses < 10_000, "evacuation never finished");
-        }
-        assert!(h.cycles > cycles);
-        assert!(h.evacuated_blocks > 1, "all in one pause");
-        let held = h.field(roots[1].addr().unwrap(), 0).addr().unwrap();
-        assert_eq!(h.field(held, 0), roots[0]);
-        assert!(well_formed(&h, roots[0], 40_000));
-    }
-
-    #[test]
-    fn rewiring_refs_while_blocks_move_loses_nothing() {
-        let mut h = generational(1024, 64, 0);
-        rewire(&mut h, 40_000, 512, 160);
-        assert!(h.evacuated_blocks > 0, "nothing was evacuated");
-    }
-
-    #[test]
-    fn rewiring_refs_while_blocks_move_concurrently_loses_nothing() {
-        let mut h = generational(1024, usize::MAX, 2);
-        rewire(&mut h, 60_000, 512, 160);
-        assert!(h.evacuated_blocks > 0, "nothing was evacuated");
-    }
-
-    #[test]
-    fn a_pointer_only_promotion_records_is_moved_too() {
-        let mut h = generational(1024, 4096, 0);
-        let mut roots = sparse(&mut h, 40_000);
-        h.collect_all(&mut roots);
-        // A cell deep in the chain, in a block chosen to move.
-        let (mut cell, mut n) = (roots[0], 40_000);
-        while !h.old.blocks[old::block_of(cell.addr().unwrap())].is_tracked() {
-            cell = h.field(cell.addr().unwrap(), 1);
-            n -= 1;
-            assert!(n > 0, "no cell in a chosen block");
-        }
-        roots.push(cell);
-        let r = alloc_rooted(&mut h, &mut roots, Kind::Ref, 0, &[0]);
-        roots[1] = r;
-        // The second cycle begins, and marks a little per pause.
-        h.old.allocated += 1 << 20;
-        while h.marking.is_none() {
-            churn(&mut h, &mut roots, 1_000);
-        }
-        // Made now, the holder is not in the cycle's snapshot, so the marker
-        // never reads it; once promoted, only an old `Ref` holds it, so no root
-        // or nursery scan finds it either. Only promoting it records its field.
-        roots.push(cell);
-        let at = roots.len() - 1;
-        let holder = alloc_rooted(&mut h, &mut roots, Kind::Data, 7, &[at]);
-        roots.truncate(2);
-        h.set_field(roots[1].addr().unwrap(), 0, holder);
-        let mut pauses = 0;
-        while h.evacuated_blocks == 0 || h.evac.has_pending() || h.marking.is_some() {
-            churn(&mut h, &mut roots, 2_000);
-            pauses += 1;
-            assert!(pauses < 10_000, "evacuation never finished");
-        }
-        let holder = h.field(roots[1].addr().unwrap(), 0).addr().unwrap();
-        assert!(holder >= OLD_BASE, "promoted");
-        assert!(well_formed(&h, h.field(holder, 0), n));
-        assert!(well_formed(&h, roots[0], 40_000));
-    }
-
-    // --- the frame stack and the collector -------------------------------------------
-
-    #[test]
-    fn what_a_frame_holds_moves_with_it_when_its_block_is_evacuated() {
-        // A frame is pushed with a bare store, so nothing records that it
-        // points into a block chosen to move: evacuation has to treat frames
-        // as it treats the registers, or the frame goes on naming where the
-        // object used to be. (`verify` is on, so before this was so the
-        // collection itself said "a pointer was not moved".)
-        let mut h = generational(1024, usize::MAX, 0);
-        let mut roots = sparse(&mut h, 40_000);
-        h.collect_all(&mut roots);
-        let (mut cell, mut n) = (roots[0], 40_000);
-        while !h.old.blocks[old::block_of(cell.addr().unwrap())].is_tracked() {
-            cell = h.field(cell.addr().unwrap(), 1);
-            n -= 1;
-            assert!(n > 0, "no cell in a chosen block");
-        }
-        roots.push(cell);
-        let held = roots.len() - 1;
-        let word = cell.bits();
-        let frame = h.push_frame(0, 1, |_| word, |_| desc::REF);
-        let mut cycles = 0;
-        while roots[held] == cell {
-            h.collect_all(&mut roots);
-            cycles += 1;
-            assert!(cycles < 32, "the cell's block never moved");
-        }
-        assert_eq!(h.field(frame, 0), roots[held], "the frame was left behind");
-        assert!(well_formed(&h, roots[0], 40_000));
-    }
-
-    #[test]
-    fn a_segment_of_two_chunks_is_walked_to_each_chunks_own_end() {
-        // A `handle` inside a `handle`: the segment a clause cuts off is two
-        // chunks. Where the lower one's frames end is in the upper one's
-        // header, which is therefore not a place to keep anything else.
-        let mut h = generational(1024, usize::MAX, 0);
-        h.promoting = true;
-        let mut roots = vec![Value::Unit];
-        roots[0] = alloc_rooted(&mut h, &mut roots, Kind::Data, 0, &[]);
-        let word = roots[0].bits();
-        h.enter_frames();
-        h.push_frame(0, 1, |_| word, |_| desc::REF);
-        let tag = h.enter_frames();
-        let lower = h.push_frame(0, 1, |_| word, |_| desc::REF);
-        h.enter_frames();
-        let mut upper = 0;
-        for _ in 0..5 {
-            upper = h.push_frame(0, 1, |_| word, |_| desc::REF);
-        }
-        let (top, end) = h.detach(tag).expect("the handler's chunk is on the stack");
-        // Collections with the segment off the stack: every frame of both
-        // chunks is a root, and what it holds moves.
-        churn(&mut h, &mut roots, 5_000);
-        assert_eq!(
-            h.field(lower, 0),
-            roots[0],
-            "the lower chunk was not walked"
-        );
-        assert_eq!(
-            h.field(upper, 0),
-            roots[0],
-            "the upper chunk was not walked"
-        );
-        // Put back, it is walked the same way on the stack, and the stack
-        // pops into the lower chunk where that chunk's frames end.
-        assert!(h.reattach(top, end));
-        churn(&mut h, &mut roots, 5_000);
-        assert_eq!(h.field(lower, 0), roots[0]);
-        h.pop_to(lower);
-        assert_eq!(h.fsp, lower);
-    }
-
-    #[test]
-    fn a_chunk_below_the_top_is_scanned_until_it_holds_nothing_young() {
-        let mut h = generational(1024, usize::MAX, 0);
-        h.promoting = true;
-        let mut roots = vec![Value::Unit];
-        roots[0] = alloc_rooted(&mut h, &mut roots, Kind::Data, 0, &[]);
-        let word = roots[0].bits();
-        h.enter_frames();
-        let lower = h.fcur;
-        let frame = h.push_frame(0, 1, |_| word, |_| desc::REF);
-        h.enter_frames();
-        assert!(!h.clean_chunks.contains(&lower));
-        // A survivor stays young for one collection and is promoted at the
-        // next, so the chunk holding it comes clean by the third.
-        for _ in 0..3 {
-            h.collect(&mut roots);
-        }
-        assert_eq!(h.field(frame, 0), roots[0], "the frame was left behind");
-        assert!(roots[0].addr().unwrap() >= OLD_BASE, "promoted by now");
-        assert!(h.clean_chunks.contains(&lower), "still being rescanned");
-        assert!(
-            !h.clean_chunks.contains(&h.fcur),
-            "the current chunk is never clean"
-        );
-        // Popping back into it makes it the current chunk again.
-        h.pop_to(frame);
-        assert!(!h.clean_chunks.contains(&lower));
-    }
-
-    // --- strings ------------------------------------------------------------------
-
-    #[test]
-    fn a_string_holds_its_bytes_through_a_collection() {
-        for mut h in [heap(), generational(64, usize::MAX, 0)] {
-            let text = "héllo, wörld -- more than one word of it";
-            let a = h.alloc_str(text.as_bytes());
-            let empty = h.alloc_str(b"");
-            assert_eq!(h.kind(a), Kind::Str);
-            assert_eq!(h.packed_len(a), text.len());
-            assert_eq!(h.packed_len(empty), 0);
-            let mut roots = [Value::Obj(a), Value::Obj(empty)];
-            h.collect(&mut roots);
-            let (a, empty) = (roots[0].addr().unwrap(), roots[1].addr().unwrap());
-            assert_eq!(h.packed_bytes(a), text.as_bytes());
-            assert_eq!(h.packed_bytes(empty), b"");
-            assert_eq!(h.packed_bytes_in(a, 1, 3), "é".as_bytes());
-            assert_eq!(h.packed_byte(a, 6), b',');
-            assert_eq!(h.packed_find(a, "wörld".as_bytes(), 0), 8);
-            assert_eq!(
-                h.packed_find(a, b"o", 9),
-                text[9..].find('o').map_or(-1, |i| (i + 9) as i64)
-            );
-            assert_eq!(h.packed_find(a, b"zzz", 0), -1);
-            let same = h.alloc_str(text.as_bytes());
-            let other = h.alloc_str("héllo, wörld -- more than one word of iT".as_bytes());
-            assert!(h.packed_eq(a, same));
-            assert!(!h.packed_eq(a, other));
-            assert!(!h.packed_eq(a, empty));
-        }
-    }
-
-    /// Word-at-a-time comparison agrees with comparing the bytes, across word
-    /// boundaries, for prefixes, and for real zero bytes against a word's
-    /// zero padding.
-    #[test]
-    fn strings_compare_as_their_bytes_do() {
-        let mut h = heap();
-        let texts: [&[u8]; 12] = [
-            b"",
-            b"a",
-            b"abcdefgh",
-            b"abcdefgh\0",
-            b"abcdefghi",
-            b"abcdefgi",
-            b"abcdefg",
-            b"\0",
-            b"\0\0",
-            b"Zebra",
-            "é".as_bytes(),
-            "z—more than two words of text".as_bytes(),
-        ];
-        let addrs: Vec<_> = texts.iter().map(|t| h.alloc_str(t)).collect();
-        for (i, a) in texts.iter().enumerate() {
-            for (j, b) in texts.iter().enumerate() {
-                assert_eq!(
-                    h.packed_compare(addrs[i], addrs[j]),
-                    meadow_rt::text::compare(a, b),
-                    "{a:?} against {b:?}"
-                );
+        if kind(w) != STRING && kind(w) != BIGINT {
+            for i in 0..len(w) {
+                stack.push((field(w, i), field_desc(w, i)));
             }
         }
     }
+    seen
+}
 
-    #[test]
-    fn an_array_of_bytes_takes_a_byte_an_element() {
-        assert_eq!(
-            Heap::BYTE,
-            desc::word(meadow_rt::num::Width::U8),
-            "the descriptor packing is keyed on"
-        );
-        let mut h = generational(64, usize::MAX, 0);
-        let words: Vec<Word> = (0..1000u64).map(|i| i % 256).collect();
-        let before = h.used();
-        let a = h.alloc_array(&words, Heap::BYTE);
-        assert_eq!(h.kind(a), Kind::Bytes);
-        assert!(
-            h.used() - before <= 2 + 125,
-            "1000 bytes in {} slots",
-            h.used() - before
-        );
-        assert_eq!(h.array_len(a), 1000);
-        assert_eq!(h.array_desc(a), Heap::BYTE);
-        assert_eq!(
-            h.array_value(a, 257),
-            Value::Word(meadow_rt::num::Width::U8, 1)
-        );
-        assert_eq!(h.array_words(a, 254, 258), [254, 255, 0, 1]);
-        let mut roots = [Value::Obj(a)];
-        h.collect(&mut roots);
-        let a = roots[0].addr().unwrap();
-        assert_eq!(
-            h.array_words(a, 0, 1000),
-            words,
-            "and it survives a collection"
-        );
-
-        // Nothing to pack, or not bytes: an ordinary array.
-        let empty = h.alloc_array(&[], Heap::BYTE);
-        assert_eq!((h.kind(empty), h.array_len(empty)), (Kind::Array, 0));
-        let ints = h.alloc_array(&[1, 2], desc::INT);
-        assert_eq!(h.kind(ints), Kind::Array);
-        assert_eq!(h.array_value(ints, 1), Value::Int(2));
-    }
-
-    #[test]
-    fn a_range_of_words_reads_only_that_range() {
-        let mut h = heap();
-        let fields: Vec<Value> = (0..100).map(Value::Int).collect();
-        let a = h.alloc(Kind::Array, 0, &fields);
-        let words: Vec<u64> = h.words_in(a, 95, 200).collect();
-        assert_eq!(words, [95, 96, 97, 98, 99]);
-        assert_eq!(h.words_in(a, 10, 10).count(), 0);
-    }
-
-    /// Objects too large for the nursery go straight to the old generation,
-    /// and while a cycle is marking they are kept until the next one. A
-    /// program making them faster than marking finishes used to grow the
-    /// generation until it ran out of addresses; an overdue heap collects
-    /// everything instead.
-    #[test]
-    fn large_garbage_made_while_marking_does_not_pile_up() {
-        let mut h = generational(1 << 10, 64, 0);
-        h.config.verify = false;
-        let mut roots = Vec::new();
-        // Enough live data that a cycle takes many pauses to mark.
-        let live = rooted_chain(&mut h, &mut roots, 60_000);
-        roots.push(live);
-        let big = 1 << 14;
-        let fields = vec![Value::Int(7); big];
-        for _ in 0..400 {
-            if !h.room_for(Heap::size_of(Kind::Array, big)) || h.wants_collection() {
-                if h.overdue() {
-                    h.collect_all(&mut roots);
+/// Live blocks not reachable from `roots` -- what the run leaked -- by kind
+/// and constructor tag, most first; and how many there are.
+pub fn leaked(roots: &[(Word, i64)]) -> (usize, Vec<(usize, u64, u32)>) {
+    let kept = reachable(roots);
+    with(|h| {
+        while !h.pending.is_empty() {
+            h.step();
+        }
+        let mut counts: std::collections::HashMap<(u64, u32), usize> =
+            std::collections::HashMap::new();
+        let mut total = 0;
+        for b in h.blocks.iter().flatten() {
+            if kept.contains(b) {
+                continue;
+            }
+            total += 1;
+            let v = *b as Word;
+            let key = (
+                kind(v),
+                if kind(v) == DATA || kind(v) == CLOSURE {
+                    meta(v)
                 } else {
-                    h.collect(&mut roots);
-                }
-                h.reserve(Heap::size_of(Kind::Array, big));
-            }
-            h.alloc(Kind::Array, 0, &fields);
+                    0
+                },
+            );
+            *counts.entry(key).or_default() += 1;
         }
-        assert!(well_formed(&h, roots[0], 60_000));
-        // 400 of them made is 6.5 million slots; kept, they would all be here.
-        assert!(
-            h.old_slots() < 3_000_000,
-            "the old generation grew to {} slots",
-            h.old_slots()
-        );
-    }
+        let mut out: Vec<(usize, u64, u32)> =
+            counts.into_iter().map(|((k, m), n)| (n, k, m)).collect();
+        out.sort_by(|a, b| b.0.cmp(&a.0));
+        (total, out)
+    })
 }

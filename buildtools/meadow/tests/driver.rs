@@ -86,7 +86,7 @@ fn what_a_thread_kept_in_a_ref_goes_when_the_thread_does() {
     let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
         .current_dir(&root)
         .env("MEADOW_SILO_LEAKS", "1")
-        .args(["run", "--runtime", "silo", "."])
+        .args(["run", "--aot", "."])
         .output()
         .expect("the meadow binary runs");
     let err = String::from_utf8_lossy(&out.stderr);
@@ -126,7 +126,7 @@ fn a_tvar_nothing_can_reach_lets_its_value_go() {
     let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
         .current_dir(&root)
         .env("MEADOW_SILO_LEAKS", "1")
-        .args(["run", "--runtime", "silo", "."])
+        .args(["run", "--aot", "."])
         .output()
         .expect("the meadow binary runs");
     let err = String::from_utf8_lossy(&out.stderr);
@@ -173,12 +173,7 @@ const GIVES_UP: &str = "use Std.Process (exit)\n\nfun main () =\n  let _ = print
 fn a_program_gives_up_on_standard_error_on_every_engine() {
     let dir = scratch("gives-up");
     let root = package(&dir, "gives-up", GIVES_UP);
-    for engine in [
-        &[][..],
-        &["--backend", "vm"],
-        &["--cek"],
-        &["--runtime", "silo"],
-    ] {
+    for engine in [&[][..], &["--backend", "vm"], &["--cek"], &["--aot"]] {
         let mut args = vec!["run"];
         args.extend_from_slice(engine);
         args.push(".");
@@ -228,8 +223,8 @@ fn an_image_runs_on_its_own() {
     let root = package(&dir, "img", ARGS);
     let (ok, _, err) = meadow(&root, &["build", "."]);
     assert!(ok, "{err}");
-    let image = root.join("target/debug/bytecode/Img.mbc");
-    assert!(image.is_file());
+    let image = root.join("target/debug/native/glade/Img.image");
+    assert!(image.is_file(), "{err}");
     let image = image.to_string_lossy().into_owned();
     for backend in ["jit", "vm"] {
         let (ok, out, err) = meadow(&dir, &["exec", &image, "--backend", backend, "--", "x"]);
@@ -238,24 +233,7 @@ fn an_image_runs_on_its_own() {
     }
     let (ok, _, err) = meadow(&dir, &["exec", &root.join("Meadow.toml").to_string_lossy()]);
     assert!(!ok);
-    assert!(err.contains("not a Meadow image"), "{err}");
-
-    // An executable from it, where there is a runtime library to link.
-    let exe = dir
-        .join("out")
-        .join(format!("img{}", std::env::consts::EXE_SUFFIX));
-    let (ok, _, err) = meadow(&dir, &["link", &image, "-o", &exe.to_string_lossy()]);
-    if !ok {
-        assert!(
-            err.contains("runtime"),
-            "a link failure other than a missing runtime: {err}"
-        );
-        eprintln!("skipping the executable: {err}");
-    } else {
-        let out = Command::new(&exe).args(["a", "b"]).output().unwrap();
-        assert!(out.status.success());
-        assert!(String::from_utf8_lossy(&out.stdout).contains(r#"["a"; "b"]"#));
-    }
+    assert!(err.contains("is not an image"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -379,7 +357,7 @@ fn a_long_chain_of_additions_compiles() {
 
 #[test]
 fn a_long_literal_compiles() {
-    // Past the register file: see `meadow_codegen`, "Spilling".
+    // More elements than a frame has registers.
     let n = 800;
     let items: Vec<String> = (1..=n).map(|i| i.to_string()).collect();
     let src = format!(
@@ -523,7 +501,7 @@ fn a_program_with_no_vector_gets_its_arguments_as_an_array() {
          prim arrayGet(v, 1; μ̃ s: str. <s | k>))))\n",
     )
     .unwrap();
-    for runtime in [&[][..], &["--runtime", "silo"]] {
+    for runtime in [&[][..], &["--aot"]] {
         let mut args = vec!["cut", "argv.cut"];
         args.extend_from_slice(runtime);
         args.extend_from_slice(&["--", "first", "second"]);
@@ -580,10 +558,10 @@ fn a_program_of_cut_is_printed_as_axcut_and_as_llvm() {
 }
 
 #[test]
-fn a_program_of_cut_runs_on_glade_and_as_an_executable_of_silos() {
+fn a_program_of_cut_runs_on_the_vm_and_as_an_executable() {
     let dir = scratch("cut");
     std::fs::write(dir.join("count.cut"), CUT).unwrap();
-    for runtime in [&[][..], &["--runtime", "silo"]] {
+    for runtime in [&[][..], &["--aot"]] {
         let mut args = vec!["cut", "count.cut"];
         args.extend_from_slice(runtime);
         let (ok, out, err) = meadow(&dir, &args);
@@ -599,7 +577,7 @@ fn a_program_of_cut_runs_on_glade_and_as_an_executable_of_silos() {
          μ̃ n: i64. prim eq(n, 42; μ̃ u: unit. <\"no\" | k>, μ̃ u: unit. <\"42\" | k>)\n",
     )
     .unwrap();
-    for runtime in [&[][..], &["--runtime", "silo"]] {
+    for runtime in [&[][..], &["--aot"]] {
         let mut args = vec!["cut", "handles.cut"];
         args.extend_from_slice(runtime);
         let (ok, out, err) = meadow(&dir, &args);
@@ -613,7 +591,7 @@ fn a_program_of_cut_runs_on_glade_and_as_an_executable_of_silos() {
          def t:Main/main (; k: ptr) =\n  t:Main/id(desc(i64), 1; μ̃ n: i64. t:Main/id(desc(str), \"generic\"; k))\n",
     )
     .unwrap();
-    for runtime in [&[][..], &["--runtime", "silo"]] {
+    for runtime in [&[][..], &["--aot"]] {
         let mut args = vec!["cut", "generic.cut"];
         args.extend_from_slice(runtime);
         let (ok, out, err) = meadow(&dir, &args);
@@ -630,7 +608,7 @@ fn a_program_of_cut_runs_on_glade_and_as_an_executable_of_silos() {
          def t:Main/main (; k: ptr) =\n  perform t:Main/Console.say(\"said\\n\"; μ̃ u: unit. <unit | k>)\n",
     )
     .unwrap();
-    for runtime in [&[][..], &["--runtime", "silo"]] {
+    for runtime in [&[][..], &["--aot"]] {
         let mut args = vec!["cut", "quiet.cut"];
         args.extend_from_slice(runtime);
         let (ok, out, err) = meadow(&dir, &args);
@@ -692,4 +670,364 @@ fn the_repl_shows_a_definition_in_each_ir() {
     assert_eq!(read.defs.len(), 1, "the local function, at the top: {text}");
     // And something not defined is said to be.
     assert!(repl(":ir nope\n:q\n").contains("nothing called `nope` is defined"));
+}
+
+#[test]
+fn the_repl_evaluates_on_the_vm() {
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    let out = repl(":silo\nfun f x = x * 2\nf 21\n\"ab\" ++ \"c\"\nprintln \"hi\"\nf\n:q\n");
+    for want in ["= 42", "= \"abc\"", "hi\n= ()", "= <closure>"] {
+        assert!(out.contains(want), "no `{want}` in:\n{out}");
+    }
+}
+
+#[test]
+fn the_repl_runs_its_session_on_one_vm() {
+    use std::io::Write;
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_meadow"))
+        .env("MEADOW_SERVE_LOG", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the meadow binary runs");
+    child
+        .stdin
+        .take()
+        .expect("a pipe")
+        .write_all(b"def x = 20\nx + 1\nprintln \"hi\"\nx * 3\nx / 0\nx - 1\n:q\n")
+        .expect("written");
+    let out = child.wait_with_output().expect("the REPL ends");
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    for want in ["= 21", "hi\n= ()", "= 60", "= 19"] {
+        assert!(stdout.contains(want), "no `{want}` in:\n{stdout}");
+    }
+    // One VM, each line's build loaded into it -- until a line fails, which
+    // ends it, as it ends any run; the next line starts another.
+    assert!(stderr.contains("division by zero"), "{stderr}");
+    assert!(stderr.contains("the program failed"), "{stderr}");
+    assert_eq!(stderr.matches("served: started").count(), 2, "{stderr}");
+    assert_eq!(stderr.matches("served: reloaded").count(), 4, "{stderr}");
+}
+
+#[test]
+fn a_profile_of_a_program_on_the_vm_names_its_functions() {
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("meadow-vm-profile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("Prof/src")).unwrap();
+    std::fs::write(
+        dir.join("Prof/Meadow.toml"),
+        "[package]\nname = \"Prof\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("Prof/src/Main.mw"),
+        "fun fib (n : Int) : Int = if n < 2 then n else fib (n - 1) + fib (n - 2)\n\n\
+         fun main () = println (fib 24)\n",
+    )
+    .unwrap();
+    let to = dir.join("prof.folded");
+    let run = |to: &std::path::Path| {
+        let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
+            .args([
+                "run",
+                "--runtime",
+                "silo",
+                "--interpret",
+                "--sample-every",
+                "1000",
+                "--profile-to",
+            ])
+            .arg(to)
+            .arg(dir.join("Prof"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "46368");
+        std::fs::read_to_string(to).unwrap()
+    };
+    let folded = run(&to);
+    // Outermost first: `main`, then `fib` as deep as it was.
+    assert!(
+        folded
+            .lines()
+            .any(|l| l.starts_with("Prof.main;Prof.fib;Prof.fib")),
+        "{folded}"
+    );
+    // A profile of work is the same profile every time.
+    let mut a: Vec<&str> = folded.lines().collect();
+    let again = run(&dir.join("again.folded"));
+    let mut b: Vec<&str> = again.lines().collect();
+    a.sort();
+    b.sort();
+    assert_eq!(a, b);
+}
+
+#[test]
+fn the_vm_says_what_a_program_reached() {
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("meadow-vm-covered-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("Cov/src")).unwrap();
+    std::fs::write(
+        dir.join("Cov/Meadow.toml"),
+        "[package]\nname = \"Cov\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("Cov/src/Main.mw"),
+        "use Std.Process as P\nuse Std.String as S\n\n\
+         fun pick (n : Int) : Int = if n > 10 then n * 2 else if n > 5 then n + 1 else 0\n\n\
+         fun main () =\n  let a = P.covered True in\n  let _ = pick 1 in\n  \
+         let b = P.covered False in\n  let _ = pick 20 in\n  let c = P.covered False in\n  \
+         println (S.concatAll [show a, \" \", show (b > a), \" \", show (c > b)])\n",
+    )
+    .unwrap();
+    let said = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
+            .arg("run")
+            .args(args)
+            .arg(dir.join("Cov"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    // The VM, interpreting or with its JIT: from nothing, and more as the
+    // program gets somewhere new. Native code notes nothing.
+    assert_eq!(said(&["--backend", "vm"]), "0 True True");
+    assert_eq!(said(&[]), "0 True True");
+    assert_eq!(said(&["--runtime", "silo", "--interpret"]), "0 True True");
+    assert_eq!(said(&["--aot"]), "0 False False");
+}
+
+#[test]
+fn gc_stats_say_what_memory_did_on_the_vm() {
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("meadow-vm-gc-stats-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("Gc/src")).unwrap();
+    std::fs::write(
+        dir.join("Gc/Meadow.toml"),
+        "[package]\nname = \"Gc\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("Gc/src/Main.mw"),
+        "use Std.Collections.Vector as V\n\n\
+         fun main () = println (V.len (V.map (\\x -> [x, x + 1]) (V.range 0 20000)))\n",
+    )
+    .unwrap();
+    for (gc, says) in [("rc", "gc: counted:"), ("tracing", "gc: traced:")] {
+        let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
+            .args([
+                "run",
+                "--runtime",
+                "silo",
+                "--interpret",
+                "--gc",
+                gc,
+                "--gc-stats",
+            ])
+            .arg(dir.join("Gc"))
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{err}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "20000");
+        assert!(
+            err.contains(says) && err.contains("gc: heaps"),
+            "{gc}: {err}"
+        );
+    }
+}
+
+#[test]
+fn exec_runs_an_image_of_axcut_on_the_vm() {
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("meadow-vm-exec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("Ex/src")).unwrap();
+    std::fs::write(
+        dir.join("Ex/Meadow.toml"),
+        "[package]\nname = \"Ex\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("Ex/src/Main.mw"),
+        "use Std.Process as P\n\nfun main () = println (P.argv ())\n",
+    )
+    .unwrap();
+    let built = Command::new(env!("CARGO_BIN_EXE_meadow"))
+        .args(["build", "--runtime", "silo", "--interpret"])
+        .arg(dir.join("Ex"))
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
+        .arg("exec")
+        .arg(dir.join("Ex/target/debug/native/glade/Ex.image"))
+        .args(["--", "a", "b"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "[a, b]");
+}
+
+/// `--jit` on Silo runs the program on the merged runtime's VM, compiling what
+/// runs often -- here everything, at first entry -- and the program prints
+/// what it prints interpreted.
+#[test]
+fn the_jit_runs_what_the_vm_runs() {
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    if !cfg!(target_arch = "x86_64") {
+        eprintln!("skipped: the first tier compiles for x86-64 only");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("meadow-vm-jit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("Jit/src")).unwrap();
+    std::fs::write(
+        dir.join("Jit/Meadow.toml"),
+        "[package]\nname = \"Jit\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("Jit/src/Main.mw"),
+        "use Std.St as St\n\n\
+         fun fib (n : Int) : Int = if n < 2 then n else fib (n - 1) + fib (n - 2)\n\n\
+         fun main () =\n  \
+           let total = runSt (\\() ->\n    \
+             let a = St.newArray 100 0.5 in\n    \
+             let _ = St.forRange 0 100 (\\i -> St.set a i (toFloat i * 2.0)) in\n    \
+             let rec sum i acc = if i >= 100 then acc else sum (i + 1) (acc + St.get a i) in\n    \
+             sum 0 0.0) in\n  \
+           println (show (fib 20) ++ \" \" ++ show total)\n",
+    )
+    .unwrap();
+    let run = |engine: &str| {
+        let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
+            .args(["run", "--runtime", "silo", engine])
+            .arg(dir.join("Jit"))
+            .env("MEADOW_JIT_THRESHOLD", "0")
+            .env("MEADOW_JIT_LOG", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (vm, _) = run("--interpret");
+    let (jit, said) = run("--jit");
+    assert_eq!(vm.trim(), "6765 9900.0");
+    assert_eq!(jit, vm, "the JIT prints what the VM prints");
+    assert!(said.contains("jit: Jit.fib"), "fib was compiled:\n{said}");
+}
+
+/// JIT-1 and JIT-6: a loop entered once is compiled while it runs. Control
+/// never joins inside a procedure, so a loop is a tail call to its own head,
+/// and every pass through the head is an entry the threshold counts: the
+/// running loop goes on in the compiled code from the pass that crosses it.
+#[test]
+fn a_loop_entered_once_is_compiled_as_it_runs() {
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    if !cfg!(target_arch = "x86_64") {
+        eprintln!("skipped: the first tier compiles for x86-64 only");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("meadow-vm-jit-loop-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("Loop/src")).unwrap();
+    std::fs::write(
+        dir.join("Loop/Meadow.toml"),
+        "[package]\nname = \"Loop\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("Loop/src/Main.mw"),
+        "fun count (i : Int) (acc : Int) : Int =\n  \
+           if i >= 100000 then acc else count (i + 1) (acc + i % 7)\n\n\
+         fun main () = println (show (count 0 0))\n",
+    )
+    .unwrap();
+    let run = |engine: &str| {
+        let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
+            .args(["run", "--runtime", "silo", engine])
+            .arg(dir.join("Loop"))
+            .env("MEADOW_JIT_LOG", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (vm, _) = run("--interpret");
+    let (jit, said) = run("--jit");
+    assert_eq!(vm.trim(), "299995");
+    assert_eq!(jit, vm, "the JIT prints what the VM prints");
+    // By either tier: the second takes a definition entered as often as the
+    // first does.
+    assert!(
+        said.lines().any(|l| (l.starts_with("jit: Loop.count")
+            || l.starts_with("jit2: Loop.count"))
+            && !l.contains("not compiled")),
+        "the loop was compiled, though entered from `main` once:\n{said}"
+    );
 }

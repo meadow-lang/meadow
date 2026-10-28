@@ -43,6 +43,12 @@ PYTHON = "py" if os.name == "nt" and shutil.which("py") else "python3"
 
 # Built once by `meadow_build`; the debug compiler is slow enough to notice.
 MEADOW = REPO / "buildtools" / "target" / "release" / f"meadow{EXE}"
+# Silo's interpreter, which `meadow-glade-vm` runs a program's image on:
+# `cargo build --release --manifest-path glade/Cargo.toml -p meadow-glade-vm`.
+SILO_VM = Path(
+    os.environ.get("MEADOW_SILO_VM")
+    or REPO / "glade" / "target" / "release" / f"meadow-glade-vm{EXE}"
+)
 
 
 # --- the tasks ----------------------------------------------------------------
@@ -140,17 +146,33 @@ def meadow_package(lang, task):
         f'[package]\nname = "{camel(task)}"\nversion = "0.1.0"\n'
     )
     shutil.copyfile(lang.source(task), out / "src" / "Main.mw")
+    if lang.name == "meadow-vm":
+        return [str(MEADOW), "build", "--release", "--emit", "image", str(out)]
     build = [str(MEADOW), "build", "--release", "--emit", "exe", str(out)]
-    if lang.name.endswith("-silo"):
+    if "-silo" in lang.name:
         build += ["--runtime", "silo"]
+    if lang.name == "meadow-glade-vm":
+        build += ["--interpret"]
     return build
 
 
 def native_exe(lang, task):
     native = lang.out_dir(task) / "target" / "release" / "native"
     if lang.name.endswith("-silo"):
-        native = native / "silo"
+        native = native / "glade"
     return [str(native / f"{camel(task)}{EXE}")]
+
+
+def glade_vm(lang, task):
+    """The image `meadow build` wrote, run by Glade's interpreter alone."""
+    image = lang.out_dir(task) / "target" / "release" / "bytecode" / f"{camel(task)}.mbc"
+    return [str(MEADOW), "exec", "--backend", "vm", str(image)]
+
+
+def silo_vm(lang, task):
+    """The image `meadow build --interpret` wrote, run by Silo's interpreter."""
+    image = lang.out_dir(task) / "target" / "release" / "native" / "glade" / f"{camel(task)}.image"
+    return [str(SILO_VM), str(image)]
 
 
 def simple(argv):
@@ -214,10 +236,22 @@ LANGS = [
         note="`meadow build --release`: -O2, compiled ahead of time",
     ),
     Lang(
-        "meadow-silo", ".mw", str(MEADOW), meadow_package, native_exe,
+        "meadow-glade", ".mw", str(MEADOW), meadow_package, native_exe,
         stem=lambda t: t,
         note="`meadow build --release --runtime silo`: the runtime of its own, "
              "counted by reference, on the native stack",
+    ),
+    # The two interpreters, for comparing the engines a debug build runs on:
+    # neither is in the default set, which is of what a release build runs.
+    Lang(
+        "meadow-vm", ".mw", str(MEADOW), meadow_package, glade_vm,
+        stem=lambda t: t,
+        note="Glade's bytecode interpreter, without the JIT: `meadow exec --backend vm`",
+    ),
+    Lang(
+        "meadow-glade-vm", ".mw", str(MEADOW), meadow_package, silo_vm,
+        stem=lambda t: t,
+        note="Silo's interpreter: AxCut run on Silo's runtime, nothing compiled",
     ),
     Lang(
         "rust", ".rs", "rustc",
@@ -290,6 +324,8 @@ LANGS = [
 ]
 
 LANG_BY_NAME = {l.name: l for l in LANGS}
+# Asked for by name only: see their entries.
+INTERPRETERS = {"meadow-vm", "meadow-glade-vm"}
 
 
 # --- running ------------------------------------------------------------------
@@ -329,8 +365,10 @@ def measure(argv, cwd, reps):
 
 
 STARTUP = {
-    "meadow-silo": 'use Std.Console (println)\n\ndef main = println "0"\n',
+    "meadow-glade": 'use Std.Console (println)\n\ndef main = println "0"\n',
     "meadow": 'use Std.Console (println)\n\ndef main = println "0"\n',
+    "meadow-vm": 'use Std.Console (println)\n\ndef main = println "0"\n',
+    "meadow-glade-vm": 'use Std.Console (println)\n\ndef main = println "0"\n',
     "rust": 'fn main() { println!("0"); }\n',
     "c": '#include <stdio.h>\nint main(void) { printf("0\\n"); return 0; }\n',
     "cpp": '#include <cstdio>\nint main() { std::printf("0\\n"); }\n',
@@ -424,7 +462,11 @@ def main():
     )
     args = ap.parse_args()
 
-    langs = [LANG_BY_NAME[n] for n in args.lang] if args.lang else LANGS
+    langs = (
+        [LANG_BY_NAME[n] for n in args.lang]
+        if args.lang
+        else [l for l in LANGS if l.name not in INTERPRETERS]
+    )
     every = ARENA if args.arena else TASKS
     tasks = args.task or [t for t, _, _ in every]
 

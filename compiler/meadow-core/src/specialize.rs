@@ -128,6 +128,7 @@ fn specialize(p: &Program, all: bool) -> Program {
         ctor_fields: p.ctor_fields.clone(),
         variants: p.variants.clone(),
         origins,
+        migrations: p.migrations.clone(),
     }
 }
 

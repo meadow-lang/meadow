@@ -2467,7 +2467,8 @@ fn list_items(v: &Value) -> Option<Vec<Value>> {
 ///
 /// The canonical name exists so that two types may each own a `Leaf`; a person
 /// reading output already has the context that disambiguates, so the qualifier
-/// would be noise. `meadow_glade::show` strips it the same way, and the
+/// would be noise. The runtime's `show` (`glade/src/show.rs`) strips it the same
+/// way, and the
 /// differential tests compare the two machines' output, so they have to agree.
 fn bare_ctor(name: &str) -> &str {
     match name.rsplit_once('.') {
@@ -2765,6 +2766,9 @@ fn compact_into(
         // A node is counted, and its children visited, the first time only.
         let mut first = |p: *const ()| !r.seen.contains(&p) && new.insert(p);
         match &v {
+            // A constructor of no fields is a word, not a block: nothing to
+            // copy.
+            Value::Ctor(_, fields) if fields.is_empty() => {}
             Value::Ctor(_, fields) => {
                 if first(Rc::as_ptr(fields) as *const ()) {
                     slots += meadow_core::compact::object_slots(false, fields.len());
@@ -2777,7 +2781,7 @@ fn compact_into(
             }
             Value::Array(xs) => {
                 if first(Rc::as_ptr(xs) as *const ()) {
-                    slots += meadow_core::compact::object_slots(true, xs.len());
+                    slots += meadow_core::compact::array_slots(xs.len());
                     stack.extend(xs.iter().cloned());
                 }
             }

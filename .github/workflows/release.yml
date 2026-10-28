@@ -220,6 +220,14 @@ jobs:
           bin="$PWD/$bin"
           "$bin" init "$RUNNER_TEMP/smokepkg"
           (cd "$RUNNER_TEMP/smokepkg" && "$bin" run --release --aot . | tail -1 | grep -q 'Hello, world!')
+          # Every Meadow source in the repository, as this binary's language
+          # server sees it, from an empty home: what is built in -- `Std`
+          # precompiled for this target -- is what an editor on this machine
+          # gets, and `check.sh` runs a `meadow` built from the checkout,
+          # which has none of it. MeadowBoot's dependencies are fetched.
+          cd "$GITHUB_WORKSPACE"
+          mapfile -t sources < <(git ls-files '*.mw' | grep -v -e '^bootstrap/tests/lex/' -e '^bootstrap/tests/parse/')
+          MEADOW_HOME="$RUNNER_TEMP/lsp-home" "$bin" lsp --check "${sources[@]}"
 
       # `meadowup`, the toolchain manager, and on Windows the double-clickable
       # bootstrap beside it. Its own workspace -- it depends on no Meadow crate,

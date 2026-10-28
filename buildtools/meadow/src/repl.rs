@@ -850,7 +850,8 @@ const COMMANDS: &[(&str, &str)] = &[
     (":reset", "forget everything defined so far"),
     (
         ":jit / :vm / :cek",
-        "switch machines (the JIT is the default)",
+        "switch machines: the VM with its JIT, one for the session (the default); \
+         the VM interpreting; or the CEK machine",
     ),
     (":time", "time every entry from now on, or stop"),
     (":time <expr>", "time just this entry"),
@@ -961,6 +962,9 @@ pub struct Session {
     /// Which machine evaluates a line. `:cek` and `:vm` switch it, which is the
     /// quickest way to decide whether something odd is the language or the VM.
     engine: meadow::Engine,
+    /// The VM the session's lines run on with its JIT: one for the whole
+    /// session, each line's build loaded into it as a reload (REPL-4).
+    session: Option<meadow::served::Served>,
     /// Report how long every entry took -- `:time` turns it on and off.
     timing: bool,
     /// Which step of the tour is showing, if any. The tour is not a mode: the
@@ -1036,8 +1040,12 @@ impl Session {
             prefix: std_pkgs,
             std_len,
             uses: Vec::new(),
-            // What a debug build runs on.
-            engine: meadow::Engine::Jit,
+            // What a debug build runs on -- or, without a VM, the CEK.
+            engine: match meadow::aot::interpreter() {
+                Ok(_) => meadow::Engine::Jit,
+                Err(_) => meadow::Engine::Cek,
+            },
+            session: None,
             timing: false,
             tour: None,
             pending: None,
@@ -1262,13 +1270,22 @@ impl Session {
                             println!("(reset)");
                         }
                         ":module" => self.list_module(),
-                        ":vm" | ":cek" | ":jit" => {
-                            self.engine = match trimmed {
+                        // `:silo`, from before there was one runtime, is `:jit`.
+                        ":vm" | ":cek" | ":jit" | ":silo" => {
+                            let engine = match trimmed {
                                 ":cek" => meadow::Engine::Cek,
-                                ":jit" => meadow::Engine::Jit,
-                                _ => meadow::Engine::Vm,
+                                ":vm" => meadow::Engine::Vm,
+                                _ => meadow::Engine::Jit,
                             };
-                            println!("(evaluating with the {})", self.engine);
+                            match meadow::aot::interpreter() {
+                                Err(e) if engine != meadow::Engine::Cek => {
+                                    println!("(no VM to evaluate on: {e})")
+                                }
+                                _ => {
+                                    self.engine = engine;
+                                    println!("(evaluating with the {})", self.engine);
+                                }
+                            }
                         }
                         ":time" => {
                             self.timing = !self.timing;
@@ -1572,9 +1589,23 @@ impl Session {
                 let program = self.program_for(&compiled, entry);
                 let checked = started.elapsed();
                 // Every line is compiled and run as a whole program, so the REPL
-                // gets the bytecode VM for free — and `:cek` switches it, the
-                // same as the flag on `meadow run`.
-                let (result, times) = runtime::run_timed(&program, self.engine, self.opts.opt);
+                // gets the VM for free — and `:cek` switches it, the same as
+                // the flag on `meadow run`.
+                let (result, times) = if self.engine == meadow::Engine::Jit {
+                    // A closure that captures nothing is a word the VM cannot
+                    // tell from a constructor by itself, so it is shown as
+                    // its type says.
+                    let function = compiled
+                        .exports
+                        .last()
+                        .is_some_and(|e| e.scheme.ty.is_fun());
+                    let (result, times) =
+                        runtime::run_in_session(&mut self.session, &program, self.opts.opt);
+                    let result = result.map(|v| if function { "<closure>".into() } else { v });
+                    (result, times)
+                } else {
+                    runtime::run_timed(&program, self.engine, self.opts.opt)
+                };
                 match result {
                     Ok(value) => println!("= {value}"),
                     Err(e) => eprintln!("{e}"),
@@ -1655,6 +1686,7 @@ impl Session {
             ctor_fields: Default::default(),
             variants: Default::default(),
             origins: Default::default(),
+            migrations: Vec::new(),
         };
         print!("{}", alone.pretty());
     }
@@ -1683,6 +1715,7 @@ impl Session {
             ctor_fields: self.cache.ctor_fields.clone(),
             variants: self.cache.variants.clone(),
             origins: Default::default(),
+            migrations: Vec::new(),
         };
         let lowered = meadow_seq::cut::to_cut(&program);
         let Some(symbol) = lowered.symbols.get(&var) else {
@@ -1736,6 +1769,7 @@ impl Session {
             ctor_fields: self.cache.ctor_fields.clone(),
             variants: self.cache.variants.clone(),
             origins: Default::default(),
+            migrations: Vec::new(),
         };
         let lowered = meadow_seq::lower_program(&program, self.opts.opt);
         let mut shown = false;
@@ -1778,6 +1812,7 @@ impl Session {
             ctor_fields,
             variants,
             origins: Default::default(),
+            migrations: Vec::new(),
         }
     }
 }

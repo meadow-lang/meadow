@@ -30,7 +30,8 @@ done
 
 # The tree is five independent Cargo workspaces, so there is no one
 # `cargo test --workspace` that covers it. Missing one is the whole reason this
-# script exists.
+# script exists. The runtime's (`glade`) comes before `buildtools`, whose tests
+# run programs on the VM it builds.
 WORKSPACES="compiler eval glade buildtools installer"
 
 step() { printf '\n\033[1m== %s\033[0m\n' "$1"; }
@@ -47,9 +48,14 @@ fi
 
 # --- tests -------------------------------------------------------------------
 
+# The VM, which `meadow` runs a debug build, the REPL and macros on: found in
+# `glade/target/release` by a checkout's `meadow` (`aot::interpreter`).
+step "build: the VM"
+(cd glade && cargo build --quiet --release -p meadow-glade-vm)
+
 for ws in $WORKSPACES; do
   step "test: $ws"
-  (cd "$ws" && cargo test --quiet)
+  (cd "$ws" && cargo test --workspace --quiet)
 done
 
 # --- the language itself -----------------------------------------------------
@@ -58,30 +64,35 @@ done
 # through the library API. Running them again through the CLI is what proves the
 # `meadow test` command works, which nothing else covers.
 #
-# Both engines, because there are two: the bytecode VM (the default) and the CEK
-# machine behind `--cek`. The CEK is the specification, so a disagreement is a VM
-# bug — and the cheapest place to notice one is here.
+# On the VM (the default), with its JIT, and on the CEK machine behind
+# `--cek`. The CEK is the specification, so a disagreement is a VM bug -- and
+# the cheapest place to notice one is here.
 
-step "meadow test --std (bytecode VM)"
+step "meadow test --std (the VM)"
 cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- test --std
+
+step "meadow test --std (the VM, its JIT compiling everything)"
+MEADOW_JIT=1 MEADOW_JIT_THRESHOLD=0 MEADOW_JIT_TIER2=0 \
+  cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- test --std
 
 step "meadow test --std (CEK machine)"
 cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- test --std --cek
 
-# The collector again, under pressure: a nursery of 64 slots, so nearly
-# everything is promoted, and a marking cycle every few hundred slots, each one
-# checked against a whole trace (`MEADOW_GC_VERIFY`). Once with marking on its
-# own threads, once on the program's. A missed barrier or a race with the marker
-# shows up here as a panic naming the object it lost, long before it would show
-# up as a wrong answer.
-for mark_threads in 2 0; do
-  step "collector stress (marking threads: $mark_threads)"
-  export MEADOW_GC_NURSERY=64 MEADOW_GC_TRIGGER=256 MEADOW_GC_VERIFY=1 MEADOW_GC_MARK_THREADS=$mark_threads
-  (cd glade && cargo test --quiet)
-  cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- test --std
-  cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- test examples/Concurrency
-  cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- test examples/Stm
-  unset MEADOW_GC_NURSERY MEADOW_GC_TRIGGER MEADOW_GC_VERIFY MEADOW_GC_MARK_THREADS
+# Every strategy and both stacks, the traced ones under pressure: a nursery of
+# 4 KiB, so nearly everything is promoted and a collection comes every few
+# allocations. A frame or a record a collection does not see shows up here as
+# a crash or a wrong answer long before it would anywhere else.
+for gc in rc tracing generational; do
+  for stack in growable heap; do
+    step "meadow test --std (--gc $gc --stack $stack)"
+    MEADOW_GC_NURSERY=4096 cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- \
+      test --std --gc "$gc" --stack "$stack"
+  done
+done
+for example in examples/concurrency examples/stm; do
+  step "meadow test $example (--gc generational, under pressure)"
+  MEADOW_GC_NURSERY=4096 cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- \
+    test --gc generational "$example"
 done
 
 # Every example package, on the VM: they are what someone new runs first, so
@@ -93,6 +104,18 @@ done
 
 step "meadow fmt --check"
 cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- fmt --check lib/Std examples
+
+# Every Meadow source in the repository, as the editor sees it: opened in the
+# language server, which must mark nothing. A build passing says the compiler
+# takes a package; this says the editor does too. The two analyse a file
+# differently -- a module at a time, macros and all, with what the editor
+# fetched -- so a package can build cleanly and still be marked throughout in
+# an editor. Left out: the inputs of MeadowBoot's lexer and parser tests,
+# which are fragments, some wrong on purpose. The release workflow runs the
+# same with each binary it builds.
+step "meadow lsp --check (every Meadow source an editor opens)"
+mapfile -t sources < <(git ls-files '*.mw' | grep -v -e '^bootstrap/tests/lex/' -e '^bootstrap/tests/parse/')
+cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- lsp --check "${sources[@]}"
 
 # --- the editor extension ----------------------------------------------------
 #

@@ -52,6 +52,7 @@ pub mod rewrite;
 pub mod simplify;
 pub mod specialize;
 pub mod trmc;
+pub mod versions;
 pub use lower::Lowerer;
 pub mod desc;
 pub use meadow_rt::{
@@ -483,6 +484,10 @@ pub struct Program {
     /// Variables a pass made as copies of others, and which: what a debugger
     /// needs to call a specialized copy's variables by their names.
     pub origins: HashMap<Var, Var>,
+    /// The `@migrate(C)` functions, and the constructor each names: what a
+    /// reload applies to a value of an earlier build's `C`, for one of this
+    /// build's type to stand in for it.
+    pub migrations: Vec<(Var, InternedString)>,
 }
 
 impl Program {
@@ -506,6 +511,35 @@ impl Program {
     }
 }
 
+/// `p` as text that is the same in every build of a program: its variables
+/// named in the order they appear, as [`Program::pretty`] names them, rather
+/// than by ids that come from the inference arena -- and each type and effect
+/// in it with its version, from `versions`, where it has one: so that a type
+/// a build changed makes a different signature of everything that mentions
+/// it (see [`versions`]).
+pub fn signature(p: &Poly, versions: &versions::Versions) -> String {
+    Printer {
+        versions: Some(versions.clone().into()),
+        ..Printer::default()
+    }
+    .poly(p)
+}
+
+/// What constructor `v`'s fields are, written as [`signature`] writes a
+/// type: `(Int, String)`, or with their labels, `(x : Int, y : Int)`.
+pub fn variant_signature(v: &meadow_infer::VariantSig) -> String {
+    let mut p = Printer::default();
+    let fields: Vec<String> = match &v.labels {
+        Some(ls) => ls
+            .iter()
+            .zip(&v.fields)
+            .map(|(l, t)| format!("{l} : {}", p.ty(t)))
+            .collect(),
+        None => v.fields.iter().map(|t| p.ty(t)).collect(),
+    };
+    format!("({})", fields.join(", "))
+}
+
 #[derive(Default)]
 struct Printer {
     names: HashMap<Var, String>,
@@ -515,9 +549,28 @@ struct Printer {
     /// nothing to a reader.
     tyvars: HashMap<u32, String>,
     next_ty: u32,
+    /// What [`signature`] writes types and effects with.
+    versions: Option<std::sync::Arc<versions::Versions>>,
 }
 
 impl Printer {
+    /// Type `n`, with its version where it has one.
+    fn con(&self, n: &InternedString) -> String {
+        let shown = hir::spelling(n).to_string();
+        match self.versions.as_ref().and_then(|v| v.types.get(n)) {
+            Some(v) => format!("{shown}#{v}"),
+            None => shown,
+        }
+    }
+
+    /// An effect row's label `l`, with its effect's version where it has one.
+    fn effect(&self, l: &InternedString) -> String {
+        match self.versions.as_ref().and_then(|v| v.effects.get(l)) {
+            Some(v) => format!("{l}#{v}"),
+            None => l.to_string(),
+        }
+    }
+
     /// A rigid type variable's printed name: `a`, `b`, … then `a1`, `b1`.
     fn tyvar(&mut self, id: u32) -> String {
         if let Some(s) = self.tyvars.get(&id) {
@@ -541,15 +594,16 @@ impl Printer {
             InferType::Bound(i) => format!("?{i}"),
             InferType::RowEmpty => "{}".to_string(),
             InferType::Error => "{error}".to_string(),
-            InferType::Con(n, args) if args.is_empty() => hir::spelling(n).to_string(),
+            InferType::Con(n, args) if args.is_empty() => self.con(n),
             InferType::Con(n, args) => {
                 let parts: Vec<String> = args.iter().map(|a| self.ty(a)).collect();
-                format!("({} {})", hir::spelling(n), parts.join(" "))
+                format!("({} {})", self.con(n), parts.join(" "))
             }
             InferType::Fun(args, ret, eff) => {
                 let parts: Vec<String> = args.iter().map(|a| self.ty(a)).collect();
                 let e = match &**eff {
                     InferType::RowEmpty => String::new(),
+                    other @ InferType::RowExtend(..) => format!(" ! {}", self.row(other, true)),
                     other => format!(" ! {}", self.ty(other)),
                 };
                 format!("({} -> {}{e})", parts.join(" "), self.ty(ret))
@@ -558,8 +612,8 @@ impl Printer {
                 let parts: Vec<String> = items.iter().map(|a| self.ty(a)).collect();
                 format!("({})", parts.join(", "))
             }
-            InferType::Record(row) => self.row(row),
-            InferType::RowExtend(..) => self.row(t),
+            InferType::Record(row) => self.row(row, false),
+            InferType::RowExtend(..) => self.row(t, false),
         }
     }
 
@@ -567,14 +621,19 @@ impl Printer {
     ///
     /// An effect's payload is the empty tuple when the effect takes no
     /// parameters, and writing `Console : ()` for that would be noise.
-    fn row(&mut self, t: &Ty) -> String {
+    fn row(&mut self, t: &Ty, effects: bool) -> String {
         let mut parts: Vec<String> = Vec::new();
         let mut cur = t;
         loop {
             match cur {
                 InferType::RowExtend(label, field, rest) => {
+                    let label = if effects {
+                        self.effect(label)
+                    } else {
+                        label.to_string()
+                    };
                     parts.push(match &**field {
-                        InferType::Tuple(xs) if xs.is_empty() => label.to_string(),
+                        InferType::Tuple(xs) if xs.is_empty() => label,
                         other => format!("{label} : {}", self.ty(other)),
                     });
                     cur = rest;

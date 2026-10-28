@@ -105,7 +105,7 @@ cli! {
       runtime
         : Option
           ("glade" | "silo")
-          "The runtime system: `glade` (the default), bytecode and a garbage collector, or `silo`, compiled all the way down by LLVM and counting references"
+          "The runtime system: `glade`, or `silo`, its name before: there is one, and how it runs a program is `--backend`'s"
           value
           "RUNTIME"
       backend
@@ -115,6 +115,18 @@ cli! {
           value
           "BACKEND"
       jit : Flag "`--backend jit`"
+      jitThreshold
+        : Option
+          Int
+          "On Silo's JIT, how many times a procedure is entered before it is compiled: 0 compiles each when it is first entered"
+          value
+          "N"
+      jitTiers
+        : Option
+          ("1" | "2")
+          "On Silo's JIT, how far it goes: its first tier alone, or the second too (the default)"
+          value
+          "TIERS"
       aot : Flag "`--backend aot`: Glade, compiled ahead of time into an executable" alias "native"
       cfg
         : Option
@@ -138,6 +150,27 @@ cli! {
           "How large Glade's collector lets a thread's nursery grow: `8M`, `512K`, `1G`, or bytes"
           value
           "SIZE"
+      gc
+        : Option
+          ("rc" | "tracing" | "generational" | "copying")
+          "How memory is managed, on either runtime: `rc`, counting references, or a tracing collector"
+          value
+          "STRATEGY"
+      interpret : Flag "Interpret what is built for Silo rather than compiling it"
+      stack
+        : Option
+          ("fixed" | "growable" | "heap")
+          "Where a program's frames live on Silo: a thread's stack, one that grows, or the heap"
+          value
+          "STACK"
+      layout
+        : Option
+          ("silo" | "glade")
+          "How a block is laid out in memory on Silo: with a count in its header, or Glade's, with none"
+          value
+          "LAYOUT"
+      noReload
+        : Flag "Build what is interpreted so that no new build of it loads into it as it runs"
       leaks : Flag "After running, report the blocks the program left behind"
       features
         : Option
@@ -176,7 +209,7 @@ cli! {
         emit
           : Option
             [String]
-            "What to write, in place of what a build writes by default: `image`, `bytecode`, `asm`, `exe`, or `expanded`. Comma-separated, or repeated"
+            "What to write, in place of what a build writes by default: `image`, `exe`, or `expanded`. Comma-separated, or repeated"
             split
             ","
             value
@@ -196,8 +229,8 @@ cli! {
             "--"
         types : Flag "Print the type of every top-level binding in your packages first"
         package : Option String "In a workspace: the member to run" short "p" value "NAME"
-        cek : Flag "Evaluate with the CEK machine rather than the bytecode VM"
-        gcStats : Flag "After running, report what the garbage collector did (VM only)"
+        cek : Flag "Evaluate with the CEK machine rather than the VM"
+        gcStats : Flag "After running, report what memory management did"
         profileTo
           : Option
             String
@@ -206,34 +239,17 @@ cli! {
             "FILE"
         sampleEvery : Option Int "Block entries between samples, with `--profile-to`" value "N"
         sampleHz : Option Int = 1000 "Samples a second, for the profile of time" value "HZ"
-        train
-          : Flag
-            "Run on the JIT and write what each call site was seen to enter, for an `aot` build to guard its calls on"
-        gc : Option ("generational" | "copying") "Which collector the VM uses" value "GC"
+        watch : Flag "Run on the VM, and load each new build into the program as it runs"
       }
       with
       Build
     | exec
-      "Run a bytecode image: what `meadow build` writes under `target/<profile>/bytecode/`, or what a compiler written in Meadow emits"
+      "Run an image on the VM: what `meadow build` writes under `target/<profile>/native/`, or `meadow cut --no-run`"
       {
         image : String "The image"
         args : [String] "Arguments for the program, after `--`" after "--"
         backend : Option String "How to run it: `vm` or `jit`" value "BACKEND"
-        optLevel : Option Int "How hard the JIT optimises: 0, 1 or 2" short "O" value "LEVEL"
       }
-    | link "Compile a bytecode image to machine code and link it into an executable" {
-      image : String "The image"
-      output : Option String "Where to write the executable" short "o" value "FILE"
-      emit : Option [String] "What to write: `exe` or `asm`" split "," value "KIND"
-      optLevel : Option Int "Optimization level: 0, 1 or 2" short "O" value "LEVEL"
-      target : Option String "The architecture to compile for" value "ARCH"
-      threads : Option Int "How many OS threads run the program's green threads" short "j" value "N"
-      nursery : Option String "How large the collector lets a thread's nursery grow" value "SIZE"
-      leaks : Flag "After running, report the blocks the program left behind"
-      features : Option String "Features of the package to build with" value "FEATURES"
-      noDefaultFeatures : Flag "Build without the package's `default` features"
-      allFeatures : Flag "Build with every feature the package has"
-    }
     | test
       "Build a package and run its `@test` functions"
       {
@@ -243,17 +259,14 @@ cli! {
         std : Flag "Also run the standard library's own tests"
         testThreads : Option Int "How many tests run at once" value "N"
         noCapture : Flag "Write what tests print as they print it" alias "nocapture"
-        cek : Flag "Evaluate with the CEK machine rather than the bytecode VM"
+        cek : Flag "Evaluate with the CEK machine rather than the VM"
       }
       with
       Members,
         Build
     | dis
-      "Disassemble a package: the bytecode the VM would run"
-      {
-        path : Maybe String "Package directory (or a single `.mw` file), or a workspace"
-        asm : Flag "The machine code an `aot` build would link, as text"
-      }
+      "Disassemble a package: the code the VM runs"
+      { path : Maybe String "Package directory (or a single `.mw` file), or a workspace" }
       with
       Members,
         Build
@@ -262,6 +275,12 @@ cli! {
       clientProcessId
         : Option Int "Ignored: the editor's process id" as "clientProcessId" value "PID"
       fetch : Flag "Fetch what a package depends on when a file of it is opened, as a build would"
+      check
+        : Option
+          [String]
+          "Serve nothing: print every error the server would mark in each `.mw` file under these paths, and exit 1 if there is one"
+          value
+          "PATH"
     }
     | dap "Run the debug adapter, speaking the Debug Adapter Protocol over stdin and stdout" {}
     | fmt "Re-indent `.mw` sources in place" {
@@ -284,26 +303,26 @@ cli! {
       path : Option String "The package whose manifest to change" value "DIR"
     }
     | cut
-      "Run a program of Cut, the IR a front end hands the back end (`docs/CUT.md`): lowered to AxCut and run on Glade, or built for Silo and run as an executable"
+      "Run a program of Cut, the IR a front end hands the back end (`docs/CUT.md`): lowered to AxCut and run on the VM, or built ahead of time and run as an executable"
       {
         file : String "The program, as the text `docs/CUT.md` describes"
         args : [String] "What the program is given, after `--`: what its `argv` answers" after "--"
         runtime : Option String =
-          "glade" "`glade`, on its bytecode, or `silo`, as native code" value "NAME"
-        aot : Flag "On Glade, compile the bytecode to machine code ahead of time and run that"
+          "glade" "`glade`, the runtime; `silo`, its name before, is taken as `--aot`" value "NAME"
+        aot : Flag "Build an executable ahead of time and run that, rather than running it on the VM"
         optLevel : Option Int =
           2 "How hard an executable is optimised: 0, 1 or 2" short "O" value "LEVEL"
-        noRun : Flag "Build what would be run -- the bytecode image, or the executable -- and stop"
+        noRun : Flag "Build what would be run -- the VM's image, or the executable -- and stop"
         target
           : Option
             String
-            "What a Silo build compiles for: `aarch64` or `x86_64`, or a target triple such as `aarch64-linux-android`"
+            "What an executable compiles for: `aarch64` or `x86_64`, or a target triple such as `aarch64-linux-android`"
             value
             "TARGET"
         emit
           : Option
             String
-            "Print what the program is made into, and run nothing: `inlined`, the Cut it is lowered from once its small definitions are inlined; `axcut`, the AxCut it is lowered to; or `llvm`, the LLVM IR a Silo build compiles"
+            "Print what the program is made into, and run nothing: `inlined`, the Cut it is lowered from once its small definitions are inlined; `axcut`, the AxCut it is lowered to; or `llvm`, the LLVM IR an executable is compiled from"
             value
             "WHAT"
       }
@@ -398,6 +417,8 @@ fun failure (e : QueryError k) : String =
 fun run (every : CliOptions) (cli : Cli) =
   match cli with
   | Cli.Build r -> driven r.path r.build None
+  -- Loading a build into a running program is `meadow`'s, for now.
+  | Cli.Run r if r.watch -> handedOn ()
   | Cli.Run r -> driven r.path r.build (Just r.args)
   -- The standard library's own tests are `meadow`'s to run, for now.
   | Cli.Test r if r.std -> handedOn ()
@@ -465,7 +486,14 @@ fun handedOn () =
 fun unheeded (b : CliBuild) : [String] =
   V.concatMap (\x -> if fst x then [snd x] else []) [
     (b.noPrune, "--no-prune"),
+    (M.isSome b.jitThreshold, "--jit-threshold"),
+    (M.isSome b.jitTiers, "--jit-tiers"),
     (M.isSome b.nursery, "--nursery"),
+    (M.isSome b.gc, "--gc"),
+    (b.interpret, "--interpret"),
+    (M.isSome b.stack, "--stack"),
+    (M.isSome b.layout, "--layout"),
+    (b.noReload, "--no-reload"),
     (b.leaks, "--leaks"),
     (M.isSome b.features, "--features"),
     (b.noDefaultFeatures, "--no-default-features"),
@@ -591,7 +619,7 @@ fun targetOf (given : Maybe String) : Goal =
 
 -- What the back end built natively for the package at `r` -- a library of
 -- what it exports, or a program -- named for the package and put where `meadow
--- build` puts a native program, `target/<profile>/native/silo`, so that two
+-- build` puts a native program, `target/<profile>/native/glade`, so that two
 -- packages' do not share a name. A library is put there; a program is not yet.
 fun placed (r : String) (profile : String) (library : Bool) (goal : Goal)
     : Result String String ! { Fs | e } =
@@ -614,10 +642,10 @@ fun placed (r : String) (profile : String) (library : Bool) (goal : Goal)
   let under = if goal.host then "" else "/${goal.triple}" in
   let built =
     Path.join
-      (Path.join (linkDirIn r profile) "target/release/native${under}/silo")
+      (Path.join (linkDirIn r profile) "target/release/native${under}/glade")
       (fileOf "program")
   in
-  let dir = Path.join r "target/${profile}/native${under}/silo" in
+  let dir = Path.join r "target/${profile}/native${under}/glade" in
   let dest = Path.join dir (fileOf name) in
   match createDirAll dir with
   | Err why -> Err why

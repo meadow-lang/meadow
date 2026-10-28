@@ -33,7 +33,7 @@ end. What does reach it is described here, and nothing else is.
 - **AxCut** is the lower IR: Cut focused and linearised until every cut has a
   variable on one side (Schuster et al., _Compiling Classical Sequent Calculus
   to Stock Hardware_, OOPSLA 2025). It keeps only machine-level passes, and the
-  runtimes compile it: Glade to bytecode, Silo to LLVM.
+  runtime runs it: its VM interprets it, and LLVM compiles it ahead of time.
 
 A front end produces Cut only. AxCut's text form exists for the back end's own
 tests and for debugging: what Cut lowered to, written down. A front end may
@@ -48,7 +48,7 @@ emit it while Cut is being built, but must not depend on it afterwards.
 None of them depends on any front end.
 
 `meadow cut FILE` runs a program of Cut's text: lowered to AxCut and run on
-Glade, or, with `--runtime silo`, built as an executable and run. The lowering
+the VM, or, with `--aot`, built as an executable and run. The lowering
 takes everything here but a `μ` where a value is wanted other than as a
 definition's argument, and refuses a program with one, saying so.
 
@@ -294,7 +294,7 @@ takes and gives, from the table below. **Native also means unhandled:** an
 operation that is not bound here, and that no handler answers, is an error
 when the program is lowered, not when it runs.
 
-The runtime's operations, as Glade and Silo perform them today. An operation
+The runtime's operations, as it performs them today. An operation
 takes one value: one that takes several takes them as a tuple (`(str, str)`).
 A front end performs its own operation with its arguments as they are,
 `perform idyll:Prelude/Fs.writeString(path, text; c)`, and the back end packs
@@ -451,14 +451,14 @@ parameters.
 
 **Reserved hints.** A binder may carry hints the back end may use and must not
 need, written after its representation with `@`: `x: ptr @once`,
-`x: ptr @0..1`. Idyll's grades are the intended source, for Silo's
+`x: ptr @0..1`. Idyll's grades are the intended source, for the back end's
 linearisation to skip uniqueness checks or place drops. v0 parses and ignores
 them.
 
 The **reference interpreter** runs Cut directly, by cut elimination: a cut of a
 constructor against a `case` picks the arm, a cut of a `μ` against a consumer
 substitutes, and so on. Its answer and what it prints define the program. The
-AxCut machine, Glade and Silo must all agree with it.
+AxCut machine, the VM and an executable must all agree with it.
 
 ## Primitives
 
@@ -489,8 +489,8 @@ at its representation first:
 prim arrayGet(xs, i; μ̃ x: 'a. <x | k>)    an element of rep 'a, to k
 ```
 
-Glade's values carry their own tags, so a wrong guess there goes unnoticed;
-Silo's do not, and a word taken for a pointer is followed.
+The runtime's values do not carry their own tags, and a word taken for a
+pointer is followed.
 
 The `i64` arithmetic is what `meadow_rt::num` does, and what every runtime and
 both front ends' interpreters agree on:
@@ -595,7 +595,7 @@ effects gets the strategy its caller's effects need:
   clause, `op(x; r, k) => <r | apply(e; k)>` with `r` not otherwise used,
   is a plain call. Any other clause captures the continuation as a stack
   segment, which is resumed in place, at most once. This is Meadow's lowering
-  today, on both Glade (heap frame chunks) and Silo (native stack segments). A
+  today, on stack segments, the native stack's or the heap's. A
   resumption the front end proved is used at most once needs no run-time
   check.
 - **`ManyEffect`**: the code between the handler and the `perform` keeps its

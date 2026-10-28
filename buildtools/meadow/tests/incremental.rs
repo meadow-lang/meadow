@@ -86,10 +86,10 @@ fn build(root: &Path, opts: meadow::Options) -> (Vec<String>, pipeline::ManyOutp
 }
 
 /// Everything a build says about a program: its symbols and their types,
-/// every node's type, the bytecode, and what running it gives.
+/// every node's type, the program the back end is given, and what running it
+/// gives.
 fn everything(out: &BuildOutput) -> String {
     let linked = out.linked.as_ref().unwrap();
-    let image = meadow::runtime::compile(&linked.program, meadow::OptLevel::O1).unwrap();
     let value = match linked.program.entry {
         Some(_) => meadow_eval::run(&linked.program).unwrap().to_string(),
         None => String::new(),
@@ -98,7 +98,7 @@ fn everything(out: &BuildOutput) -> String {
         "{}{}{}{value}",
         linked.dump(),
         linked.annotations(),
-        image.disassemble()
+        linked.program.pretty()
     )
 }
 
