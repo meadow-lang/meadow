@@ -1123,6 +1123,17 @@ pub(super) fn build(
     path: &Path,
     entry: Option<&Entry>,
 ) -> Result<(meadow_seq::Program, Vec<meadow_compiler::CompiledPackage>), LaunchError> {
+    build_reloadable(path, entry, false)
+}
+
+/// [`build`], lowered -- if `reloadable` -- so that a new build may be loaded
+/// into it as it runs, as an interpreted build is (`aot::lowered_for`): what
+/// Silo's interpreter runs under a debugger.
+pub(super) fn build_reloadable(
+    path: &Path,
+    entry: Option<&Entry>,
+    reloadable: bool,
+) -> Result<(meadow_seq::Program, Vec<meadow_compiler::CompiledPackage>), LaunchError> {
     let path =
         std::fs::canonicalize(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     let mut options = Resolved::new(Profile::Debug).options;
@@ -1182,7 +1193,7 @@ pub(super) fn build(
     if linked.program.entry.is_none() {
         return Err(format!("{} has no `main` to run", path_display(&path)));
     }
-    let lowered = meadow_seq::lower_program(&linked.program, options.opt);
+    let lowered = meadow_seq::lower_program_with(&linked.program, options.opt, reloadable);
     if !lowered.unsupported.is_empty() {
         return Err(format!(
             "the back end cannot compile this program: {:?}",

@@ -856,8 +856,15 @@ labels, an array's elements, a closure's captures.
 where the debugger follows continuations on the heap.
 - *Status:* done; `dap_silo` under `MEADOW_STACK=heap`.
 
-**DBG-9.** (planned, R5) The debugger stops in reloaded code, by line, in
-every segment.
+**DBG-9.** The debugger stops in reloaded code, by line, in every segment,
+and names each frame's segment.
+- *Status:* done; `dap_silo::a_breakpoint_stops_in_the_code_a_reload_brought`,
+  on both stacks.
+
+**DBG-10.** `meadow dap` can watch sources and reload, as `meadow run
+--watch` does: a launch with `"watch": true`.
+- *Status:* done; the same test, which changes the source while the program
+  runs.
 
 ## 13. The REPL
 
@@ -1222,15 +1229,32 @@ VM.
 
 - **HF-1.** Under `--stack heap`, frames live on a stack of chunks, as
   Glade's do. A frame that is captured is copied to the heap.
+  - *Status:* done on the VM. Its image keeps the program's frames, and a
+    call that waits does not call natively: the caller's resumption goes on
+    the loop's own stack of them, and the loop goes on in the callee. A
+    resumption is the rest of a procedure (its procedure, the pc after the
+    call, its slots, where the answer goes) or a frame not built. A
+    callee's slots are boxed from a pool, so neither side's are copied, and
+    the records a frame keeps on the shadow chain are in chunks that do
+    not move, so a call allocates nothing once warm. A frame used as a
+    value is built on the heap, as on the other stacks. When records begin
+    -- a debugger, a profile, coverage -- the loop hands its frames to the
+    loop that keeps records. The debugger shows the frames waiting as the
+    calls they are. The JIT is off under `heap`, since compiled code calls
+    natively. An executable under `heap` is as before: every continuation
+    an object.
 - **HF-2.** fib on the VM under `heap` is within 20% of the growable stack's
   time (today 563 ms against 345 ms).
+  - *Status:* done: 356 ms against 352 ms (Windows desktop).
 
 ### R5. The debugger and reloading together
 
 - **DBG-9.** The debugger stops in reloaded code, by line, in every segment,
   and names each frame's segment.
+  - *Status:* done (section 12).
 - **DBG-10.** `meadow dap` can watch sources and reload, as `meadow run
   --watch` does.
+  - *Status:* done (section 12).
 
 ### R6. Hot loading, further
 

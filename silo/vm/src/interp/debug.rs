@@ -22,11 +22,21 @@
 //! decides it; or when the adapter asked for a pause. Then the program waits,
 //! answering questions, until it is told to run again.
 //!
-//! **What the VM is told** (adapter to VM): `setup` (the boundaries, and a
-//! key per pc saying which line it is on), `breakpoints`, `run` (how far),
-//! `stack`, `children` (of a value shown before), `pause`, `terminate`.
+//! **What the VM is told** (adapter to VM): `setup` (of a segment: the
+//! boundaries, and a key per pc saying which line it is on), `breakpoints`
+//! (each a segment and a pc), `run` (how far), `stack`, `children` (of a
+//! value shown before), `pause`, `terminate`.
 //! **What it says**: `ready` (its procedures and where each instruction was
-//! written), `stopped`, `exception`, `exited`, and the answers.
+//! written), `loaded` (the same, of a segment a reload added), `reloaded`
+//! or `refused` (how a reload ended), `stopped`, `exception`, `exited`, and
+//! the answers.
+//!
+//! **Segments.** Each load's code is a segment of its own, with its own pcs
+//! and procedures (`docs/RUNTIME-MERGE.md`, "Hot loading"), and the adapter
+//! is told of each: a frame says which segment its procedure is in, and its
+//! procedure and pc are numbered within it. A reload says `loaded` before
+//! anything can call the new code, and waits for the segment's `setup`, so
+//! that a breakpoint in it is there from the first call.
 
 use super::{Env, V, Vm, d, vm};
 use meadow_rt::desc;
@@ -36,7 +46,8 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::{Condvar, Mutex, OnceLock, mpsc};
+use std::time::Duration;
 
 /// An activation's record, on the native stack of the loop it belongs to.
 pub(super) struct Act {
@@ -45,6 +56,9 @@ pub(super) struct Act {
     pub(super) proc: u32,
     pub(super) pc: usize,
     pub(super) env: *const Env,
+    /// Under `--stack heap`, the activation's frames waiting on its calls
+    /// (`Vec<super::Resume>`), or null.
+    pub(super) frames: *const (),
 }
 
 impl Act {
@@ -92,14 +106,32 @@ struct State {
     handles: Vec<(Word, i64)>,
 }
 
-pub(super) struct Debugger {
-    /// Where a step may stop, and which line each pc is on: told once,
-    /// before the program begins, and only read after.
+/// What the adapter has said of one segment's code.
+struct Seg {
+    /// Where a step may stop, and which line each pc is on: told once, before
+    /// the segment's code runs, and only read after.
     boundary: OnceLock<Vec<bool>>,
     keys: OnceLock<Vec<u64>>,
+    breakpoint: Vec<AtomicBool>,
+}
+
+impl Seg {
+    fn of(n: usize) -> Seg {
+        Seg {
+            boundary: OnceLock::new(),
+            keys: OnceLock::new(),
+            breakpoint: (0..n).map(|_| AtomicBool::new(false)).collect(),
+        }
+    }
+}
+
+pub(super) struct Debugger {
+    /// Each segment's, by its number, once it is loaded.
+    segs: Box<[OnceLock<Seg>]>,
+    /// Told when a segment's setup arrives.
+    told: (Mutex<()>, Condvar),
     out: Mutex<TcpStream>,
     inbox: Mutex<mpsc::Receiver<Json>>,
-    breakpoint: Vec<AtomicBool>,
     pause: AtomicBool,
     state: Mutex<State>,
     /// Which slots hold a value where, by procedure: worked out for a
@@ -121,13 +153,13 @@ pub fn start(port: u16) -> Result<(), String> {
     let reader = stream.try_clone().map_err(|e| e.to_string())?;
     let (tx, rx) = mpsc::channel();
     let v = vm();
-    let n = v.first().code.ins.len();
+    let segs: Box<[OnceLock<Seg>]> = (0..super::SEGMENTS).map(|_| OnceLock::new()).collect();
+    let _ = segs[0].set(Seg::of(v.first().code.ins.len()));
     let made = Debugger {
-        boundary: OnceLock::new(),
-        keys: OnceLock::new(),
+        segs,
+        told: (Mutex::new(()), Condvar::new()),
         out: Mutex::new(stream),
         inbox: Mutex::new(rx),
-        breakpoint: (0..n).map(|_| AtomicBool::new(false)).collect(),
         pause: AtomicBool::new(false),
         live: Mutex::new(std::collections::HashMap::new()),
         state: Mutex::new(State {
@@ -157,6 +189,10 @@ pub fn start(port: u16) -> Result<(), String> {
                 me.pause.store(true, Ordering::Relaxed);
             } else if let Some(pcs) = msg.get("breakpoints") {
                 me.set_breakpoints(pcs);
+            } else if let Some(setup) = msg.get("setup") {
+                // At once, even while the program runs: a reload waits for
+                // it.
+                me.set_up(setup);
             } else if msg.get("terminate").is_some() {
                 std::process::exit(0);
             } else if tx.send(msg).is_err() {
@@ -167,28 +203,11 @@ pub fn start(port: u16) -> Result<(), String> {
         std::process::exit(0);
     });
     let me = debugger().expect("set above");
-    me.send(json!({ "ready": v.description() }));
-    // The setup, and then how to begin.
+    me.send(json!({ "ready": v.description(0) }));
+    // How to begin, once the setup has been taken.
     loop {
         let msg = me.next();
-        if let Some(setup) = msg.get("setup") {
-            let mut boundary = vec![false; n];
-            for b in setup["boundary"].as_array().into_iter().flatten() {
-                if let Some(pc) = b.as_u64().filter(|pc| (*pc as usize) < n) {
-                    boundary[pc as usize] = true;
-                }
-            }
-            let mut keys = vec![0; n];
-            for pair in setup["keys"].as_array().into_iter().flatten() {
-                if let (Some(pc), Some(k)) = (pair[0].as_u64(), pair[1].as_u64())
-                    && (pc as usize) < n
-                {
-                    keys[pc as usize] = k;
-                }
-            }
-            let _ = me.boundary.set(boundary);
-            let _ = me.keys.set(keys);
-        } else if let Some(run) = msg.get("run") {
+        if let Some(run) = msg.get("run") {
             let mut st = me.state();
             st.mode = mode(run);
             st.from = 0;
@@ -196,6 +215,16 @@ pub fn start(port: u16) -> Result<(), String> {
             return Ok(());
         }
     }
+}
+
+/// The procedure numbered `local` in segment `seg`, as the VM numbers it.
+fn proc_of(seg: u64, local: u64) -> u32 {
+    ((seg as u32) << super::SEG) | (local as u32 & super::LOCAL)
+}
+
+/// The segment procedure `proc` is in, and its number there.
+fn place(proc: u32) -> (u32, u32) {
+    (proc >> super::SEG, proc & super::LOCAL)
 }
 
 fn mode(run: &Json) -> Mode {
@@ -208,7 +237,7 @@ fn mode(run: &Json) -> Mode {
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter_map(|p| p.as_u64().map(|p| p as u32))
+                .filter_map(|p| Some(proc_of(p[0].as_u64()?, p[1].as_u64()?)))
                 .collect(),
         ),
         _ => Mode::Continue,
@@ -240,33 +269,109 @@ impl Debugger {
         }
     }
 
-    /// Which line `pc` is on, as the adapter numbered lines.
-    fn key(&self, pc: usize) -> u64 {
-        self.keys.get().map_or(0, |k| k[pc])
+    /// Which line `act` is on, as the adapter numbered lines: the same
+    /// number in every segment.
+    fn key(&self, act: &Act) -> u64 {
+        let seg = self
+            .segs
+            .get(place(act.proc).0 as usize)
+            .and_then(|s| s.get());
+        seg.and_then(|s| s.keys.get())
+            .and_then(|k| k.get(act.pc))
+            .copied()
+            .unwrap_or(0)
     }
 
-    fn set_breakpoints(&self, pcs: &Json) {
-        for b in &self.breakpoint {
-            b.store(false, Ordering::Relaxed);
+    /// A segment's setup: its boundaries and keys.
+    fn set_up(&self, setup: &Json) {
+        let at = setup["segment"].as_u64().unwrap_or(0) as usize;
+        let Some(seg) = self.segs.get(at).and_then(|s| s.get()) else {
+            return;
+        };
+        let n = seg.breakpoint.len();
+        let mut boundary = vec![false; n];
+        for b in setup["boundary"].as_array().into_iter().flatten() {
+            if let Some(pc) = b.as_u64().filter(|pc| (*pc as usize) < n) {
+                boundary[pc as usize] = true;
+            }
         }
-        for pc in pcs.as_array().into_iter().flatten() {
-            if let Some(b) = pc.as_u64().and_then(|pc| self.breakpoint.get(pc as usize)) {
+        let mut keys = vec![0; n];
+        for pair in setup["keys"].as_array().into_iter().flatten() {
+            if let (Some(pc), Some(k)) = (pair[0].as_u64(), pair[1].as_u64())
+                && (pc as usize) < n
+            {
+                keys[pc as usize] = k;
+            }
+        }
+        let _ = seg.boundary.set(boundary);
+        let _ = seg.keys.set(keys);
+        let _held = self.told.0.lock().unwrap_or_else(|p| p.into_inner());
+        self.told.1.notify_all();
+    }
+
+    /// The breakpoints, every one: each a segment and a pc in it.
+    fn set_breakpoints(&self, pcs: &Json) {
+        for seg in self.segs.iter().filter_map(|s| s.get()) {
+            for b in &seg.breakpoint {
+                b.store(false, Ordering::Relaxed);
+            }
+        }
+        for at in pcs.as_array().into_iter().flatten() {
+            let (Some(seg), Some(pc)) = (at[0].as_u64(), at[1].as_u64()) else {
+                continue;
+            };
+            if let Some(b) = self
+                .segs
+                .get(seg as usize)
+                .and_then(|s| s.get())
+                .and_then(|s| s.breakpoint.get(pc as usize))
+            {
                 b.store(true, Ordering::Relaxed);
             }
         }
     }
 
-    /// Before the instruction `act` is at: stop there if anything says to.
-    pub(super) fn at(&self, act: &Act) {
-        // The pcs the adapter knows are the first load's.
-        if act.proc >> super::SEG != 0 {
+    /// A reload has added segment `seg`, which nothing calls yet: tell the
+    /// adapter, and wait for it to say where its lines and breakpoints are.
+    pub(super) fn loaded(&self, seg: usize) {
+        let v = vm();
+        let n = v.seg(proc_of(seg as u64, 0)).code.ins.len();
+        if self.segs[seg].set(Seg::of(n)).is_err() {
             return;
         }
+        self.send(json!({ "loaded": { "segment": seg, "description": v.description(seg) } }));
+        // Not for ever: an adapter that does not answer leaves the new code
+        // run without stops, rather than the program stopped.
+        let told = || self.segs[seg].get().is_some_and(|s| s.keys.get().is_some());
+        let mut held = self.told.0.lock().unwrap_or_else(|p| p.into_inner());
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while !told() {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            held = match self.told.1.wait_timeout(held, left) {
+                Ok((h, _)) => h,
+                Err(p) => p.into_inner().0,
+            };
+        }
+    }
+
+    /// Before the instruction `act` is at: stop there if anything says to.
+    pub(super) fn at(&self, act: &Act) {
+        // Code of a segment the adapter has not been told of yet runs on.
+        let Some(seg) = self
+            .segs
+            .get(place(act.proc).0 as usize)
+            .and_then(|s| s.get())
+        else {
+            return;
+        };
         let pc = act.pc;
-        let boundary = self.boundary.get().is_some_and(|b| b[pc]);
+        let boundary = seg.boundary.get().is_some_and(|b| b[pc]);
         let reason = if self.pause.swap(false, Ordering::Relaxed) {
             Some("pause")
-        } else if self.breakpoint[pc].load(Ordering::Relaxed) {
+        } else if seg.breakpoint[pc].load(Ordering::Relaxed) {
             Some("breakpoint")
         } else if !boundary {
             None
@@ -276,7 +381,7 @@ impl Debugger {
                 // By line, as a person reads code -- and a call begun on the
                 // line it was made from is somewhere new all the same, so a
                 // change of frame counts as moving too.
-                let moved = self.key(pc) != st.from;
+                let moved = self.key(act) != st.from;
                 let (here, from) = (act.depth, st.depth);
                 // The same frame: as deep on the native stack, and returning
                 // to the same continuation. Returned: shallower, or now
@@ -317,7 +422,8 @@ impl Debugger {
             }
         };
         if let Some(reason) = reason {
-            self.send(json!({ "stopped": reason, "pc": pc }));
+            let (seg, _) = place(act.proc);
+            self.send(json!({ "stopped": reason, "segment": seg, "pc": pc }));
             self.serve(Some(act));
         }
     }
@@ -341,7 +447,7 @@ impl Debugger {
                 unpin(st.parent_k.unwrap_or(0));
                 (st.from_k, st.parent_k) = (0, None);
                 if let Some(a) = act {
-                    st.from = self.key(a.pc);
+                    st.from = self.key(a);
                     st.depth = a.depth;
                     st.from_k = ret_of(a);
                     st.parent_k = parent_of(st.from_k);
@@ -354,8 +460,6 @@ impl Debugger {
         }
     }
 
-    /// The running chain, innermost first, at most `max` deep: each frame's
-    /// procedure, pc, and the named registers that hold something.
     /// Which of procedure `proc`'s slots hold a value at each of its pcs.
     fn live_of(&self, proc: u32) -> std::sync::Arc<super::live::Live> {
         let mut cache = self.live.lock().unwrap_or_else(|p| p.into_inner());
@@ -378,6 +482,59 @@ impl Debugger {
             .clone()
     }
 
+    /// The frame of procedure `proc` at `pc`, whose slots are `env`: where it
+    /// stopped if `innermost`, and waiting on a call there if not.
+    fn frame(&self, proc: u32, pc: usize, env: &Env, innermost: bool) -> Json {
+        let p = vm().proc(proc);
+        // Only what its slots still hold for it: the innermost frame is
+        // where it stopped, and every other is waiting on a call, which its
+        // arguments have gone to.
+        let live = self.live_of(proc);
+        let live = if innermost {
+            live.at(pc)
+        } else {
+            live.waiting(pc)
+        };
+        let mut vars = Vec::new();
+        for (slot, var) in p.slot_vars.iter().enumerate() {
+            let (Some(var), Some(V::Val(w))) = (var, env.get(slot)) else {
+                continue;
+            };
+            let described = match p.slot_descs[slot] {
+                super::D::S(s) => live.has(s),
+                super::D::K(_) => true,
+            };
+            if !live.has(slot as u32) || !described {
+                continue;
+            }
+            let dd = d(p.slot_descs[slot], env);
+            let (shown, handle) = self.value(*w, dd);
+            vars.push(json!([var, shown, handle]));
+        }
+        framed(proc, pc, vars)
+    }
+
+    /// The frame not built `fr`, waiting to be entered with a call's answer:
+    /// its code, and what it captured.
+    fn waiting_frame(&self, fr: &super::Frame) -> Json {
+        let v = vm();
+        let p = v.proc(fr.proc);
+        let vars: Vec<Json> = fr
+            .captured
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (c, dd, _))| {
+                let var = p.slot_vars.get(i).copied().flatten()?;
+                let V::Val(w) = c else { return None };
+                let (shown, handle) = self.value(*w, *dd);
+                Some(json!([var, shown, handle]))
+            })
+            .collect();
+        framed(fr.proc, p.entry as usize, vars)
+    }
+
+    /// The running chain, innermost first, at most `max` deep: each frame's
+    /// procedure, pc, and the named registers that hold something.
     fn stack(&self, max: usize) -> Vec<Json> {
         let v = vm();
         let mut out = Vec::new();
@@ -390,32 +547,29 @@ impl Debugger {
             // Safety: the activation's registers, which nothing writes while
             // the program is stopped.
             let env: &Env = unsafe { &*a.env };
-            // Only what its slots still hold for it: the innermost frame is
-            // where it stopped, and every other is waiting on a call, which
-            // its arguments have gone to.
-            let live = self.live_of(a.proc);
-            let live = if out.is_empty() {
-                live.at(a.pc)
-            } else {
-                live.waiting(a.pc)
-            };
-            let mut vars = Vec::new();
-            for (slot, var) in p.slot_vars.iter().enumerate() {
-                let (Some(var), Some(V::Val(w))) = (var, env.get(slot)) else {
-                    continue;
-                };
-                let described = match p.slot_descs[slot] {
-                    super::D::S(s) => live.has(s),
-                    super::D::K(_) => true,
-                };
-                if !live.has(slot as u32) || !described {
-                    continue;
+            out.push(self.frame(a.proc, a.pc, env, out.is_empty()));
+            // Under `--stack heap`, the calls it has waiting, innermost
+            // first: each a frame of its own, as on the native stack.
+            if !a.frames.is_null() {
+                // Safety: the activation's stack of frames, which nothing
+                // changes while the program is stopped.
+                let frames = unsafe { &*(a.frames as *const Vec<super::Resume<'static>>) };
+                for r in frames.iter().rev() {
+                    if out.len() >= max {
+                        break;
+                    }
+                    match r {
+                        super::Resume::At {
+                            proc, pc, slots, ..
+                        } => {
+                            // Safety: the caller's slots, where they wait.
+                            let caller: &Env = unsafe { &**slots };
+                            out.push(self.frame(*proc, pc - 1, caller, false));
+                        }
+                        super::Resume::Frame { fr, .. } => out.push(self.waiting_frame(fr)),
+                    }
                 }
-                let dd = d(p.slot_descs[slot], env);
-                let (shown, handle) = self.value(*w, dd);
-                vars.push(json!([var, shown, handle]));
             }
-            out.push(json!({ "proc": a.proc, "pc": a.pc, "vars": vars }));
             // What it returns to, when that is an object rather than the
             // native stack: under `--stack heap` every caller is one.
             let k = p.slot_vars.iter().enumerate().find_map(|(slot, var)| {
@@ -486,7 +640,7 @@ impl Debugger {
                         var.map(|var| json!([var, shown, handle]))
                     })
                     .collect();
-                out.push(json!({ "proc": proc, "pc": p.entry, "vars": vars }));
+                out.push(framed(proc, p.entry as usize, vars));
             }
             let named = |set: &std::collections::HashSet<meadow_axcut::Name>| {
                 captured
@@ -596,6 +750,24 @@ impl Debugger {
 
 /// The continuation the activation `act` returns to: the null one when its
 /// caller called it natively.
+/// A frame as the adapter is told of it: the segment its procedure is in,
+/// and the procedure and pc as that segment numbers them.
+fn framed(proc: u32, pc: usize, vars: Vec<Json>) -> Json {
+    let (seg, local) = place(proc);
+    json!({ "segment": seg, "proc": local, "pc": pc, "vars": vars })
+}
+
+/// A reload of the image has ended, as `done` says: the adapter is told, if
+/// there is one.
+pub fn reloaded(done: &Result<String, String>) {
+    if let Some(me) = debugger() {
+        me.send(match done {
+            Ok(what) => json!({ "reloaded": what }),
+            Err(why) => json!({ "refused": why }),
+        });
+    }
+}
+
 fn ret_of(act: &Act) -> Word {
     let v = vm();
     let Some(slot) = v.proc(act.proc).ret_slot else {
@@ -693,10 +865,11 @@ pub fn exited(shown: Option<String>) {
 }
 
 impl Vm {
-    /// What the adapter needs to know of the loaded program: each procedure's
-    /// name and code, and where each instruction was written.
-    fn description(&self) -> Json {
-        let first = self.first();
+    /// What the adapter needs to know of segment `seg` of the loaded program:
+    /// each procedure's name and code, and where each instruction was
+    /// written -- numbered within the segment.
+    fn description(&self, seg: usize) -> Json {
+        let first = self.seg(proc_of(seg as u64, 0));
         let mut order: Vec<usize> = (0..first.procs.len()).collect();
         order.sort_by_key(|i| first.procs[*i].entry);
         let mut procs = vec![Json::Null; first.procs.len()];
@@ -715,7 +888,8 @@ impl Vm {
                 && let Some(&(proc, _)) = first
                     .methods
                     .get(first.code.news[*n as usize].base as usize)
-                && origin[proc as usize].is_null()
+                && let (_, proc) = place(proc)
+                && origin.get(proc as usize).is_some_and(|o| o.is_null())
             {
                 origin[proc as usize] = json!(pc);
             }

@@ -1127,6 +1127,91 @@ pending.
 
 These are a whole process's times, its start and its compiling included.
 
+### Heap frames on the VM's own stack (2026-10-28)
+
+**Before.** Under `--stack heap`, the VM's image dropped the program's
+frames, so every continuation was a closure: built on the heap at each
+non-tail call, and released when it was entered. fib took 563 ms against
+345 ms on the growable stack.
+
+**Now.** The image keeps the frames, and the VM runs them on a stack of its
+own (HF-1).
+- **A call that waits** does not call natively. The caller's resumption goes
+  on the loop's stack, and the loop goes on in the callee. A resumption is
+  the rest of the procedure that called -- its procedure, the pc after the
+  call, its slots, where the answer goes -- or a frame not built that was
+  handed the call as its continuation.
+- **A return** to the null continuation goes on with the last resumption,
+  and leaves the loop only when there is none.
+- **A frame used as a value** is built on the heap, as on the other stacks.
+
+**Making it cheap took three steps:**
+1. The callee's slots are boxed from a pool, so that neither side's are
+   copied or cleared.
+2. The records a frame keeps on the shadow chain -- a program that detaches
+   continuations keeps them for every frame -- are in chunks that do not
+   move, so a call allocates nothing. Boxing each record was a `malloc` and
+   a `free` a call, which `perf` in WSL showed as a quarter of the time.
+3. The two hooks the loop gives `instruction!`, for a call that waits with a
+   frame and for one that holds slots, are where the stack of frames comes
+   in, so nothing runs before the other instructions.
+
+fib now takes 356 ms against 352 ms (HF-2).
+
+**Records begun.** When a debugger, a profile or coverage begins, the loop
+that keeps no records hands its stack of frames to the loop that keeps
+them, at the next procedure entry. Std's steered fuzzer is what found that
+it must.
+
+**The interpreter's own regression, found on the way.** fib on the VM had
+gone from 345 ms to 398 ms over the JIT's work. The JIT does not run there:
+the loop's code had changed with the code around it. Passing a call's slots
+to `exec` and `run` by reference rather than by value -- 264 bytes copied
+twice a call -- brings it back to 348 ms, level with before, with matmul and
+binarytrees level too.
+
+### The debugger and reloading together (2026-10-28)
+
+**Before.** The debugger knew only the first load's code. Code a reload
+brought ran past every breakpoint, and a step through it saw nothing.
+`meadow dap` did not reload at all.
+
+**Now.** Each load is a segment with its own pcs and procedures, and the
+debugger is told of each (DBG-9).
+- **The VM** keeps boundaries, line keys and breakpoints per segment. A frame
+  names its segment, with its procedure and pc numbered within it. A
+  breakpoint is a segment and a pc.
+- **A reload under a debugger** says `loaded`, with the new segment's
+  description, before anything can call the new code. It then waits for
+  the segment's setup. So a breakpoint in the new code is in place from
+  the first call, and nothing runs the new code unseen.
+- **The adapter** works each segment out as it works out the first, from
+  the build that made it: that build's sources, lines and variables. Its
+  tables run every segment's pcs one after another. A breakpoint is set in
+  each segment's code for its line: the old code's as well as the new,
+  since a call under way runs on in the old. A frame of reloaded code is
+  named for its reload: `greet [reload 1]`.
+
+**Watching** (DBG-10). Launched with `"watch": true`, `meadow dap` looks at
+the package's sources as `meadow run --watch` does. When they change, it
+builds the program again and writes the image, and the VM, started with
+`--watch`, loads it. The VM then says `reloaded` or `refused`, and the
+adapter shows what the VM printed of it. A build that fails says why, and
+the program runs on as it was. A session builds reloadably, as an
+interpreted build does, unless reloading is turned off.
+
+**Found on the way.** Std's steered fuzzer kept an input whenever the count
+of places reached grew. The fuzzer's own code reaches new places as its
+draws vary, so it kept inputs for nothing the property did. How far that
+noise carried it depended on how an engine numbers its places. On the
+growable stack it found `fuzz` only after 3,381 tries, where the test allows
+1,000. It now counts only what the property reaches, and every engine finds
+it on the same try, the 82nd.
+
+**Not done.** A line whose only code begins a continuation -- `m` alone,
+after a call -- is never a boundary, so a step goes past it. That was so
+before reloading, and is so in every segment.
+
 ### Replacing Glade in full (2026-10-24)
 
 The merged runtime is to be Glade's next release, so it has to do all that

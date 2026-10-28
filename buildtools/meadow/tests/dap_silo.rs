@@ -219,6 +219,86 @@ fun main () = println (down 2000000)
     assert_eq!(s.take_output(), "2000000\n");
 }
 
+// --- reloading -------------------------------------------------------------------
+
+/// A package `Hot` whose `main` waits for `DIR/go` and then calls `greet`,
+/// which adds `by`, prints what it made on line 5, and prints `n` on line 6.
+fn waiting(dir: &std::path::Path, by: u32) -> String {
+    let go = dir.join("go").to_string_lossy().replace('\\', "/");
+    format!(
+        "\
+use Std.Time (sleep)
+
+fun greet (n : Int) =
+  let m = n + {by} in
+  let u = println m in
+  let v = println n in
+  m
+
+fun wait () = if exists \"{go}\" then () else let _ = sleep 10 in wait ()
+
+fun main () =
+  let _ = wait () in
+  println (greet 1)
+"
+    )
+}
+
+#[test]
+fn a_breakpoint_stops_in_the_code_a_reload_brought() {
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("meadow-dap-silo-{}-reload", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("Meadow.toml"),
+        "[package]\nname = \"Hot\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let main = dir.join("src").join("Main.mw");
+    std::fs::write(&main, waiting(&dir, 1)).unwrap();
+    let mut s = SiloSession::launch_watching(&dir, None, None, true)
+        .unwrap_or_else(|e| panic!("launch: {e}"));
+    assert_eq!(s.set_breakpoints(&main, &[5]), vec![Some(5)]);
+    s.resume(Mode::Continue);
+    // A new build, while the program waits: `greet` adds a hundred.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    std::fs::write(&main, waiting(&dir, 100)).unwrap();
+    let mut said = String::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while !said.contains("reloaded") && std::time::Instant::now() < deadline {
+        s.tick();
+        assert_eq!(s.run(0), None, "it runs on while it is rebuilt: {said}");
+        said.push_str(&s.take_output());
+    }
+    assert!(said.contains("reloaded"), "{said}");
+    assert!(!said.contains("not reloaded"), "{said}");
+    std::fs::write(dir.join("go"), "").unwrap();
+    // The new `greet`, called by name after the reload, stops at the line
+    // the breakpoint was set on -- in the new code, which says it is.
+    let stop = loop {
+        if let Some(stop) = s.run(0) {
+            break stop;
+        }
+    };
+    assert_eq!(stop, Stop::Breakpoint);
+    let frames = stack(&mut s);
+    assert_eq!(frames[0], ("greet [reload 1]".to_string(), 5), "{frames:?}");
+    assert_eq!(frames[1].0, "main", "{frames:?}");
+    assert_eq!(local(&mut s, 0, "m").value, "101");
+    // And steps by its lines, as the first load's code does.
+    assert_eq!(go(&mut s, Mode::StepOver), Stop::Step);
+    assert_eq!(stack(&mut s)[0], ("greet [reload 1]".to_string(), 6));
+    assert_eq!(
+        go(&mut s, Mode::Continue),
+        Stop::Exited(Ok("()".to_string()))
+    );
+    assert!(s.take_output().ends_with("101\n1\n101\n"));
+}
+
 // --- the protocol ----------------------------------------------------------------
 
 /// The same session as `tests/dap.rs` has, through the adapter, launched on

@@ -238,11 +238,9 @@ pub fn write_image_with(
         (true, None) => return Err("the program has no entry point".into()),
         (false, _) => tests.clone(),
     };
-    // Every continuation an object, if the stack is to be the heap.
+    // The VM keeps frames on a stack of its own under `--stack heap`, where
+    // an executable makes every continuation an object: the image keeps them.
     let mut program = program;
-    if config.without_frames() {
-        program.frames.clear();
-    }
     let linear = meadow_llvm::linear::program(&program, &roots).map_err(|e| e.msg)?;
     // What the definitions were before the pass is not read again.
     for d in &mut program.defs {

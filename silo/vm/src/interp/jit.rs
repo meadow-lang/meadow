@@ -215,15 +215,7 @@ impl Vm {
         let mut env = Env::new();
         self.bind(p, args, &mut env);
         self.safe_point(p, &mut env);
-        let mut p = p;
-        match self.jitted(&mut p, &mut env) {
-            Jitted::Done(w) => w,
-            Jitted::Entry => {
-                let (code, pc) = self.entry(p);
-                self.run_from::<false, true>(p, env, code, pc)
-            }
-            Jitted::At(n) => self.run_from::<false, true>(p, env, self.entry(p).0, n),
-        }
+        self.run::<false, true, false>(p, &mut env, None)
     }
 
     /// Procedure `p`'s function, or its body if `body`, compiling it if it

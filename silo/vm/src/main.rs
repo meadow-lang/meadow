@@ -147,10 +147,12 @@ fn watch(path: std::path::PathBuf) {
             };
             // What the new code is made of, for as long as it may run.
             let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
-            match meadow_axcut::image::decode(bytes).and_then(|i| interp::vm().reload(i)) {
+            let done = meadow_axcut::image::decode(bytes).and_then(|i| interp::vm().reload(i));
+            match &done {
                 Ok(what) => eprintln!("reloaded {}: {what}", path.display()),
                 Err(e) => eprintln!("not reloaded: {e}"),
             }
+            interp::debug::reloaded(&done);
         }
     });
 }
@@ -262,7 +264,8 @@ fn main() {
         print!("{}", interp::vm().disassemble());
         return;
     }
-    if watching {
+    // Under a debugger, once it is connected: it is told of each reload.
+    if watching && debug.is_none() {
         watch(std::path::PathBuf::from(path));
     }
     if ANSWER_TO.get().is_some() && interp::vm().tests().is_none() {
@@ -284,6 +287,9 @@ fn main() {
         if let Err(e) = interp::debug::start(port) {
             eprintln!("error: {e}");
             std::process::exit(1);
+        }
+        if watching {
+            watch(std::path::PathBuf::from(path));
         }
         // Safety: as below.
         let status = unsafe { meadow_silo::meadow_run(entry_debugged, 0, std::ptr::null()) };

@@ -68,8 +68,9 @@ pub fn run(mut program: Command, root: &Path) -> i32 {
 }
 
 /// What the package's sources are, as when each was last written: its
-/// files, but for what builds write.
-fn sources(root: &Path) -> Vec<(PathBuf, u64, Option<std::time::SystemTime>)> {
+/// files, but for what builds write. A debugging session that watches
+/// (`dap::silo`) looks at them as this does.
+pub(crate) fn sources(root: &Path) -> Vec<(PathBuf, u64, Option<std::time::SystemTime>)> {
     let mut out = Vec::new();
     let mut dirs = vec![root.to_path_buf()];
     while let Some(dir) = dirs.pop() {

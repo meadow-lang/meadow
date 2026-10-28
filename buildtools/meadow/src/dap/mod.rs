@@ -82,6 +82,16 @@ impl Debuggee {
     fn evaluate(&mut self, frame: usize, expr: &str) -> Option<session::Variable> {
         either!(self, s => s.evaluate(frame, expr))
     }
+    /// Under `"watch"`, rebuild and reload if the sources changed: Silo's
+    /// interpreter takes a new build; Glade's VM is never launched to watch.
+    fn tick(&mut self) {
+        if let Debuggee::Silo(s) = self {
+            s.tick();
+        }
+    }
+    fn watching(&self) -> bool {
+        matches!(self, Debuggee::Silo(s) if s.watching())
+    }
     /// Stop the running program. Glade's is run a slice at a time, and is
     /// stopped by not running another; Silo's runs on its own, and is told.
     fn pause(&mut self) -> Option<Stop> {
@@ -182,6 +192,13 @@ impl Adapter {
                     Err(mpsc::TryRecvError::Empty) => None,
                     Err(mpsc::TryRecvError::Disconnected) => break,
                 }
+            } else if self.session.as_ref().is_some_and(Debuggee::watching) {
+                // Stopped, and watching the sources all the same.
+                match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+                    Ok(m) => Some(m),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
             } else {
                 match rx.recv() {
                     Ok(m) => Some(m),
@@ -190,6 +207,10 @@ impl Adapter {
             };
             if let Some(m) = msg {
                 self.handle(m);
+            }
+            if let Some(s) = &mut self.session {
+                s.tick();
+                self.flush_output();
             }
             if self.running {
                 self.slice();
@@ -359,8 +380,12 @@ impl Adapter {
                 };
                 let launched = if silo {
                     // `stack`: `heap` for frames on the heap, as Glade's are.
+                    // `watch`: build and reload as the sources change, as
+                    // `meadow run --watch` does.
                     let stack = args["stack"].as_str().and_then(meadow_llvm::Stack::named);
-                    silo::SiloSession::launch_with(path, entry.as_ref(), stack).map(Debuggee::Silo)
+                    let watch = args["watch"].as_bool().unwrap_or(false);
+                    silo::SiloSession::launch_watching(path, entry.as_ref(), stack, watch)
+                        .map(Debuggee::Silo)
                 } else {
                     Session::launch_at(path, entry.as_ref()).map(Debuggee::Glade)
                 };

@@ -92,7 +92,7 @@ enum Next {
 /// it makes run with the JIT: so that the interpreter without it calls only
 /// code without it, and pays nothing for its being there.
 macro_rules! instruction {
-    ($vm:ident, $jit:expr, $p:ident, $env:ident, $code:ident, $pc:ident, $go:ident, $enter:ident, $done:ident, $set_env:ident) => {
+    ($vm:ident, $jit:expr, $p:ident, $env:ident, $code:ident, $pc:ident, $go:ident, $enter:ident, $done:ident, $set_env:ident, $wait_frame:ident, $wait_held:ident) => {
         // Safety: every pc is a procedure's entry, an instruction's
         // successor within its procedure, or a target `Code::emit` patched
         // in -- all inside the array.
@@ -223,11 +223,7 @@ macro_rules! instruction {
                         $vm.bind($p, vals, &mut $env);
                         $vm.safe_point($p, &mut $env);
                     }
-                    Some(mut fr) => {
-                        let callee = $vm.target(j.proc);
-                        let r = $vm.waiting(&mut fr, || $vm.call::<{ $jit }>(callee, vals));
-                        $p = $vm.enter_frame(fr, V::Val(r), &mut $env);
-                    }
+                    Some(fr) => $wait_frame!(fr, Target::Def($vm.target(j.proc)), vals),
                 }
                 $enter!();
             }
@@ -260,14 +256,7 @@ macro_rules! instruction {
                         $set_env!($vm.enter_method(t, m, ncap, vals));
                         $vm.safe_point($p, &mut $env);
                     }
-                    Some(mut fr) => {
-                        let r = $vm.waiting(&mut fr, || {
-                            let mut e = $vm.enter_method(t, m, ncap, vals);
-                            $vm.safe_point(m, &mut e);
-                            $vm.exec::<{ $jit }>(m, e)
-                        });
-                        $p = $vm.enter_frame(fr, V::Val(r), &mut $env);
-                    }
+                    Some(fr) => $wait_frame!(fr, Target::Method(t, m, ncap), vals),
                 }
                 $enter!();
             }
@@ -279,26 +268,18 @@ macro_rules! instruction {
                     .map(|a| V::Val($vm.val(*a, &mut $env)))
                     .collect();
                 vals.push(V::Val(0));
-                let r = match c.callee {
-                    Callee::Proc(q) => {
-                        let q = $vm.target(q);
-                        $vm.waiting_in(&c.held, &mut $env, || $vm.call::<{ $jit }>(q, vals))
-                    }
+                let target = match c.callee {
+                    Callee::Proc(q) => Target::Def($vm.target(q)),
                     Callee::Method { target, tag } => {
                         let t = $vm.val(target, &mut $env);
                         if t == 0 {
                             fail("the null continuation was given a frame");
                         }
                         let (m, ncap) = $vm.method(method_of(t) + tag as usize);
-                        $vm.waiting_in(&c.held, &mut $env, || {
-                            let mut e = $vm.enter_method(t, m, ncap, vals);
-                            $vm.safe_point(m, &mut e);
-                            $vm.exec::<{ $jit }>(m, e)
-                        })
+                        Target::Method(t, m, ncap)
                     }
                 };
-                $env[c.answer as usize] = V::Val(r);
-                $go!($pc + 1);
+                $wait_held!(c, target, vals);
             }
             Ins::Prim(i) => {
                 let x = &$code.prims[i as usize];
@@ -907,8 +888,116 @@ pub struct Vm {
     /// Whether a frame waiting on a call puts what it holds on the shadow
     /// chain: when continuations can be abandoned, or memory is traced.
     shadow: bool,
+    /// Whether frames live on the interpreter's own stack of them rather than
+    /// on the native stack (`--stack heap`): see [`Resume`].
+    heap_frames: bool,
     /// The JIT, when it was asked for: see [`jit`].
     jit: Option<Box<jit::Jit>>,
+}
+
+/// Under `--stack heap`, the calls waiting on the loop that made them: the
+/// frames ([`Resume`]); the slots of their callees, each boxed where it does
+/// not move, innermost last -- the first `depth` of them, the rest kept to use
+/// again; and the records of what they hold.
+#[derive(Default)]
+struct Heap<'a> {
+    frames: Vec<Resume<'a>>,
+    boxes: Vec<Box<Env>>,
+    depth: usize,
+    records: Records,
+}
+
+/// Under `--stack heap`, the words of the records of the calls waiting, kept
+/// in chunks that do not move -- made and given up in a stack's order, as the
+/// calls are -- so that a record on the shadow chain costs no allocation.
+#[derive(Default)]
+struct Records {
+    chunks: Vec<Box<[i64]>>,
+    chunk: usize,
+    at: usize,
+}
+
+/// How many words a chunk of [`Records`] has, at least.
+const RECORDS_CHUNK: usize = 4096;
+
+/// A record [`Records`] holds: where its words are, and where the stack of
+/// them was before it.
+struct Rec {
+    at: *mut i64,
+    len: usize,
+    mark: (usize, usize),
+}
+
+impl Rec {
+    fn words(&self) -> &[i64] {
+        // Safety: the record's words, which stay where they are until it is
+        // given up.
+        unsafe { std::slice::from_raw_parts(self.at, self.len) }
+    }
+}
+
+impl Records {
+    /// A record of `words`, on top.
+    fn push(&mut self, words: &[i64]) -> Rec {
+        let mark = (self.chunk, self.at);
+        let n = words.len();
+        if self.chunks.is_empty() || self.at + n > self.chunks[self.chunk].len() {
+            if !self.chunks.is_empty() {
+                self.chunk += 1;
+            }
+            self.at = 0;
+            if self.chunk == self.chunks.len() {
+                self.chunks
+                    .push(vec![0; RECORDS_CHUNK.max(n)].into_boxed_slice());
+            } else if self.chunks[self.chunk].len() < n {
+                self.chunks[self.chunk] = vec![0; n].into_boxed_slice();
+            }
+        }
+        let room = &mut self.chunks[self.chunk][self.at..self.at + n];
+        room.copy_from_slice(words);
+        self.at += n;
+        Rec {
+            at: room.as_mut_ptr(),
+            len: n,
+            mark,
+        }
+    }
+
+    /// Give up `r`, the record on top.
+    fn pop(&mut self, r: &Rec) {
+        (self.chunk, self.at) = r.mark;
+    }
+}
+
+/// What a call goes to: a definition's procedure, or method `m` -- of `ncap`
+/// captures -- of the closure `obj`.
+#[derive(Clone, Copy)]
+enum Target {
+    Def(u32),
+    Method(Word, u32, usize),
+}
+
+/// Under `--stack heap`, a call waiting for its answer, kept by the loop that
+/// made it rather than by a native call: what it goes on with when the
+/// callee returns to the null continuation. The rest of a procedure that
+/// made the call itself -- its procedure, the pc after the call, its slots,
+/// which stay where they are while the callee has slots of its own, and
+/// where the answer goes -- or a frame not built that was handed the call as
+/// its continuation. With, where frames are recorded, the record of what it
+/// holds, on the shadow chain while it waits.
+enum Resume<'a> {
+    At {
+        proc: u32,
+        pc: usize,
+        answer: Slot,
+        slots: *mut Env,
+        held: &'a [(U, Hold)],
+        rec: Option<Rec>,
+    },
+    Frame {
+        fr: Box<Frame>,
+        rec: Option<Rec>,
+    },
 }
 
 // Safety: the program is read-only once loaded; a `Vm` is shared by the
@@ -1029,7 +1118,14 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
         debugging: DEBUGGING.load(Ordering::Relaxed) || profile::on(),
         growable,
         shadow: tracing || c.detaches,
-        jit: jit::Jit::from_env(c_threads)?.map(Box::new),
+        heap_frames: image.config.stack == meadow_axcut::config::Stack::Heap,
+        // Compiled code calls natively, which frames on the interpreter's own
+        // stack are there not to.
+        jit: if image.config.stack == meadow_axcut::config::Stack::Heap {
+            None
+        } else {
+            jit::Jit::from_env(c_threads)?.map(Box::new)
+        },
     };
     // Its records kept from the start: see `meadow_silo::coverage::recording`.
     if vm.debugging {
@@ -1113,6 +1209,11 @@ impl Vm {
         })?;
         let c = made.expect("compiled");
         let _ = self.segs[seg].set(c.segment);
+        // Under a debugger, which is told of the new code before anything
+        // calls it.
+        if let Some(d) = debug::debugger() {
+            d.loaded(seg);
+        }
         // The segment in place first: a slot is read by whatever calls it.
         for (slot, proc) in &c.defs {
             self.defs[*slot as usize].store(*proc, Ordering::Release);
@@ -2172,22 +2273,25 @@ impl Vm {
         let mut env = self.enter_method(obj, p, ncap, args.iter().map(|a| V::Val(*a)).collect());
         self.safe_point(p, &mut env);
         if self.jit.is_some() {
-            self.exec::<true>(p, env)
+            self.exec::<true>(p, &mut env)
         } else {
-            self.exec::<false>(p, env)
+            self.exec::<false>(p, &mut env)
         }
     }
 
     /// Procedure `p` with `args`, to its native return: with the JIT if
-    /// `JIT`.
+    /// `JIT`. The slots are this native frame's, and the loop works in them
+    /// where they are.
+    #[inline(always)]
     fn call<const JIT: bool>(&self, p: u32, args: Args) -> Word {
         let mut env = Env::new();
         self.bind(p, args, &mut env);
         self.safe_point(p, &mut env);
-        self.exec::<JIT>(p, env)
+        self.exec::<JIT>(p, &mut env)
     }
 
     /// `env` made procedure `p`'s, holding `args` as its first slots.
+    #[inline(always)]
     fn bind(&self, p: u32, args: Args, env: &mut Env) {
         env.clear();
         env.resize_with(self.proc(p).slots.max(args.len()), V::default);
@@ -2196,7 +2300,7 @@ impl Vm {
         }
     }
 
-    fn exec<const JIT: bool>(&self, p: u32, env: Env) -> Word {
+    fn exec<const JIT: bool>(&self, p: u32, env: &mut Env) -> Word {
         // Every call the interpreter makes natively begins here: where a
         // growable program checks it has stack enough left.
         if self.growable && meadow_silo::stack::low() {
@@ -2206,49 +2310,181 @@ impl Vm {
         // reached: the loop that keeps records, and notes what it runs.
         // With the JIT: the loop that enters compiled code where it can, and
         // records nothing.
-        if meadow_silo::coverage::recording() {
-            self.run::<true, false>(p, env)
-        } else if JIT {
-            self.run::<false, true>(p, env)
-        } else {
-            self.run::<false, false>(p, env)
+        if self.heap_frames {
+            return if meadow_silo::coverage::recording() {
+                self.run_heap::<true>(p, env)
+            } else {
+                self.run_heap::<false>(p, env)
+            };
         }
+        if meadow_silo::coverage::recording() {
+            self.run::<true, false, false>(p, env, None)
+        } else if JIT {
+            self.run::<false, true, false>(p, env, None)
+        } else {
+            self.run::<false, false, false>(p, env, None)
+        }
+    }
+
+    /// [`Vm::run`] under `--stack heap`: frames on the loop's own stack of
+    /// them ([`Resume`]), and no call made natively.
+    fn run_heap<const DEBUG: bool>(&self, p: u32, env: &mut Env) -> Word {
+        self.run::<DEBUG, false, true>(p, env, None)
+    }
+
+    /// Call `target` with `vals`, to its native return.
+    #[inline(always)]
+    fn called<const JIT: bool>(&self, target: Target, vals: Args) -> Word {
+        match target {
+            Target::Def(q) => self.call::<JIT>(q, vals),
+            Target::Method(t, m, ncap) => {
+                let mut e = self.enter_method(t, m, ncap, vals);
+                self.safe_point(m, &mut e);
+                self.exec::<JIT>(m, &mut e)
+            }
+        }
+    }
+
+    /// Make `env` the slots of `target` called with `vals`, past its safe
+    /// point: the procedure to go on in.
+    #[inline(always)]
+    fn begin(&self, target: Target, vals: Args, env: &mut Env) -> u32 {
+        let p = match target {
+            Target::Def(q) => {
+                self.bind(q, vals, env);
+                q
+            }
+            Target::Method(t, m, ncap) => {
+                self.enter_method_into(t, m, ncap, vals, env);
+                m
+            }
+        };
+        self.safe_point(p, env);
+        p
+    }
+
+    /// What a call that waits holds, on the shadow chain while it waits: what
+    /// [`Vm::waiting_in`] records, kept where it does not move.
+    #[inline(always)]
+    fn record_held(&self, held: &[(U, Hold)], env: &[V], recs: &mut Records) -> Option<Rec> {
+        if !self.shadow {
+            return None;
+        }
+        self.record_held_now(held, env, recs)
+    }
+
+    #[inline(never)]
+    fn record_held_now(&self, held: &[(U, Hold)], env: &[V], recs: &mut Records) -> Option<Rec> {
+        let mut rec: SmallVec<[i64; 18]> = SmallVec::new();
+        rec.push(meadow_silo::shadow::head() as i64);
+        rec.push(0);
+        for (u, h) in held {
+            hold(&env[u.s as usize], d(u.d, env), *h, &mut rec, self.moving);
+        }
+        Self::linked(rec, recs)
+    }
+
+    /// [`Vm::record_held`], of what frame `fr` holds.
+    fn record_frame(&self, fr: &Frame, recs: &mut Records) -> Option<Rec> {
+        if !self.shadow {
+            return None;
+        }
+        let mut rec: SmallVec<[i64; 18]> = SmallVec::new();
+        rec.push(meadow_silo::shadow::head() as i64);
+        rec.push(0);
+        held(fr, &mut rec, self.moving);
+        Self::linked(rec, recs)
+    }
+
+    /// `rec`, a record's words, put in `recs` and made the shadow chain's
+    /// head -- unless it holds nothing.
+    fn linked(mut rec: SmallVec<[i64; 18]>, recs: &mut Records) -> Option<Rec> {
+        if rec.len() == 2 {
+            return None;
+        }
+        rec[1] = (rec.len() as i64 - 2) / 2;
+        let r = recs.push(&rec);
+        meadow_silo::shadow::set(r.at as Word);
+        Some(r)
+    }
+
+    /// A call that waited holding `held` of `env`, its slots, is answered:
+    /// its record off the chain and given up, and what it holds read back
+    /// where a collection moved it.
+    #[inline(always)]
+    fn unrecord_held(
+        &self,
+        rec: Option<Rec>,
+        held: &[(U, Hold)],
+        env: &mut Env,
+        recs: &mut Records,
+    ) {
+        let Some(rec) = rec else { return };
+        let words = rec.words();
+        meadow_silo::shadow::set(words[0] as Word);
+        if self.moving {
+            let mut at = 2;
+            for (u, h) in held {
+                let dd = d(u.d, env);
+                unhold(&mut env[u.s as usize], dd, *h, words, &mut at);
+            }
+        }
+        recs.pop(&rec);
+    }
+
+    /// [`Vm::unrecord_held`], for frame `fr`.
+    #[inline(always)]
+    fn unrecord_frame(&self, rec: Option<Rec>, fr: &mut Frame, recs: &mut Records) {
+        let Some(rec) = rec else { return };
+        let words = rec.words();
+        meadow_silo::shadow::set(words[0] as Word);
+        if self.moving {
+            unheld(fr, words, &mut 2);
+        }
+        recs.pop(&rec);
     }
 
     /// The interpreter's loop, from the start of procedure `p`: with a
     /// debugger's record kept and its stops checked when `DEBUG`, which a
     /// program run without one never pays for.
-    fn run<const DEBUG: bool, const JIT: bool>(&self, mut p: u32, mut env: Env) -> Word {
+    ///
+    /// With `HEAP`, a call that waits for its answer does not call natively:
+    /// the caller's [`Resume`] goes on the loop's stack of them, and the loop
+    /// goes on in the callee; a return to the null continuation goes on with
+    /// the last of them, and leaves the loop only when there is none.
+    fn run<'a, const DEBUG: bool, const JIT: bool, const HEAP: bool>(
+        &'a self,
+        mut p: u32,
+        mut env: &mut Env,
+        handed: Option<(usize, Heap<'a>)>,
+    ) -> Word {
         let (mut code, mut pc) = self.entry(p);
         if JIT {
-            match self.jitted(&mut p, &mut env) {
+            match self.jitted(&mut p, env) {
                 jit::Jitted::Done(w) => return w,
                 jit::Jitted::Entry => (code, pc) = self.entry(p),
                 jit::Jitted::At(n) => (code, pc) = (self.entry(p).0, n),
             }
         }
-        self.run_from::<DEBUG, JIT>(p, env, code, pc)
-    }
-
-    /// The interpreter's loop, from `pc` of procedure `p`, whose code is
-    /// `code`: [`Vm::run`] once it is known where to begin.
-    #[inline(always)]
-    fn run_from<'a, const DEBUG: bool, const JIT: bool>(
-        &'a self,
-        mut p: u32,
-        mut env: Env,
-        mut code: &'a Code,
-        mut pc: usize,
-    ) -> Word {
+        // Under `HEAP`, the calls waiting: see [`Heap`]. Handed over by a
+        // loop that did not keep records, when records began, with the pc
+        // it was at.
+        let mut heap: Heap<'a> = Heap::default();
+        if let Some((at, h)) = handed {
+            pc = at;
+            heap = h;
+        }
         // The record a debugger reads this activation by, on the running
         // segment's chain while it runs.
         let parent = if DEBUG { meadow_silo::frames::top() } else { 0 };
+        let base = debug::Act::depth_of(parent) + 1;
         let mut act = debug::Act {
             parent,
-            depth: debug::Act::depth_of(parent) + 1,
+            depth: base,
             proc: p,
             pc,
-            env: &env as *const Env,
+            env: &*env as *const Env,
+            frames: std::ptr::null(),
         };
         let _popped = DEBUG.then(|| {
             meadow_silo::frames::set_top(&act as *const debug::Act as Word);
@@ -2259,6 +2495,13 @@ impl Vm {
             if DEBUG {
                 act.proc = p;
                 act.pc = pc;
+                if HEAP {
+                    // Each frame waiting is a call deeper, as it would be
+                    // on the native stack.
+                    act.depth = base + heap.frames.len() as u32;
+                    act.env = &*env as *const Env;
+                    act.frames = &heap.frames as *const Vec<Resume<'a>> as *const ();
+                }
                 match watching {
                     Some(w) => w.at(&act),
                     None => profile::tick(&act),
@@ -2270,6 +2513,16 @@ impl Vm {
                 }
             }
             let vm = self;
+            // Records begun, under `HEAP` in the loop that keeps none: the
+            // loop that keeps them goes on from here, with the calls waiting.
+            macro_rules! handover {
+                () => {
+                    if HEAP && !DEBUG && meadow_silo::coverage::recording() {
+                        let h = std::mem::take(&mut heap);
+                        return vm.run::<true, false, true>(p, env, Some((pc, h)));
+                    }
+                };
+            }
             macro_rules! go {
                 ($n:expr) => {{
                     pc = $n;
@@ -2283,10 +2536,9 @@ impl Vm {
                         // are kept by the loop that keeps them, which never
                         // enters compiled code.
                         if meadow_silo::coverage::recording() {
-                            let (c, at) = vm.entry(p);
-                            return vm.run_from::<true, false>(p, env, c, at);
+                            return vm.run::<true, false, false>(p, env, None);
                         }
-                        match vm.jitted(&mut p, &mut env) {
+                        match vm.jitted(&mut p, env) {
                             jit::Jitted::Done(w) => return w,
                             jit::Jitted::At(n) => {
                                 (code, pc) = (vm.entry(p).0, n);
@@ -2296,20 +2548,104 @@ impl Vm {
                         }
                     }
                     (code, pc) = vm.entry(p);
+                    handover!();
                     continue;
                 }};
             }
             macro_rules! done {
-                ($w:expr) => {
-                    return $w
-                };
+                ($w:expr) => {{
+                    let w = $w;
+                    if HEAP && let Some(r) = heap.frames.pop() {
+                        match r {
+                            Resume::At {
+                                proc,
+                                pc: at,
+                                answer,
+                                slots,
+                                held,
+                                rec,
+                            } => {
+                                heap.depth -= 1;
+                                // Safety: the caller's slots, which stay where
+                                // they are while it waits.
+                                env = unsafe { &mut *slots };
+                                vm.unrecord_held(rec, held, env, &mut heap.records);
+                                env[answer as usize] = V::Val(w);
+                                p = proc;
+                                pc = at;
+                                code = vm.entry(p).0;
+                            }
+                            Resume::Frame { mut fr, rec } => {
+                                vm.unrecord_frame(rec, &mut fr, &mut heap.records);
+                                p = vm.enter_frame(fr, V::Val(w), env);
+                                (code, pc) = vm.entry(p);
+                            }
+                        }
+                        handover!();
+                        continue;
+                    }
+                    return w;
+                }};
             }
             macro_rules! set_env {
                 ($e:expr) => {
-                    env = $e
+                    *env = $e
                 };
             }
-            instruction!(vm, JIT, p, env, code, pc, go, enter, done, set_env)
+            // A call that waits for its answer: natively, or -- under `HEAP`
+            // -- by putting the caller on the stack of frames and going on
+            // in the callee.
+            macro_rules! wait_frame {
+                ($fr:expr, $target:expr, $vals:expr) => {{
+                    let fr = $fr;
+                    if HEAP {
+                        let rec = vm.record_frame(&fr, &mut heap.records);
+                        heap.frames.push(Resume::Frame { fr, rec });
+                        p = vm.begin($target, $vals, &mut env);
+                    } else {
+                        let mut fr = fr;
+                        let r = vm.waiting(&mut fr, || vm.called::<JIT>($target, $vals));
+                        p = vm.enter_frame(fr, V::Val(r), &mut env);
+                    }
+                }};
+            }
+            macro_rules! wait_held {
+                ($c:expr, $target:expr, $vals:expr) => {{
+                    let c = $c;
+                    if HEAP {
+                        let rec = vm.record_held(&c.held, &env, &mut heap.records);
+                        heap.frames.push(Resume::At {
+                            proc: p,
+                            pc: pc + 1,
+                            answer: c.answer,
+                            slots: &mut *env as *mut Env,
+                            held: &c.held,
+                            rec,
+                        });
+                        // The callee's slots, of their own.
+                        if heap.depth == heap.boxes.len() {
+                            heap.boxes.push(Box::default());
+                        }
+                        let b: *mut Env = &mut *heap.boxes[heap.depth];
+                        heap.depth += 1;
+                        // Safety: a box, which does not move while it is in
+                        // `boxes`, and is not used again until the callee
+                        // returns.
+                        env = unsafe { &mut *b };
+                        p = vm.begin($target, $vals, env);
+                        (code, pc) = vm.entry(p);
+                        handover!();
+                        continue;
+                    }
+                    let r = vm.waiting_in(&c.held, &mut env, || vm.called::<JIT>($target, $vals));
+                    env[c.answer as usize] = V::Val(r);
+                    pc += 1;
+                    continue;
+                }};
+            }
+            instruction!(
+                vm, JIT, p, env, code, pc, go, enter, done, set_env, wait_frame, wait_held
+            )
         }
     }
 
@@ -2342,7 +2678,24 @@ impl Vm {
                 *env = $e
             };
         }
-        instruction!(vm, true, p, env, code, pc, go, enter, done, set_env)
+        macro_rules! wait_frame {
+            ($fr:expr, $target:expr, $vals:expr) => {{
+                let mut fr = $fr;
+                let r = vm.waiting(&mut fr, || vm.called::<true>($target, $vals));
+                p = vm.enter_frame(fr, V::Val(r), env);
+            }};
+        }
+        macro_rules! wait_held {
+            ($c:expr, $target:expr, $vals:expr) => {{
+                let c = $c;
+                let r = vm.waiting_in(&c.held, env, || vm.called::<true>($target, $vals));
+                env[c.answer as usize] = V::Val(r);
+                return Next::At(pc + 1);
+            }};
+        }
+        instruction!(
+            vm, true, p, env, code, pc, go, enter, done, set_env, wait_frame, wait_held
+        )
     }
 
     /// The whole program's code, procedure by procedure, as `--dis` writes it.
@@ -2453,6 +2806,7 @@ impl Vm {
 
     /// [`Vm::waiting`], for a frame never made: what it would have held is in
     /// `env`, where `held` says.
+    #[inline(always)]
     fn waiting_in(&self, held: &[(U, Hold)], env: &mut [V], call: impl FnOnce() -> Word) -> Word {
         if !self.shadow {
             return call();
@@ -2484,10 +2838,18 @@ impl Vm {
 
     /// Under tracing, where a function begins: if a collection is due, run it
     /// with the parameters on the shadow chain.
+    #[inline(always)]
     fn safe_point(&self, p: u32, env: &mut [V]) {
         if !self.tracing || meadow_silo::trace::meadow_gc_due.load(Ordering::Relaxed) == 0 {
             return;
         }
+        self.collect_at(p, env);
+    }
+
+    /// [`Vm::safe_point`] when a collection is due: out of line, since it
+    /// seldom is.
+    #[inline(never)]
+    fn collect_at(&self, p: u32, env: &mut [V]) {
         let prev = meadow_silo::shadow::head();
         let mut rec: Vec<i64> = vec![prev as i64, 0];
         let mut at = Vec::new();
@@ -2514,8 +2876,16 @@ impl Vm {
     /// A method's entry: its captures loaded out of the closure `obj`, which
     /// is released, and then its arguments.
     fn enter_method(&self, obj: Word, p: u32, ncap: usize, args: Args) -> Env {
-        let proc = self.proc(p);
         let mut env = Env::new();
+        self.enter_method_into(obj, p, ncap, args, &mut env);
+        env
+    }
+
+    /// [`Vm::enter_method`], into `env`, whatever it held.
+    #[inline(always)]
+    fn enter_method_into(&self, obj: Word, p: u32, ncap: usize, args: Args, env: &mut Env) {
+        let proc = self.proc(p);
+        env.clear();
         env.resize_with(proc.slots.max(ncap + args.len()), V::default);
         let loaded = load_fields(obj, ncap);
         for (slot, x) in env.iter_mut().zip(&loaded) {
@@ -2524,9 +2894,8 @@ impl Vm {
         for (slot, a) in env[ncap..].iter_mut().zip(args) {
             *slot = a;
         }
-        let descs: Descs = proc.params[..ncap].iter().map(|pd| d(*pd, &env)).collect();
+        let descs: Descs = proc.params[..ncap].iter().map(|pd| d(*pd, env)).collect();
         self.release(obj, &loaded, &descs);
-        env
     }
 
     // --- values ---------------------------------------------------------------

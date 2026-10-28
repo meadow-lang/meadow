@@ -577,7 +577,7 @@ extern "C" fn jit_call_method(idx: u64, args: *const u64, n: u64) -> u64 {
         args[1..].iter().map(|w| V::Val(*w)).collect(),
     );
     vm.safe_point(m, &mut env);
-    vm.exec::<true>(m, env)
+    vm.exec::<true>(m, &mut env)
 }
 
 /// What a compiled call answered, `r`: the answer, or -- if it left a tail
@@ -589,7 +589,7 @@ extern "C" fn jit_resume(r: u64) -> u64 {
     let vm = super::vm();
     let mut env = Env::new();
     let p = vm.enter_pending(pend, &mut env);
-    vm.exec::<true>(p, env)
+    vm.exec::<true>(p, &mut env)
 }
 
 /// A name of the LIR's, as the module knows it: a segment's own, since two
