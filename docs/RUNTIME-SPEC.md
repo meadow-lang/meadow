@@ -1232,16 +1232,18 @@ VM.
     script is `scratchpad/jitdiff.sh`.
 - **JIT-9.** (should) A long-running loop under `jit` runs within a factor of
   the AOT build's speed, to be set once tier 1 is measured.
-  - *Status:* matmul under `jit` takes 909 ms, against 2,113 ms
-    interpreted, on the Windows desktop; natively it takes about 27 ms, so
-    tier 1 is far from it. Tier 2 (JIT-3) is what is to close it.
+  - *Status:* set at a factor of 2.5, and met: matmul under `jit` takes
+    93 ms, against 46 ms for the executable, its start and its compiling
+    counted, on the Windows desktop (2026-10-28). Tier 2 compiles a
+    definition once it has been entered a thousand times more; at ten
+    thousand, the default before, matmul took 226 ms.
 - **JIT-12.** (should) A program the JIT cannot speed up runs no slower
   under `jit` than interpreted.
-  - *Status:* met by binarytrees (8.1 s against 9.8 s) and rbtree (46.6 s
-    against 60.4 s), which tier 1 now speeds up; not by fib, 398 ms against
-    373 ms, whose calls cost more through the call helper than in the
-    interpreter's loop. Measured with the machine loaded, to be measured
-    again.
+  - *Status:* met, with both tiers, the default: fib 66 ms against 357 ms
+    interpreted, binarytrees 0.82 s against 9.8 s, rbtree 3.4 s against
+    60.4 s, mandelbrot and wordfreq no slower (2026-10-28). With tier 1
+    alone (`--jit-tiers 1`) fib is slower, 434 ms, since its calls cost more
+    through the call helper than in the interpreter's loop.
 - **JIT-11.** The VM without the JIT is no slower for its being there
   (PERF-3).
   - *Status:* done; measured with code layout held still (functions and

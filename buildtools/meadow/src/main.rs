@@ -653,7 +653,7 @@ struct ProfileArgs {
     /// On Silo's JIT, how far it goes: `1`, its first tier alone, which
     /// compiles a procedure instruction for instruction over the VM's slots;
     /// or `2` (the default), which also compiles a definition entered
-    /// thousands of times more as an executable's definitions are compiled.
+    /// a thousand times more as an executable's definitions are compiled.
     #[arg(long, value_name = "TIERS", value_parser = ["1", "2"])]
     jit_tiers: Option<String>,
     /// `--backend aot`: Glade, compiled ahead of time into an executable.

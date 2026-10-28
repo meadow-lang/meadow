@@ -227,7 +227,10 @@ fn runtime_symbols() -> Vec<(&'static str, *const u8)> {
 
 impl Tier2 {
     /// The second tier `MEADOW_JIT_TIERS` (2 by default) asks for, compiling
-    /// what is entered `MEADOW_JIT_TIER2` (10000 by default) times more.
+    /// what is entered `MEADOW_JIT_TIER2` (1000 by default) times more. A
+    /// thousand, measured: matmul under the JIT took 226 ms at ten thousand
+    /// and 93 ms at a thousand, rbtree 4.7 s and 3.4 s, and nothing was
+    /// slower for it.
     pub(super) fn from_env(threaded: bool, regs: usize) -> Result<Option<Tier2>, String> {
         let tiers = std::env::var("MEADOW_JIT_TIERS").unwrap_or_else(|_| "2".into());
         if tiers.trim() == "1" {
@@ -238,7 +241,7 @@ impl Tier2 {
                 .trim()
                 .parse()
                 .map_err(|_| format!("MEADOW_JIT_TIER2 is `{n}`, not a number of entries"))?,
-            Err(_) => 10_000,
+            Err(_) => 1_000,
         };
         let mut flags = settings::builder();
         flags.set("opt_level", "speed").map_err(|e| e.to_string())?;
