@@ -967,8 +967,11 @@ pub struct Session {
     engine: meadow::Engine,
     /// Whether a line runs on the merged runtime's VM instead -- Silo's
     /// interpreter, in a process of its own -- as `:silo` says, until one of
-    /// the others is chosen again.
+    /// the others is chosen again. It does from the start, where there is one.
     silo: bool,
+    /// The VM the session's lines run on there: one for the whole session,
+    /// each line's build loaded into it as a reload (REPL-4).
+    session: Option<meadow::served::Served>,
     /// Report how long every entry took -- `:time` turns it on and off.
     timing: bool,
     /// Which step of the tour is showing, if any. The tour is not a mode: the
@@ -1046,7 +1049,8 @@ impl Session {
             uses: Vec::new(),
             // What a debug build runs on.
             engine: meadow::Engine::Jit,
-            silo: false,
+            silo: meadow::aot::interpreter().is_ok(),
+            session: None,
             timing: false,
             tour: None,
             pending: None,
@@ -1600,7 +1604,8 @@ impl Session {
                         .exports
                         .last()
                         .is_some_and(|e| e.scheme.ty.is_fun());
-                    let (result, times) = runtime::run_on_vm(&program, self.opts.opt);
+                    let (result, times) =
+                        runtime::run_in_session(&mut self.session, &program, self.opts.opt);
                     let result = result.map(|v| if function { "<closure>".into() } else { v });
                     (result, times)
                 } else {

@@ -130,11 +130,45 @@ fn shown(v: Val) -> String {
     show::show(w, d)
 }
 
+/// Where the program's console is, when it is not the process's: the lines
+/// its input gives, and what it has written -- for a run whose caller hands
+/// it its input and reads what it wrote, as a macro's does (`capture`).
+static CAPTURED: std::sync::Mutex<Option<(std::collections::VecDeque<String>, String)>> =
+    std::sync::Mutex::new(None);
+
+/// The program's console from now on: `lines` to read, each whole, and a
+/// buffer its output goes to, until [`captured`] takes it.
+pub fn capture(lines: Vec<String>) {
+    *CAPTURED.lock().unwrap_or_else(|p| p.into_inner()) = Some((lines.into(), String::new()));
+}
+
+/// What the program wrote since [`capture`], and its console the process's
+/// again.
+pub fn captured() -> Option<String> {
+    let taken = CAPTURED.lock().unwrap_or_else(|p| p.into_inner()).take();
+    taken.map(|(_, out)| out)
+}
+
 /// The runtime, as `meadow_rt::world` asks of it.
 struct Here;
 
 impl World for Here {
     type Value = Val;
+
+    fn write_out(&mut self, s: &str) {
+        use std::io::Write;
+        match CAPTURED.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+            Some((_, out)) => out.push_str(s),
+            None => {
+                let _ = std::io::stdout().lock().write_all(s.as_bytes());
+            }
+        }
+    }
+
+    fn read_line(&mut self) -> Option<Option<String>> {
+        let mut c = CAPTURED.lock().unwrap_or_else(|p| p.into_inner());
+        c.as_mut().map(|(lines, _)| lines.pop_front())
+    }
 
     /// What the engine has noted, which native code never does: see
     /// `crate::coverage`.

@@ -145,6 +145,75 @@ pub fn run_on_vm(program: &core::Program, opt: OptLevel) -> (Result<String, Stri
     )
 }
 
+/// [`run_on_vm`], in a session: `program` loaded into the VM the session has
+/// kept, as a reload, and its entry run there -- or, if there is none yet, or
+/// it cannot take this build, or the last run ended it, run on a new one,
+/// kept for the session from then on (REPL-4).
+pub fn run_in_session(
+    session: &mut Option<crate::served::Served>,
+    program: &core::Program,
+    opt: OptLevel,
+) -> (Result<String, String>, Timings) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+    static LINES: AtomicUsize = AtomicUsize::new(0);
+    let start = Instant::now();
+    let dir = std::env::temp_dir().join(format!("meadow-repl-{}", std::process::id()));
+    // An image a line: the VM reads each as it is told to load it.
+    let image = dir.join(format!(
+        "line-{}.image",
+        LINES.fetch_add(1, Ordering::Relaxed)
+    ));
+    // Built to be loaded into the program running, as an interpreted build is.
+    let lowered = meadow_seq::lower_program_with(program, opt, true);
+    let written = if !lowered.unsupported.is_empty() {
+        Err(format!(
+            "the back end cannot translate {:?} yet",
+            lowered.unsupported
+        ))
+    } else {
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("could not create {}: {e}", dir.display()))
+            .and_then(|()| {
+                // A stack that grows, as an edit-run loop's should.
+                let config = meadow_llvm::Config {
+                    stack: meadow_llvm::Stack::Growable,
+                    ..crate::aot::config()
+                };
+                crate::aot::write_image_with(&image, lowered.program, Vec::new(), config)
+            })
+    };
+    let compile = Some(start.elapsed());
+    let start = Instant::now();
+    let result = written.and_then(|()| {
+        // Into the VM the session has, if it takes it.
+        let loaded = match session {
+            Some(s) => s.load(&image).is_ok(),
+            None => false,
+        };
+        if !loaded {
+            *session = None;
+            *session = Some(crate::served::Served::start(&image, true)?);
+        }
+        let s = session.as_mut().expect("started");
+        match s.run(None, None, None) {
+            Ok((shown, _)) => Ok(shown),
+            Err(e) => {
+                *session = None;
+                Err(e.said())
+            }
+        }
+    });
+    let _ = std::fs::remove_file(&image);
+    (
+        result,
+        Timings {
+            compile,
+            run: start.elapsed(),
+        },
+    )
+}
+
 pub fn run_timed(
     program: &core::Program,
     engine: Engine,

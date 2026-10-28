@@ -661,6 +661,42 @@ fn the_repl_evaluates_on_the_merged_runtime_s_vm() {
 }
 
 #[test]
+fn the_repl_runs_its_session_on_one_vm() {
+    use std::io::Write;
+    if let Err(e) = meadow::aot::interpreter() {
+        eprintln!("skipped: {e}");
+        return;
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_meadow"))
+        .env("MEADOW_SERVE_LOG", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the meadow binary runs");
+    child
+        .stdin
+        .take()
+        .expect("a pipe")
+        .write_all(b"def x = 20\nx + 1\nprintln \"hi\"\nx * 3\nx / 0\nx - 1\n:q\n")
+        .expect("written");
+    let out = child.wait_with_output().expect("the REPL ends");
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    for want in ["= 21", "hi\n= ()", "= 60", "= 19"] {
+        assert!(stdout.contains(want), "no `{want}` in:\n{stdout}");
+    }
+    // One VM, each line's build loaded into it -- until a line fails, which
+    // ends it, as it ends any run; the next line starts another.
+    assert!(stderr.contains("division by zero"), "{stderr}");
+    assert!(stderr.contains("the program failed"), "{stderr}");
+    assert_eq!(stderr.matches("served: started").count(), 2, "{stderr}");
+    assert_eq!(stderr.matches("served: reloaded").count(), 4, "{stderr}");
+}
+
+#[test]
 fn a_profile_of_a_program_on_the_merged_runtime_s_vm_names_its_functions() {
     if let Err(e) = meadow::aot::interpreter() {
         eprintln!("skipped: {e}");

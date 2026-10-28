@@ -35,6 +35,7 @@ pub mod profile;
 pub mod runtime;
 pub mod samples;
 pub mod semver;
+pub mod served;
 pub mod status;
 pub mod stdlib;
 pub mod test;

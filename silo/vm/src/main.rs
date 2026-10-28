@@ -129,6 +129,91 @@ extern "C" fn entry_debugged() -> Word {
     v
 }
 
+/// `--serve PORT`: the connection to whoever keeps this VM for many runs --
+/// a REPL's session, a build's macros -- which says, a JSON object a line,
+/// what to load and what to run, and is answered likewise:
+///
+/// - `{"load": PATH}`: the image at `PATH`, loaded as a reload; answered
+///   `{"reloaded": WHAT}` or `{"refused": WHY}`.
+/// - `{"run": {"entry": N, "input": [LINE, ...], "fresh": true}}`: entry `N`
+///   of a program of entries, or with no `N` the entry of the last build
+///   loaded; with `input`, the program's console reads those lines, each
+///   whole, and what it writes is kept; `fresh`, with no top-level value
+///   computed yet, as a program just begun. Answered `{"done": SHOWN, "output": WRITTEN}`, its
+///   value as it is shown and what it wrote, once its output is flushed.
+/// - `{"exit": true}`.
+///
+/// The first image is the one the VM was started with, and it says
+/// `{"ready": true}` before anything else. A program that fails ends the
+/// VM, as it would end any run, with its message on standard error.
+static SERVED: std::sync::OnceLock<std::sync::Mutex<std::net::TcpStream>> =
+    std::sync::OnceLock::new();
+
+/// [`entry`], kept for many runs: see [`SERVED`].
+extern "C" fn entry_served() -> Word {
+    use std::io::{BufRead, Write};
+    let conn = SERVED.get().expect("connected");
+    let mut input = {
+        let c = conn.lock().unwrap_or_else(|p| p.into_inner());
+        std::io::BufReader::new(c.try_clone().expect("a connection"))
+    };
+    let say = |msg: serde_json::Value| {
+        let mut text = msg.to_string();
+        text.push('\n');
+        let mut c = conn.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = c.write_all(text.as_bytes());
+        let _ = c.flush();
+    };
+    say(serde_json::json!({ "ready": true }));
+    loop {
+        let mut line = String::new();
+        match input.read_line(&mut line) {
+            Ok(0) | Err(_) => std::process::exit(0),
+            Ok(_) => {}
+        }
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let Some(path) = msg["load"].as_str() {
+            let done = std::fs::read(path)
+                .map_err(|e| format!("{path}: {e}"))
+                .and_then(|bytes| {
+                    // What the new code is made of, for as long as it may run.
+                    let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+                    meadow_axcut::image::decode(bytes).and_then(|i| interp::vm().reload(i))
+                });
+            say(match done {
+                Ok(what) => serde_json::json!({ "reloaded": what }),
+                Err(why) => serde_json::json!({ "refused": why }),
+            });
+        } else if let Some(run) = msg.get("run") {
+            if run["fresh"].as_bool() == Some(true) {
+                meadow_silo::prims::forget_globals();
+            }
+            if let Some(lines) = run["input"].as_array() {
+                let lines = lines
+                    .iter()
+                    .map(|l| l.as_str().unwrap_or("").to_string())
+                    .collect();
+                meadow_silo::native::capture(lines);
+            }
+            let (w, d) = match run["entry"].as_u64() {
+                Some(i) => {
+                    interp::choose(i as usize);
+                    (interp::vm().run_entry(), meadow_rt::desc::UNIT)
+                }
+                None => interp::vm().run_latest(),
+            };
+            let shown = meadow_silo::show::show(w, d);
+            let written = meadow_silo::native::captured();
+            let _ = std::io::stdout().flush();
+            say(serde_json::json!({ "done": shown, "output": written }));
+        } else if msg.get("exit").is_some() {
+            std::process::exit(0);
+        }
+    }
+}
+
 /// How a reload ended, a line a reload, for whoever runs the program to read
 /// at `MEADOW_WATCH_REPORT`: `meadow run --watch`, which offers to start the
 /// program again when one is refused.
@@ -187,6 +272,8 @@ fn main() {
     let mut debug = None;
     // `--watch`: load the image again whenever it is written anew.
     let mut watching = false;
+    // `--serve PORT`: kept for many runs, by whoever listens there.
+    let mut serve = None;
     // `--profile FILE`: where to write a profile, and how to take it.
     let mut profile_to: Option<std::path::PathBuf> = None;
     let mut how = interp::profile::How {
@@ -231,6 +318,17 @@ fn main() {
                 let _ = ANSWER_TO.set(std::path::PathBuf::from(to));
                 args.drain(1..3);
             }
+            Some("--serve") => {
+                let port = args.get(2).and_then(|p| p.parse::<u16>().ok());
+                args.drain(1..3.min(args.len()));
+                match port {
+                    Some(p) => serve = Some(p),
+                    None => {
+                        eprintln!("usage: meadow-silo-vm --serve PORT PROGRAM.image");
+                        std::process::exit(2);
+                    }
+                }
+            }
             Some("--debug") => {
                 let port = args.get(2).and_then(|p| p.parse::<u16>().ok());
                 args.drain(1..3.min(args.len()));
@@ -247,6 +345,10 @@ fn main() {
     }
     if debug.is_some() {
         interp::debugging();
+    }
+    // Kept for builds yet to come, whatever they do.
+    if serve.is_some() {
+        interp::open();
     }
     if profile_to.is_some() {
         interp::profile::start(how);
@@ -299,6 +401,19 @@ fn main() {
         // Safety: as below.
         let status = unsafe { meadow_silo::meadow_run(entry_answered, 0, std::ptr::null()) };
         ended(status, profile_to.as_deref())
+    }
+    if let Some(port) = serve {
+        let conn = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap_or_else(|e| {
+            eprintln!("error: could not reach port {port}: {e}");
+            std::process::exit(1);
+        });
+        let _ = SERVED.set(std::sync::Mutex::new(conn));
+        // Safety: before the runtime starts, which reads it. Each run's
+        // value is answered, not printed.
+        unsafe { meadow_result_desc = meadow_rt::desc::UNIT };
+        // Safety: as below.
+        let status = unsafe { meadow_silo::meadow_run(entry_served, 0, std::ptr::null()) };
+        std::process::exit(status)
     }
     if let Some(port) = debug {
         // Safety: before the runtime starts, which reads it.

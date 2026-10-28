@@ -741,6 +741,18 @@ pub fn byte_array(v: Val, what: &str) -> Vec<u8> {
         .collect()
 }
 
+/// Every top-level value this thread has computed, forgotten and let go: each
+/// is computed again when next it is asked for, as by a program just begun --
+/// what a VM kept for many runs does before a run that must be one.
+pub fn forget_globals() {
+    let gone = globals(std::mem::take);
+    for (w, d) in gone.into_iter().flatten() {
+        if !crate::trace::on() {
+            crate::heap::erase(w, d);
+        }
+    }
+}
+
 /// This thread's top-level values: each thread computes its own (`crate::ctx`).
 fn globals<T>(f: impl FnOnce(&mut Vec<Option<(Word, i64)>>) -> T) -> T {
     // Safety: the running thread's context.

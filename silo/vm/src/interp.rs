@@ -885,6 +885,9 @@ pub struct Vm {
     defs: Box<[std::sync::atomic::AtomicU32]>,
     /// Where it begins, by slot: its entry, or each of its tests.
     entries: Vec<u32>,
+    /// The entry of the last build loaded, by slot, and how what it answers
+    /// is shown: what a VM kept for many runs runs (`--serve`).
+    latest: std::sync::Mutex<(u32, i64)>,
     is_tests: bool,
     state: std::sync::Mutex<LoadState>,
     tracing: bool,
@@ -1058,6 +1061,16 @@ pub fn debugging() {
     DEBUGGING.store(true, Ordering::Relaxed);
 }
 
+/// Whether the program is set up for whatever a build loaded into it later
+/// does -- detach continuations, start threads -- whether or not it does:
+/// a VM kept for a session's builds (`--serve`), each loaded as a reload.
+static OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set the program up for every later build: see [`OPEN`].
+pub fn open() {
+    OPEN.store(true, Ordering::Relaxed);
+}
+
 pub fn vm() -> &'static Vm {
     VM.get().expect("the program was loaded")
 }
@@ -1111,7 +1124,8 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
                 .ok_or("an entry the program does not have")
         })
         .collect::<Result<Vec<u32>, _>>()?;
-    let c_threads = c.threads;
+    let open = OPEN.load(Ordering::Relaxed);
+    let c_threads = c.threads || open;
     let tracing = image.config.memory.traced();
     // Blocks that move: what the interpreter can follow, holding every
     // reference where the collector rewrites it (see `Vm::moving`).
@@ -1149,6 +1163,7 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
     let vm = Vm {
         segs,
         defs,
+        latest: std::sync::Mutex::new((entries.first().copied().unwrap_or(0), result)),
         entries,
         is_tests,
         state: std::sync::Mutex::new(state),
@@ -1157,7 +1172,7 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
         // A profile reads the debugger's records of the activations.
         debugging: DEBUGGING.load(Ordering::Relaxed) || profile::on(),
         growable,
-        shadow: tracing || c.detaches,
+        shadow: tracing || c.detaches || open,
         heap_frames: image.config.stack == meadow_axcut::config::Stack::Heap,
         // Compiled code calls natively, which frames on the interpreter's own
         // stack are there not to.
@@ -1178,7 +1193,7 @@ pub fn load(image: meadow_axcut::image::Image) -> Result<(), String> {
     }
     // Safety: set before the runtime starts, which reads them.
     unsafe {
-        crate::meadow_threaded = u8::from(c.threads);
+        crate::meadow_threaded = u8::from(c_threads);
         crate::meadow_cycles = u8::from(!tracing);
         crate::meadow_gc = if moving { 2 } else { u8::from(tracing) };
         crate::meadow_result_desc = result;
@@ -1287,6 +1302,16 @@ impl Vm {
             if let Some(t2) = self.jit.as_ref().and_then(|j| j.tier2.as_ref()) {
                 t2.forget_slot(*slot);
             }
+        }
+        // Its entry, for a VM kept for many runs: a build of a session that
+        // grows a line at a time.
+        if let Some(slot) = program.entry.and_then(|e| c.slots.get(&e)) {
+            let shown = program
+                .entry
+                .and_then(|e| program.results.get(&e))
+                .and_then(|r| r.desc())
+                .unwrap_or(desc::ANY);
+            *self.latest.lock().unwrap_or_else(|p| p.into_inner()) = (*slot, shown);
         }
         state.segments = seg + 1;
         *held = state;
@@ -2500,6 +2525,21 @@ impl Vm {
         } else {
             self.call::<false>(p, args)
         }
+    }
+
+    /// The entry of the last build loaded, given the null continuation: what
+    /// it answers, and how that is shown.
+    pub fn run_latest(&self) -> (Word, i64) {
+        let (slot, shown) = *self.latest.lock().unwrap_or_else(|p| p.into_inner());
+        let mut args = Args::new();
+        args.push(V::Val(0));
+        let p = self.target(slot);
+        let w = if self.jit.is_some() {
+            self.call::<true>(p, args)
+        } else {
+            self.call::<false>(p, args)
+        };
+        (w, shown)
     }
 
     /// Method `tag` of the closure `obj`, with `args`: entered from the

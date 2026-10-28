@@ -42,6 +42,12 @@ pub fn encode(image: &Image) -> Result<Vec<u8>, String> {
 
 /// The image in `bytes`, which live as long as the program does: a message
 /// in it is borrowed for the rest of the run.
+/// Whether `bytes` say they are an image of this version: what a cache of
+/// them checks before it keeps one, without decoding all of it.
+pub fn is_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(MAGIC)
+}
+
 pub fn decode(bytes: &'static [u8]) -> Result<Image, String> {
     let Some(body) = bytes.strip_prefix(MAGIC) else {
         return Err("not a program of AxCut, or one written by another version".into());
