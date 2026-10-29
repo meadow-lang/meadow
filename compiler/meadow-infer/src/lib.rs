@@ -1065,6 +1065,17 @@ impl TypeTable {
 // The inference pass
 // ===========================================================================
 
+/// What [`Infer::infer_unit_planned`] does with one binding group.
+pub enum Planned {
+    /// Infer it, as [`Infer::infer_unit`] does every group.
+    Infer,
+    /// Take these as its members' types without looking at their bodies:
+    /// they stand in the environment and the result as if inferred here.
+    Known(Vec<(VarId, Scheme)>),
+    /// Leave it alone. Nothing inferred in this run may mention it.
+    Skip,
+}
+
 /// What one inference run hands back.
 pub struct InferResult {
     pub table: TypeTable,
@@ -1726,11 +1737,43 @@ impl Infer {
         filenames: &[String],
         groups: &[(Vec<(usize, usize)>, bool)],
     ) {
+        self.infer_unit_planned(modules, filenames, groups, |_| Planned::Infer);
+    }
+
+    /// [`Infer::infer_unit`], doing with each group what `plan` says, by its
+    /// place in `groups`.
+    ///
+    /// What an editor does to answer for one module of a large package: the
+    /// groups of that module are inferred, and the groups they mention take
+    /// the types an earlier run gave them, as a dependency's bindings do.
+    /// Whoever plans is answerable for those types still being right.
+    pub fn infer_unit_planned(
+        &mut self,
+        modules: &[&hir::LModule],
+        filenames: &[String],
+        groups: &[(Vec<(usize, usize)>, bool)],
+        mut plan: impl FnMut(usize) -> Planned,
+    ) {
         for (m, file) in modules.iter().zip(filenames) {
             self.set_filename(file.clone());
             self.declarations(m.value());
         }
-        for (members, recursive) in groups {
+        for (g, (members, recursive)) in groups.iter().enumerate() {
+            match plan(g) {
+                Planned::Infer => {}
+                Planned::Known(schemes) => {
+                    for (vid, scheme) in schemes {
+                        // Recorded as generalized too, as everything inferred
+                        // at the top is, with no variables of this run behind
+                        // its quantifiers: lowering a mention reads it there.
+                        self.record_mono(vid, &scheme);
+                        self.env.insert(vid, scheme);
+                        self.exports.push(vid);
+                    }
+                    continue;
+                }
+                Planned::Skip => continue,
+            }
             let binds: Vec<(&hir::Bind, Span, String)> = members
                 .iter()
                 .filter_map(|&(m, i)| {

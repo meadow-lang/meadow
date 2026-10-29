@@ -106,18 +106,34 @@ pub const BATCH: usize = 64;
 pub const BUDGET: usize = 6_000;
 
 unsafe extern "C" {
-    /// Whether the program can make a cycle at all: the emitted module says
-    /// so, having looked for a store into a block that already exists. See
+    /// Whether the program can make a cycle at all, and how they are found if
+    /// it can: 0 for a program that cannot, 1 for trial deletion, 2 for
+    /// concurrent tracing ([`crate::trace`]). The emitted module says so,
+    /// having looked for a store into a block that already exists. See
     /// `meadow_llvm::emit`.
     static meadow_cycles: u8;
 }
 
 /// Whether this program can make a cycle. A program that cannot pays nothing
-/// for this module: no buffering, no colours, no collection.
+/// for either collector: no buffering, no colours, no barrier, no trace.
 #[inline(always)]
 pub fn possible() -> bool {
     // Safety: a constant the emitted module defines.
     unsafe { meadow_cycles != 0 }
+}
+
+/// Whether this program's cycles are found by trial deletion: this module.
+#[inline(always)]
+pub fn trial() -> bool {
+    // Safety: as `possible`.
+    unsafe { meadow_cycles == 1 }
+}
+
+/// Whether they are found by concurrent tracing: [`crate::trace`].
+#[inline(always)]
+pub fn tracing() -> bool {
+    // Safety: as `possible`.
+    unsafe { meadow_cycles == 2 }
 }
 
 /// A block whose count went down without reaching zero. Kept for the next
@@ -128,7 +144,7 @@ pub fn possible() -> bool {
 /// `v` must be a live block.
 #[unsafe(no_mangle)]
 pub extern "C" fn meadow_candidate(v: Word) {
-    if !possible() || !heap::is_block(v) || !worth_keeping(v) {
+    if !trial() || !heap::is_block(v) || !worth_keeping(v) {
         return;
     }
     heap::keep_candidate(v);
@@ -277,7 +293,7 @@ pub fn counting() -> bool {
 
 /// What this thread's collector has done.
 pub fn report() {
-    if !counting() {
+    if !counting() || !trial() {
         return;
     }
     TALLY.with(|t| {
@@ -310,7 +326,7 @@ pub fn report() {
 /// program asks for when it wants to know what it really has left, and what
 /// the leak check asks before it counts.
 pub fn collect_all(heap: &mut heap::Heap) {
-    if !possible() {
+    if !trial() {
         return;
     }
     heap.retry_oversized();

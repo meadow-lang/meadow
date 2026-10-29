@@ -70,10 +70,12 @@ pub(crate) type Segment = Coroutine<Down, Up, Word, DefaultStack>;
 pub(crate) struct SendSegment(pub Segment);
 
 /// A segment that is not running, and the head of its shadow chain where it
-/// stopped -- what its frames hold (see `crate::shadow`).
+/// stopped -- what its frames hold (see `crate::shadow`) -- and where its stack
+/// begins and where it stopped, which a trace scans (`crate::trace`).
 pub(crate) struct Parked {
     pub segment: SendSegment,
     pub shadow: Word,
+    pub level: crate::trace::Level,
 }
 
 /// A continuation's segments: the one suspended for `handler`, and those
@@ -121,10 +123,43 @@ fn run(closure: Word, arg: Word) -> Word {
 /// is resumed with -- perhaps on another OS thread.
 pub(crate) fn suspend(y: *const Yielder<Down, Up>, up: Up) -> Down {
     cx().running.pop();
-    // Safety: the yielder of the innermost segment running, which is this one.
-    let down = unsafe { &*y }.suspend(up);
+    let level = cx().levels.pop().unwrap_or_default();
+    // Where this stack stops, for the frame it suspends to to keep with it:
+    // what a trace scans of it while it waits.
+    let down = crate::trace::stopped(|sp| {
+        cx().stopped = Some(crate::trace::Level {
+            stopped: sp,
+            ..level
+        });
+        // Safety: the yielder of the innermost segment running, which is this
+        // one.
+        unsafe { &*y }.suspend(up)
+    });
     cx().running.push(y as *const ());
+    cx().levels.push(level);
     down
+}
+
+/// Where the segment that has just suspended stopped: see [`suspend`].
+fn stopped_level() -> crate::trace::Level {
+    cx().stopped.take().unwrap_or_default()
+}
+
+/// Resume `segment` with `down`, having said where the stack this runs on
+/// stops while it waits for it.
+pub(crate) fn resume(segment: &mut Segment, down: Down) -> CoroutineResult<Up, Word> {
+    crate::trace::stopped(|sp| {
+        let c = cx();
+        match c.levels.last_mut() {
+            Some(l) => l.stopped = sp,
+            None => {
+                if let Some(o) = &mut c.os_level {
+                    o.stopped = sp;
+                }
+            }
+        }
+        segment.resume(down)
+    })
 }
 
 pub(crate) fn innermost() -> Option<*const Yielder<Down, Up>> {
@@ -186,15 +221,16 @@ pub extern "C" fn meadow_enter(target: Word, body: Word) -> Word {
     let record: [i64; 4] = [crate::shadow::head() as i64, 1, after as i64, desc::REF];
     crate::shadow::set(record.as_ptr() as Word);
     LIVE.fetch_add(1, Ordering::Relaxed);
-    let segment = Coroutine::with_stack(
-        take_stack(SEGMENT),
-        move |y: &Yielder<Down, Up>, _: Down| {
-            cx().running.push(y as *const _ as *const ());
-            let v = run(body, 0);
-            cx().running.pop();
-            v
-        },
-    );
+    let stack = take_stack(SEGMENT);
+    let base = corosensei::stack::Stack::base(&stack).get();
+    let segment = Coroutine::with_stack(stack, move |y: &Yielder<Down, Up>, _: Down| {
+        cx().running.push(y as *const _ as *const ());
+        cx().levels.push(crate::trace::Level { base, stopped: 0 });
+        let v = run(body, 0);
+        cx().levels.pop();
+        cx().running.pop();
+        v
+    });
     let v = drive(segment, Down::Start, handler, Vec::new(), 0);
     crate::shadow::set(record[0] as Word);
     // The handle is done: carry on where its value was to go, on this stack.
@@ -212,6 +248,7 @@ fn outer(target: Word) -> Word {
         return 0;
     }
     let k = heap::field(target, 0);
+    crate::trace::log(k);
     heap::set_field(target, 0, 0, desc::REF);
     k
 }
@@ -254,7 +291,7 @@ fn drive(
     cx().parked.append(&mut nested);
     loop {
         crate::shadow::set(shadow);
-        let result = segment.resume(down);
+        let result = resume(&mut segment, down);
         shadow = crate::shadow::head();
         crate::shadow::set(here);
         match result {
@@ -266,12 +303,14 @@ fn drive(
             CoroutineResult::Yield(Up::Detach { target, then }) => {
                 if meta_of(target) == handler {
                     let nested = cx().parked.split_off(mark);
+                    let level = stopped_level();
                     let id = {
                         let s = &mut cx().suspended;
                         s.push(Some(Suspended {
                             top: Parked {
                                 segment: SendSegment(segment),
                                 shadow,
+                                level,
                             },
                             handler,
                             nested,
@@ -284,9 +323,11 @@ fn drive(
                 }
                 let Some(y) = innermost() else { escaped() };
                 let inside = cx().parked.len() - mark;
+                let level = stopped_level();
                 cx().parked.push(Parked {
                     segment: SendSegment(segment),
                     shadow,
+                    level,
                 });
                 down = suspend(y, Up::Detach { target, then });
                 (segment, shadow) = unpark();
@@ -297,9 +338,11 @@ fn drive(
                     crate::fail("a thread waited outside every thread")
                 };
                 let inside = cx().parked.len() - mark;
+                let level = stopped_level();
                 cx().parked.push(Parked {
                     segment: SendSegment(segment),
                     shadow,
+                    level,
                 });
                 down = suspend(y, Up::Park);
                 (segment, shadow) = unpark();
@@ -317,6 +360,7 @@ fn unpark() -> (Segment, Word) {
         Some(Parked {
             segment: SendSegment(s),
             shadow,
+            ..
         }) => (s, shadow),
         None => crate::fail("a segment resumed without the segment it was driving"),
     }
@@ -345,10 +389,12 @@ pub extern "C" fn meadow_reattach(k: Word, code: Word) -> Word {
         })
         .flatten();
     let Some(Suspended {
-        top: Parked {
-            segment: SendSegment(segment),
-            shadow,
-        },
+        top:
+            Parked {
+                segment: SendSegment(segment),
+                shadow,
+                ..
+            },
         handler,
         nested,
     }) = taken
@@ -366,6 +412,7 @@ pub fn discard(id: u32) {
         for Parked {
             segment: SendSegment(mut segment),
             shadow,
+            ..
         } in std::iter::once(top).chain(nested)
         {
             // What its frames were holding across calls goes first, while
@@ -382,12 +429,15 @@ pub fn discard(id: u32) {
     }
 }
 
-/// A thread's own segment begins: operations and waits suspend through `y`.
-pub(crate) fn enter_thread(y: &Yielder<Down, Up>) {
+/// A thread's own segment begins, on a stack whose base is `base`:
+/// operations and waits suspend through `y`.
+pub(crate) fn enter_thread(y: &Yielder<Down, Up>, base: usize) {
     cx().running.push(y as *const _ as *const ());
+    cx().levels.push(crate::trace::Level { base, stopped: 0 });
 }
 
 pub(crate) fn leave_thread() {
+    cx().levels.pop();
     cx().running.pop();
 }
 

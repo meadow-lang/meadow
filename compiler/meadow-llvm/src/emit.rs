@@ -233,7 +233,10 @@ pub struct Module<'p> {
     threaded: bool,
     /// Whether it can make a cycle: see [`ties_knots`]. If it cannot, its
     /// counting helpers keep no candidates and its runtime collects none.
-    cycles: bool,
+    /// Whether it can tie a knot, and how its cycles are found if it can: 0
+    /// for a program that cannot, 1 for trial deletion, 2 for concurrent
+    /// tracing -- what `@meadow_cycles` tells the runtime. See [`Cycles`].
+    cycles: u8,
     /// Whether it can make a compact region: see [`makes_regions`]. If it
     /// cannot, no value it ever holds is inside one, so its counting helpers
     /// do not ask.
@@ -276,7 +279,11 @@ impl<'p> Module<'p> {
             frame_tables: HashMap::new(),
             pending_frames: Vec::new(),
             threaded: spawns(program),
-            cycles: ties_knots(program),
+            cycles: if ties_knots(program) {
+                crate::cycles().mode()
+            } else {
+                0
+            },
             regions: makes_regions(program),
             shadow: uses(program, &[Prim::Detach]),
             spill_words: 0,
@@ -350,6 +357,33 @@ impl<'p> Module<'p> {
     /// so.
     fn cx(&self) -> &'static str {
         if self.threaded { CTX } else { "0" }
+    }
+
+    /// The barrier before a reference `old` is overwritten in a block that
+    /// already exists, in a program whose cycles are traced: while some heap
+    /// is marking, `old` is logged, so that whatever the trace's snapshot
+    /// could reach stays marked however the program rearranges it
+    /// (`silo/src/trace.rs`). A load and a branch, the rest of the time.
+    fn satb(&self, f: &mut Fun, old: &str) {
+        self.barrier(f, "meadow_satb", old);
+    }
+
+    fn barrier(&self, f: &mut Fun, entry: &str, v: &str) {
+        if self.cycles != 2 {
+            return;
+        }
+        let on = f.t();
+        f.i(format!(
+            "{on} = load atomic i64, ptr @meadow_marking monotonic, align 8"
+        ));
+        let any = f.t();
+        f.i(format!("{any} = icmp ne i64 {on}, 0"));
+        let (log, go) = (f.b(), f.b());
+        f.i(format!("br i1 {any}, label %{log}, label %{go}, !prof !0"));
+        f.label(&log);
+        f.i(format!("call void @{entry}(i64 {}, i64 {v})", self.cx()));
+        f.i(format!("br label %{go}"));
+        f.label(&go);
     }
 
     /// How many of a call's arguments travel in registers: all the
@@ -994,6 +1028,9 @@ impl<'p> Module<'p> {
                 f.i(format!("{has} = icmp ne i64 {token}, 0"));
                 f.i(format!("br i1 {has}, label %{keep}, label %{fresh}"));
                 f.label(&keep);
+                // The dead block is about to become a new one: a trace
+                // marking logs what it still holds, and marks it.
+                self.barrier(f, "meadow_satb_reuse", token);
                 self.write_block(f, token, kind, meta, vals, descs, Some(origin.as_ref()));
                 let keep_end = f.b();
                 f.i(format!("br label %{keep_end}"));
@@ -2025,6 +2062,9 @@ impl<'p> Module<'p> {
         f.i(format!("{q} = getelementptr i64, ptr {p}, i64 3"));
         let old = f.t();
         f.i(format!("{old} = load i64, ptr {q}"));
+        if !matches!(d, D::Known(k) if *k != desc::REF) {
+            self.satb(f, &old);
+        }
         // What it held is gone; what it holds now is one more reference. The
         // old one is erased by the same descriptor, since a `Ref` holds one
         // type.
@@ -2183,6 +2223,9 @@ impl<'p> Module<'p> {
                 f.i(format!("{q} = getelementptr i64, ptr {p}, i64 {idx}"));
                 let old = f.t();
                 f.i(format!("{old} = load i64, ptr {q}"));
+                if matches!(d, D::Known(k) if k == desc::REF) {
+                    self.satb(f, &old);
+                }
                 self.share(f, v, &d, 1);
                 f.i(format!("store i64 {v}, ptr {q}"));
                 self.erase(f, &old, &d);
@@ -2506,7 +2549,7 @@ impl<'p> Module<'p> {
             "@meadow_threaded = constant i8 {}\n@meadow_cycles = constant i8 {}\n\
              @meadow_spill_words = constant i64 {}\n\n",
             u8::from(self.threaded),
-            u8::from(self.cycles),
+            self.cycles,
             self.spill_area()
         );
         let string_sizes: HashMap<&str, usize> = self
@@ -2547,7 +2590,7 @@ impl<'p> Module<'p> {
                         "; A Meadow program, compiled by meadow-llvm: part {i}.\n"
                     );
                     out.push_str(RUNTIME);
-                    out.push_str(&helpers(self.cycles, self.regions));
+                    out.push_str(&helpers(self.cycles == 1, self.regions, self.cycles == 2));
                     // Of no stated length: how many methods the program has
                     // is not this unit's to say, and would be one more thing
                     // that changed its text when another unit changed.
@@ -2629,7 +2672,7 @@ impl<'p> Module<'p> {
         let mut out = String::new();
         let _ = writeln!(out, "; A Meadow program, compiled by meadow-llvm.\n");
         out.push_str(RUNTIME);
-        out.push_str(&helpers(self.cycles, self.regions));
+        out.push_str(&helpers(self.cycles == 1, self.regions, self.cycles == 2));
         out.push_str(&invokers(self.cc, self.threaded));
         let _ = writeln!(out, "@meadow_silo_{fingerprint} = external global i8");
         let _ = writeln!(
@@ -2852,6 +2895,9 @@ declare i64 @meadow_text(ptr, i64)
 declare i64 @meadow_bigint(i64)
 declare void @meadow_preempted()
 declare void @meadow_candidate(i64)
+declare void @meadow_satb(i64, i64)
+declare void @meadow_satb_reuse(i64, i64)
+@meadow_marking = external global i64
 declare void @meadow_region_shared(i64)
 declare void @meadow_region_erased(i64)
 declare i64 @meadow_hash(i64, i64)
@@ -3403,7 +3449,7 @@ fn export_fn(
 /// block whose count went down without reaching zero to the collector, which
 /// is where a cycle is noticed (`silo/src/cycles.rs`); one that cannot has no
 /// such call anywhere in it.
-fn helpers(cycles: bool, regions: bool) -> String {
+fn helpers(cycles: bool, regions: bool, barriers: bool) -> String {
     // The test before the call is inline, and on a program that makes no
     // cycles it is the whole cost, so it is one mask and one compare against
     // a constant. A block is worth keeping only if it is a `Ref` or a mutable
@@ -3461,7 +3507,8 @@ noreg:
     // Counting happens everywhere and both of these are rare, so say which
     // way the tests go: the calls and their setup are laid out away from the
     // path every share and every decrement takes.
-    let cold = if cycles || regions {
+    // The trace's barrier is the same: see `Module::barrier`.
+    let cold = if cycles || regions || barriers {
         "\n!0 = !{!\"branch_weights\", i32 1, i32 4096}\n"
     } else {
         ""

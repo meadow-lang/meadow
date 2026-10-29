@@ -150,6 +150,11 @@ pub fn group_module(module: &mut hir::Module, overloads: &hir::Overloads) {
 pub struct UnitGroup {
     pub members: Vec<(usize, usize)>,
     pub recursive: bool,
+    /// The groups this one mentions, by their place in the list: always
+    /// earlier ones, since a group comes after everything it mentions. What
+    /// an editor reusing the types of some groups needs, to know which
+    /// others a group's type was worked out from.
+    pub uses: Vec<usize>,
 }
 
 /// The binding groups of a whole unit, in dependency order across its modules.
@@ -187,11 +192,29 @@ pub fn unit_groups(modules: &[&hir::Module], overloads: &hir::Overloads) -> Vec<
             edges[slot] = seen;
         }
     }
-    scc(&edges)
-        .into_iter()
-        .map(|comp| UnitGroup {
-            recursive: comp.len() > 1 || comp.first().is_some_and(|&s| edges[s].contains(&s)),
-            members: comp.iter().map(|&s| at[s]).collect(),
+    let comps = scc(&edges);
+    let mut group_of = vec![0; at.len()];
+    for (g, comp) in comps.iter().enumerate() {
+        for &s in comp {
+            group_of[s] = g;
+        }
+    }
+    comps
+        .iter()
+        .enumerate()
+        .map(|(g, comp)| {
+            let mut uses: Vec<usize> = comp
+                .iter()
+                .flat_map(|&s| edges[s].iter().map(|&t| group_of[t]))
+                .filter(|&u| u != g)
+                .collect();
+            uses.sort_unstable();
+            uses.dedup();
+            UnitGroup {
+                recursive: comp.len() > 1 || comp.first().is_some_and(|&s| edges[s].contains(&s)),
+                members: comp.iter().map(|&s| at[s]).collect(),
+                uses,
+            }
         })
         .collect()
 }

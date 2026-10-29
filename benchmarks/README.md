@@ -116,7 +116,7 @@ nested patterns; Rust, Go, Python and JavaScript are ports of the same.
 | language   | how it is built                                                                                                                                                          |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Meadow     | `meadow build --release` — `-O2`, compiled ahead of time to a native executable                                                                                          |
-| Meadow/aot | `meadow build --release --runtime silo` — the same program against the runtime of its own: counted by reference, cycles collected by trial deletion, on the native stack |
+| Meadow/aot | `meadow build --release --runtime silo` — the same program against the runtime of its own: counted by reference, cycles found by concurrent tracing (trial deletion when these were measured), on the native stack |
 | Rust       | `rustc -C opt-level=3`, what `cargo build --release` uses                                                                                                                |
 | C          | `cc -O3 -ffp-contract=off` — `-O3` to match Rust's `opt-level=3`; `-ffp-contract=off` so `matmul` measures the loop and not who emits a fused multiply-add               |
 | C++        | `clang++ -O3 -std=c++17` — only `rbtree` has a C++ program, Koka's                                                                                                       |

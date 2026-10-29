@@ -22,6 +22,18 @@ impl Client {
     /// The same, with the standard library's sources written out somewhere --
     /// which is what lets a definition inside `Std` be named as a file.
     fn start_with(std_src_root: Option<std::path::PathBuf>) -> Client {
+        Client::start_loading(std_src_root, None)
+    }
+
+    /// A server that finds the package a document is in, as `meadow lsp` does.
+    fn in_packages() -> Client {
+        Client::start_loading(None, Some(meadow::editor::find_package))
+    }
+
+    fn start_loading(
+        std_src_root: Option<std::path::PathBuf>,
+        load_package: Option<meadow_lsp::analysis::PackageLoader>,
+    ) -> Client {
         let (server, client) = Connection::memory();
         let handle = std::thread::spawn(move || {
             let opts = meadow::Options::debug();
@@ -37,7 +49,7 @@ impl Client {
                 modules,
                 std_src_root,
                 meadow::stdlib::MODULES,
-                None,
+                load_package,
             )
             .expect("server");
         });
@@ -1080,4 +1092,129 @@ fn a_definition_is_answered_in_an_ir_with_where_the_name_at_the_cursor_is() {
             .contains("def #")
     );
     assert_eq!(ask(&mut c, "llvm"), Value::Null);
+}
+
+/// A package on disk, for a server that loads packages: `Main` calling `Eval`.
+fn evaluator(dir: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("meadow-protocol-{dir}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("Meadow.toml"), "[package]\nname = \"Demo\"\n").unwrap();
+    std::fs::write(root.join("src").join("Eval.mw"), EVAL).unwrap();
+    std::fs::write(root.join("src").join("Main.mw"), MAIN).unwrap();
+    std::fs::canonicalize(&root).unwrap()
+}
+
+const EVAL: &str = "@pub(pkg) fun eval n = n + 1\n";
+const MAIN: &str = "use Demo.Eval (eval)\ndef demo = eval 1 + 1\n";
+/// `eval` made a string, which breaks `Main`'s `+ 1`.
+const EVAL_BROKEN: &str = "@pub(pkg) fun eval n = \"n\"\n";
+
+fn uri_of(path: &std::path::Path) -> String {
+    format!("file://{}", path.display())
+}
+
+impl Client {
+    fn open(&self, uri: &str, text: &str) {
+        self.notify(
+            "textDocument/didOpen",
+            json!({"textDocument": {"uri": uri, "languageId": "meadow", "version": 1, "text": text}}),
+        );
+    }
+
+    fn change(&self, uri: &str, text: &str) {
+        self.notify(
+            "textDocument/didChange",
+            json!({"textDocument": {"uri": uri, "version": 2}, "contentChanges": [{"text": text}]}),
+        );
+    }
+
+    /// The next diagnostics published for `uri`, passing over any for others.
+    fn diagnostics_of(&self, uri: &str) -> Vec<Diagnostic> {
+        loop {
+            if let Message::Notification(n) = self.conn.receiver.recv().unwrap()
+                && n.method == "textDocument/publishDiagnostics"
+            {
+                let p: PublishDiagnosticsParams = serde_json::from_value(n.params).unwrap();
+                if p.uri.as_str() == uri {
+                    return p.diagnostics;
+                }
+            }
+        }
+    }
+
+    /// Every document diagnostics are published for in the next `ms`.
+    fn published_within(&self, ms: u64) -> Vec<String> {
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        let mut uris = Vec::new();
+        while let Some(left) = until.checked_duration_since(std::time::Instant::now()) {
+            match self.conn.receiver.recv_timeout(left) {
+                Ok(Message::Notification(n)) if n.method == "textDocument/publishDiagnostics" => {
+                    let p: PublishDiagnosticsParams = serde_json::from_value(n.params).unwrap();
+                    uris.push(p.uri.as_str().to_string());
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        uris
+    }
+}
+
+#[test]
+fn saving_an_open_document_as_the_editor_holds_it_analyses_nothing_again() {
+    // With autosave on, a save follows every pause in typing, and each one
+    // reaches the server as a file changed on disk. The editor already sent
+    // what it says.
+    let root = evaluator("save");
+    let main = uri_of(&root.join("src").join("Main.mw"));
+    let c = Client::in_packages();
+    c.open(&main, MAIN);
+    assert!(c.diagnostics_of(&main).is_empty());
+    c.notify(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": main, "type": 2}]}),
+    );
+    assert_eq!(c.published_within(1500), Vec::<String>::new());
+}
+
+#[test]
+fn a_sibling_changed_on_disk_analyses_the_open_documents_again() {
+    let root = evaluator("sibling");
+    let main = uri_of(&root.join("src").join("Main.mw"));
+    let eval = root.join("src").join("Eval.mw");
+    let c = Client::in_packages();
+    c.open(&main, MAIN);
+    assert!(c.diagnostics_of(&main).is_empty());
+    std::fs::write(&eval, EVAL_BROKEN).unwrap();
+    c.notify(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri_of(&eval), "type": 2}]}),
+    );
+    assert!(
+        !c.diagnostics_of(&main).is_empty(),
+        "`eval` changed under `Main`"
+    );
+}
+
+#[test]
+fn typing_in_one_document_analyses_its_open_siblings_again() {
+    let root = evaluator("typing");
+    let main = uri_of(&root.join("src").join("Main.mw"));
+    let eval = uri_of(&root.join("src").join("Eval.mw"));
+    let c = Client::in_packages();
+    c.open(&main, MAIN);
+    assert!(c.diagnostics_of(&main).is_empty());
+    c.open(&eval, EVAL);
+    assert!(c.diagnostics_of(&eval).is_empty());
+    // Not saved: only the editor has it.
+    c.change(&eval, EVAL_BROKEN);
+    assert!(c.diagnostics_of(&eval).is_empty());
+    assert!(
+        !c.diagnostics_of(&main).is_empty(),
+        "`Main` was not told `eval` changed"
+    );
+    // And back.
+    c.change(&eval, EVAL);
+    assert!(c.diagnostics_of(&main).is_empty());
 }

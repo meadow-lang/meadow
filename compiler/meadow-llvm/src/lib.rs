@@ -38,6 +38,61 @@ impl From<emit::Error> for Error {
 /// The symbol a runtime library built from the sources this compiler was
 /// defines, and that the emitted module refers to: so that a program links
 /// with that runtime and no other. See `build.rs`.
+/// How a program that can tie a knot has its cycles found, which is decided
+/// when it is built: concurrent tracing (`silo/src/trace.rs`), unless trial
+/// deletion (`silo/src/cycles.rs`) is asked for. `docs/SILO.md`, "Cycles".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Cycles {
+    Trial,
+    #[default]
+    Tracing,
+}
+
+impl Cycles {
+    /// What `@meadow_cycles` says of a program that can tie a knot.
+    pub fn mode(self) -> u8 {
+        match self {
+            Cycles::Trial => 1,
+            Cycles::Tracing => 2,
+        }
+    }
+
+    /// `trial` or `tracing`, as a profile or `MEADOW_CYCLES` says it.
+    pub fn named(name: &str) -> Option<Cycles> {
+        match name {
+            "trial" => Some(Cycles::Trial),
+            "tracing" => Some(Cycles::Tracing),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Cycles::Trial => "trial",
+            Cycles::Tracing => "tracing",
+        }
+    }
+}
+
+thread_local! {
+    static CYCLES: std::cell::Cell<Cycles> = const { std::cell::Cell::new(Cycles::Tracing) };
+}
+
+/// The collector the programs this thread compiles get: see [`with_cycles`].
+pub fn cycles() -> Cycles {
+    CYCLES.with(std::cell::Cell::get)
+}
+
+/// Compile, in `f`, with `how` for the cycles: a setting of this thread's,
+/// so that what compiles a program need not say it at every call, and two
+/// threads compiling two programs do not share it.
+pub fn with_cycles<T>(how: Cycles, f: impl FnOnce() -> T) -> T {
+    let was = CYCLES.with(|c| c.replace(how));
+    let out = f();
+    CYCLES.with(|c| c.set(was));
+    out
+}
+
 pub fn runtime_symbol() -> String {
     format!("meadow_silo_{}", fingerprint())
 }

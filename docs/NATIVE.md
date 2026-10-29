@@ -62,6 +62,43 @@ it compiles _nothing_, and gets faster as it compiles more (§10).
 The system libraries to link are `Format::system_libs` in
 `glade/src/codegen/object.rs`; on Windows `main` is compiled `/MD`.
 
+### A library
+
+A program that exports functions to C (`@export`, which Cut writes as
+`export "name" = S -> rep`) is linked as a shared library instead: the same
+object file and runtime, and in place of `main`, `<name>-exports.c`, with a C
+function for each export (`object::library_c`). `meadow cut --runtime glade`
+builds one for any program of Cut with exports, and `MeadowBoot build
+--runtime glade` for a package of `@export` functions, into
+`target/<profile>/native/` (Silo's are in `native/silo/`). A C function takes
+and answers the C types Silo's do -- `int64_t` for `Int`, `double`,
+`float`, the sized integers, `unsigned char` for `Bool`, `uint32_t` for
+`Char`, and `void` for `()` -- and so a program of either runtime calls it
+through `Std.Ffi` as it calls any C:
+
+```c
+MEADOW_EXPORT int32_t twice(int32_t a0) {
+    static const unsigned char k[2] = {10, 0};
+    uint64_t w[2] = {0};
+    uint64_t r = 0;
+    w[0] = (uint64_t)(int64_t)a0;
+    meadow_glade_export(meadow_code, meadow_data, 109u, w, k, 1u, &r);
+    return (int32_t)r;
+}
+```
+
+`meadow_glade_export` (`glade/src/aot.rs`) is told the definition, by its
+place in the image's entries, and each argument as a 64-bit word with what it
+holds (`aot::kind`). The first call reads the image and its native code, which
+are kept for the library's life. Each call is then a run of its own on the
+scheduler, whose main thread enters the definition with the arguments and then
+the halt continuation, as `main` is entered with the halt alone: the call has
+a heap of its own, which goes when it answers, and so do the top-level values
+it made. A call that fails answers zero, says why on standard error, and keeps
+the message for `Std.Ffi.failure` on that OS thread; C goes on. On ELF a
+library is linked `-Bsymbolic`, so that it calls its own runtime whatever else
+is loaded.
+
 ## 2. The object file
 
 Mach-O, ELF or COFF, with **two symbols and no relocations**:

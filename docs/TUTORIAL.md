@@ -2093,6 +2093,40 @@ in one probe; `lookup`, `member`, `adjust`, `delete` and `foldl` are what they
 are for `HashMap`. What comes out of the `runSt` is what `toVec`, `keys` or
 `values` read out, never the table.
 
+For keeping track of which things have been found to be the same --
+connected components, equivalence classes, the type variables a type checker
+unifies -- `Std.Collections.UnionFind` is a disjoint-set forest of the same
+kind. Its elements are the numbers `0`, `1`, …, `union` joins two elements'
+groups, and `find` names the group an element is in by a representative,
+pointing everything it passes straight at it on the way:
+
+```meadow
+use Std.St as St
+use Std.Collections.Vector as V
+use Std.Collections.UnionFind as UF
+
+fun components n edges =
+  runSt (\() ->
+    let uf = UF.make n () in
+    let _ = V.forEach (\e -> let _ = UF.union (fst e) (snd e) uf in ()) edges in
+    UF.groups uf)
+
+fun main () = println (components 6 [(0, 1), (1, 2), (4, 5)])
+```
+
+```
+[[0, 1, 2], [3], [4, 5]]
+```
+
+`union` hangs the smaller group's tree under the larger's and `find`
+compresses the paths it walks, so a long run of operations costs a few steps
+each, for any input there will ever be. Every group also holds a value -- `()`
+above -- which `value` reads, `setValue` replaces, and `unionWith f` sets to
+`f` of the two groups' values when it joins them; `examples/MiniML` keeps what
+each type variable has been solved to there. `same`, `count` and `sizeOf` ask
+whether two elements are in one group, how many groups there are, and how big
+one is.
+
 ### The collector
 
 Each green thread has a heap of its own, and the VM collects it in short

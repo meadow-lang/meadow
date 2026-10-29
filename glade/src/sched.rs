@@ -85,6 +85,9 @@ pub const GLOBAL_EVERY: u64 = 61;
 pub struct Outcome {
     /// The main thread's result, rendered, or why it failed.
     pub result: Result<String, Error>,
+    /// The main thread's answer itself, where it is not an object: what a C
+    /// function a library exports answers (see [`run_export`]).
+    pub answer: Option<crate::value::Value>,
     pub stats: Stats,
     /// Every thread's samples, merged. `None` unless the run was sampled.
     pub profile: Option<crate::profile::Profile>,
@@ -212,7 +215,15 @@ pub fn run_captured(
     workers: usize,
     sink: Sink,
 ) -> Outcome {
-    run_all(program, native, entry, fuel, workers, None, Some(sink))
+    run_all(
+        program,
+        native,
+        Wake::Entry(entry),
+        fuel,
+        workers,
+        None,
+        Some(sink),
+    )
 }
 
 /// [`run_native`], sampled.
@@ -224,7 +235,40 @@ pub fn run_sampled(
     workers: usize,
     sampling: Option<Sampling>,
 ) -> Outcome {
-    run_all(program, native, entry, fuel, workers, sampling, None)
+    run_all(
+        program,
+        native,
+        Wake::Entry(entry),
+        fuel,
+        workers,
+        sampling,
+        None,
+    )
+}
+
+/// Run the definition at `entry` with `args`, as a call C made into a library
+/// does: a run of its own, whose main thread is the call, which answers what
+/// the definition answers -- a number, a `Bool`, a `Char` or `()` -- or why
+/// it failed.
+pub fn run_export(
+    program: &Program,
+    native: Option<&crate::jit::Native>,
+    entry: Pc,
+    args: Vec<crate::value::Value>,
+) -> Result<crate::value::Value, Error> {
+    let outcome = run_all(
+        program,
+        native,
+        Wake::Call(entry, args),
+        u64::MAX,
+        workers(),
+        None,
+        None,
+    );
+    outcome.result?;
+    outcome.answer.ok_or_else(|| Error {
+        msg: "the call answered an object, which C cannot take".into(),
+    })
 }
 
 /// A machine's output, sent to `sink`.
@@ -238,7 +282,7 @@ fn capture(vm: &mut Vm, sink: &Option<Sink>) {
 fn run_all(
     program: &Program,
     native: Option<&crate::jit::Native>,
-    entry: Pc,
+    start: Wake,
     fuel: u64,
     workers: usize,
     sampling: Option<Sampling>,
@@ -253,10 +297,16 @@ fn run_all(
         .filter(|s| s.every.is_none())
         .map(|s| crate::profile::Ticker::at(s.hz));
     let world = Arc::new(crate::stm::World::default());
+    // A call into a library starts small, as a spawned thread does: most
+    // make little, and every call makes its heap anew.
+    let vm = match start {
+        Wake::Call(..) => Vm::with_heap(program, Heap::with_capacity(THREAD_INITIAL)),
+        _ => Vm::new(program),
+    };
     let mut main = Box::new(Fiber {
-        vm: Vm::new(program),
+        vm,
         task: 0,
-        wake: Wake::Entry(entry),
+        wake: start,
     });
     main.vm.scheduled = true;
     main.vm.world = Some(world.clone());
@@ -285,6 +335,7 @@ fn run_all(
         wake: Condvar::new(),
         done: AtomicBool::new(false),
         finished: Mutex::new(None),
+        answer: Mutex::new(None),
         started: AtomicBool::new(false),
         stats: Mutex::new(Stats::default()),
         sampling,
@@ -307,8 +358,10 @@ fn run_all(
     });
     let stats = lock(&shared.stats).clone();
     let profile = lock(&shared.profile).take();
+    let answer = lock(&shared.answer).take();
     Outcome {
         result,
+        answer,
         stats,
         profile,
     }
@@ -328,6 +381,9 @@ enum Wake {
     Go,
     /// Start at a definition -- the main thread.
     Entry(Pc),
+    /// Start at a definition with these arguments -- the main thread of a
+    /// call C made into a library.
+    Call(Pc, Vec<crate::value::Value>),
     /// Start by calling a function with `()` -- a spawned thread.
     Start(Parcel, meadow_rt::desc::Desc),
     /// The answer to what it was waiting for, into a register.
@@ -391,6 +447,9 @@ struct Shared<'p> {
     wake: Condvar,
     done: AtomicBool,
     finished: Mutex<Option<Result<String, Error>>>,
+    /// The main thread's answer, where it is not an object: see
+    /// [`Outcome::answer`].
+    answer: Mutex<Option<crate::value::Value>>,
     /// Have the workers past the first been started?
     started: AtomicBool,
     stats: Mutex<Stats>,
@@ -741,6 +800,9 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
             Stop::Halted(v) => {
                 Self::collect(sh, &mut fiber);
                 if fiber.task == 0 {
+                    if !matches!(v, crate::value::Value::Obj(_)) {
+                        *lock(&sh.answer) = Some(v);
+                    }
                     let shown = fiber.vm.show(v);
                     {
                         let mut stats = lock(&sh.stats);
@@ -1002,6 +1064,7 @@ fn run_slice(sh: &Shared, fiber: &mut Fiber) -> Stop {
     match std::mem::replace(&mut fiber.wake, Wake::Go) {
         Wake::Go => {}
         Wake::Entry(pc) => vm.start(pc),
+        Wake::Call(pc, args) => vm.start_with(pc, &args),
         Wake::Start(body, answer) => {
             if let Err(e) = vm.start_call(&body, answer) {
                 return Stop::Failed(e);

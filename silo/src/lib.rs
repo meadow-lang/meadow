@@ -31,6 +31,7 @@ pub mod sched;
 pub mod segments;
 pub mod shadow;
 pub mod show;
+pub mod trace;
 pub mod value;
 
 use ctx::Ctx;
@@ -55,7 +56,13 @@ unsafe extern "C" {
 /// A block of `words` words for a `let` or a `new`, count zero.
 #[unsafe(no_mangle)]
 pub extern "C" fn meadow_acquire(c: *mut ctx::Ctx, words: i64) -> Word {
-    heap::acquire_in(ctx::given(c), words as usize)
+    let c = ctx::given(c);
+    // Only here, from compiled code, does a trace take its roots or sweep:
+    // every block made before this call is written whole. See `trace`.
+    if cycles::tracing() {
+        trace::poll(c);
+    }
+    heap::acquire_in(c, words as usize)
 }
 
 /// The last reference to the block at `v` was erased: it is block `v` and its
@@ -165,7 +172,12 @@ fn run_main(entry: extern "C" fn() -> Word) -> (Box<Ctx>, Word) {
     }
     let mut c = Ctx::new(0);
     ctx::set(&mut *c);
+    // The program runs on this stack until a `handle` starts a segment, and
+    // a trace scans it from here down: see `trace::Level`.
+    let base = trace::stopped(|sp| sp);
+    c.os_level = Some(trace::Level { base, stopped: 0 });
     let v = entry();
+    c.os_level = None;
     (c, v)
 }
 
@@ -333,6 +345,7 @@ pub unsafe extern "C" fn meadow_run(
         let text = show::show(v, d);
         prims::report();
         cycles::report();
+        trace::report();
         heap::quarantined();
         heap::erase(v, d);
         if std::env::var_os("MEADOW_SILO_LEAKS").is_some() {

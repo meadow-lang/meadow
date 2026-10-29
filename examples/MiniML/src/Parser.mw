@@ -15,7 +15,6 @@ use Syntax.Expr.*
 use Std.String.Parse as P
 use Std.String.Parse.Char as C
 use Std.String.Parse.Lexer as L
-use Std.String as S
 use Std.Char as Ch
 use Std.Collections.Vector as V
 use Std.Bool (not)
@@ -51,10 +50,7 @@ fun ident =
     (P.try
        (P.bind
           (lexeme
-             (P.lift2
-                (\c cs -> S.concat (Ch.toString c) cs)
-                (P.satisfy isIdentStart)
-                (P.takeWhileP isIdentChar)))
+             (P.lift2 (\c cs -> "${c}${cs}") (P.satisfy isIdentStart) (P.takeWhileP isIdentChar)))
           (\name ->
             if V.elem name reserved then P.fail "`${name}` is a keyword, not a name"
             else P.pure name)))
