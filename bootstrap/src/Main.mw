@@ -105,7 +105,7 @@ cli! {
       runtime
         : Option
           ("glade" | "silo")
-          "The runtime system: `glade` (the default), bytecode and a garbage collector, or `silo`, compiled all the way down by LLVM and counting references"
+          "The runtime system: `glade` (the default), bytecode and a garbage collector, or `silo`, compiled all the way down by LLVM and counting references. A library of `@export` functions is Silo's unless `glade` is named"
           value
           "RUNTIME"
       backend
@@ -289,7 +289,10 @@ cli! {
         file : String "The program, as the text `docs/CUT.md` describes"
         args : [String] "What the program is given, after `--`: what its `argv` answers" after "--"
         runtime : Option String =
-          "glade" "`glade`, on its bytecode, or `silo`, as native code" value "NAME"
+          "glade"
+            "`glade`, on its bytecode, or `silo`, as native code. A program that exports functions to C is built by either as a library of them, and not run"
+            value
+            "NAME"
         aot : Flag "On Glade, compile the bytecode to machine code ahead of time and run that"
         optLevel : Option Int =
           2 "How hard an executable is optimised: 0, 1 or 2" short "O" value "LEVEL"
@@ -515,17 +518,19 @@ fun driven (path : Maybe String) (b : CliBuild) (args : Maybe [String]) =
                  | None -> ()
                in
                -- A program that exports functions to C is a library of them,
-               -- built native, and not run.
+               -- built native, and not run: by Silo, unless `--runtime glade`
+               -- asks for Glade's.
                let library =
                  match readToString program with
                  | Ok text -> S.contains "\nexport " text
                  | Err _ -> False
                in
+               let libraryRuntime = M.unwrapOr "silo" b.runtime in
                let aimed = match b.target with | Just t -> ["--target", t] | None -> [] in
                let back =
                  if library then
                    V.concat [
-                     ["cut", program, "--runtime", "silo", "-O", show level, "--no-run"],
+                     ["cut", program, "--runtime", libraryRuntime, "-O", show level, "--no-run"],
                      aimed
                    ]
                  else
@@ -539,7 +544,7 @@ fun driven (path : Maybe String) (b : CliBuild) (args : Maybe [String]) =
                   | Ok 0 ->
                       if not library then exit 0
                       else
-                        (match placed r profile library goal with
+                        (match placed r profile libraryRuntime goal with
                          | Ok at -> (let u = writeError "      Copied ${at}\n" in exit 0)
                          | Err why ->
                              (let u =
@@ -589,11 +594,12 @@ fun targetOf (given : Maybe String) : Goal =
   let triple = if S.contains "-" t then t else "${arch}-${rest}" in
   Goal { os, arch, triple, host = os == hostOs and arch == hostArch }
 
--- What the back end built natively for the package at `r` -- a library of
--- what it exports, or a program -- named for the package and put where `meadow
--- build` puts a native program, `target/<profile>/native/silo`, so that two
--- packages' do not share a name. A library is put there; a program is not yet.
-fun placed (r : String) (profile : String) (library : Bool) (goal : Goal)
+-- The library of what the package at `r` exports, which `runtime` built
+-- natively, named for the package and put where `meadow build` puts that
+-- runtime's native program -- `target/<profile>/native/silo` for Silo's,
+-- `target/<profile>/native` for Glade's -- so that two packages' do not share
+-- a name.
+fun placed (r : String) (profile : String) (runtime : String) (goal : Goal)
     : Result String String ! { Fs | e } =
   let name =
     match readToString (Path.join r "Meadow.toml") with
@@ -602,22 +608,21 @@ fun placed (r : String) (profile : String) (library : Bool) (goal : Goal)
   in
   let fileOf =
     \n ->
-      if library then
-        (if goal.os == "windows" then "${n}.dll"
-         else if goal.os == "macos" then "lib${n}.dylib"
-         else if goal.os == "ios" then "lib${n}.a"
-         else "lib${n}.so")
-      else if goal.os == "windows" then "${n}.exe"
-      else n
+      if goal.os == "windows" then "${n}.dll"
+      else if goal.os == "macos" then "lib${n}.dylib"
+      else if goal.os == "ios" then "lib${n}.a"
+      else "lib${n}.so"
   in
-  -- A build for another system is under its triple, as `meadow`'s is.
+  -- A build for another system is under its triple, as `meadow`'s is; and
+  -- Silo's beside Glade's, which is the default runtime's.
   let under = if goal.host then "" else "/${goal.triple}" in
+  let beside = if runtime == "glade" then "" else "/silo" in
   let built =
     Path.join
-      (Path.join (linkDirIn r profile) "target/release/native${under}/silo")
+      (Path.join (linkDirIn r profile) "target/release/native${under}${beside}")
       (fileOf "program")
   in
-  let dir = Path.join r "target/${profile}/native${under}/silo" in
+  let dir = Path.join r "target/${profile}/native${under}${beside}" in
   let dest = Path.join dir (fileOf name) in
   match createDirAll dir with
   | Err why -> Err why

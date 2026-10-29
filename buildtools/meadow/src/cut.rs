@@ -176,9 +176,17 @@ pub fn run_on_glade(path: &Path) -> Result<(), String> {
     .map_err(|e| e.msg)
 }
 
+/// Whether the program at `path` exports functions to C, and so is built as
+/// a library of them rather than run: whether a line of it starts `export`,
+/// which only a top-level declaration can.
+pub fn is_library(path: &Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|text| text.lines().any(|l| l.starts_with("export ")))
+}
+
 /// Build it for Glade ahead of time -- its bytecode compiled to machine
 /// code, linked with the `meadow_glade` runtime -- beside the file, under
-/// `target`, and answer where the executable is.
+/// `target`, and answer where the executable is: or, for a program that
+/// exports functions to C, the library of them.
 pub fn build_for_glade(path: &Path, opt: meadow_compiler::OptLevel) -> Result<PathBuf, String> {
     let root = path
         .parent()
@@ -190,6 +198,18 @@ pub fn build_for_glade(path: &Path, opt: meadow_compiler::OptLevel) -> Result<Pa
         .ok_or("a file with a name")?;
     let program = lowered(path)?;
     let image = meadow_codegen::compile(&program).map_err(|e| e.msg)?;
+    if !program.exports.is_empty() {
+        return aot::build_library(
+            root,
+            Profile::Release,
+            opt,
+            name,
+            &image,
+            &aot::glade_exports(&program.exports)?,
+            aot::Target::host()?,
+            &Default::default(),
+        );
+    }
     aot::build(
         root,
         Profile::Release,

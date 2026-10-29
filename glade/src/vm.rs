@@ -517,6 +517,23 @@ impl<'p> Vm<'p> {
         self.at = NO_PC;
     }
 
+    /// Put the machine at `entry` with `args` in the first registers and the
+    /// halt continuation after them: what a C function a library exports
+    /// enters its definition with, which takes its arguments and then the
+    /// continuation it answers through (`meadow_axcut::Export`).
+    pub fn start_with(&mut self, entry: Pc, args: &[Value]) {
+        self.heap.reserve(Heap::size_of(Kind::Closure, 1));
+        let answer = self.program.result_at(entry);
+        let halt = self.heap.alloc(Kind::Closure, 0, &[Value::Int(answer)]);
+        for (i, a) in args.iter().enumerate() {
+            self.regs[i] = a.bits();
+        }
+        self.regs[args.len()] = Value::Obj(halt).bits();
+        self.live = args.len() + 1;
+        self.pc = entry as usize;
+        self.at = NO_PC;
+    }
+
     /// One instruction. `Some` means the program halted.
     pub fn step(&mut self) -> Result<Option<Value>, Error> {
         let Some(&i) = self.program.code.get(self.pc) else {

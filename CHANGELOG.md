@@ -13,8 +13,33 @@ beyond the last release is under _Unreleased_.
 
 ## Unreleased
 
+### Breaking
+
+- The float operators `+.`, `-.`, `*.`, `/.`, `<.`, `>.`, `<=.` and `>=.`
+  are gone, and so is their trait, `Std.Ops.Floating`. `Float` and `Float32`
+  implement `Add`, `Sub`, `Mul` and `Div`, and were already `PartialOrd`, so
+  `x + y` and `x < y` are what float code writes now, at the same cost. Write
+  `+` for `+.`, `<` for `<.`, and so on. A program built without `Std` names
+  the float primitives (`_primAddF x y`), since there `+` is the integers'
+  primitive.
+
 ### Added
 
+- Glade builds a library of what a package exports to C, as Silo does:
+  `MeadowBoot build --runtime glade` for a package of `@export` functions, or
+  `meadow cut --runtime glade` for a program of Cut with exports, makes
+  `Name.dll`, `libName.so` or `libName.dylib` in `target/<profile>/native/`.
+  Its C functions take and answer the C types Silo's do, so a Silo program
+  calls Glade's code through `Std.Ffi` -- and a Glade program calls it too.
+  A call that fails answers zero and leaves its message for
+  `Std.Ffi.failure`, as Silo's does. Each call runs with a heap of its own:
+  the top-level values a call makes are made again by the next. For this
+  system only; a library for another is Silo's.
+- `Std.Collections.UnionFind`: disjoint sets inside a `runSt`, with union
+  by size and path compression. `make`, `add`, `find`, `union`, `same`,
+  `count` and `groups`, and a value per group that `unionWith` merges, which
+  is what unification wants; the MiniML example's type checker is built on
+  it.
 - Silo finds a program's garbage cycles by concurrent tracing, unless the
   build asks for trial deletion with `cycles = "trial"` in a
   `[profile.<name>]` of `Meadow.toml` or `MEADOW_CYCLES=trial`. A trace of a
@@ -31,16 +56,6 @@ beyond the last release is under _Unreleased_.
 
 - `MEADOW_SILO_POISON` and `MEADOW_SILO_LEAKS` together counted every
   poisoned block as left behind at exit.
-
-### Breaking
-
-- The float operators `+.`, `-.`, `*.`, `/.`, `<.`, `>.`, `<=.` and `>=.`
-  are gone, and so is their trait, `Std.Ops.Floating`. `Float` and `Float32`
-  implement `Add`, `Sub`, `Mul` and `Div`, and were already `PartialOrd`, so
-  `x + y` and `x < y` are what float code writes now, at the same cost. Write
-  `+` for `+.`, `<` for `<.`, and so on. A program built without `Std` names
-  the float primitives (`_primAddF x y`), since there `+` is the integers'
-  primitive.
 
 ## 0.4.0 - 2026-10-24
 
