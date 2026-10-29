@@ -287,7 +287,9 @@ enum Cmd {
         /// The program, as the text `docs/CUT.md` describes.
         #[arg(value_name = "FILE")]
         file: PathBuf,
-        /// `glade`, on its bytecode, or `silo`, as native code.
+        /// `glade`, on its bytecode, or `silo`, as native code. A program that
+        /// exports functions to C is built by either as a library of them,
+        /// and not run.
         #[arg(long, default_value = "glade", value_name = "NAME")]
         runtime: String,
         /// On Glade, compile the bytecode to machine code ahead of time and
@@ -1048,6 +1050,16 @@ fn command() {
                 _ if emit.is_some() => {
                     meadow::cut::emitted(&file, emit.as_deref().unwrap_or_default()).map(|text| {
                         print!("{text}");
+                        0
+                    })
+                }
+                // A library of what it exports to C is built ahead of time,
+                // whatever else was asked, and there is nothing to run.
+                Some(aot::Runtime::Glade)
+                    if meadow::cut::is_library(&file) && !target.is_some_and(|t| !t.is_host()) =>
+                {
+                    meadow::cut::build_for_glade(&file, opt).map(|lib| {
+                        meadow::status::status("Built", lib.display().to_string());
                         0
                     })
                 }

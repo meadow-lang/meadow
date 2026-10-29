@@ -13,6 +13,19 @@ beyond the last release is under _Unreleased_.
 
 ## Unreleased
 
+### Added
+
+- Glade builds a library of what a package exports to C, as Silo does:
+  `MeadowBoot build --runtime glade` for a package of `@export` functions, or
+  `meadow cut --runtime glade` for a program of Cut with exports, makes
+  `Name.dll`, `libName.so` or `libName.dylib` in `target/<profile>/native/`.
+  Its C functions take and answer the C types Silo's do, so a Silo program
+  calls Glade's code through `Std.Ffi` -- and a Glade program calls it too.
+  A call that fails answers zero and leaves its message for
+  `Std.Ffi.failure`, as Silo's does. Each call runs with a heap of its own:
+  the top-level values a call makes are made again by the next. For this
+  system only; a library for another is Silo's.
+
 ### Breaking
 
 - The float operators `+.`, `-.`, `*.`, `/.`, `<.`, `>.`, `<=.` and `>=.`
