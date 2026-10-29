@@ -67,12 +67,13 @@ pub use meadow_span as span;
 
 pub mod cfg;
 pub mod expand;
+pub mod focus;
 mod options;
 pub use options::{Cfg, OptLevel, Options, Strictness};
 
 mod unit;
 pub use unit::{
     AstModule, CompiledPackage, Dep, Export, Resolved, TestSite, TypedModule, compile_str,
-    compile_str_with, compile_unit, compile_unit_above, compile_unit_as, compile_unit_in_package,
-    compile_unit_with_procs, resolve_module,
+    compile_str_with, compile_unit, compile_unit_above, compile_unit_as, compile_unit_focused,
+    compile_unit_in_package, compile_unit_with_procs, resolve_module,
 };

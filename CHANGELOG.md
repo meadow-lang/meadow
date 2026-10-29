@@ -23,6 +23,16 @@ beyond the last release is under _Unreleased_.
   the float primitives (`_primAddF x y`), since there `+` is the integers'
   primitive.
 
+### Fixed
+
+- The language server answers for one file of a large package without
+  compiling the whole package on every change. It infers the module being
+  edited and reuses what earlier compiles found for the rest, while what
+  that was worked out from is unchanged; the first compile of a package
+  answers for all of its open files at once; and an autosave of an open file
+  re-analyses nothing. An edit in MeadowBoot took about 23 seconds to answer
+  before, and the same again for each other file open.
+
 ## 0.4.0 - 2026-10-24
 
 Meadow on phones: Silo builds a program, or a library an app loads, for
@@ -98,7 +108,7 @@ is doing.
   runtime's TLS is rustls, so nothing has to be installed where a program
   runs.
 - `Std.Http`, HTTP/1.1 in the standard library. A server: `serve host port
-  handler`, a `handler : Request -> Response ! Eff` answering each request on
+handler`, a `handler : Request -> Response ! Eff` answering each request on
   a thread of the connection's own, with keep-alive, chunked bodies and
   `serveTls` for HTTPS; `serveOn` and `serveOne` for a listener of the
   program's own. A client: `get`, `post` and `request`, over `http://` or
@@ -226,7 +236,7 @@ scripts.
   `build` asks the back end for.
 - Property tests and fuzzing in the standard library. `Std.Test.Property`
   checks a property on a hundred values a generator makes -- `forAll gen
-  prop`, or `check` where the property draws for itself -- and fails with the
+prop`, or `check` where the property draws for itself -- and fails with the
   smallest case it found. A generator is a function that draws numbers
   (`between`, `bool`, `vector`, `element`, `oneOf`, `maybe`, `char`, `text`),
   so one of your own is any function that calls them, and it shrinks as they
