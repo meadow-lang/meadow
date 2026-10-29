@@ -3324,7 +3324,33 @@ fn a_constructor_is_written_through_the_module_an_alias_names() {
 /// name or the one `@export(name)` gives it, and the answers come back.
 #[test]
 fn a_function_meadowboot_exports_is_called_from_c() {
-    let root = std::env::temp_dir().join(format!("meadowboot-exports-{}", std::process::id()));
+    exports_are_called_from_c("silo", &[&["run", "--offline"]]);
+}
+
+/// The same library built by Glade, with `--runtime glade`: its functions are
+/// C's as Silo's are, and a program of either runtime calls them -- on
+/// Glade's JIT, as Glade's executable, and as Silo's -- so that Silo's code
+/// can call Glade's.
+#[test]
+fn a_library_glade_builds_is_called_from_glade_and_from_silo() {
+    exports_are_called_from_c(
+        "glade",
+        &[
+            &["run", "--offline"],
+            &["run", "--offline", "--release"],
+            &["run", "--offline", "--runtime", "silo"],
+        ],
+    );
+}
+
+/// Build the library of [`a_function_meadowboot_exports_is_called_from_c`]
+/// with `runtime`, and call it from a Meadow program run by `meadow` with
+/// each of `hosts`' arguments.
+fn exports_are_called_from_c(runtime: &str, hosts: &[&[&str]]) {
+    let root = std::env::temp_dir().join(format!(
+        "meadowboot-exports-{runtime}-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&root);
     // A dependency's exports are the library's too.
     let dep = root.join("Dep");
@@ -3367,13 +3393,15 @@ fn a_function_meadowboot_exports_is_called_from_c() {
     .expect("the library's source");
     let built = Command::new(meadowboot_exe())
         .arg("build")
+        .args(["--runtime", runtime])
         .arg(&lib)
         .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
         .env("MEADOW", meadow())
         .env_remove("MEADOWBOOT_EXPANSIONS")
         .output()
         .expect("MeadowBoot runs");
-    // Named for its package, and where `meadow build` puts a native program.
+    // Named for its package, and where `meadow build` puts a native program
+    // of the runtime's: Silo's beside Glade's.
     let name = if cfg!(windows) {
         "Lib.dll"
     } else if cfg!(target_os = "macos") {
@@ -3381,7 +3409,12 @@ fn a_function_meadowboot_exports_is_called_from_c() {
     } else {
         "libLib.so"
     };
-    let library = lib.join("target/debug/native/silo").join(name);
+    let native = lib.join("target/debug/native");
+    let library = if runtime == "glade" {
+        native.join(name)
+    } else {
+        native.join("silo").join(name)
+    };
     assert!(
         library.exists(),
         "no library at {}:\n{}{}",
@@ -3428,27 +3461,29 @@ fn a_function_meadowboot_exports_is_called_from_c() {
         ),
     )
     .expect("the host's source");
-    let out = Command::new(meadow())
-        .args(["run", "--offline"])
-        .arg(&host)
-        .output()
-        .expect("meadow runs");
-    let said = String::from_utf8_lossy(&out.stdout);
+    for args in hosts {
+        let out = Command::new(meadow())
+            .args(*args)
+            .arg(&host)
+            .output()
+            .expect("meadow runs");
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            said.contains("(Ok(42), Ok(1.5), Ok(0.25), Ok(42))"),
+            "meadow {args:?}: {said}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // A call that fails answers zero, and C goes on: the library's next
+        // call is answered, and one of its functions calling another through
+        // C gets control back and is told why that one failed. And the
+        // dependency's function is called as the library's own are.
+        assert!(
+            said.contains("(Ok(0), Ok(42), Ok(1), Ok(3))"),
+            "meadow {args:?}: {said}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
     let _ = std::fs::remove_dir_all(&root);
-    assert!(
-        said.contains("(Ok(42), Ok(1.5), Ok(0.25), Ok(42))"),
-        "{said}{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    // A call that fails answers zero, and C goes on: the library's next call
-    // is answered, and one of its functions calling another through C gets
-    // control back and is told why that one failed. And the dependency's
-    // function is called as the library's own are.
-    assert!(
-        said.contains("(Ok(0), Ok(42), Ok(1), Ok(3))"),
-        "{said}{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 /// What a program prints when it is asked for help, on either stream.

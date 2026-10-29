@@ -1583,3 +1583,515 @@ fn the_same_program_compiles_to_the_same_ir() {
         }
     }
 }
+
+// --- tracing --------------------------------------------------------------------
+//
+// Unless a build asks for trial deletion, a program that ties knots has its
+// cycles found by concurrent tracing (`silo/src/trace.rs`): the roots taken
+// in a pause, marking on a thread of its own, a barrier at every overwrite,
+// and a sweep a slice at a time. These run programs under both collectors and
+// ask the tally whether a trace ran while the program did -- not only at
+// exit, where the leak check collects everything there is anyway -- and some
+// run with every freed block poisoned, so that one the trace frees while it
+// is still in use is found.
+
+use meadow_llvm::Cycles;
+
+/// Compile `src` with `how` for its cycles, run it with `env`, and answer
+/// what it printed and said on stderr: the leak check's lines, and the
+/// collectors' tallies. Not checked against the AxCut machine, which has no
+/// threads, and not checked for leaks: the callers say what they expect.
+#[track_caller]
+fn run_mode(name: &str, src: &str, how: Cycles, env: &[(&str, &str)]) -> (String, String) {
+    let prog = program(src);
+    let lowered = meadow_seq::lower_program(&prog, meadow_core::OptLevel::O2);
+    assert!(lowered.unsupported.is_empty(), "{:?}", lowered.unsupported);
+    let units = meadow_llvm::with_cycles(how, || {
+        meadow_llvm::compile_split(&lowered.program, usize::MAX, meadow_llvm::CallConv::host())
+    })
+    .unwrap_or_else(|e| panic!("{}", e.msg));
+    let name = format!("{name}_{}", how.name());
+    let dir = std::env::temp_dir().join("meadow-llvm-tests").join(&name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let paths: Vec<PathBuf> = units
+        .iter()
+        .enumerate()
+        .map(|(i, ll)| {
+            let path = dir.join(format!("prog{i}.ll"));
+            std::fs::write(&path, &ll.text).unwrap();
+            path
+        })
+        .collect();
+    let exe = dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
+    let out = Command::new("clang")
+        .args(["-O2", "-Wno-override-module", "-o"])
+        .arg(&exe)
+        .args(&paths)
+        .arg(runtime())
+        .args(system_libs())
+        .output()
+        .expect("clang runs");
+    assert!(
+        out.status.success(),
+        "clang failed on {}:\n{}",
+        paths[0].display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut cmd = Command::new(&exe);
+    cmd.env("MEADOW_SILO_LEAKS", "1")
+        .env("MEADOW_SILO_CYCLES", "1");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let ran = cmd.output().expect("the program runs");
+    let stdout = String::from_utf8_lossy(&ran.stdout).trim_end().to_string();
+    let stderr = String::from_utf8_lossy(&ran.stderr).to_string();
+    assert!(
+        ran.status.success(),
+        "{name} failed: {stderr}\n(see {})",
+        paths[0].display()
+    );
+    (stdout, stderr)
+}
+
+/// The number before `suffix` on the `aot: ` line that ends with it.
+fn said(stderr: &str, suffix: &str) -> Option<u64> {
+    stderr.lines().find_map(|l| {
+        l.strip_prefix("aot: ")?
+            .strip_suffix(suffix)?
+            .trim()
+            .parse()
+            .ok()
+    })
+}
+
+fn live_at_exit(stderr: &str) -> u64 {
+    said(stderr, " blocks live at exit").expect("the leak check says what is live")
+}
+
+/// How many traces ran while the program did, and how many blocks they freed.
+fn traced(stderr: &str) -> (u64, u64) {
+    stderr
+        .lines()
+        .find_map(|l| {
+            let rest = l.strip_prefix("aot: ")?;
+            let (n, rest) = rest.split_once(" traces, ")?;
+            let freed = rest.strip_suffix(" blocks freed by tracing")?;
+            Some((n.parse().ok()?, freed.parse().ok()?))
+        })
+        .unwrap_or((0, 0))
+}
+
+/// Under `MEADOW_SILO_POISON`: no freed block was written to after it was
+/// freed, and none was freed twice.
+#[track_caller]
+fn poison_clean(stderr: &str) {
+    assert!(
+        stderr.contains("; 0 written to after, 0 freed twice"),
+        "the poisoned heap says otherwise: {stderr}"
+    );
+}
+
+const KNOT: &str = "data L = Nil | Node Int (Ref L)
+     use L.*
+     fun knot (n : Int) =
+       let r = newRef Nil in
+       let _ = setRef r (Node n r) in
+       ()
+     fun knots (n : Int) : Int ! Mut = if n == 0 then 0 else let _ = knot n in knots (n - 1)
+";
+
+#[test]
+fn every_kind_of_cycle_is_collected_by_either_collector() {
+    let cases = [
+        (
+            "both_ref",
+            format!("{KNOT}def result = knots 20000"),
+            "0",
+        ),
+        (
+            "both_long",
+            "data L = Nil | Node Int (Ref L)
+             use L.*
+             fun knot (n : Int) =
+               let a = newRef Nil in
+               let b = newRef Nil in
+               let _ = setRef a (Node n b) in
+               let _ = setRef b (Node n a) in
+               ()
+             fun many (n : Int) : Int ! Mut = if n == 0 then 0 else let _ = knot n in many (n - 1)
+             def result = many 20000"
+                .to_string(),
+            "0",
+        ),
+        (
+            "both_array",
+            "data Opt a = No | Some a
+             use Opt.*
+             data N s = N (StArray s (Opt (N s))) Int
+             fun knot (n : Int) : Int =
+               runSt (\\() ->
+                 let a = stNewArray 2 No in
+                 let _ = stSetArray a 0 (Some (N a n)) in
+                 n)
+             fun many (n : Int) (acc : Int) : Int = if n == 0 then acc else many (n - 1) (acc + knot n)
+             def result = many 20000 0"
+                .to_string(),
+            "200010000",
+        ),
+        (
+            "both_leaves",
+            "data L = Nil | Node String (Array Int) (Ref L)
+             use L.*
+             fun knot (n : Int) =
+               let r = newRef Nil in
+               let _ = setRef r (Node (show n) #[n, n + 1] r) in
+               ()
+             fun many (n : Int) : Int ! Mut = if n == 0 then 0 else let _ = knot n in many (n - 1)
+             def result = many 20000"
+                .to_string(),
+            "0",
+        ),
+    ];
+    for (name, src, want) in &cases {
+        for how in [Cycles::Tracing, Cycles::Trial] {
+            let (got, stderr) = run_mode(name, src, how, &[]);
+            assert_eq!(got, *want, "{name} under {how:?}");
+            assert_eq!(live_at_exit(&stderr), 0, "{name} under {how:?}: {stderr}");
+        }
+    }
+}
+
+#[test]
+fn a_trace_runs_while_the_program_does() {
+    // Forty thousand knots of two blocks each: the heap doubles past the
+    // first trace's mark many times over, so traces run as the program goes
+    // and free what it let go of -- not only the collection at exit.
+    let (got, stderr) = run_mode(
+        "trace_runs",
+        &format!("{KNOT}def result = knots 40000"),
+        Cycles::Tracing,
+        &[],
+    );
+    assert_eq!(got, "0");
+    let (traces, freed) = traced(&stderr);
+    assert!(traces >= 1, "no trace ran while the program did: {stderr}");
+    assert!(freed >= 4096, "the traces freed only {freed}: {stderr}");
+    assert_eq!(live_at_exit(&stderr), 0, "{stderr}");
+}
+
+/// The cycle trial deletion is documented to miss: its `Ref` is let go of
+/// while the cycle is still held -- here by a list, long enough for runs of
+/// the collector to look at the `Ref` and find it alive -- and the cycle
+/// becomes garbage later, when the list lets go of the node, which is not a
+/// `Ref` and so is never a candidate.
+const HELD_KNOTS: &str = "data L = Nil | Node Int (Ref L)
+     data K = KNil | KCons L K
+     use L.*
+     use K.*
+     fun knot (n : Int) : L ! Mut =
+       let r = newRef Nil in
+       let node = Node n r in
+       let _ = setRef r node in
+       node
+     fun build (n : Int) (acc : K) : K ! Mut = if n == 0 then acc else build (n - 1) (KCons (knot n) acc)
+     fun count (ks : K) (acc : Int) : Int = match ks with
+       | KNil -> acc
+       | KCons _ rest -> count rest (acc + 1)
+     def result = count (build 6000 KNil) 0
+";
+
+#[test]
+fn a_cycle_trial_deletion_misses_is_traced() {
+    // The list is counted, not taken apart: taking a node apart would let go
+    // of its `Ref` again, which trial deletion would see.
+    let (got, stderr) = run_mode("held_knots", HELD_KNOTS, Cycles::Tracing, &[]);
+    assert_eq!(got, "6000");
+    assert_eq!(live_at_exit(&stderr), 0, "tracing left it behind: {stderr}");
+    // And the hole is still where the design says it is: what trial deletion
+    // leaves is exactly what tracing exists to find.
+    let (got, stderr) = run_mode("held_knots", HELD_KNOTS, Cycles::Trial, &[]);
+    assert_eq!(got, "6000");
+    assert!(
+        live_at_exit(&stderr) > 0,
+        "trial deletion found these after all; the design says it cannot: {stderr}"
+    );
+}
+
+#[test]
+fn a_live_ring_rewritten_while_tracing_keeps_every_node() {
+    // A ring of a hundred `Ref`s held from one place, whose first ten nodes
+    // are replaced by new ones at every turn, while garbage knots keep the
+    // traces coming: each replaced node is logged by the barrier, the new
+    // ones are black, and the rest of the ring is reached from the roots.
+    // Every freed block is poisoned, so a node freed while the ring still
+    // holds it is read as junk -- an address nothing is mapped at.
+    let src = format!(
+        "{KNOT}\
+         fun link (first : Ref L) (prev : Ref L) (i : Int) (n : Int) : () ! Mut =
+           if i == n then setRef prev (Node (n - 1) first)
+           else
+             let r = newRef Nil in
+             let _ = setRef prev (Node (i - 1) r) in
+             link first r (i + 1) n
+         fun ring (n : Int) : Ref L ! Mut =
+           let first = newRef Nil in
+           let _ = link first first 1 n in
+           first
+         fun bump (r : Ref L) (k : Int) : () ! Mut =
+           if k == 0 then ()
+           else match getRef r with
+             | Nil -> ()
+             | Node v next -> let _ = setRef r (Node (v + 1) next) in bump next (k - 1)
+         fun turn (r : Ref L) (i : Int) : Int ! Mut =
+           if i == 0 then 0 else let _ = bump r 10 in let _ = knots 40 in turn r (i - 1)
+         fun total (r : Ref L) (k : Int) (acc : Int) : Int ! Mut =
+           if k == 0 then acc
+           else match getRef r with | Nil -> acc | Node v next -> total next (k - 1) (acc + v)
+         def result = let r = ring 100 in let _ = turn r 3000 in total r 100 0"
+    );
+    let (got, stderr) = run_mode(
+        "live_ring",
+        &src,
+        Cycles::Tracing,
+        &[("MEADOW_SILO_POISON", "ptr")],
+    );
+    assert_eq!(got, "34950");
+    assert!(traced(&stderr).0 >= 2, "too few traces ran: {stderr}");
+    poison_clean(&stderr);
+    assert_eq!(live_at_exit(&stderr), 0, "{stderr}");
+}
+
+#[test]
+fn a_reference_moved_between_refs_while_marking_is_kept() {
+    // The case a barrier is for: the only reference to a chain moves from one
+    // `Ref` to another and back, over and over, while traces mark -- so at
+    // some point one of them has scanned the `Ref` it is moving to before
+    // the move, and not yet the one it is moving from. Without the logged
+    // reference, the chain would go unmarked and be freed in use.
+    let src = format!(
+        "{KNOT}\
+         fun chain (n : Int) (acc : L) : L ! Mut = if n == 0 then acc else chain (n - 1) (Node n (newRef acc))
+         fun swap (a : Ref L) (b : Ref L) (i : Int) : () ! Mut =
+           if i == 0 then ()
+           else
+             let x = getRef a in
+             let _ = setRef b x in
+             let _ = setRef a Nil in
+             let _ = knots 20 in
+             swap b a (i - 1)
+         fun sum (l : L) (acc : Int) : Int ! Mut =
+           match l with | Nil -> acc | Node v next -> sum (getRef next) (acc + v)
+         def result =
+           let a = newRef (chain 200 Nil) in
+           let b = newRef Nil in
+           let _ = swap a b 5001 in
+           sum (getRef b) 0 + sum (getRef a) 0"
+    );
+    let (got, stderr) = run_mode(
+        "moved_ref",
+        &src,
+        Cycles::Tracing,
+        &[("MEADOW_SILO_POISON", "ptr")],
+    );
+    assert_eq!(got, "20100");
+    assert!(traced(&stderr).0 >= 2, "too few traces ran: {stderr}");
+    poison_clean(&stderr);
+    assert_eq!(live_at_exit(&stderr), 0, "{stderr}");
+}
+
+#[test]
+fn reuse_in_a_program_that_ties_knots_survives_tracing() {
+    // `inc` rebuilds the list in the cells it takes apart: each rebuilt cell
+    // goes through the reuse barrier while a trace marks, and is a new block
+    // from then on.
+    let src = format!(
+        "{LIST}\
+         data R = RNil | RNode Int (Ref R)
+         use R.*
+         fun knot (n : Int) =
+           let r = newRef RNil in
+           let _ = setRef r (RNode n r) in
+           ()
+         fun knots (n : Int) : Int ! Mut = if n == 0 then 0 else let _ = knot n in knots (n - 1)
+         fun rounds (xs : L) (i : Int) : L ! Mut =
+           if i == 0 then xs else let _ = knots 30 in rounds (inc xs) (i - 1)
+         def result = total (rounds (build 2000 Nil) 300)"
+    );
+    let (got, stderr) = run_mode(
+        "reuse_traced",
+        &src,
+        Cycles::Tracing,
+        &[("MEADOW_SILO_POISON", "ptr")],
+    );
+    assert_eq!(got, "2601000");
+    assert!(traced(&stderr).0 >= 1, "no trace ran: {stderr}");
+    poison_clean(&stderr);
+    assert_eq!(live_at_exit(&stderr), 0, "{stderr}");
+}
+
+#[test]
+fn knots_tied_under_a_handler_are_traced() {
+    // The body runs on a segment of its own, and each operation suspends it
+    // to the handler's: a trace that starts in either finds the roots on
+    // both, and on every segment that is waiting.
+    let src = format!(
+        "{KNOT}\
+         effect Ask {{ ask : () -> Int }}
+         fun body (n : Int) = if n == 0 then 0 else let _ = knots 4 in body (n - 1) + ask ()
+         def result = handle body 3000 with {{ ask u k -> k 1 }}"
+    );
+    let (got, stderr) = run_mode("handler_knots", &src, Cycles::Tracing, &[]);
+    assert_eq!(got, "3000");
+    assert!(traced(&stderr).0 >= 1, "no trace ran: {stderr}");
+    assert_eq!(live_at_exit(&stderr), 0, "{stderr}");
+    assert_eq!(said(&stderr, " segments live at exit"), Some(0), "{stderr}");
+}
+
+#[test]
+fn threads_each_trace_their_own_heap() {
+    // Every thread has a heap of its own, and so a trace of its own; the
+    // marker takes them in turn. The knots are a mutable array's, made under
+    // `runSt`, which a thread may do.
+    let src = "data Opt a = No | Some a
+         use Opt.*
+         data N s = N (StArray s (Opt (N s))) Int
+         fun knot (n : Int) : Int =
+           runSt (\\() ->
+             let a = stNewArray 2 No in
+             let _ = stSetArray a 0 (Some (N a n)) in
+             n)
+         fun knots (n : Int) (acc : Int) : Int = if n == 0 then acc else knots (n - 1) (acc + knot 1)
+         fun work (n : Int) : Int = knots n 0
+         def result =
+           let a = threadSpawn (\\() -> work 20000) in
+           let b = threadSpawn (\\() -> work 20000) in
+           let c = threadSpawn (\\() -> work 20000) in
+           let d = work 20000 in
+           threadAwait a + threadAwait b + threadAwait c + d";
+    let (got, stderr) = run_mode("thread_knots", src, Cycles::Tracing, &[]);
+    assert_eq!(got, "80000");
+    assert!(
+        traced(&stderr).0 >= 4,
+        "a trace per thread at least: {stderr}"
+    );
+    assert_eq!(live_at_exit(&stderr), 0, "{stderr}");
+    assert!(
+        !stderr.contains("held by threads when they ended"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_cycle_through_a_large_array_is_traced() {
+    // An array of six hundred elements is a block too large for a size
+    // class: allocated alone, and swept from the trace's list of them.
+    let src = "data Opt a = No | Some a
+         use Opt.*
+         data N s = N (StArray s (Opt (N s))) Int
+         fun knot (n : Int) : Int =
+           runSt (\\() ->
+             let a = stNewArray 600 No in
+             let _ = stSetArray a 7 (Some (N a n)) in
+             n)
+         fun many (n : Int) (acc : Int) : Int = if n == 0 then acc else many (n - 1) (acc + knot n)
+         def result = many 3000 0";
+    let (got, stderr) = run_mode(
+        "large_knots",
+        src,
+        Cycles::Tracing,
+        &[("MEADOW_SILO_POISON", "ptr")],
+    );
+    assert_eq!(got, "4501500");
+    poison_clean(&stderr);
+    assert_eq!(live_at_exit(&stderr), 0, "{stderr}");
+}
+
+#[test]
+fn a_compact_only_garbage_cycles_hold_goes_with_them() {
+    // Each knot holds a compact: freeing the cycle lets go of the compact,
+    // and with it its region.
+    let src = format!(
+        "{COMPACTED}\
+         data K = KNil | KNode L (Ref K)
+         use K.*
+         fun knot (n : Int) =
+           let r = newRef KNil in
+           let _ = setRef r (KNode (getCompact (compact (build 20))) r) in
+           ()
+         fun many (n : Int) : Int ! Mut = if n == 0 then 0 else let _ = knot n in many (n - 1)
+         def result = many 5000"
+    );
+    let (got, stderr) = run_mode("compact_knots", &src, Cycles::Tracing, &[]);
+    assert_eq!(got, "0");
+    assert_eq!(live_at_exit(&stderr), 0, "{stderr}");
+    assert_eq!(said(&stderr, " regions live at exit"), Some(0), "{stderr}");
+}
+
+#[test]
+fn one_large_cycle_is_freed_by_a_trace() {
+    // A single ring of two hundred thousand cells: trial deletion frees a
+    // cycle that size in one long pause, if at all; a trace frees it in the
+    // sweep, a slice at a time, once the program has let go of it and gone on
+    // to allocate: enough, after it, for the heap to double past it however
+    // the traces fall.
+    let src = format!(
+        "{KNOT}\
+         fun link (first : Ref L) (prev : Ref L) (n : Int) : () ! Mut =
+           if n == 0 then setRef prev (Node 0 first)
+           else
+             let r = newRef Nil in
+             let _ = setRef prev (Node n r) in
+             link first r (n - 1)
+         fun ring (n : Int) : () ! Mut =
+           let first = newRef Nil in
+           link first first n
+         def result = let _ = ring 200000 in knots 1000000"
+    );
+    let (got, stderr) = run_mode("big_ring", &src, Cycles::Tracing, &[]);
+    assert_eq!(got, "0");
+    let (traces, freed) = traced(&stderr);
+    assert!(traces >= 2, "{stderr}");
+    assert!(
+        freed >= 400_000,
+        "the ring was not freed while running: {stderr}"
+    );
+    assert_eq!(live_at_exit(&stderr), 0, "{stderr}");
+}
+
+#[test]
+fn the_collector_is_emitted_only_for_a_program_that_can_tie_a_knot() {
+    let ir = |src: &str, how: Cycles| -> String {
+        let prog = program(src);
+        let lowered = meadow_seq::lower_program(&prog, meadow_core::OptLevel::O2);
+        meadow_llvm::with_cycles(how, || {
+            meadow_llvm::compile_split(&lowered.program, usize::MAX, meadow_llvm::CallConv::host())
+        })
+        .unwrap_or_else(|e| panic!("{}", e.msg))
+        .into_iter()
+        .map(|u| u.text)
+        .collect::<Vec<_>>()
+        .join("\n")
+    };
+    let knots = format!("{KNOT}def result = knots 10");
+    let none = format!("{LIST}def result = total (inc (build 10 Nil))");
+    // Tracing: the flag says so, the barrier is there, the candidate test is
+    // not.
+    let traced = ir(&knots, Cycles::Tracing);
+    assert!(traced.contains("@meadow_cycles = constant i8 2"));
+    assert!(traced.contains("call void @meadow_satb("));
+    assert!(!traced.contains("call void @meadow_candidate("));
+    // Trial deletion: the other way round.
+    let trial = ir(&knots, Cycles::Trial);
+    assert!(trial.contains("@meadow_cycles = constant i8 1"));
+    assert!(trial.contains("call void @meadow_candidate("));
+    assert!(!trial.contains("call void @meadow_satb"));
+    // A program that cannot tie a knot has neither, whatever was asked.
+    for how in [Cycles::Tracing, Cycles::Trial] {
+        let plain = ir(&none, how);
+        assert!(plain.contains("@meadow_cycles = constant i8 0"), "{how:?}");
+        assert!(!plain.contains("call void @meadow_satb"), "{how:?}");
+        assert!(!plain.contains("call void @meadow_candidate("), "{how:?}");
+    }
+}

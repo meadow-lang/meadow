@@ -6,3 +6,5 @@
 @pub mod Set
 @pub mod Map
 @pub mod HashMap
+@pub mod HashTable
+@pub mod UnionFind

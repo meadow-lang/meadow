@@ -202,7 +202,19 @@ pub fn keep_candidate(v: Word) {
 
 /// Word counts with a size class of their own; bigger blocks are allocated
 /// alone and freed at once when clean.
-const CLASSES: usize = 128;
+pub(crate) const CLASSES: usize = 128;
+
+/// What word 0's count says of a clean block, waiting in its size class's
+/// list: no block that is in use has four thousand million references. The
+/// list runs through word 1, so that a trace walking a chunk can tell a
+/// clean block from one in use by its first word (`crate::trace`).
+pub(crate) const FREE: u32 = u32::MAX;
+
+/// Is the block at `v` clean, waiting to be handed out again?
+#[inline]
+pub(crate) fn is_free(v: Word) -> bool {
+    word(v, 0) as u32 == FREE
+}
 /// Memory taken from the system at a time for the size classes, in words: the
 /// first chunk is small -- a thread may allocate almost nothing -- and each
 /// after it twice the last, up to this.
@@ -224,7 +236,7 @@ pub struct Heap {
     clean: [*mut Word; CLASSES],
     /// Blocks whose last reference was erased, and how far into their fields
     /// erasing has got.
-    pending: Vec<(*mut Word, usize)>,
+    pub(crate) pending: Vec<(*mut Word, usize)>,
     chunk: *mut Word,
     left: usize,
     /// Blocks acquired and not yet clean: what a leak check counts.
@@ -269,13 +281,25 @@ pub struct Heap {
     /// The memory it has: chunks, and blocks too big for a size class --
     /// what dropping it gives back.
     chunks: Vec<(*mut Word, usize)>,
-    large: crate::ctx::ByAddress<usize>,
+    pub(crate) large: crate::ctx::ByAddress<usize>,
     /// Under `MEADOW_SILO_MEMORY`: the words in this heap's blocks that are
     /// in use.
     held: usize,
     /// Under `MEADOW_SILO_PRIMS`: how many blocks of each kind this heap has
     /// erased, by what makes them -- a constructor, a closure's code.
     erased: Option<std::collections::HashMap<(u64, u32), u64>>,
+    /// Under tracing: what each chunk says of where its blocks begin and which
+    /// are marked, by address; and the chunk blocks are being carved from.
+    pub(crate) chunk_meta: Vec<std::sync::Arc<crate::trace::Chunk>>,
+    cur_meta: Option<std::sync::Arc<crate::trace::Chunk>>,
+    /// The concurrent trace of this heap: see [`crate::trace`].
+    pub(crate) trace: crate::trace::State,
+    /// Under tracing: how many blocks in use can be part of a cycle -- a
+    /// `Ref`, or a mutable array that may hold references ([`MUTABLE`]). Every
+    /// cycle has one, so a heap with none has no cycle to trace for. Counted
+    /// as such a block is made and as it is freed; a block reused as another
+    /// kind is never counted off, which only ever makes this too high.
+    pub(crate) mutables: usize,
 }
 
 impl Heap {
@@ -300,7 +324,18 @@ impl Heap {
             large: crate::ctx::ByAddress::default(),
             held: 0,
             erased: crate::prims::counting().then(std::collections::HashMap::new),
+            chunk_meta: Vec::new(),
+            cur_meta: None,
+            trace: crate::trace::State::new(),
+            mutables: 0,
         }
+    }
+}
+
+impl Heap {
+    /// Blocks acquired and not yet clean.
+    pub(crate) fn live_blocks(&self) -> usize {
+        self.live.max(0) as usize
     }
 }
 
@@ -427,6 +462,8 @@ impl Heap {
 
 impl Drop for Heap {
     fn drop(&mut self) {
+        // A trace still marking this heap stops before its memory goes.
+        crate::trace::forget(self);
         self.tell();
         // Under the leak check: what this heap's thread ended still holding,
         // by kind -- blocks that go with the heap unerased, and so without
@@ -628,7 +665,7 @@ pub fn erase(v: Word, d: i64) {
                 // Safety: the count says it is in a region. The region cannot
                 // go under us: this is one of its own references.
                 unsafe { crate::region::erased(v) };
-            } else if crate::cycles::possible() {
+            } else if crate::cycles::trial() {
                 crate::cycles::meadow_candidate(v);
             }
         }
@@ -649,7 +686,7 @@ pub fn died_in(c: *mut crate::ctx::Ctx, v: Word) {
     if crate::prims::counting() {
         dropped(v);
     }
-    if crate::cycles::possible() && buffered(v) {
+    if crate::cycles::trial() && buffered(v) {
         // Black and dead: what the collector must not mistake for a
         // candidate with a reference left, since the count it reads is the
         // references besides one.
@@ -721,8 +758,11 @@ impl Heap {
         }
         let p = h.clean[words];
         if !p.is_null() {
-            // Safety: a clean block, whose word 0 is the next.
-            h.clean[words] = unsafe { *p } as *mut Word;
+            // Safety: a clean block, whose word 1 is the next.
+            h.clean[words] = unsafe { *p.add(1) } as *mut Word;
+            if h.trace.black {
+                crate::trace::blacken(&h.chunk_meta, &mut h.trace.hint, p as Word);
+            }
             return p as Word;
         }
         if h.left < words {
@@ -744,11 +784,25 @@ impl Heap {
             h.chunks.push((p, size));
             h.chunk = p;
             h.left = size;
+            if crate::cycles::tracing() {
+                let meta = crate::trace::Chunk::new(p as usize, size);
+                let at = h.chunk_meta.partition_point(|m| m.start < p as usize);
+                h.chunk_meta.insert(at, meta.clone());
+                h.cur_meta = Some(meta);
+            }
         }
         let p = h.chunk;
         // Safety: inside the chunk, which has `left` words from `chunk`.
         h.chunk = unsafe { p.add(words) };
         h.left -= words;
+        if let Some(m) = &h.cur_meta {
+            // Where a block begins is set once, as it is carved out: a size
+            // class is a word count, so a block's place never changes.
+            m.set_start(p as usize);
+            if h.trace.black && m.traced() {
+                m.mark(p as usize);
+            }
+        }
         p as Word
     }
 }
@@ -894,7 +948,7 @@ pub fn clean(v: Word) {
 
 /// [`clean`], into context `c`'s heap.
 pub fn clean_in(c: *mut crate::ctx::Ctx, v: Word) {
-    if crate::cycles::possible() && buffered(v) {
+    if crate::cycles::trial() && buffered(v) {
         // Waiting in the candidate buffer: hold the memory back, and
         // remember that there is nothing left inside to erase.
         set_word(v, 1, (word(v, 1) | DEAD | MOVED) & !(3 << COLOUR_SHIFT));
@@ -1090,10 +1144,33 @@ impl Heap {
         self.clean_block(ptr(v), words);
     }
 
-    fn clean_block(&mut self, p: *mut Word, words: usize) {
+    pub(crate) fn clean_block(&mut self, p: *mut Word, words: usize) {
+        // While a trace marks, nothing freed is handed out again: the marker
+        // may yet read it. See `crate::trace`.
+        if self.trace.limbo_on {
+            self.trace.limbo.push((p, words));
+            return;
+        }
         self.live -= 1;
-        if poisoning() && (!poison_collector_only() || crate::cycles::running()) {
+        // Safety: the block's header, which nothing has written over yet.
+        if crate::cycles::tracing() && unsafe { *p.add(1) } & MUTABLE != 0 {
+            self.mutables = self.mutables.saturating_sub(1);
+        }
+        if poisoning()
+            && (!poison_collector_only() || crate::cycles::running() || crate::trace::sweeping())
+        {
             quarantine(p, words);
+            // Gone, as far as the leak check is concerned, as a block handed
+            // back is.
+            if let Some(b) = &mut self.blocks {
+                b.remove(&(p as usize));
+            }
+            // Junk where its first word says it is clean: a trace must not
+            // take it for a block in use. It is never handed out again.
+            if crate::cycles::tracing() {
+                crate::trace::unstart(&self.chunk_meta, p as usize);
+                self.large.remove(&(p as usize));
+            }
             return;
         }
         if crate::memory::on() {
@@ -1112,7 +1189,10 @@ impl Heap {
             return;
         }
         // Safety: a block of `words` words, which nothing reads any more.
-        unsafe { *p = self.clean[words] as Word };
+        unsafe {
+            *p = (*p & !(FREE as Word)) | FREE as Word;
+            *p.add(1) = self.clean[words] as Word;
+        }
         self.clean[words] = p;
     }
 
@@ -1126,7 +1206,7 @@ impl Heap {
         let to = (from + STEP).min(n);
         let first = first_field(v);
         let refs = kind(v) != STRING && kind(v) != BIGINT;
-        let cycles = crate::cycles::possible();
+        let cycles = crate::cycles::trial();
         if refs {
             for i in from..to {
                 let d = field_desc(v, i);
@@ -1156,24 +1236,7 @@ impl Heap {
         if to < n && refs {
             self.pending.push((p, to));
         } else {
-            // A continuation nobody can resume now: its segments go.
-            if kind(v) == STACK {
-                crate::segments::discard(meta(v));
-            }
-            // One fewer that could await the thread: see `crate::sched::held`.
-            if kind(v) == TASK {
-                crate::sched::let_go(meta(v));
-            }
-            if kind(v) == TVAR {
-                crate::sched::let_go_var(field(v, 0) as usize);
-            }
-            // The last reference to a compact: its region loses the one this
-            // block held, and goes with it if that was the last. Everything
-            // inside it is freed there, all at once, and never here.
-            if kind(v) == COMPACT {
-                // Safety: a `Compact` block whose fields are still in it.
-                unsafe { crate::region::forget(v) };
-            }
+            finalize(v);
             if let Some(erased) = &mut self.erased {
                 *erased.entry((kind(v), meta(v))).or_default() += 1;
             }
@@ -1183,9 +1246,43 @@ impl Heap {
     }
 }
 
+/// What a block that is going lets go of outside the heap: a continuation's
+/// segments, a thread's or a `TVar`'s handle, a compact's region.
+pub(crate) fn finalize(v: Word) {
+    // A continuation nobody can resume now: its segments go.
+    if kind(v) == STACK {
+        crate::segments::discard(meta(v));
+    }
+    // One fewer that could await the thread: see `crate::sched::held`.
+    if kind(v) == TASK {
+        crate::sched::let_go(meta(v));
+    }
+    if kind(v) == TVAR {
+        crate::sched::let_go_var(field(v, 0) as usize);
+    }
+    // The last reference to a compact: its region loses the one this
+    // block held, and goes with it if that was the last. Everything
+    // inside it is freed there, all at once, and never here.
+    if kind(v) == COMPACT {
+        // Safety: a `Compact` block whose fields are still in it.
+        unsafe { crate::region::forget(v) };
+    }
+}
+
 /// Look for every cycle there is now, and erase everything pending: what is
 /// live after this is what the program really holds. See [`crate::cycles`].
 pub fn settle() {
+    if crate::cycles::tracing() {
+        crate::trace::collect_now(crate::ctx::get());
+        with(|h| {
+            while !h.pending.is_empty() {
+                h.step();
+            }
+        });
+        // Erasing what was pending can leave a cycle of its own.
+        crate::trace::collect_now(crate::ctx::get());
+        return;
+    }
     with(|h| crate::cycles::collect_all(h));
     with(|h| {
         while !h.pending.is_empty() {
@@ -1244,6 +1341,7 @@ pub fn build(kind: u64, meta: u32, fields: &[Word], descs: &[i64]) -> Word {
     let v = acquire(2 + dw + n);
     set_word(v, 0, (n as u64) << 32);
     set_word(v, 1, kind | mutable(kind) | (u64::from(meta) << 32));
+    count_mutable(v);
     for w in 0..dw {
         let mut bits = 0u64;
         for (j, d) in descs.iter().enumerate().skip(16 * w).take(16) {
@@ -1273,7 +1371,17 @@ pub fn build_uniform(kind: u64, meta: u32, n: usize, d: i64) -> Word {
             | UNIFORM
             | (u64::from(meta) << 32),
     );
+    count_mutable(v);
     v
+}
+
+/// Count the block just made at `v`, if it is one a cycle can run through:
+/// see [`Heap::mutables`].
+#[inline]
+pub(crate) fn count_mutable(v: Word) {
+    if crate::cycles::tracing() && word(v, 1) & MUTABLE != 0 {
+        with(|h| h.mutables += 1);
+    }
 }
 
 /// A string of `bytes`, eight to a word.

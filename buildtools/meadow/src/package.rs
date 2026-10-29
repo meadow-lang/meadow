@@ -38,6 +38,7 @@
 //! cfg = "fast, feature=gpu" # flags `@cfg(…)` can test
 //! threads = 4              # OS threads for the green ones: `-j`
 //! nursery = "8M"           # how large Glade's nursery may grow: `--nursery`
+//! cycles = "trial"         # how Silo finds cycles: "tracing" (the default) | "trial"
 //! leaks = true             # report what the program left behind: `--leaks`
 //! target = "aarch64"       # the processor a native build is for: `--target`
 //! ```
@@ -268,6 +269,10 @@ pub struct ProfileConfig {
     /// `target = "aarch64"`: the processor a native build is for, as
     /// `--target` says.
     pub target: Option<InternedString>,
+    /// `cycles = "trial"`: how a Silo program that can tie a knot has its
+    /// cycles found -- concurrent tracing, the default, or trial deletion
+    /// (`docs/SILO.md`, "Cycles"). `MEADOW_CYCLES` says the same, and wins.
+    pub cycles: Option<meadow_llvm::Cycles>,
 }
 
 impl ProfileConfig {
@@ -1277,6 +1282,7 @@ fn parse_manifest(text: &str, dir: &Path) -> (Manifest, Inherits) {
                         }
                     }
                     "target" => p.target = Some(InternedString::from(unquote(value))),
+                    "cycles" => p.cycles = meadow_llvm::Cycles::named(unquote(value)),
                     "cfg" => p.cfg = Some(InternedString::from(unquote(value))),
                     "prune" => {
                         p.prune = match unquote(value) {
