@@ -468,6 +468,9 @@ pub struct Heap {
     /// `fbase + (a - fcur) * 8`, one load rather than the block table's three.
     pub(crate) fcur: Addr,
     pub(crate) fbase: *mut Word,
+    /// `fbase - fcur` slots, so that a frame at `a` in the current chunk is at
+    /// `fbias + a * 8`: one load and an add, for every push and return.
+    pub(crate) fbias: *mut Word,
     /// Chunks entered so far: the serial the next one gets.
     chunk_serial: u32,
     /// The nursery's half of `tables`, which this owns.
@@ -655,6 +658,7 @@ impl Heap {
             flim: 0,
             fcur: 0,
             fbase: std::ptr::null_mut(),
+            fbias: std::ptr::null_mut(),
             chunk_serial: 0,
             nursery_blocks: Vec::new(),
             free_chunks: Vec::new(),
@@ -718,6 +722,9 @@ impl Heap {
         } else {
             self.old.base_ptr(self.fcur)
         };
+        // Only ever added to an address in the current chunk, which brings it
+        // back inside the chunk; with no chunk, nothing is.
+        self.fbias = self.fbase.wrapping_sub(self.fcur as usize);
     }
 
     /// Has enough gone into regions since the last collection that dead ones

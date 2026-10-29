@@ -466,6 +466,28 @@ pub fn stamp_lines(blocks: &[Arc<Block>], a: Addr, size: usize, epoch: u32) {
     }
 }
 
+/// How many slots ahead of where it writes promotion asks for memory: eight
+/// cache lines.
+const PREFETCH: usize = 64;
+
+/// Ask for the cache line at `p`, to be written soon. Only a hint: nothing
+/// happens on a machine without one.
+#[inline(always)]
+fn prefetch(p: *const Word) {
+    #[cfg(target_arch = "x86_64")]
+    // Safety: a prefetch has no effect a program can see, at any address.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p as *const i8)
+    };
+    #[cfg(target_arch = "aarch64")]
+    // Safety: as above.
+    unsafe {
+        std::arch::asm!("prfm pstl1keep, [{0}]", in(reg) p, options(nostack, preserves_flags))
+    };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = p;
+}
+
 /// The old generation, as its heap sees it.
 pub struct Old {
     pub blocks: Vec<Arc<Block>>,
@@ -614,6 +636,15 @@ impl Old {
         // Safety: `off + words.len() <= BLOCK`, inside the block's memory; see
         // the `Sync` impl for who else may be reading it.
         unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), b.base().add(off), words.len()) }
+        // Promotion bumps through lines that were last written long ago, so
+        // nearly every new cache line it reaches is a miss, paid for in the
+        // pause. Ask for the line a few ahead each time a new one is begun,
+        // and the write gets there to find it.
+        let line_end = (off + words.len()).div_ceil(8);
+        if line_end != off.div_ceil(8) && off + PREFETCH + words.len() <= BLOCK {
+            // Safety: inside the block, as above; a prefetch reads nothing.
+            prefetch(unsafe { b.base().add(off + PREFETCH) });
+        }
         let mut k = 0;
         while k < words.len() {
             let slot = off + k;
