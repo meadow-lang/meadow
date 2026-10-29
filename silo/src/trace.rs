@@ -1151,7 +1151,10 @@ fn sweep(c: *mut Ctx, words: usize, blocks: usize) -> bool {
             false
         }
         Step::Free { next } => {
-            let to = (next + blocks).min(s.doomed.len());
+            // Saturating: a sweep finished at once asks for `usize::MAX`
+            // blocks, and from part-way through that would wrap to before
+            // `next`.
+            let to = next.saturating_add(blocks).min(s.doomed.len());
             let batch: Vec<Word> = s.doomed[next..to].to_vec();
             let through = to == s.doomed.len();
             s.step = Step::Free { next: to };
