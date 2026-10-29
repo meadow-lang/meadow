@@ -94,6 +94,19 @@ done
 step "meadow fmt --check"
 cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- fmt --check lib/Std examples
 
+# Every Meadow source in the repository, as the editor sees it: opened in the
+# language server, which must mark nothing. A build passing says the compiler
+# takes a package; this says the editor does too. The two analyse a file
+# differently -- a module at a time, macros and all, with what the editor
+# fetched -- so a package can build cleanly and still be marked throughout in
+# an editor. Left out: the inputs of MeadowBoot's lexer and parser tests,
+# which are fragments, some wrong on purpose, and the package its `@cfg`
+# rename test reads, which is wrong on purpose everywhere but Windows. The
+# release workflow runs the same with each binary it builds.
+step "meadow lsp --check (every Meadow source an editor opens)"
+mapfile -t sources < <(git ls-files '*.mw' | grep -v -e '^bootstrap/tests/lex/' -e '^bootstrap/tests/parse/' -e '^bootstrap/tests/rename/Cfg/')
+cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- lsp --check "${sources[@]}"
+
 # --- the editor extension ----------------------------------------------------
 #
 # The `.vsix` is only built by `release.yml`, so until this was here a broken
