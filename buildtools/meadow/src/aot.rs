@@ -1022,9 +1022,23 @@ pub fn link_image(
     let main = dir.join(format!("{name}-main.c"));
     write(&main, codegen::object::main_c().as_bytes())?;
 
+    link_with_runtime(&main, &object, &runtimes, &exe, target, false)
+}
+
+/// Link `main` and `object` with the first of `runtimes` built from this
+/// compiler's sources into `exe` -- a library of C functions when `library`
+/// -- or say why none would link.
+fn link_with_runtime(
+    main: &Path,
+    object: &Path,
+    runtimes: &[PathBuf],
+    exe: &Path,
+    target: Target,
+    library: bool,
+) -> Result<(), String> {
     let mut stale = Vec::new();
-    for runtime in &runtimes {
-        match link(&main, &object, runtime, &exe, target) {
+    for runtime in runtimes {
+        match link(main, object, runtime, exe, target, library) {
             Ok(()) => return Ok(()),
             Err(e) if e.contains(&codegen::object::runtime_symbol()) => stale.push(runtime),
             Err(e) => return Err(e),
@@ -1041,19 +1055,116 @@ pub fn link_image(
     Err(msg)
 }
 
-/// Link `main`, `object` and `runtime` into `exe`, or say why the linker would
-/// not.
+/// What a C function a Glade library exports takes or answers, for a value of
+/// `rep`: as Silo's are, a number, a `Bool`, a `Char` or `()`.
+fn glade_kind(rep: meadow_seq::Rep) -> Option<u8> {
+    use meadow_glade::aot::kind;
+    use meadow_seq::Rep;
+    match rep {
+        Rep::Int => Some(kind::INT),
+        Rep::Float => Some(kind::FLOAT),
+        Rep::Bits(d) => kind::of_bits(d),
+        _ => None,
+    }
+}
+
+/// The C functions a library of `exports` has, as Glade's runtime calls them.
+pub fn glade_exports(
+    exports: &[meadow_seq::Export],
+) -> Result<Vec<codegen::object::CExport>, String> {
+    exports
+        .iter()
+        .map(|e| {
+            let params = e
+                .params
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    glade_kind(*r).ok_or_else(|| {
+                        format!("`{}`'s argument {i} is not of a type C can pass", e.name)
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let result = glade_kind(e.result)
+                .ok_or_else(|| format!("what `{}` answers is not of a type C can take", e.name))?;
+            Ok(codegen::object::CExport {
+                name: e.name.clone(),
+                def: e.label.0,
+                params,
+                result,
+            })
+        })
+        .collect()
+}
+
+/// Build `image` for Glade as a library of the C functions `exports` --
+/// package `name`'s, named as this system names one, in its native directory
+/// -- and answer where it is. Left alone if it is already what this makes.
+#[allow(clippy::too_many_arguments)]
+pub fn build_library(
+    root: &Path,
+    profile: Profile,
+    opt: meadow_compiler::OptLevel,
+    name: &str,
+    image: &meadow_bytecode::Program,
+    exports: &[codegen::object::CExport],
+    target: Target,
+    calls: &codegen::Calls,
+) -> Result<PathBuf, String> {
+    if target.os != Os::host() {
+        return Err(format!(
+            "Glade builds ahead of time for {} only; for `{}`, build with `--runtime silo`",
+            Os::host().cfg_name(),
+            target.triple()
+        ));
+    }
+    let dir = native_dir(root, profile, target);
+    let lib = dir.join(target.format.library_name(name));
+    let stamp = lib.with_extension("stamp");
+    let want = format!("{}\n{exports:?}", made_from(image, opt, target, calls));
+    if lib.exists() && std::fs::read_to_string(&stamp).is_ok_and(|had| had == want) {
+        return Ok(lib);
+    }
+    let runtimes = runtimes(target)?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    let compiled = codegen::compile_guided(image, target.arch, opt, calls);
+    let bytes = meadow_bytecode::image::encode(image);
+    let object = dir.join(format!("{name}.{}", target.format.object_extension()));
+    write(
+        &object,
+        &codegen::object::write(&compiled, &bytes, target.format),
+    )?;
+    let c = dir.join(format!("{name}-exports.c"));
+    write(&c, codegen::object::library_c(exports)?.as_bytes())?;
+    link_with_runtime(&c, &object, &runtimes, &lib, target, true)?;
+    let _ = std::fs::write(&stamp, &want);
+    Ok(lib)
+}
+
+/// Link `main`, `object` and `runtime` into `exe` -- a shared library when
+/// `library` -- or say why the linker would not.
 fn link(
     main: &Path,
     object: &Path,
     runtime: &Path,
     exe: &Path,
     target: Target,
+    library: bool,
 ) -> Result<(), String> {
     let (mut cmd, cc) = compiler(target)?;
     match target.format {
         Format::MachO | Format::Elf => {
             cmd.arg(main).arg(object).arg(runtime).arg("-o").arg(exe);
+            if library {
+                // Its calls bind to its own runtime, whatever else the
+                // process has loaded: a program of another runtime, or
+                // another library of this one.
+                cmd.arg("-shared").arg("-fPIC");
+                if target.format == Format::Elf {
+                    cmd.arg("-Wl,-Bsymbolic");
+                }
+            }
             if target.format == Format::MachO {
                 let arch = match target.arch {
                     Arch::Aarch64 => "arm64",
@@ -1069,12 +1180,11 @@ fn link(
             fo.push(main.with_extension("obj"));
             let mut fe = std::ffi::OsString::from("/Fe");
             fe.push(exe);
-            cmd.args(["/nologo", "/MD"])
-                .arg(fo)
-                .arg(fe)
-                .arg(main)
-                .arg(object)
-                .arg(runtime);
+            cmd.args(["/nologo", "/MD"]);
+            if library {
+                cmd.arg("/LD");
+            }
+            cmd.arg(fo).arg(fe).arg(main).arg(object).arg(runtime);
         }
     }
     cmd.args(target.format.system_libs());

@@ -474,6 +474,154 @@ pub fn main_c() -> String {
     )
 }
 
+/// A C function a library exports: its name, the definition it calls, by
+/// its place in [`meadow_bytecode::Program::entries`], and what its
+/// arguments and answer are ([`crate::aot::kind`]).
+#[derive(Debug, Clone)]
+pub struct CExport {
+    pub name: String,
+    pub def: u32,
+    pub params: Vec<u8>,
+    pub result: u8,
+}
+
+/// The C type of a word of `kind`, and how the word is made of a value of it:
+/// `None` for one C does not pass.
+fn c_type(kind: u8) -> Option<&'static str> {
+    use crate::aot::kind;
+    use meadow_rt::num::Width;
+    Some(match kind {
+        kind::UNIT => "void",
+        kind::INT => "int64_t",
+        kind::FLOAT => "double",
+        kind::FLOAT32 => "float",
+        kind::BOOL => "unsigned char",
+        kind::CHAR => "uint32_t",
+        k if k >= kind::WORD && ((k - kind::WORD) as usize) < Width::ALL.len() => {
+            match Width::ALL[(k - kind::WORD) as usize] {
+                Width::I8 => "int8_t",
+                Width::I16 => "int16_t",
+                Width::I32 => "int32_t",
+                Width::U8 => "uint8_t",
+                Width::U16 => "uint16_t",
+                Width::U32 => "uint32_t",
+                Width::U64 => "uint64_t",
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// The C a library links in place of [`main_c`]: for each of `exports`, a C
+/// function of its C types that hands its arguments to the runtime as words,
+/// with what each is, and answers what comes back as its own type -- zero
+/// where the call failed ([`crate::aot::meadow_glade_export`]). It refers to
+/// [`runtime_symbol`], as `main` does, so that it links only with a runtime
+/// its code was generated for.
+pub fn library_c(exports: &[CExport]) -> Result<String, String> {
+    use crate::aot::kind;
+    use std::fmt::Write;
+    let runtime = runtime_symbol();
+    let mut out = format!(
+        "#include <stdint.h>\n\
+         #include <string.h>\n\
+         extern const unsigned char {CODE}[];\n\
+         extern const unsigned char {DATA}[];\n\
+         extern const unsigned char {runtime};\n\
+         const unsigned char *const meadow_runtime = &{runtime};\n\
+         extern int meadow_glade_export(const unsigned char *code, const unsigned char *data,\n\
+         \x20                              uint32_t def, const uint64_t *args,\n\
+         \x20                              const unsigned char *kinds, uint32_t n, uint64_t *out);\n\
+         #ifdef _WIN32\n\
+         #define MEADOW_EXPORT __declspec(dllexport)\n\
+         #else\n\
+         #define MEADOW_EXPORT __attribute__((visibility(\"default\")))\n\
+         #endif\n"
+    );
+    for e in exports {
+        let named = e
+            .name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && e.name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !named {
+            return Err(format!(
+                "`{}` is not a name C can call a function by",
+                e.name
+            ));
+        }
+        let rty = c_type(e.result)
+            .ok_or_else(|| format!("what `{}` answers is not of a type C can take", e.name))?;
+        let mut sig = Vec::new();
+        let mut body = String::new();
+        let n = e.params.len();
+        for (i, &k) in e.params.iter().enumerate() {
+            let ty = c_type(k).ok_or_else(|| {
+                format!("`{}`'s argument {i} is not of a type C can pass", e.name)
+            })?;
+            match k {
+                kind::UNIT => {
+                    let _ = writeln!(body, "    w[{i}] = 0;");
+                }
+                kind::FLOAT => {
+                    sig.push(format!("double a{i}"));
+                    let _ = writeln!(body, "    memcpy(&w[{i}], &a{i}, 8);");
+                }
+                kind::FLOAT32 => {
+                    sig.push(format!("float a{i}"));
+                    let _ = writeln!(
+                        body,
+                        "    {{ uint32_t t; memcpy(&t, &a{i}, 4); w[{i}] = t; }}"
+                    );
+                }
+                _ => {
+                    sig.push(format!("{ty} a{i}"));
+                    // A signed type is extended by its sign, as C converts it.
+                    let _ = writeln!(body, "    w[{i}] = (uint64_t)(int64_t)a{i};");
+                }
+            }
+        }
+        let kinds: Vec<String> = e
+            .params
+            .iter()
+            .map(|k| k.to_string())
+            .chain(["0".into()])
+            .collect();
+        let answer = match e.result {
+            kind::UNIT => String::new(),
+            kind::FLOAT => "    { double d; memcpy(&d, &r, 8); return d; }\n".to_string(),
+            kind::FLOAT32 => {
+                "    { uint32_t t = (uint32_t)r; float f; memcpy(&f, &t, 4); return f; }\n"
+                    .to_string()
+            }
+            _ => format!("    return ({rty})r;\n"),
+        };
+        let params = if sig.is_empty() {
+            "void".to_string()
+        } else {
+            sig.join(", ")
+        };
+        let _ = write!(
+            out,
+            "\nMEADOW_EXPORT {rty} {name}({params}) {{\n\
+             \x20   static const unsigned char k[{room}] = {{{kinds}}};\n\
+             \x20   uint64_t w[{room}] = {{0}};\n\
+             \x20   uint64_t r = 0;\n\
+             {body}\
+             \x20   meadow_glade_export({CODE}, {DATA}, {def}u, w, k, {n}u, &r);\n\
+             {answer}}}\n",
+            name = e.name,
+            room = n + 1,
+            kinds = kinds.join(", "),
+            def = e.def,
+        );
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::Format;
