@@ -267,15 +267,23 @@ lends what the function borrowed rather than counting it in.
 
 ## Cycles
 
-Counting misses a cycle, and this runtime cannot have the usual backstop: a
-tracing collector needs the roots, and the roots are in native frames and
-registers with no map saying which slots hold references. What needs no roots
-is **trial deletion** -- Bacon and Rajan, _Concurrent Cycle Collection in
-Reference Counted Systems_, ECOOP 2001 -- and `silo/src/cycles.rs` implements
-it: buffer each block whose count goes down without reaching zero, then mark
-its subgraph gray while subtracting the references that come from inside it,
-scan to restore everything an outside reference still holds, and free what is
-left white.
+Counting misses a cycle: two blocks that hold each other keep each other's
+count above zero once the last reference from outside has gone. So a program
+that can tie a knot is built with a collector for what counting cannot free,
+and the build chooses which:
+
+- **concurrent tracing**, the default (`silo/src/trace.rs`): a mark-and-sweep
+  of the thread's heap, marking on a thread of its own while the program
+  runs, which frees every garbage cycle and stops the program only to take
+  its roots;
+- **trial deletion**, with `cycles = "trial"` in a `[profile.<name>]` of
+  `Meadow.toml`, or `MEADOW_CYCLES=trial` for any build (`silo/src/cycles.rs`):
+  no thread, no barrier, and nothing that changes as the program runs, for
+  where a background thread is not wanted; it misses one kind of cycle, and
+  a large cycle is one long pause.
+
+Counting does everything else under either: it frees what dies the moment it
+dies, and reuse is untouched. The collector only frees what counting left.
 
 **Emitted only where it can matter.** A cycle needs a store of a reference
 into a block that already exists, which is `setRef` or a write into a mutable
@@ -284,9 +292,118 @@ backwards, and `setField` -- which destination-passing uses to fill a hole --
 writes something newer than what it writes into. `emit::ties_knots` looks for
 those two primitives _and at what they store_, since `Std` builds every string
 it prints in a mutable array of bytes and a byte cannot point at anything. A
-program without one defines `@meadow_cycles` as zero, its counting helpers
-have no candidate test in them, and its runtime never buffers, colours or
-collects anything.
+program without one defines `@meadow_cycles` as zero: no barrier, no
+candidate test, and no collector of either kind. One with one defines it as 1
+for trial deletion or 2 for tracing, and is emitted for that one alone.
+
+### Concurrent tracing
+
+Trial deletion asks a local question -- would this subgraph still be held if
+its own references were taken away? -- and that is why it needs no roots and
+why it has its two limits: it only asks of blocks it has seen let go of, and
+it must answer in one pause. A tracer asks the global one -- what can the
+program still reach? -- which every cycle, of any size and however it came to
+be garbage, fails. What it needs is the roots, and a way to keep tracing while
+the program changes the heap under it.
+
+**When.** A heap that can hold a cycle starts a trace when it has doubled since
+the last one ended, from 4,096 blocks; most programs that tie knots tie few,
+and a trace walks what is live, so this keeps its work in proportion to the
+program's. A heap is a green thread's (`crate::ctx`), and so is a trace: each
+thread's heap is traced on its own, with its own roots, which is what one heap
+per thread -- nothing shared, everything that crosses copied -- makes
+possible.
+
+**The roots, and the one pause.** A trace starts inside `meadow_acquire`
+called from compiled code, before the new block is taken: the one point at
+which every block the program has made is written whole. (The runtime's own
+allocations never start one: a parcel being unpacked, or an array being
+filled, is half made in between.) There the program stops while its roots are
+taken:
+
+- the native stacks it runs on, scanned conservatively: the OS thread's stack
+  below where the program began, for one that never spawns, and every
+  segment the thread has -- running, parked, or a continuation's -- from
+  where it stopped to its base, with the callee-saved registers written out
+  first. A word is taken for a reference if it points into a block of this
+  heap: a block's start is known from a bit set when it is first carved out
+  of a chunk, and a block never moves, splits or merges -- a size class is a
+  word count -- so a pointer into the middle of one finds it;
+- what the context holds of the heap's: top-level values, literals, a
+  transaction's writes, the spill area, what the leak check keeps;
+- the blocks waiting to be erased, and what each still holds: they are dead,
+  and counting frees them, but the tracer must not free under it what they
+  will give back.
+
+No stack map is needed. Counting never moves a block, so a word that only
+looks like a reference costs nothing but keeping what it seems to point at
+until the next trace.
+
+**Marking, while the program runs.** One thread marks for the whole process,
+a heap at a time. Marks are bits beside each chunk, not in the block, since the
+program writes a block's header as it builds one. A block's fields are read by
+their descriptors, and every word the marker follows is first checked to be a
+block of the heap: it reads blocks the program may be rewriting -- a dead one
+being reused, a token whose fields were taken -- and a word read half-changed
+can then only mark too much, never lead it astray.
+
+**What the program does meanwhile.**
+
+- _New blocks are black._ A block made after the roots were taken is marked
+  as it is acquired, in a chunk the trace knows; one in a chunk made since is
+  new by where it is.
+- _A barrier before every overwrite_ (snapshot at the beginning: Yuasa's). A
+  store into a block that already exists logs the reference it replaces,
+  while a trace is marking: `setRef`, `setField`, the reuse of a dead block
+  -- which logs the fields it had and is blackened, being a new block now --
+  and the runtime's writes in place (`meadow_st_set`, an array pushed or
+  concatenated into its room, a record updated in place, a handler's target).
+  So whatever was reachable when the roots were taken is marked, however the
+  program rearranges it after. Outside a trace the barrier is a load and a
+  branch, in a program that can tie a knot and nowhere else.
+- _Nothing freed is handed out again while marking._ What counting frees then
+  waits, unused, until the marking ends, so the marker never reads a block
+  that has become another.
+
+**The end.** Marking is done when the marker has nothing left and the program
+has logged nothing more since -- asked under one lock, from the program's
+side, as it allocates. Then a sweep, on the program's thread, a slice per
+allocation. An unmarked block in the heap as it was is garbage -- nothing
+reached it when the roots were taken, and nothing can reach garbage after --
+and every such block is either in a cycle or held only by one. The sweep
+first finds them all, then for each gives up its references to blocks that are
+live (counting frees those that were held only by garbage), lets go of what
+it held outside the heap (a continuation's segments, a compact's region, a
+thread or a `TVar`), and frees it. The memory comes back once the sweep is
+through, so that no address one garbage block names is handed out while
+another may still name it.
+
+**Tokens.** A reuse token -- a dead block kept to build the next one in -- is
+carried in a frame built as a closure as an `Int`, since it is not counted.
+So a closure's `Int` fields are read as possible references too: a token a
+live frame holds is kept, and one only garbage holds is freed with it, as the
+memory it is, without giving up the fields it no longer has.
+
+**What it costs.** For a program that cannot tie a knot, nothing. For one that
+can: a bit set as each block is carved from a chunk; the barrier's load and
+branch at each store into a block and each reuse; during a trace, a mark at
+each allocation and the memory counting frees held until it ends; and the
+marking itself, on another core.
+
+**What it does not catch.** A cycle that runs through the frames of a
+suspended continuation -- a `Ref` holding a continuation whose frames hold the
+`Ref` -- is kept: a continuation's stack is scanned as a root, not as
+something garbage could hold. Trial deletion does not see through a
+continuation's frames either.
+
+### Trial deletion
+
+What needs no roots at all is **trial deletion** -- Bacon and Rajan,
+_Concurrent Cycle Collection in Reference Counted Systems_, ECOOP 2001 -- and
+`silo/src/cycles.rs` implements it: buffer each block whose count goes down
+without reaching zero, then mark its subgraph gray while subtracting the
+references that come from inside it, scan to restore everything an outside
+reference still holds, and free what is left white.
 
 **What a program that does pay, pays.** The test before the call is inline and
 is one mask and one compare against a constant: a block is worth keeping only
