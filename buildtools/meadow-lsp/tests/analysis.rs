@@ -2029,6 +2029,50 @@ fn a_field_goes_to_where_its_record_declares_it() {
     assert_eq!(jumps(src, "@").0, "items");
 }
 
+/// What a keyword leads to: nothing. A declaration's keyword is not the name
+/// it declares, and an editor offers a link wherever a definition answers.
+#[test]
+fn a_keyword_has_no_definition() {
+    for (src, keyword) in [
+        ("$data Colour = Red | Green\n", "data"),
+        (
+            "@derive(Debug, PartialEq)\n$data Colour = Red | Green\n",
+            "data",
+        ),
+        ("@derive(Debug)\n@pub $data Colour = Red | Green\n", "data"),
+        (
+            "@derive(Debug, Eq, Ord)\n$record Point = { x : Int, y : Int }\n",
+            "record",
+        ),
+        ("@$derive(Debug)\ndata Colour = Red | Green\n", "derive"),
+        ("$record Point = { x : Int, y : Int }\n", "record"),
+        ("$effect Ask { ask : Unit -> Int }\n", "effect"),
+        ("$type Name = String\n", "type"),
+        ("$trait Sized a { size : a -> Int }\n", "trait"),
+        ("$fun twice x = x * 2\n", "fun"),
+        ("$def one = 1\n", "def"),
+        (
+            "data Colour = Red | Green\n$impl Show Colour { fun show c = \"c\" }\n",
+            "impl",
+        ),
+        ("$use Std.Collections.Vector as V\n", "use"),
+        ("def n = $match 1 with | _ -> 2\n", "match"),
+        ("def n = $let x = 1 in x\n", "let"),
+    ] {
+        let (a, off) = at(src, "$");
+        for o in off..off + keyword.len() {
+            let found = STD.with(|s| a.definition_at(o, s.definitions(), s.declared_names()));
+            assert!(
+                found.is_none(),
+                "`{keyword}` at {o} goes to {:?} in {src:?}",
+                found.map(
+                    |l| l.source.content[l.span.start as usize..l.span.end as usize].to_string()
+                )
+            );
+        }
+    }
+}
+
 /// A package of four modules, `Main` calling `Eval` calling `Syntax`, and
 /// `Report` beside them calling `Eval` too.
 fn four_modules(dir: &str) -> std::path::PathBuf {

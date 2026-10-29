@@ -63,6 +63,10 @@ beyond the last release is under _Unreleased_.
   answers for all of its open files at once; and an autosave of an open file
   re-analyses nothing. An edit in MeadowBoot took about 23 seconds to answer
   before, and the same again for each other file open.
+- In an editor, a declaration a procedural derive is written for is not a
+  link to itself from its keyword: what `@derive(Lexer)` wrote spanned the
+  whole declaration, so `data` went to the type, and a rename of the type
+  would have written over all of it. Only names are links now.
 
 ## 0.4.0 - 2026-10-24
 

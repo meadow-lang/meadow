@@ -195,3 +195,76 @@ fn a_path_dependency_is_still_loaded_for_the_editor() {
     let diags = diagnostics(&file);
     assert!(diags.is_empty(), "{diags:?}");
 }
+
+#[test]
+fn what_a_derive_writes_does_not_make_its_declaration_a_link() {
+    // A procedural derive's output has the declaration's span, the type it
+    // names included: every character of `data Colour = ...` -- the keyword
+    // too -- went to `Colour`, and an editor offered a link on all of it.
+    let lib = package(
+        "derive-dep",
+        "[package]\nname = \"Maker\"\nversion = \"0.1.0\"\n",
+        &[(
+            "Lib.mw",
+            "use Std.Macro.TokenTree.*\n\n@macro\n\
+             @pub fun describe ts = [Code \"fun describe (c : Colour) : Int = 1\"]\n",
+        )],
+    );
+    let src = "use maker (describe!)\n\n@derive(Describe)\ndata Colour = Red | Green\n\n\
+               def result = describe Colour.Red\n";
+    let app = package(
+        "derive-user",
+        &format!(
+            "[package]\nname = \"App\"\nversion = \"0.1.0\"\n\n[dependencies]\nmaker = {{ path = \"{}\" }}\n",
+            lib.display()
+        ),
+        &[("Lib.mw", src)],
+    );
+    let file = app
+        .join("src/Lib.mw")
+        .canonicalize()
+        .expect("the file is there");
+    let sources = meadow::editor::load_package(&file).expect("a package");
+    let std = std_lib();
+    let a = std.analyse_package(&sources, &file, src).expect("analysis");
+    assert!(
+        a.diagnostics.is_empty(),
+        "{:?}",
+        a.diagnostics.iter().map(|d| &d.msg).collect::<Vec<_>>()
+    );
+    let decl = src.find("data Colour").unwrap();
+    let line = "data Colour = Red | Green";
+    for (off, c) in line.char_indices() {
+        // The keyword, and what stands between the names.
+        if !(off < "data".len() || "=| ".contains(c)) {
+            continue;
+        }
+        let found = a.definition_at(decl + off, std.definitions(), std.declared_names());
+        assert!(
+            found.is_none(),
+            "{c:?} at {off} is a link to {:?}",
+            found.map(|l| l.source.content[l.span.start as usize..l.span.end as usize].to_string())
+        );
+    }
+    // The name it declares is itself, as any declaration's is -- not the
+    // whole declaration the derive's output stands at.
+    let name = decl + "data ".len();
+    let found = a
+        .definition_at(name, std.definitions(), std.declared_names())
+        .expect("the name");
+    assert_eq!(
+        &src[found.span.start as usize..found.span.end as usize],
+        "Colour"
+    );
+    // What is written still is: `describe` and `Colour` in `result`.
+    let at = src.rfind("Colour.Red").unwrap();
+    assert!(
+        a.definition_at(at, std.definitions(), std.declared_names())
+            .is_some()
+    );
+    let at = src.rfind("describe").unwrap();
+    assert!(
+        a.definition_at(at, std.definitions(), std.declared_names())
+            .is_some()
+    );
+}
