@@ -2,13 +2,22 @@
 --
 -- The difference from Algorithm W, and the reason to write J: W builds a
 -- *substitution* and threads it through every recursive call, composing as it
--- goes. J puts a mutable cell in the type variable instead, so unifying writes
--- the answer where everyone can already see it and nothing has to be threaded.
+-- goes. J solves type variables in place instead, so unifying writes the
+-- answer where everyone can already see it and nothing has to be threaded.
 -- The inference function returns a type and nothing else.
 --
--- That is what `Ty.Var (Ref Tv)` is for, and it is why every function here
--- carries `! { Mut | e }` in its type. The compiler tracking that is the point:
--- the mutation is real, and it says so.
+-- The place is a union-find, `Std.Collections.UnionFind`, with every type
+-- variable of the run as one of its elements. Unifying two variables joins
+-- their groups; unifying a variable with anything else writes that into its
+-- group, as the group's value. Which is the whole of unification, and the
+-- reason union-find was invented for it: a chain of variables unified one
+-- after another is one group, and `find` keeps the walk from any of them to
+-- what they are short.
+--
+-- That is mutation, so it happens inside a `runSt`, and every function here
+-- carries `! { St s | e }` in its type. The compiler tracking that is the
+-- point: the mutation is real, and it says so -- and `typeOf`, which runs the
+-- whole thing inside its own `runSt`, is pure.
 --
 -- Generalization uses **levels**, after Rémy. Every variable records the
 -- `let`-depth at which it was created. When generalizing at depth `d`, a
@@ -18,124 +27,120 @@
 -- variables", which is correct and quadratic.
 
 -- Naming a type in a `use` brings the type, not its constructors, so every
--- constructor here is written under its type: `Expr.Int`, `Ty.Int`, `Tv.Link`.
--- That is not only the rule but a help -- `Expr` and `Ty` share `Int`, `Bool`
--- and `Var`, and the qualifier says which one a line means.
+-- constructor here is written under its type: `Expr.Int`, `Ty.Int`,
+-- `Tv.Bound`. That is not only the rule but a help -- `Expr` and `Ty` share
+-- `Int`, `Bool` and `Var`, and the qualifier says which one a line means.
 use Syntax (Expr, Ty, Tv, Scheme)
-use Std.Ref (modify)
+use Std.Collections.UnionFind as UF
 use Std.Collections.List as L
 use Std.Collections.Vector as V
-use Std.String as S
 use Std.Exn (raise, toResult)
 use Std.Bool (not)
 
--- --- the variable supply --------------------------------------------------
+-- --- type variables -------------------------------------------------------
 --
--- One counter for the whole run, in a `Ref`. A fresh variable starts `Unbound`
--- at the current level.
+-- One union-find, `uf`, for the whole run. A fresh variable is a new element
+-- of it, in a group of its own, `Unbound` at the current level.
 
-fun newTv counter level =
-  let n = getRef counter in
-  let ignored = setRef counter (n + 1) in
-  Ty.Var (newRef (Tv.Unbound n level))
+fun newTv uf level = Ty.Var (UF.add (Tv.Unbound level) uf)
 
--- Follow links to whatever a type currently is. Not path compression -- a toy
--- can afford the walk -- but the same idea.
-fun force t =
+-- What a type currently is: what a solved variable was solved to, or an
+-- unsolved one as its group's representative, so that two variables unified
+-- together read as the same one.
+fun force uf t =
   match t with
-  | Ty.Var r ->
-      (match getRef r with
-       | Tv.Link inner -> force inner
-       | Tv.Unbound n l -> t)
+  | Ty.Var i ->
+      (match UF.value i uf with
+       | Tv.Bound solved -> solved
+       | Tv.Unbound l -> Ty.Var (UF.find i uf))
   | other -> other
+
+-- The level of an unsolved variable. Only ever asked of a variable `force`
+-- answered, and those are unsolved.
+fun levelOf uf i =
+  match UF.value i uf with
+  | Tv.Unbound l -> l
+  | Tv.Bound t -> 0
 
 -- --- unification ----------------------------------------------------------
 
-fun typeName t =
-  match force t with
+fun typeName uf t =
+  match force uf t with
   | Ty.Int -> "Int"
   | Ty.Bool -> "Bool"
-  | Ty.Fun a b -> S.concatAll ["(", typeName a, " -> ", typeName b, ")"]
-  | Ty.Var r ->
-      (match getRef r with
-       | Tv.Unbound n l -> S.concat "t" (S.fromInt n)
-       | Tv.Link inner -> typeName inner)
+  | Ty.Fun a b -> "(${typeName uf a} -> ${typeName uf b})"
+  | Ty.Var i -> "t${i}"
 
 -- The occurs check, which also lowers levels.
 --
 -- Two jobs in one walk, as is traditional: refuse `t = t -> t` (which would
 -- make an infinite type), and pull any variable inside `t` down to `level` so
 -- that a variable escaping into an outer scope stops being generalizable.
-fun occursAdjust id level t =
-  match force t with
-  | Ty.Var r ->
-      (match getRef r with
-       | Tv.Unbound n l ->
-           if n == id then raise "occurs check: a type would contain itself"
-           else if l > level then setRef r (Tv.Unbound n level)
-           else ()
-       | Tv.Link inner -> occursAdjust id level inner)
+-- `v` is a representative, as `force` answers every variable it meets.
+fun occursAdjust uf v level t =
+  match force uf t with
+  | Ty.Var i ->
+      if i == v then raise "occurs check: a type would contain itself"
+      else if levelOf uf i > level then UF.setValue i (Tv.Unbound level) uf
+      else ()
   | Ty.Fun a b ->
-      let ignored = occursAdjust id level a in
-      occursAdjust id level b
+      let ignored = occursAdjust uf v level a in
+      occursAdjust uf v level b
   | other -> ()
 
-fun unify a b =
-  match (force a, force b) with
+-- Two unsolved variables made one: the group keeps the shallower level, the
+-- one a variable escaping into the outer scope would have been lowered to.
+fun lowerOf x y =
+  match (x, y) with
+  | (Tv.Unbound l1, Tv.Unbound l2) -> Tv.Unbound (min l1 l2)
+  | (other, _) -> other
+
+-- Solve the unsolved variable `v` to `t`, which is not a variable.
+fun bind uf v t =
+  let ignored = occursAdjust uf v (levelOf uf v) t in
+  UF.setValue v (Tv.Bound t) uf
+
+fun unify uf a b =
+  match (force uf a, force uf b) with
   | (Ty.Int, Ty.Int) -> ()
   | (Ty.Bool, Ty.Bool) -> ()
-  | (Ty.Fun a1 b1, Ty.Fun a2 b2) -> let ignored = unify a1 a2 in unify b1 b2
-  | (Ty.Var r1, Ty.Var r2) ->
-      if r1 == r2 then ()
-      else
-        (match getRef r1 with
-         | Tv.Unbound n l ->
-             let ignored = occursAdjust n l (Ty.Var r2) in
-             setRef r1 (Tv.Link (Ty.Var r2))
-         | Tv.Link inner -> unify inner (Ty.Var r2))
-  | (Ty.Var r, other) ->
-      (match getRef r with
-       | Tv.Unbound n l ->
-           let ignored = occursAdjust n l other in
-           setRef r (Tv.Link other)
-       | Tv.Link inner -> unify inner other)
-  | (other, Ty.Var r) -> unify (Ty.Var r) other
-  | (x, y) -> raise (S.concatAll ["cannot unify ", typeName x, " with ", typeName y])
+  | (Ty.Fun a1 b1, Ty.Fun a2 b2) -> let ignored = unify uf a1 a2 in unify uf b1 b2
+  | (Ty.Var i, Ty.Var j) -> let ignored = UF.unionWith lowerOf i j uf in ()
+  | (Ty.Var v, other) -> bind uf v other
+  | (other, Ty.Var v) -> bind uf v other
+  | (x, y) -> raise "cannot unify ${typeName uf x} with ${typeName uf y}"
 
 -- --- generalization and instantiation -------------------------------------
 
--- Every `Unbound` id in `t` whose level is deeper than `level`: the variables
--- this `let` owns, and so the ones it may quantify.
-fun freeAbove level t acc =
-  match force t with
-  | Ty.Var r ->
-      (match getRef r with
-       | Tv.Unbound n l -> if l > level and not (V.elem n acc) then V.pushBack acc n else acc
-       | Tv.Link inner -> freeAbove level inner acc)
-  | Ty.Fun a b -> freeAbove level b (freeAbove level a acc)
+-- Every unsolved variable in `t` whose level is deeper than `level`, by its
+-- representative: the variables this `let` owns, and so the ones it may
+-- quantify.
+fun freeAbove uf level t acc =
+  match force uf t with
+  | Ty.Var i -> if levelOf uf i > level and not (V.elem i acc) then V.pushBack acc i else acc
+  | Ty.Fun a b -> freeAbove uf level b (freeAbove uf level a acc)
   | other -> acc
 
-fun generalize level t = Scheme.Forall (freeAbove level t V.empty) t
+fun generalize uf level t = Scheme.Forall (freeAbove uf level t V.empty) t
 
--- Replace each quantified id with a fresh variable. Everything else is shared,
--- which is what makes instantiation cheap.
-fun substitute pairs t =
-  match force t with
-  | Ty.Var r ->
-      (match getRef r with
-       | Tv.Unbound n l ->
-           (match V.find (\p -> fst p == n) pairs with
-            | Just (id, fresh) -> fresh
-            | None -> t)
-       | Tv.Link inner -> substitute pairs inner)
-  | Ty.Fun a b -> Ty.Fun (substitute pairs a) (substitute pairs b)
+-- Replace each quantified variable with a fresh one. Everything else is
+-- shared, which is what makes instantiation cheap. A quantified variable is
+-- never unified again -- nothing outside the scheme can reach it -- so the
+-- representative it was quantified as is still the one `force` answers.
+fun substitute uf pairs t =
+  match force uf t with
+  | Ty.Var i ->
+      (match V.find (\p -> fst p == i) pairs with
+       | Just (id, fresh) -> fresh
+       | None -> Ty.Var i)
+  | Ty.Fun a b -> Ty.Fun (substitute uf pairs a) (substitute uf pairs b)
   | other -> other
 
-fun instantiate counter level scheme =
+fun instantiate uf level scheme =
   match scheme with
   | Scheme.Forall ids body ->
-      let pairs = V.map (\n -> (n, newTv counter level)) ids in
-      substitute pairs body
+      let pairs = V.map (\n -> (n, newTv uf level)) ids in
+      substitute uf pairs body
 
 -- --- inference ------------------------------------------------------------
 --
@@ -149,65 +154,66 @@ fun instantiate counter level scheme =
 fun lookupVar env name =
   match L.lookupAssoc name env with
   | Just scheme -> scheme
-  | None -> raise (S.concat "unbound variable: " name)
+  | None -> raise "unbound variable: ${name}"
 
 fun binOpType op =
   if op == "+" or op == "-" or op == "*" or op == "/" then (Ty.Int, Ty.Int, Ty.Int)
   else (Ty.Int, Ty.Int, Ty.Bool)
 
-fun infer counter env level e =
+fun infer uf env level e =
   match e with
   | Expr.Int n -> Ty.Int
   | Expr.Bool b -> Ty.Bool
-  | Expr.Var name -> instantiate counter level (lookupVar env name)
+  | Expr.Var name -> instantiate uf level (lookupVar env name)
   | Expr.Lam param body ->
-      let argT = newTv counter level in
-      let bodyT = infer counter ((param, Scheme.Forall V.empty argT) :: env) level body in
+      let argT = newTv uf level in
+      let bodyT = infer uf ((param, Scheme.Forall V.empty argT) :: env) level body in
       Ty.Fun argT bodyT
   | Expr.App f a ->
-      let fT = infer counter env level f in
-      let aT = infer counter env level a in
-      let resT = newTv counter level in
-      let ignored = unify fT (Ty.Fun aT resT) in
+      let fT = infer uf env level f in
+      let aT = infer uf env level a in
+      let resT = newTv uf level in
+      let ignored = unify uf fT (Ty.Fun aT resT) in
       resT
   | Expr.Let name rhs body ->
       -- The right-hand side is checked one level deeper, so the variables it
       -- invents are marked as belonging to it. Anything that escaped into the
       -- environment was pulled back down by `occursAdjust` and will not be
       -- generalized here.
-      let rhsT = infer counter env (level + 1) rhs in
-      let scheme = generalize level rhsT in
-      infer counter ((name, scheme) :: env) level body
+      let rhsT = infer uf env (level + 1) rhs in
+      let scheme = generalize uf level rhsT in
+      infer uf ((name, scheme) :: env) level body
   | Expr.LetRec name param rhs body ->
       -- The name is in scope while checking its own definition, and
       -- *monomorphically* -- a recursive call cannot be at a different type.
       -- Only afterwards is it generalized for the body.
-      let fT = newTv counter (level + 1) in
-      let argT = newTv counter (level + 1) in
-      let resT = newTv counter (level + 1) in
+      let fT = newTv uf (level + 1) in
+      let argT = newTv uf (level + 1) in
+      let resT = newTv uf (level + 1) in
       let inner = (param, Scheme.Forall V.empty argT) :: (name, Scheme.Forall V.empty fT) :: env in
-      let ignored = unify fT (Ty.Fun argT resT) in
-      let bodyT = infer counter inner (level + 1) rhs in
-      let ignored2 = unify resT bodyT in
-      infer counter ((name, generalize level fT) :: env) level body
+      let ignored = unify uf fT (Ty.Fun argT resT) in
+      let bodyT = infer uf inner (level + 1) rhs in
+      let ignored2 = unify uf resT bodyT in
+      infer uf ((name, generalize uf level fT) :: env) level body
   | Expr.If c t f ->
-      let cT = infer counter env level c in
-      let ignored = unify cT Ty.Bool in
-      let tT = infer counter env level t in
-      let fT = infer counter env level f in
-      let ignored2 = unify tT fT in
+      let cT = infer uf env level c in
+      let ignored = unify uf cT Ty.Bool in
+      let tT = infer uf env level t in
+      let fT = infer uf env level f in
+      let ignored2 = unify uf tT fT in
       tT
   | Expr.Bin op l r ->
       match binOpType op with
       | (lWant, rWant, out) ->
-          let lT = infer counter env level l in
-          let ignored = unify lT lWant in
-          let rT = infer counter env level r in
-          let ignored2 = unify rT rWant in
+          let lT = infer uf env level l in
+          let ignored = unify uf lT lWant in
+          let rT = infer uf env level r in
+          let ignored2 = unify uf rT rWant in
           out
 
 -- Infer the type of a whole expression. `Err` carries the message a failed
 -- unification or an unbound name raised -- `Exn` is doing the unwinding, so
--- nothing between here and `raise` has to mention failure.
+-- nothing between here and `raise` has to mention failure. The union-find is
+-- made inside the `runSt` and never leaves it; only the type's name does.
 @pub(pkg) fun typeOf e =
-  toResult (\() -> let counter = newRef 0 in typeName (infer counter [;] 0 e))
+  runSt (\() -> toResult (\() -> let uf = UF.new () in typeName uf (infer uf [;] 0 e)))
