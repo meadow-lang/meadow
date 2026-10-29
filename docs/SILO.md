@@ -414,6 +414,13 @@ time, and no trace starts. Where knots are tied:
 | two million knots, each let go of at once | 187 ms | 107 ms |
 | a live ring of 200,000 `Ref`s, a million knots made and let go of around it | 249 ms | 67 ms; the longest pause 0.007 ms against 4.1 |
 | the same, twenty million knots | 2.0 s | 1.3 s |
+| knots made a million frames deep in a recursion | 45 ms | 44 ms; the longest pause 4.6 ms, scanning the stack |
+| MeadowBoot building itself | 74.8 s | 75.8 s; the longest pause 3.2 ms |
+
+A pause is what its roots take, and so it grows with the stacks: a frame a
+few words, a million of them a few milliseconds. MeadowBoot holds its `Ref`s
+to the end and makes no cyclic garbage, so its traces find nothing, on the
+marker's core; the next waits for as much allocation as the last one marked.
 
 What tracing pays for that is memory. It frees garbage a trace at a time,
 where trial deletion frees a knot as soon as it looks at it: under a stream
