@@ -2028,3 +2028,180 @@ fn a_field_goes_to_where_its_record_declares_it() {
     let src = "record Box = { items : Int }\n\nfun count b = b.@items + 1\n";
     assert_eq!(jumps(src, "@").0, "items");
 }
+
+/// What a keyword leads to: nothing. A declaration's keyword is not the name
+/// it declares, and an editor offers a link wherever a definition answers.
+#[test]
+fn a_keyword_has_no_definition() {
+    for (src, keyword) in [
+        ("$data Colour = Red | Green\n", "data"),
+        (
+            "@derive(Debug, PartialEq)\n$data Colour = Red | Green\n",
+            "data",
+        ),
+        ("@derive(Debug)\n@pub $data Colour = Red | Green\n", "data"),
+        (
+            "@derive(Debug, Eq, Ord)\n$record Point = { x : Int, y : Int }\n",
+            "record",
+        ),
+        ("@$derive(Debug)\ndata Colour = Red | Green\n", "derive"),
+        ("$record Point = { x : Int, y : Int }\n", "record"),
+        ("$effect Ask { ask : Unit -> Int }\n", "effect"),
+        ("$type Name = String\n", "type"),
+        ("$trait Sized a { size : a -> Int }\n", "trait"),
+        ("$fun twice x = x * 2\n", "fun"),
+        ("$def one = 1\n", "def"),
+        (
+            "data Colour = Red | Green\n$impl Show Colour { fun show c = \"c\" }\n",
+            "impl",
+        ),
+        ("$use Std.Collections.Vector as V\n", "use"),
+        ("def n = $match 1 with | _ -> 2\n", "match"),
+        ("def n = $let x = 1 in x\n", "let"),
+    ] {
+        let (a, off) = at(src, "$");
+        for o in off..off + keyword.len() {
+            let found = STD.with(|s| a.definition_at(o, s.definitions(), s.declared_names()));
+            assert!(
+                found.is_none(),
+                "`{keyword}` at {o} goes to {:?} in {src:?}",
+                found.map(
+                    |l| l.source.content[l.span.start as usize..l.span.end as usize].to_string()
+                )
+            );
+        }
+    }
+}
+
+/// A package of four modules, `Main` calling `Eval` calling `Syntax`, and
+/// `Report` beside them calling `Eval` too.
+fn four_modules(dir: &str) -> std::path::PathBuf {
+    package(
+        dir,
+        Some("[package]\nname = \"Demo\"\n"),
+        &[
+            (
+                "Syntax.mw",
+                "@pub(pkg) data Expr = Int Int | Add Expr Expr\n@pub(pkg) fun zero u = Expr.Int 0\n",
+            ),
+            (
+                "Eval.mw",
+                "use Demo.Syntax.Expr.*\n\n@pub(pkg) fun eval e = match e with\n  | Int n -> n\n  | Add a b -> eval a + eval b\n",
+            ),
+            (
+                "Report.mw",
+                "use Demo.Eval (eval)\nuse Demo.Syntax (zero)\n@pub(pkg) fun report u = \"{eval (zero u)}\"\n",
+            ),
+            (
+                "Main.mw",
+                "use Demo.Eval (eval)\nuse Demo.Syntax (Expr)\ndef demo = eval (Expr.Int 1)\n",
+            ),
+        ],
+    )
+}
+
+/// What an analysis says that a reader sees: its diagnostics, and the hover
+/// at every offset of the document.
+fn seen(a: &meadow_lsp::analysis::Analysis, text: &str) -> (Vec<String>, Vec<Option<String>>) {
+    let mut msgs: Vec<String> = a.diagnostics.iter().map(|d| d.msg.clone()).collect();
+    msgs.sort();
+    (msgs, (0..text.len()).map(|o| a.hover_at(o)).collect())
+}
+
+#[test]
+fn a_focused_analysis_says_what_a_whole_one_does() {
+    use meadow_compiler::focus::Memory;
+    use meadow_lsp::analysis::Reuse;
+    let root = four_modules("focused");
+    let main = root.join("src").join("Main.mw");
+    let eval = root.join("src").join("Eval.mw");
+    let sources = meadow::editor::load_package(&main).expect("a package");
+    let main_text = std::fs::read_to_string(&main).unwrap();
+    let mut memory = Memory::default();
+    STD.with(|s| {
+        s.analyse_documents(
+            &sources,
+            &[(&main, &main_text)],
+            Reuse::Remember(&mut memory),
+        )
+    });
+
+    // An edit to `Main` that reuses `eval` and `Expr`; then one that breaks.
+    for text in [
+        "use Demo.Eval (eval)\nuse Demo.Syntax (Expr)\ndef demo = eval (Expr.Add (Expr.Int 1) (Expr.Int 2))\n",
+        "use Demo.Eval (eval)\nuse Demo.Syntax (Expr)\ndef demo = eval 3\n",
+    ] {
+        let focused = STD
+            .with(|s| s.analyse_documents(&sources, &[(&main, text)], Reuse::Focus(&mut memory)))
+            .pop()
+            .flatten()
+            .expect("analysis");
+        let t = memory.last();
+        assert!(t.reused >= 2 && t.inferred == 1, "{t:?}");
+        let whole = STD
+            .with(|s| s.analyse_package(&sources, &main, text))
+            .expect("analysis");
+        assert_eq!(seen(&focused, text), seen(&whole, text), "{text}");
+    }
+
+    // A module below changed on disk: what `Main` calls is inferred again.
+    let eval_text = std::fs::read_to_string(&eval)
+        .unwrap()
+        .replace("| Int n -> n", "| Int n -> \"n\"");
+    let focused = STD
+        .with(|s| {
+            s.analyse_documents(
+                &sources,
+                &[(&main, &main_text), (&eval, &eval_text)],
+                Reuse::Focus(&mut memory),
+            )
+        })
+        .remove(0)
+        .expect("analysis");
+    let whole = STD
+        .with(|s| {
+            s.analyse_documents(
+                &sources,
+                &[(&main, &main_text), (&eval, &eval_text)],
+                Reuse::Nothing,
+            )
+        })
+        .remove(0)
+        .expect("analysis");
+    assert_eq!(seen(&focused, &main_text), seen(&whole, &main_text));
+}
+
+#[test]
+fn one_compile_answers_for_every_open_document_of_a_package() {
+    use meadow_compiler::focus::Memory;
+    use meadow_lsp::analysis::Reuse;
+    let root = four_modules("together");
+    let files: Vec<(std::path::PathBuf, String)> = ["Main.mw", "Report.mw", "Syntax.mw"]
+        .iter()
+        .map(|f| {
+            let p = root.join("src").join(f);
+            let t = std::fs::read_to_string(&p).unwrap();
+            (p, t)
+        })
+        .collect();
+    let sources = meadow::editor::load_package(&files[0].0).expect("a package");
+    let docs: Vec<(&std::path::Path, &str)> = files
+        .iter()
+        .map(|(p, t)| (p.as_path(), t.as_str()))
+        .collect();
+    let mut memory = Memory::default();
+    let together = STD.with(|s| s.analyse_documents(&sources, &docs, Reuse::Remember(&mut memory)));
+    assert_eq!(together.len(), 3);
+    for ((path, text), a) in files.iter().zip(&together) {
+        let alone = STD
+            .with(|s| s.analyse_package(&sources, path, text))
+            .expect("analysis");
+        assert_eq!(
+            seen(a.as_ref().expect("analysed"), text),
+            seen(&alone, text),
+            "{}",
+            path.display()
+        );
+    }
+    assert!(!memory.is_empty(), "the whole compile was remembered");
+}

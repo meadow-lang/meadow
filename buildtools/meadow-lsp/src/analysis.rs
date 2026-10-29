@@ -484,6 +484,9 @@ pub struct PackageSources {
     /// The package's name, which is also the first segment of a `use` path
     /// naming one of its own modules.
     pub name: InternedString,
+    /// The directory its `Meadow.toml` is in: which package it is, for
+    /// whoever keeps something per package.
+    pub root: std::path::PathBuf,
     pub modules: Vec<ModuleFile>,
     /// What it depends on, compiled, each under the name this package calls
     /// it -- which is what its `use` lines say and need not be what the
@@ -496,6 +499,20 @@ pub struct PackageSources {
     /// What can run a procedural macro one of them exports. `None` where
     /// nothing can, and then a call is reported rather than quietly ignored.
     pub procs: Option<std::rc::Rc<dyn meadow_compiler::expand::proc::Runner>>,
+}
+
+/// What [`Std::analyse_documents`] may reuse from earlier compiles of the
+/// package.
+pub enum Reuse<'m> {
+    /// Nothing: every module is compiled, and nothing is kept.
+    Nothing,
+    /// Every module is compiled, and what was found is kept in the memory for
+    /// a later [`Reuse::Focus`].
+    Remember(&'m mut meadow_compiler::focus::Memory),
+    /// Only the first document's module is inferred; the rest of the package
+    /// is taken from the memory where it still holds. See
+    /// `meadow_compiler::focus`.
+    Focus(&'m mut meadow_compiler::focus::Memory),
 }
 
 /// One `.mw` file of a package.
@@ -769,37 +786,65 @@ impl Std {
         open: &std::path::Path,
         text: &str,
     ) -> Option<Analysis> {
+        self.analyse_documents(sources, &[(open, text)], Reuse::Nothing)
+            .pop()
+            .flatten()
+    }
+
+    /// [`Std::analyse_package`] for several documents of one package at
+    /// once, each path with the text its editor holds -- from one compile of
+    /// the package, however many there are. One analysis per document, in
+    /// order, or `None` for one that is not a module of the package.
+    ///
+    /// With [`Reuse::Focus`] only the first is analysed, the others' text
+    /// standing in for their files, and the compile reuses what earlier ones
+    /// found for the rest of the package: see `meadow_compiler::focus`.
+    pub fn analyse_documents(
+        &self,
+        sources: &PackageSources,
+        docs: &[(&std::path::Path, &str)],
+        reuse: Reuse<'_>,
+    ) -> Vec<Option<Analysis>> {
         let deps: Vec<&CompiledPackage> = self.packages.iter().collect();
-        let mut here: Option<Source> = None;
+        let focusing = matches!(reuse, Reuse::Focus(_));
+        let wanted = if focusing {
+            docs.len().min(1)
+        } else {
+            docs.len()
+        };
+        // Per document: its source, what lexing and parsing said of it, and
+        // where its macro calls are.
+        let mut opened: Vec<Option<(Source, Vec<Diagnostic>, Vec<Span>)>> = vec![None; docs.len()];
         let mut modules: Vec<AstModule> = Vec::new();
-        let mut diagnostics: Vec<Diagnostic> = Vec::new();
-        let mut calls: Vec<Span> = Vec::new();
+        let mut focus_path: Option<Vec<InternedString>> = None;
 
         for m in &sources.modules {
-            let mine = m.file == open;
-            // The open buffer is newer than the file it came from, and it is
+            let doc = docs.iter().position(|(path, _)| m.file == *path);
+            // An open buffer is newer than the file it came from, and it is
             // the one the editor is asking about.
-            let body = if mine { text } else { &m.text };
+            let body = match doc {
+                Some(d) => docs[d].1,
+                None => &m.text,
+            };
             let name = InternedString::from(m.file.display().to_string());
             let source = Source::new(SourceKind::File(name), body.into());
-            if mine {
-                here = Some(source);
-            }
             let lex = tokenize(source);
             let (ast, perrs) = parser::parse(m.name, source, &lex.tokens);
-            if mine {
-                diagnostics.extend(lex.errors);
+            if let Some(d) = doc.filter(|&d| d < wanted) {
+                let mut diagnostics = lex.errors;
                 for e in &perrs {
                     diagnostics.push(meadow_compiler::diagnostics::from_parse_error(
                         &name.to_string(),
                         e,
                     ));
                 }
+                let calls = ast.as_ref().map(macro_calls).unwrap_or_default();
+                opened[d] = Some((source, diagnostics, calls));
+                if d == 0 {
+                    focus_path = Some(m.path.clone());
+                }
             }
             if let Some(ast) = ast {
-                if mine {
-                    calls = macro_calls(&ast);
-                }
                 modules.push(AstModule {
                     path: m.path.clone(),
                     name: m.name,
@@ -808,7 +853,9 @@ impl Std {
                 });
             }
         }
-        let here = here?;
+        if opened.iter().all(Option::is_none) {
+            return opened.into_iter().map(|_| None).collect();
+        }
 
         // The standard library, and then what this package itself depends on,
         // each under the name it calls it by.
@@ -823,31 +870,81 @@ impl Std {
                 .iter()
                 .map(|(alias, pkg)| meadow_compiler::Dep::named(*alias, pkg.as_ref())),
         );
-        let (pkg, unit_diags) = match &sources.procs {
-            Some(procs) => meadow_compiler::compile_unit_with_procs(
-                sources.name,
-                sources.name,
-                sources.name,
-                1,
-                modules,
-                &views,
-                Options::debug(),
-                0,
-                procs.as_ref(),
-            ),
-            None => meadow_compiler::compile_unit_in_package(
-                sources.name,
-                sources.name,
-                1,
-                modules,
-                &views,
-                Options::debug(),
-            ),
+        let procs = sources.procs.as_deref();
+        let (pkg, unit_diags) = match reuse {
+            Reuse::Nothing => match procs {
+                Some(procs) => meadow_compiler::compile_unit_with_procs(
+                    sources.name,
+                    sources.name,
+                    sources.name,
+                    1,
+                    modules,
+                    &views,
+                    Options::debug(),
+                    0,
+                    procs,
+                ),
+                None => meadow_compiler::compile_unit_in_package(
+                    sources.name,
+                    sources.name,
+                    1,
+                    modules,
+                    &views,
+                    Options::debug(),
+                ),
+            },
+            Reuse::Remember(memory) | Reuse::Focus(memory) => {
+                let module = if focusing { focus_path.clone() } else { None };
+                meadow_compiler::compile_unit_focused(
+                    sources.name,
+                    sources.name,
+                    sources.name,
+                    1,
+                    modules,
+                    &views,
+                    Options::debug(),
+                    0,
+                    procs,
+                    meadow_compiler::focus::Focus { module, memory },
+                )
+            }
         };
+        opened
+            .into_iter()
+            .zip(docs)
+            .map(|(o, (_, text))| {
+                let (here, diagnostics, calls) = o?;
+                Some(self.index_document(
+                    sources,
+                    &deps,
+                    &pkg,
+                    &unit_diags,
+                    here,
+                    diagnostics,
+                    &calls,
+                    text,
+                ))
+            })
+            .collect()
+    }
+
+    /// The analysis of the document `here`, one module of `pkg`.
+    #[allow(clippy::too_many_arguments)]
+    fn index_document(
+        &self,
+        sources: &PackageSources,
+        deps: &[&CompiledPackage],
+        pkg: &CompiledPackage,
+        unit_diags: &[Diagnostic],
+        here: Source,
+        mut diagnostics: Vec<Diagnostic>,
+        calls: &[Span],
+        text: &str,
+    ) -> Analysis {
         // A diagnostic names the file it is in, so the ones for the rest of the
         // package are simply not this document's to report.
         let mine = here.name().to_string();
-        diagnostics.extend(unit_diags.into_iter().filter(|d| d.filename == mine));
+        diagnostics.extend(unit_diags.iter().filter(|d| d.filename == mine).cloned());
 
         let mut a = Analysis {
             source: text.to_string(),
@@ -943,8 +1040,8 @@ impl Std {
         mark_tests(&mut a, &pkg);
         a.ctor_paths = ctor_paths(&pkg, Some(sources.name), &deps, None);
         a.paths = path_index(&pkg, Some(sources.name), &deps, None);
-        a.leave_out_expansions(&calls);
-        Some(a)
+        a.leave_out_expansions(calls);
+        a
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1155,6 +1252,21 @@ impl Analysis {
     /// and go-to-definition, which are asked about a place, and its
     /// diagnostics; it loses the lenses and hints, which are put on places
     /// unasked.
+    ///
+    /// And the references the macro wrote rather than passed on. Those span
+    /// the whole call -- for a `@derive`, the whole declaration, keyword and
+    /// all -- so every character of it went to whatever they named, and an
+    /// editor offered a link on `data`; a rename would have written the new
+    /// name over all of it. What was written in the file keeps its own span,
+    /// which is a name and nothing more.
+    /// Whether `span` of this document is a name as written: one word, as
+    /// against the whole of a macro call that something it wrote stands at.
+    fn is_a_name(&self, span: Span) -> bool {
+        self.source
+            .get(span.start as usize..span.end as usize)
+            .is_some_and(|t| !t.is_empty() && !t.contains(char::is_whitespace))
+    }
+
     fn leave_out_expansions(&mut self, calls: &[Span]) {
         if calls.is_empty() {
             return;
@@ -1164,6 +1276,20 @@ impl Analysis {
         let inside = |at: u32| calls.iter().any(|c| c.start <= at && at <= c.end);
         self.functions.retain(|f| !inside(f.span.start));
         self.binders.retain(|h| !inside(h.offset));
+        let keep: Vec<bool> = self
+            .refs
+            .iter()
+            .map(|(s, _)| !inside(s.start) || self.is_a_name(*s))
+            .collect();
+        let mut keep = keep.into_iter();
+        self.refs.retain(|_| keep.next().unwrap_or(true));
+        let keep: Vec<bool> = self
+            .name_refs
+            .iter()
+            .map(|(s, _, _)| !inside(s.start) || self.is_a_name(*s))
+            .collect();
+        let mut keep = keep.into_iter();
+        self.name_refs.retain(|_| keep.next().unwrap_or(true));
     }
 }
 
@@ -2096,10 +2222,12 @@ impl Analysis {
             .min_by_key(|(s, v)| (s.end - s.start, !self.defs.contains_key(v)))
             .map(|(_, v)| *v)
             .or_else(|| {
-                // Standing on the definition itself counts as referring to it.
+                // Standing on the definition itself counts as referring to it
+                // -- on its name. One a macro wrote stands at the whole call,
+                // and is somewhere to go, not something to stand on.
                 self.defs
                     .iter()
-                    .filter(|(_, l)| covers(l.span, offset))
+                    .filter(|(_, l)| covers(l.span, offset) && self.is_a_name(l.span))
                     .min_by_key(|(_, l)| l.span.end - l.span.start)
                     .map(|(v, _)| *v)
             })

@@ -351,7 +351,9 @@ pub fn compile_unit_as(
     opts: Options,
     floor: u32,
 ) -> (CompiledPackage, Vec<Diagnostic>) {
-    compile_unit_inner(pkg, ident, unit_name, id, modules, deps, opts, floor, None)
+    compile_unit_inner(
+        pkg, ident, unit_name, id, modules, deps, opts, floor, None, None,
+    )
 }
 
 /// [`compile_unit_in_package`], minting no variable below `floor`.
@@ -371,7 +373,9 @@ pub fn compile_unit_above(
     opts: Options,
     floor: u32,
 ) -> (CompiledPackage, Vec<Diagnostic>) {
-    compile_unit_inner(pkg, pkg, unit_name, id, modules, deps, opts, floor, None)
+    compile_unit_inner(
+        pkg, pkg, unit_name, id, modules, deps, opts, floor, None, None,
+    )
 }
 
 /// [`compile_unit_as`], with something that can run a procedural macro.
@@ -403,6 +407,36 @@ pub fn compile_unit_with_procs(
         opts,
         floor,
         Some(procs),
+        None,
+    )
+}
+
+/// [`compile_unit_with_procs`], for an editor asking about one module: see
+/// [`crate::focus`]. Only the focused module comes out typed and lowered.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_unit_focused(
+    pkg: InternedString,
+    ident: InternedString,
+    unit_name: InternedString,
+    id: usize,
+    modules: Vec<AstModule>,
+    deps: &[Dep<'_>],
+    opts: Options,
+    floor: u32,
+    procs: Option<&dyn crate::expand::proc::Runner>,
+    focus: crate::focus::Focus<'_>,
+) -> (CompiledPackage, Vec<Diagnostic>) {
+    compile_unit_inner(
+        pkg,
+        ident,
+        unit_name,
+        id,
+        modules,
+        deps,
+        opts,
+        floor,
+        procs,
+        Some(focus),
     )
 }
 
@@ -439,6 +473,7 @@ fn compile_unit_inner(
     opts: Options,
     floor: u32,
     procs: Option<&dyn crate::expand::proc::Runner>,
+    mut focus: Option<crate::focus::Focus<'_>>,
 ) -> (CompiledPackage, Vec<Diagnostic>) {
     let mut diags = Vec::new();
     let filename = unit_name.to_string();
@@ -466,6 +501,7 @@ fn compile_unit_inner(
         }
     }
     modules.retain(|m| !dropped.iter().any(|d| m.path.starts_with(d)));
+    let snapshot = focus.as_ref().map(|_| crate::focus::snapshot(&modules));
     // Macros: read from every module of the unit, then expanded in each.
     let (macros, bindings, expansions) =
         crate::expand::expand_unit(pkg, &mut modules, deps, procs, &filename, &mut diags);
@@ -717,6 +753,10 @@ fn compile_unit_inner(
         infer.register_impls(&m.hir.value().decls);
         infer.export_traits(&m.hir.value().decls);
     }
+    // Focused on one module, only its bodies are looked at; see `crate::focus`.
+    let focused: Option<Vec<InternedString>> = focus.as_ref().and_then(|f| f.module.clone());
+    let in_focus = |path: &[InternedString]| focused.as_deref().is_none_or(|f| f == path);
+    let mut planned: Option<(crate::focus::Plan, Vec<bool>)> = None;
     // The bindings of every module, as one graph: a module whose tests call a
     // sibling that uses it must not see the sibling's names before they have
     // types. See `meadow_scc::unit_groups`.
@@ -726,22 +766,39 @@ fn compile_unit_inner(
             .iter()
             .map(|m| module_filename(&filename, m.source))
             .collect();
-        let groups: Vec<(Vec<(usize, usize)>, bool)> = scc::unit_groups(
+        let unit_groups = scc::unit_groups(
             &hirs.iter().map(|m| m.value()).collect::<Vec<_>>(),
             &overloads,
-        )
-        .into_iter()
-        .map(|g| (g.members, g.recursive))
-        .collect();
-        infer.infer_unit(&hirs, &files, &groups);
+        );
+        let groups: Vec<(Vec<(usize, usize)>, bool)> = unit_groups
+            .iter()
+            .map(|g| (g.members.clone(), g.recursive))
+            .collect();
+        match (&focus, &snapshot) {
+            (Some(f), Some(snap)) => {
+                let typed_refs: Vec<&TypedModule> = typed.iter().collect();
+                let mut plan =
+                    crate::focus::Plan::new(f, snap, &typed_refs, &unit_groups, resolver.names());
+                let mut inferred = vec![false; groups.len()];
+                infer.infer_unit_planned(&hirs, &files, &groups, |g| {
+                    let p = plan.take(g);
+                    inferred[g] = matches!(p, crate::infer::Planned::Infer);
+                    p
+                });
+                planned = Some((plan, inferred));
+            }
+            _ => infer.infer_unit(&hirs, &files, &groups),
+        }
     }
     // The bodies inside traits and `impl`s last: they may mention any binding
     // of the unit, and no binding needs more of them than their types.
-    for m in &typed {
+    for m in typed.iter().filter(|m| in_focus(&m.path)) {
         infer.set_filename(module_filename(&filename, m.source));
         infer.infer_traits(&m.hir);
     }
-    if let Some((main, at, source)) = main_at {
+    if let Some((main, at, source)) = main_at
+        && in_focus(&[])
+    {
         infer.set_filename(module_filename(&filename, source));
         infer.check_main(main, at);
     }
@@ -756,6 +813,9 @@ fn compile_unit_inner(
         errors,
     } = infer.finish();
     diags.extend(errors);
+    if let (Some(f), Some(snap), Some((plan, inferred))) = (&mut focus, &snapshot, &planned) {
+        plan.remember(f.memory, snap, inferred, &schemes);
+    }
     // From here on an overloaded name is whichever candidate inference chose,
     // so nothing downstream has to know it was ever in question.
     for m in &mut typed {
@@ -780,7 +840,7 @@ fn compile_unit_inner(
     let hirs: Vec<&hir::LModule> = typed.iter().map(|m| &m.hir).collect();
     let own_compacting = exhaust::compacting_wrappers(&hirs, &mut compacting);
     let synonyms = exhaust::synonyms(&hirs, resolver.names());
-    for m in &typed {
+    for m in typed.iter().filter(|m| in_focus(&m.path)) {
         diags.extend(exhaust::check_module(
             &module_filename(&filename, m.source),
             &m.hir,
@@ -823,7 +883,7 @@ fn compile_unit_inner(
     lowerer.evidence = Some(&evidence);
     lowerer.traits = Some(&traits);
     let mut defs = Vec::new();
-    for m in &typed {
+    for m in typed.iter().filter(|m| in_focus(&m.path)) {
         lowerer.locations = opts.debug_info.then_some(m.source.id);
         let from = defs.len();
         defs.extend(lowerer.lower_module(&m.hir));
@@ -866,7 +926,17 @@ fn compile_unit_inner(
             variants: variants.clone(),
             origins: Default::default(),
         };
-        let imported: HashMap<VarId, Scheme> = dep_schemes.iter().cloned().collect();
+        let mut imported: HashMap<VarId, Scheme> = dep_schemes.iter().cloned().collect();
+        // Focused, what was lowered calls the rest of the unit as it would a
+        // dependency: by the types it was given.
+        if focused.is_some() {
+            let lowered: std::collections::HashSet<VarId> = defs.iter().map(|d| d.var).collect();
+            for (var, g) in &generalized {
+                if !lowered.contains(var) {
+                    imported.entry(*var).or_insert_with(|| g.scheme.clone());
+                }
+            }
+        }
         let problems = core::lint::check(&program, &variants, &imported);
         assert!(
             problems.is_empty(),
