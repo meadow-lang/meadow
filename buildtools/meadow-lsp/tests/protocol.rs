@@ -1110,8 +1110,20 @@ const MAIN: &str = "use Demo.Eval (eval)\ndef demo = eval 1 + 1\n";
 /// `eval` made a string, which breaks `Main`'s `+ 1`.
 const EVAL_BROKEN: &str = "@pub(pkg) fun eval n = \"n\"\n";
 
+/// `path` as an editor names it: on Windows `file:///C:/...`, without the
+/// `\\?\` that `canonicalize` puts in front. Spelled any other way, the server
+/// answers for a document of another name, and nothing waiting for this one
+/// ever hears of it.
 fn uri_of(path: &std::path::Path) -> String {
-    format!("file://{}", path.display())
+    let shown = path.display().to_string();
+    let plain = shown
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&shown)
+        .replace('\\', "/");
+    match plain.starts_with('/') {
+        true => format!("file://{plain}"),
+        false => format!("file:///{plain}"),
+    }
 }
 
 impl Client {
