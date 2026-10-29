@@ -54,6 +54,10 @@ beyond the last release is under _Unreleased_.
 
 ### Fixed
 
+- A function that performs two effects whose rows met in inference read
+  with its effect's tail as a record's -- `forall r. () -> () ! { Ask, Tell |
+  r }` -- in an editor's hover and wherever a type is shown, and was
+  quantified as one. It is `e`, as for any other effect.
 - `MEADOW_SILO_POISON` and `MEADOW_SILO_LEAKS` together counted every
   poisoned block as left behind at exit.
 - The language server answers for one file of a large package without

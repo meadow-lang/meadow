@@ -56,6 +56,24 @@ fn hover_shows_the_generalised_scheme_not_the_use_site() {
 }
 
 #[test]
+fn an_effect_row_two_effects_meet_in_ends_in_an_effect_variable() {
+    // Each effect's operation is open in the rest of its row, and where the
+    // two rows meet, unification grows one by the other's label. What is
+    // left of it is still an effect's tail, `e`, not a record's, `r`.
+    let src = "effect Ask { ask : Unit -> Int }
+               effect Tell { tell : Int -> Unit }
+               fun relay u = tell (ask ())
+               def demo = re@lay
+";
+    let (a, off) = at(src, "@");
+    let hover = a.hover_at(off).expect("hover");
+    assert!(
+        hover.contains("relay : forall a e. a -> () ! { Ask, Tell | e }"),
+        "got: {hover}"
+    );
+}
+
+#[test]
 fn hover_includes_the_doc_comment_above_the_definition() {
     let src = "\
 -- Doubles its argument.

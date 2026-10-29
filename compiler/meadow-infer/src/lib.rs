@@ -851,7 +851,12 @@ impl Arena {
                 let at = self.slot_level(id);
                 let saved = std::mem::replace(&mut self.level, at);
                 let field = self.fresh();
-                let new_rest = self.fresh_row();
+                // The rest is the same kind of row: an effect's tail stays an
+                // effect's, or it prints, and quantifies, as a record's.
+                let new_rest = match self.slot_kind(id) {
+                    VarKind::Effect => self.fresh_effect(),
+                    _ => self.fresh_row(),
+                };
                 self.level = saved;
                 // What is left of the row keeps the promise.
                 self.require_lacks(new_rest.clone(), &lacks)?;
