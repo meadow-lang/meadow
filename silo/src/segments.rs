@@ -429,6 +429,17 @@ pub fn discard(id: u32) {
     }
 }
 
+/// A segment of a thread that is over, its context going: never resumed, and
+/// not unwound -- what its frames held was in the thread's heap, which goes
+/// whole -- but its stack is given back.
+pub(crate) fn abandon(p: Parked) {
+    let mut segment = p.segment.0;
+    // Safety: nothing will resume it.
+    unsafe { segment.force_reset() };
+    LIVE.fetch_sub(1, Ordering::Relaxed);
+    drop(segment.into_stack());
+}
+
 /// A thread's own segment begins, on a stack whose base is `base`:
 /// operations and waits suspend through `y`.
 pub(crate) fn enter_thread(y: &Yielder<Down, Up>, base: usize) {
