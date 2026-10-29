@@ -754,6 +754,21 @@ fn a_nested_handler_takes_precedence_over_an_outer_one() {
     );
 }
 
+/// What a program does happens in the order it is written, on every engine
+/// and at every level -- the rule `docs/TUTORIAL.md` states under
+/// "Evaluation order". Each number is the order one construct's parts were
+/// evaluated in: `evaluation_order.mw` says which. Silo runs the same program
+/// (`compiler/meadow-llvm/tests/native.rs`), and MeadowBoot's CEK machine
+/// does too, as it does every case here.
+#[test]
+fn everything_is_evaluated_in_the_order_it_is_written() {
+    assert_eq!(agree(include_str!("evaluation_order.mw")), EVALUATION_ORDER);
+}
+
+/// What `evaluation_order.mw` answers.
+const EVALUATION_ORDER: &str = "(123, 123, 123, 12, 12, 123, 123, 12, 12, 123, 12, 12, 12, \
+     1234, 12, 1234, 123, 12, 12, 12, 122, 1234567, 12)";
+
 #[test]
 fn resuming_twice_is_refused_everywhere() {
     let prog = program(

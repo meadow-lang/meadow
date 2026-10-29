@@ -834,7 +834,33 @@ impl Lower {
                 Ty::Fun(_, ret, _) => *ret,
                 _ => return None,
             },
-            Term::Let(_, _, _, body) | Term::LetRec(_, body) => return self.type_of(body),
+            // What a `let` answers may be what it binds -- a call inlined,
+            // `(id f) x`, is the `let`s of its parameters around one of them
+            // -- and a name bound here is not one this knows yet: it is
+            // known once its `let` is lowered, and its type is asked for
+            // before then, by the application the `let` is the function of.
+            Term::Let(..) | Term::LetRec(..) => {
+                let mut bound: Vec<(Var, &Ty)> = Vec::new();
+                let mut at = t;
+                loop {
+                    match at {
+                        Term::Loc(_, inner) => at = inner,
+                        Term::Let(v, poly, _, body) => {
+                            bound.push((*v, &poly.ty));
+                            at = body;
+                        }
+                        Term::LetRec(binds, body) => {
+                            bound.extend(binds.iter().map(|(v, poly, _)| (*v, &poly.ty)));
+                            at = body;
+                        }
+                        Term::Var(w) => match bound.iter().rev().find(|(v, _)| v == w) {
+                            Some((_, ty)) => return Some((*ty).clone()),
+                            None => return self.type_of(at),
+                        },
+                        _ => return self.type_of(at),
+                    }
+                }
+            }
             Term::Join { ty, .. } | Term::Jump(_, _, ty) => ty.clone(),
             Term::If(_, then, _) => return self.type_of(then),
             Term::Tuple(items) => Ty::Tuple(

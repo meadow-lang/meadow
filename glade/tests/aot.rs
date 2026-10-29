@@ -235,6 +235,18 @@ fn everything_else_goes_through_the_interpreter() {
     assert_eq!(agrees("mixed", src), "(500500, 63, \"hi\", True)");
 }
 
+/// What a program does happens in the order it is written, compiled ahead of
+/// time as much as in the VM: the program `differential.rs` runs on every
+/// engine. See "Evaluation order" in `docs/TUTORIAL.md`.
+#[test]
+fn everything_is_evaluated_in_the_order_it_is_written() {
+    assert_eq!(
+        agrees("order", include_str!("evaluation_order.mw")),
+        "(123, 123, 123, 12, 12, 123, 123, 12, 12, 123, 12, 12, 12, \
+         1234, 12, 1234, 123, 12, 12, 12, 122, 1234567, 12)"
+    );
+}
+
 /// Objects that have been promoted are read, matched on and invoked by native
 /// code, not handed back to the interpreter -- and read *correctly*: the old
 /// generation is separate blocks, reached through a table that moves as blocks

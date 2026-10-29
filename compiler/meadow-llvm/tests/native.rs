@@ -447,6 +447,19 @@ fn nested_handlers_and_performing_outwards() {
     );
 }
 
+/// What a program does happens in the order it is written: the program every
+/// engine runs and must answer alike (`glade/tests/differential.rs`), whose
+/// numbers are the order each construct's parts were evaluated in. See
+/// "Evaluation order" in `docs/TUTORIAL.md`.
+#[test]
+fn everything_is_evaluated_in_the_order_it_is_written() {
+    let src = include_str!("../../../glade/tests/evaluation_order.mw");
+    let want = "(123, 123, 123, 12, 12, 123, 123, 12, 12, 123, 12, 12, 12, \
+                1234, 12, 1234, 123, 12, 12, 12, 122, 1234567, 12)";
+    assert_eq!(run("evaluation_order", src), want);
+    assert_eq!(run_o1("evaluation_order_o1", src), want);
+}
+
 // --- threads -----------------------------------------------------------------
 //
 #[test]
