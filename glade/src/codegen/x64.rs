@@ -159,6 +159,106 @@ impl Asm {
         }
     }
 
+    /// `dst op= src`, 64 bits, for an ALU `opcode` of the `r/m64, r64` form:
+    /// `0x01` add, `0x29` sub, `0x21` and, `0x39` cmp, `0x85` test.
+    fn alu_rr(&mut self, opcode: u8, dst: u8, src: u8) {
+        self.rex_w(src, dst);
+        self.bytes(&[opcode, 0xC0 | (src & 7) << 3 | (dst & 7)]);
+    }
+
+    /// `dst op= imm`, 64 bits, sign-extended from 32: `81 /ext` -- 0 add, 4
+    /// and, 5 sub, 7 cmp.
+    fn alu_ri(&mut self, ext: u8, dst: u8, imm: i32) {
+        self.rex_w(0, dst);
+        self.bytes(&[0x81, 0xC0 | ext << 3 | (dst & 7)]);
+        self.bytes(&imm.to_le_bytes());
+    }
+
+    /// The machine register `c` is in: its own if it is pinned, else `rcx`
+    /// with it put there.
+    fn operand_reg(&mut self, c: Operand) -> u8 {
+        match c {
+            Operand::Reg(r) => match self.pinned(r as u32) {
+                Some(m) => m,
+                None => {
+                    self.get(RCX, r as u32);
+                    RCX
+                }
+            },
+            Operand::Imm(n) => {
+                self.imm(RCX, n as u64);
+                RCX
+            }
+        }
+    }
+
+    /// `cmp reg, c`
+    fn cmp_reg(&mut self, reg: u8, c: Operand) {
+        match self.short_imm(c) {
+            Some(k) => self.alu_ri(7, reg, k),
+            None => {
+                let s = self.operand_reg(c);
+                self.alu_rr(0x39, reg, s);
+            }
+        }
+    }
+
+    /// `r[a] = r[b] op c` where `r[a]` is pinned, done in its own register --
+    /// `add r9, 1` rather than through `rax` and back -- or `false`, having
+    /// emitted nothing, where it cannot be: division, which wants `rax` and
+    /// `rdx`, and a `c` that is `r[a]` itself when `a` is not `b`.
+    fn int_in_place(&mut self, op: IntOp, a: Reg, b: Reg, c: Operand) -> bool {
+        let Some(d) = self.pinned(a as u32) else {
+            return false;
+        };
+        if matches!(op, IntOp::Div | IntOp::Rem)
+            || (a != b && matches!(c, Operand::Reg(r) if r == a))
+        {
+            return false;
+        }
+        if a != b {
+            self.get(d, b as u32);
+        }
+        match (op, self.short_imm(c)) {
+            (IntOp::Add, Some(k)) => self.alu_ri(0, d, k),
+            (IntOp::Sub, Some(k)) => self.alu_ri(5, d, k),
+            (IntOp::And, Some(k)) => self.alu_ri(4, d, k),
+            (IntOp::Mul, Some(k)) => {
+                self.rex_w(d, d);
+                self.bytes(&[0x69, 0xC0 | (d & 7) << 3 | (d & 7)]); // imul d, d, k
+                self.bytes(&k.to_le_bytes());
+            }
+            _ => {
+                let s = self.operand_reg(c);
+                match op {
+                    IntOp::Add => self.alu_rr(0x01, d, s),
+                    IntOp::Sub => self.alu_rr(0x29, d, s),
+                    IntOp::And => self.alu_rr(0x21, d, s),
+                    IntOp::Mul => {
+                        self.rex_w(d, s);
+                        self.bytes(&[0x0F, 0xAF, 0xC0 | (d & 7) << 3 | (s & 7)]); // imul d, s
+                    }
+                    // The count in `cl`; modulo 64, as `wrapping_shl` is.
+                    IntOp::Shl | IntOp::Shr | IntOp::Ushr => {
+                        self.mov_rr(RCX, s);
+                        let ext = match op {
+                            IntOp::Shl => 4,
+                            IntOp::Shr => 7,
+                            _ => 5,
+                        };
+                        self.rex_w(0, d);
+                        self.bytes(&[0xD3, 0xC0 | ext << 3 | (d & 7)]); // shl/sar/shr d, cl
+                    }
+                    IntOp::Div | IntOp::Rem => unreachable!("refused above"),
+                }
+            }
+        }
+        if !self.defer_live {
+            self.raise(a as u32 + 1);
+        }
+        true
+    }
+
     /// `rcx = c`
     fn operand(&mut self, c: Operand) {
         match c {
@@ -359,7 +459,21 @@ impl Asm {
         self.bytes(&[0x48, 0x89, 0xC6]); // mov rsi, rax
         self.bytes(&[0x48, 0xC1, 0xEE, 31]); // shr rsi, 31
         self.jcc(CC_NE, slow);
-        self.thin_where();
+        // The old generation, then, whose table is the second: what
+        // `thin_where` finds by the generation bit, known here.
+        {
+            use super::addr::*;
+            self.load(2, RBX, layout::TABLES + 8); // rdx = tables[1]
+            self.bytes(&[0x89, 0xC6]); // mov esi, eax
+            self.bytes(&[0xC1, 0xEE, BLOCK_SHIFT as u8]); // shr esi, 13
+            self.bytes(&[0x81, 0xE6]); // and esi, BLOCK_MASK
+            self.bytes(&(BLOCK_MASK as u32).to_le_bytes());
+            self.bytes(&[0x48, 0x8B, 0x14, 0xF2]); // mov rdx, [rdx + rsi*8]
+            self.bytes(&[0x89, 0xC6]); // mov esi, eax
+            self.bytes(&[0x81, 0xE6]); // and esi, SLOT_MASK
+            self.bytes(&(SLOT_MASK as u32).to_le_bytes());
+            self.bytes(&[0x48, 0x8D, 0x14, 0xF2]); // lea rdx, [rdx + rsi*8]
+        }
         self.bind(found);
         self.bytes(&[0x48, 0x8B, 0x32]); // mov rsi, [rdx]
         self.bytes(&[0x40, 0x0F, 0xB6, 0xCE]); // movzx ecx, sil
@@ -683,11 +797,37 @@ impl Emit for Asm {
     }
 
     fn mov(&mut self, a: Reg, b: Reg) {
-        self.get(RAX, b as u32);
-        self.store(a);
+        match (self.pinned(a as u32), self.pinned(b as u32)) {
+            (Some(d), _) => self.get(d, b as u32),
+            (None, Some(s)) => self.save(s, R12, Self::slot(a as u32)),
+            (None, None) => {
+                self.get(RAX, b as u32);
+                self.save(RAX, R12, Self::slot(a as u32));
+            }
+        }
+        if !self.defer_live {
+            self.raise(a as u32 + 1);
+        }
     }
 
     fn word(&mut self, a: Reg, w: u64) {
+        if let Some(d) = self.pinned(a as u32) {
+            match u32::try_from(w) {
+                Ok(w) if self.short => {
+                    // mov d32, w: zero-extended to the whole register.
+                    if d >= 8 {
+                        self.bytes(&[0x41]);
+                    }
+                    self.bytes(&[0xB8 + (d & 7)]);
+                    self.bytes(&w.to_le_bytes());
+                }
+                _ => self.imm(d, w),
+            }
+            if !self.defer_live {
+                self.raise(a as u32 + 1);
+            }
+            return;
+        }
         match u32::try_from(w) {
             Ok(w) if self.short => {
                 self.bytes(&[0xB8]); // mov eax, w
@@ -699,6 +839,9 @@ impl Emit for Asm {
     }
 
     fn int(&mut self, op: IntOp, a: Reg, b: Reg, c: Operand, zero: Label) {
+        if self.int_in_place(op, a, b, c) {
+            return;
+        }
         self.get(RAX, b as u32);
         match (op, self.short_imm(c)) {
             (IntOp::Add, Some(k)) => {
@@ -824,8 +967,13 @@ impl Emit for Asm {
     }
 
     fn cmp_int(&mut self, cond: Cond, a: Reg, b: Reg, c: Operand) {
-        self.get(RAX, b as u32);
-        self.cmp_rax(c);
+        match self.pinned(b as u32) {
+            Some(m) => self.cmp_reg(m, c),
+            None => {
+                self.get(RAX, b as u32);
+                self.cmp_rax(c);
+            }
+        }
         self.bytes(&[0x0F, 0x90 | Self::int_cc(cond), 0xC0]); // setcc al
         self.bytes(&[0x0F, 0xB6, 0xC0]); // movzx eax, al
         self.store(a);
@@ -840,8 +988,13 @@ impl Emit for Asm {
     }
 
     fn branch_int(&mut self, cond: Cond, x: Reg, y: Operand, to: Label) {
-        self.get(RAX, x as u32);
-        self.cmp_rax(y);
+        match self.pinned(x as u32) {
+            Some(m) => self.cmp_reg(m, y),
+            None => {
+                self.get(RAX, x as u32);
+                self.cmp_rax(y);
+            }
+        }
         self.jcc(Self::int_cc(cond) ^ 1, to);
     }
 
@@ -854,8 +1007,14 @@ impl Emit for Asm {
     }
 
     fn branch_zero(&mut self, x: Reg, to: Label) {
-        self.get(RAX, x as u32);
-        self.bytes(&[0x48, 0x85, 0xC0]); // test rax, rax
+        let m = match self.pinned(x as u32) {
+            Some(m) => m,
+            None => {
+                self.get(RAX, x as u32);
+                RAX
+            }
+        };
+        self.alu_rr(0x85, m, m); // test m, m
         self.jcc(CC_E, to);
     }
 
