@@ -472,6 +472,7 @@ pub fn build_native_of(
                 .flat_map(|d| d.as_nanos().to_le_bytes()),
         )
         .collect::<Vec<u8>>();
+    let collector = cycles()?;
     let keyed = inputs.map(|f| {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for b in f
@@ -479,6 +480,7 @@ pub fn build_native_of(
             .into_iter()
             .chain(opt.name().bytes())
             .chain(target.triple().bytes())
+            .chain(collector.name().bytes())
             .chain(linked_with.iter().copied())
             // How a program of Cut is lowered, where it is one.
             .chain(
@@ -517,8 +519,10 @@ pub fn build_native_of(
         exe
     };
     let stamp = exe.with_extension("stamp");
-    let units = meadow_llvm::compile_split(&lowered, meadow_llvm::UNIT, target.call_conv())
-        .map_err(|e| e.msg)?;
+    let units = meadow_llvm::with_cycles(collector, || {
+        meadow_llvm::compile_split(&lowered, meadow_llvm::UNIT, target.call_conv())
+    })
+    .map_err(|e| e.msg)?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
     // Unchanged module and runtime: the executable there is this one.
@@ -614,6 +618,19 @@ pub fn build_native_of(
 
 /// What says a unit's object is the one its text compiles to: the text, and
 /// how it was compiled.
+/// How a Silo program that can tie a knot finds its cycles: what
+/// `MEADOW_CYCLES` says -- `tracing`, the default, or `trial` -- which a
+/// profile's `cycles` sets when the environment does not. See `docs/SILO.md`,
+/// "Cycles".
+pub fn cycles() -> Result<meadow_llvm::Cycles, String> {
+    match std::env::var("MEADOW_CYCLES") {
+        Err(_) => Ok(meadow_llvm::Cycles::default()),
+        Ok(s) => meadow_llvm::Cycles::named(s.trim()).ok_or_else(|| {
+            format!("MEADOW_CYCLES is `{s}`: `tracing` or `trial`, for how Silo finds cycles")
+        }),
+    }
+}
+
 fn unit_print(text: &str, opt: meadow_compiler::OptLevel, target: Target) -> String {
     // Two hashes of the same bytes, differently seeded: 128 bits between an
     // object and being taken for another's.

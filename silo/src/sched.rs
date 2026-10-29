@@ -468,10 +468,11 @@ fn coroutine(size: usize, body: impl FnOnce() -> Word + 'static) -> SendSegment 
         DefaultStack::new(size)
             .unwrap_or_else(|e| crate::fail(&format!("could not make a thread's stack: {e}")))
     });
+    let base = corosensei::stack::Stack::base(&stack).get();
     SendSegment(Coroutine::with_stack(
         stack,
         move |y: &Yielder<Down, Up>, _: Down| {
-            segments::enter_thread(y);
+            segments::enter_thread(y, base);
             let v = body();
             segments::leave_thread();
             v
@@ -1205,6 +1206,7 @@ thread_local! {
 pub fn export_run(body: extern "C" fn(*mut std::ffi::c_void), env: *mut std::ffi::c_void) -> i32 {
     let c = cx();
     let depth = c.running.len();
+    let levels = c.levels.len();
     let shadow = crate::shadow::head();
     let in_txn = c.txn.is_some();
     let guarded = std::mem::replace(&mut c.guarded, true);
@@ -1218,14 +1220,15 @@ pub fn export_run(body: extern "C" fn(*mut std::ffi::c_void), env: *mut std::ffi
             })
         });
     let env = env as usize;
+    let base = corosensei::stack::Stack::base(&stack).get();
     let mut co: segments::Segment =
         Coroutine::with_stack(stack, move |y: &Yielder<Down, Up>, _: Down| {
-            segments::enter_thread(y);
+            segments::enter_thread(y, base);
             body(env as *mut std::ffi::c_void);
             segments::leave_thread();
             0
         });
-    let failed = match co.resume(Down::Start) {
+    let failed = match segments::resume(&mut co, Down::Start) {
         CoroutineResult::Return(_) => None,
         CoroutineResult::Yield(up) => {
             let why = match (up, cx().request.take()) {
@@ -1249,6 +1252,7 @@ pub fn export_run(body: extern "C" fn(*mut std::ffi::c_void), env: *mut std::ffi
     });
     let c = cx();
     c.running.truncate(depth);
+    c.levels.truncate(levels);
     c.guarded = guarded;
     if !in_txn {
         c.txn = None;

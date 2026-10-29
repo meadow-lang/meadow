@@ -13,6 +13,25 @@ beyond the last release is under _Unreleased_.
 
 ## Unreleased
 
+### Added
+
+- Silo finds a program's garbage cycles by concurrent tracing, unless the
+  build asks for trial deletion with `cycles = "trial"` in a
+  `[profile.<name>]` of `Meadow.toml` or `MEADOW_CYCLES=trial`. A trace of a
+  thread's heap takes its roots in one short pause, marks on a thread of its
+  own while the program runs, and sweeps a slice at a time, freeing every
+  cycle counting left -- including the ones trial deletion missed, whose
+  `Ref` was let go of while the cycle was still held, and without the long
+  pause trial deletion took over a large one. Counting still frees everything
+  else, and a program that cannot tie a knot carries neither collector.
+  `MEADOW_SILO_CYCLES` says what the traces did. `docs/SILO.md`, "Cycles", is
+  the design.
+
+### Fixed
+
+- `MEADOW_SILO_POISON` and `MEADOW_SILO_LEAKS` together counted every
+  poisoned block as left behind at exit.
+
 ### Breaking
 
 - The float operators `+.`, `-.`, `*.`, `/.`, `<.`, `>.`, `<=.` and `>=.`

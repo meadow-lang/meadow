@@ -96,6 +96,79 @@ fn what_a_thread_kept_in_a_ref_goes_when_the_thread_does() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Knots tied and let go of: what Silo's collector for cycles is there for.
+const KNOTS: &str = r#"data L = Nil | Node Int (Ref L)
+
+use L.*
+
+fun knot (n : Int) : () ! Mut =
+  let r = newRef Nil in
+  setRef r (Node n r)
+
+fun many (n : Int) : Int ! Mut = if n == 0 then 0 else let u = knot n in many (n - 1)
+
+fun main () = println (show (many 30000))
+"#;
+
+/// How a Silo program finds its cycles is chosen when it is built: tracing
+/// by default, trial deletion where a profile says `cycles = "trial"`, and
+/// whichever `MEADOW_CYCLES` names over both. Each collector says what it
+/// did under `MEADOW_SILO_CYCLES`, and only the one built in says anything.
+#[test]
+fn a_profile_or_the_environment_chooses_how_silo_finds_cycles() {
+    let dir = scratch("cycles-chosen");
+    let root = package(&dir, "cycles-chosen", KNOTS);
+    let run = |env: Option<&str>| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_meadow"));
+        cmd.current_dir(&root)
+            .env("MEADOW_SILO_CYCLES", "1")
+            .env("MEADOW_SILO_LEAKS", "1")
+            .env_remove("MEADOW_CYCLES")
+            .args(["run", "--offline", "--runtime", "silo", "."]);
+        if let Some(e) = env {
+            cmd.env("MEADOW_CYCLES", e);
+        }
+        let out = cmd.output().expect("the meadow binary runs");
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        let said = answer(&String::from_utf8_lossy(&out.stdout)).to_string();
+        (out.status.success(), said, err)
+    };
+    let traced = |err: &str| err.contains(" traces, ") || err.contains("no trace:");
+    let trial = |err: &str| err.contains("cycle collection");
+
+    let (ok, got, err) = run(None);
+    assert!(ok, "{err}");
+    assert_eq!(got, "0");
+    assert!(
+        traced(&err) && !trial(&err),
+        "the default is tracing: {err}"
+    );
+    assert!(err.contains("aot: 0 blocks live at exit"), "{err}");
+
+    std::fs::write(
+        root.join("Meadow.toml"),
+        "[package]\nname = \"CyclesChosen\"\n\n[profile.debug]\ncycles = \"trial\"\n",
+    )
+    .unwrap();
+    let (ok, got, err) = run(None);
+    assert!(ok, "{err}");
+    assert_eq!(got, "0");
+    assert!(
+        trial(&err) && !traced(&err),
+        "the profile asked for trial deletion: {err}"
+    );
+    assert!(err.contains("aot: 0 blocks live at exit"), "{err}");
+
+    let (ok, _, err) = run(Some("tracing"));
+    assert!(ok, "{err}");
+    assert!(traced(&err) && !trial(&err), "the environment wins: {err}");
+
+    let (ok, _, err) = run(Some("refcount"));
+    assert!(!ok, "a collector that is not one is refused");
+    assert!(err.contains("MEADOW_CYCLES"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A hundred `TVar`s, made and read and let go of on five threads, each
 /// holding a vector.
 const VARS_LET_GO: &str = r#"use Std.Stm as T

@@ -92,6 +92,15 @@ pub struct Ctx {
     pub regions: crate::region::Tallies,
     /// The segments running, innermost last: see `crate::segments`.
     pub running: Vec<*const ()>,
+    /// Where each of `running`'s stacks begins and where it last stopped, in
+    /// step with it: what a trace scans for roots (`crate::trace`).
+    pub(crate) levels: Vec<crate::trace::Level>,
+    /// The same for the OS thread's own stack, where a program that never
+    /// spawns runs until a `handle` starts a segment: from where it began.
+    pub(crate) os_level: Option<crate::trace::Level>,
+    /// The level of the segment that has just suspended, for the `drive`
+    /// frame it suspended to: see `crate::segments::suspend`.
+    pub(crate) stopped: Option<crate::trace::Level>,
     /// Suspended segments, by the number their stack objects hold, with the
     /// handler each was suspended for and the segments suspended inside it.
     pub(crate) suspended: Vec<Option<Suspended>>,
@@ -135,6 +144,9 @@ impl Ctx {
             heap: Heap::new(),
             regions: crate::region::Tallies::new(),
             running: Vec::new(),
+            levels: Vec::new(),
+            os_level: None,
+            stopped: None,
             suspended: Vec::new(),
             parked: Vec::new(),
             next_handler: 1,

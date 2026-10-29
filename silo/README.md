@@ -127,27 +127,35 @@ as they are finished.
 This is what keeps every operation constant work. No erase ever walks a
 structure, and no allocation ever waits for a whole structure to be walked.
 
-### Cycles, without tracing from roots
+### Cycles: traced by default, or trial deletion
 
-Counting misses a cycle, and the usual answer — a tracing collector as a
-backstop — is not available here: values live in native frames and registers
-with no map saying which slots hold references, so the roots cannot be
-enumerated. What works without roots is **trial deletion**, from Bacon and
-Rajan's _Concurrent Cycle Collection in Reference Counted Systems_ (ECOOP
-2001), and `silo/src/cycles.rs` is it.
+Counting misses a cycle, so a program that can tie a knot is built with a
+collector for what counting cannot free, and the build chooses which
+(`docs/SILO.md`, "Cycles", is the design):
 
-Take a block whose count went down without reaching zero — a cycle must
-contain one — and ask a local question: subtract the references that come from
-_inside_ the subgraph it reaches, and see whose count reaches zero. Those are
-reachable only from each other, which is what garbage means. Three passes do
-it: mark gray subtracting the inside edges, scan putting back everything an
-outside reference still holds, and collect what is left white.
+- **Concurrent tracing**, the default (`silo/src/trace.rs`): a mark-and-sweep
+  of one green thread's heap. The roots are taken in one short pause at an
+  allocation from compiled code -- the native stacks scanned conservatively,
+  which needs no stack maps because counting never moves a block -- then a
+  thread of its own marks while the program runs, a barrier at every
+  overwrite keeping the trace right, and the program sweeps a slice at a
+  time. It frees every garbage cycle, however large and however it became
+  garbage.
+- **Trial deletion**, with `cycles = "trial"` in a profile or
+  `MEADOW_CYCLES=trial` (`silo/src/cycles.rs`), from Bacon and Rajan's
+  _Concurrent Cycle Collection in Reference Counted Systems_ (ECOOP 2001):
+  take a block whose count went down without reaching zero and ask a local
+  question -- subtract the references from _inside_ the subgraph it reaches,
+  and see whose count reaches zero. No thread and no barrier; but it only
+  asks of a `Ref` or a mutable array it has seen let go of, so a cycle that
+  becomes garbage when something else is let go of is missed, and a large
+  cycle is one long pause.
 
-**A program that cannot tie a knot has none of it.** A cycle needs a store
-into a block that already exists, which in Meadow is `setRef` or a write into
-a mutable array, and it must store a _reference_: the compiler looks for that,
-and a program without one is emitted with no candidate buffering in its
-counting helpers and no collector in its runtime.
+**A program that cannot tie a knot has neither.** A cycle needs a store into a
+block that already exists, which in Meadow is `setRef` or a write into a
+mutable array, and it must store a _reference_: the compiler looks for that,
+and a program without one is emitted with no barrier, no candidate buffering
+in its counting helpers, and no collector in its runtime.
 
 **Pauses are bounded, not amortized away.** A run looks at 64 buffered
 candidates and walks at most 6,000 blocks; past that the mark pass stops and
@@ -204,6 +212,7 @@ carry no maps saying which slots hold references.
 | module                | what it is                                                                     |
 | --------------------- | ------------------------------------------------------------------------------ |
 | `heap.rs`             | blocks, `share`/`erase`/`acquire`/`clean`, size classes, the pending list      |
+| `trace.rs`            | concurrent tracing: the roots, the marker thread, the barrier, the sweep       |
 | `cycles.rs`           | trial deletion, the candidate buffer, and what bounds a pause                  |
 | `ctx.rs`              | one green thread's state: its heap, segments, literals, spill area             |
 | `prims.rs`            | the primitives the emitted code does not do inline                             |
@@ -281,5 +290,6 @@ other and the program does not link, which is the check working.
 | `MEADOW_THREADS`     | how many OS threads run green threads (`meadow run -j N`) |
 | `MEADOW_SILO_LEAKS`  | report blocks still held at exit (`meadow run --leaks`)   |
 | `MEADOW_SILO_PRIMS`  | count the primitives a run called, and report them        |
-| `MEADOW_SILO_CYCLES` | the cycle collector's runs, what they freed, and pauses   |
+| `MEADOW_SILO_CYCLES` | the cycle collector's runs or traces, what they freed, and pauses |
+| `MEADOW_CYCLES`      | at build time: `tracing` (the default) or `trial`         |
 | `MEADOW_CLANG`       | the clang to compile and link with                        |
