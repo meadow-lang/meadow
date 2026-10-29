@@ -241,6 +241,7 @@ pub fn find_package(
     let built = dependencies(&root, &graph);
     Some(Ok(meadow_lsp::analysis::PackageSources {
         name: pkg.name,
+        root: root.clone(),
         modules,
         deps: built.deps.clone(),
         procs: Some(built.procs.clone()),

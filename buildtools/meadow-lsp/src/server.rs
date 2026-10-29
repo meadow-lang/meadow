@@ -5,7 +5,9 @@
 //! and a cancellation protocol would be more machinery than the problem needs.
 //! `Std` is compiled once at startup, which is the only slow part.
 
-use crate::analysis::{Analysis, HintPart, Loc, PackageLoader, PathKind, Std};
+use crate::analysis::{
+    Analysis, HintPart, Loc, PackageLoader, PackageSources, PathKind, Reuse, Std,
+};
 use crate::pos::LineIndex;
 use crate::tokens;
 use lsp_server::{Connection, ExtractError, Message, Request, RequestId, Response};
@@ -119,6 +121,8 @@ pub fn serve(
         docs: HashMap::new(),
         indexes: HashMap::new(),
         load_package,
+        memory: Default::default(),
+        stale: Default::default(),
     };
     // Two threads. This one analyses, which for a package with macros to
     // expand is seconds of work for each change; the other reads what the
@@ -322,6 +326,15 @@ struct Server {
     indexes: HashMap<u32, LineIndex>,
     /// How to find the package a document belongs to, when it belongs to one.
     load_package: Option<PackageLoader>,
+    /// Per package, by its root: what compiling it has found so far, so that
+    /// a change to one module infers that module rather than the package --
+    /// see `meadow_compiler::focus` -- and what it depended on then, since
+    /// none of it holds once that changes.
+    memory: std::cell::RefCell<HashMap<std::path::PathBuf, (u64, meadow_compiler::focus::Memory)>>,
+    /// Open documents a change elsewhere may have changed the meaning of,
+    /// oldest first. Analysed again when nothing else is waiting: a sibling
+    /// of the file being typed in can wait, the file itself cannot.
+    stale: std::collections::VecDeque<Uri>,
 }
 
 impl Server {
@@ -335,6 +348,13 @@ impl Server {
         let mut stopping = false;
         loop {
             waiting.extend(inbox.try_iter());
+            if waiting.is_empty()
+                && let Some(uri) = self.stale.pop_front()
+            {
+                let uris = self.reanalyse(uri);
+                self.publish_all(c, uris)?;
+                continue;
+            }
             let msg = match waiting.pop_front() {
                 Some(msg) => msg,
                 None => match inbox.recv() {
@@ -374,21 +394,43 @@ impl Server {
                 }
                 Message::Notification(note) if note.method == Exit::METHOD => return Ok(()),
                 Message::Notification(note) => {
-                    for uri in self.notification(note) {
-                        let diagnostics = self.publish(&uri);
-                        c.sender
-                            .send(Message::Notification(lsp_server::Notification {
-                                method: PublishDiagnostics::METHOD.to_string(),
-                                params: serde_json::to_value(PublishDiagnosticsParams {
-                                    uri,
-                                    diagnostics,
-                                    version: None,
-                                })?,
-                            }))?;
-                    }
+                    let uris = self.notification(note);
+                    self.publish_all(c, uris)?;
                 }
                 Message::Response(_) => {}
             }
+        }
+    }
+
+    /// Send the diagnostics of each of `uris`.
+    fn publish_all(
+        &self,
+        c: &Connection,
+        uris: Vec<Uri>,
+    ) -> Result<(), Box<dyn Error + Sync + Send>> {
+        for uri in uris {
+            let diagnostics = self.publish(&uri);
+            c.sender
+                .send(Message::Notification(lsp_server::Notification {
+                    method: PublishDiagnostics::METHOD.to_string(),
+                    params: serde_json::to_value(PublishDiagnosticsParams {
+                        uri,
+                        diagnostics,
+                        version: None,
+                    })?,
+                }))?;
+        }
+        Ok(())
+    }
+
+    /// Analyse the open document `uri` again, as it stands in the editor.
+    fn reanalyse(&mut self, uri: Uri) -> Vec<Uri> {
+        match self.docs.get(&uri) {
+            Some(doc) => {
+                let text = doc.text.clone();
+                self.set(uri, text)
+            }
+            None => Vec::new(),
         }
     }
 
@@ -399,8 +441,7 @@ impl Server {
                 let Ok(p) = serde_json::from_value::<DidOpenTextDocumentParams>(note.params) else {
                     return Vec::new();
                 };
-                self.set(p.text_document.uri.clone(), p.text_document.text);
-                vec![p.text_document.uri]
+                self.set(p.text_document.uri, p.text_document.text)
             }
             DidChangeTextDocument::METHOD => {
                 let Ok(p) = serde_json::from_value::<DidChangeTextDocumentParams>(note.params)
@@ -411,8 +452,11 @@ impl Server {
                 let Some(change) = p.content_changes.into_iter().last() else {
                     return Vec::new();
                 };
-                self.set(p.text_document.uri.clone(), change.text);
-                vec![p.text_document.uri]
+                let uri = p.text_document.uri;
+                let uris = self.set(uri.clone(), change.text);
+                // What this file declares, its siblings may use.
+                self.mark_siblings(&uri);
+                uris
             }
             DidCloseTextDocument::METHOD => {
                 if let Ok(p) = serde_json::from_value::<DidCloseTextDocumentParams>(note.params) {
@@ -423,38 +467,64 @@ impl Server {
             // A file changed on disk: a sibling module, a manifest, or the
             // lockfile a build wrote having fetched what the editor could
             // not. Any of them can change what an open document means, so
-            // every one is analysed again, as it stands in the editor.
+            // every one is analysed again, as it stands in the editor -- once
+            // nothing else is waiting.
+            //
+            // Except a save: an open document written to disk as the editor
+            // holds it says nothing the editor has not already said, and with
+            // autosave on, there is one every time typing pauses.
             DidChangeWatchedFiles::METHOD => {
-                let open: Vec<(Uri, String)> = self
-                    .docs
-                    .iter()
-                    .map(|(uri, doc)| (uri.clone(), doc.text.clone()))
-                    .collect();
-                open.into_iter()
-                    .map(|(uri, text)| {
-                        self.set(uri.clone(), text);
-                        uri
-                    })
-                    .collect()
+                let Ok(p) = serde_json::from_value::<DidChangeWatchedFilesParams>(note.params)
+                else {
+                    return Vec::new();
+                };
+                let news = p.changes.iter().any(|change| {
+                    let Some(doc) = self.docs.get(&change.uri) else {
+                        return true;
+                    };
+                    let on_disk =
+                        uri_to_path(&change.uri).and_then(|f| std::fs::read_to_string(f).ok());
+                    on_disk.as_deref() != Some(doc.text.as_str())
+                });
+                if news {
+                    let mut open: Vec<Uri> = self.docs.keys().cloned().collect();
+                    open.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+                    for uri in open {
+                        self.mark_stale(uri);
+                    }
+                }
+                Vec::new()
             }
             _ => Vec::new(),
         }
     }
 
-    fn set(&mut self, uri: Uri, text: String) {
+    /// Take `text` as the document at `uri`, and analyse it. Returns every
+    /// document analysed: more than the one when its package was compiled
+    /// whole, which answers for all of its open documents at once.
+    fn set(&mut self, uri: Uri, text: String) -> Vec<Uri> {
+        self.stale.retain(|u| *u != uri);
         // A file that *is* a `Std` module is analysed in its own place. Analysed
         // the ordinary way it would declare every one of its own types a second
         // time — once here, once in the `Std` it depends on — and the editor
         // would fill with `already defined`.
-        let analysis = match self.std.module_at(uri.as_str()) {
-            Some(i) => self.std.analyse_module(i, &text),
-            // A file inside a package is analysed as part of it, so that a
-            // `use` of a sibling module resolves. Everything else — a scratch
-            // file, a document with no package around it — stands alone.
-            None => self
-                .in_package(&uri, &text)
-                .unwrap_or_else(|| self.std.analyse(&text)),
-        };
+        if let Some(i) = self.std.module_at(uri.as_str()) {
+            let analysis = self.std.analyse_module(i, &text);
+            self.put(uri.clone(), text, analysis);
+            return vec![uri];
+        }
+        // A file inside a package is analysed as part of it, so that a `use`
+        // of a sibling module resolves. Everything else — a scratch file, a
+        // document with no package around it — stands alone.
+        if let Some(done) = self.in_package(&uri, &text) {
+            return done;
+        }
+        let analysis = self.std.analyse(&text);
+        self.put(uri.clone(), text, analysis);
+        vec![uri]
+    }
+
+    fn put(&mut self, uri: Uri, text: String, analysis: Analysis) {
         let index = LineIndex::new(&text);
         self.docs.insert(
             uri,
@@ -466,15 +536,72 @@ impl Server {
         );
     }
 
-    /// Analyse `text` as the module of its package that it is, if it is one.
-    fn in_package(&self, uri: &Uri, text: &str) -> Option<Analysis> {
+    fn mark_stale(&mut self, uri: Uri) {
+        if !self.stale.contains(&uri) {
+            self.stale.push_back(uri);
+        }
+    }
+
+    /// Mark the other open documents of `uri`'s package stale.
+    fn mark_siblings(&mut self, uri: &Uri) {
+        let Some(root) = self.package_root(uri) else {
+            return;
+        };
+        let mut siblings: Vec<Uri> = self
+            .docs
+            .keys()
+            .filter(|u| *u != uri && self.package_root(u).as_ref() == Some(&root))
+            .cloned()
+            .collect();
+        siblings.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        for u in siblings {
+            self.mark_stale(u);
+        }
+    }
+
+    /// The root of the package whose memory holds `uri`'s module, if one does.
+    fn package_root(&self, uri: &Uri) -> Option<std::path::PathBuf> {
+        let path = uri_to_path(uri)?;
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        self.memory
+            .borrow()
+            .keys()
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .cloned()
+    }
+
+    /// Analyse `text` as the module of its package that it is, if it is one,
+    /// and keep the analysis. Returns the documents analysed, or `None` for
+    /// a document in no package.
+    fn in_package(&mut self, uri: &Uri, text: &str) -> Option<Vec<Uri>> {
+        let analysed = self.package_analyses(uri, text)?;
+        let mut done = Vec::new();
+        for (u, t, a) in analysed {
+            self.stale.retain(|s| *s != u);
+            self.put(u.clone(), t, a);
+            done.push(u);
+        }
+        Some(done)
+    }
+
+    /// `text` analysed as the module of its package that `uri` is, with
+    /// whatever else that compile answered for: the other open documents of
+    /// the package, the first time it is compiled. `None` for a document in
+    /// no package.
+    ///
+    /// The first time a package is seen it is compiled whole, and that one
+    /// compile answers for every one of its documents that is open. After
+    /// that, a document's module is inferred on its own, with what the
+    /// package's memory has for the rest: see `meadow_compiler::focus`.
+    fn package_analyses(&self, uri: &Uri, text: &str) -> Option<Vec<(Uri, String, Analysis)>> {
         let load = self.load_package?;
         let path = uri_to_path(uri)?;
         // The same spelling the loader uses, or the open document will not
         // match the module it is.
         let path = std::fs::canonicalize(&path).unwrap_or(path);
-        match load(&path)? {
-            Ok(sources) => self.std.analyse_package(&sources, &path, text),
+        let sources = match load(&path)? {
+            Ok(sources) => sources,
             // In a package, but one that cannot be loaded. Analyse the file on
             // its own so it keeps what colouring and hover it can, and put the
             // reason first: otherwise every `use` of a sibling fails, and those
@@ -490,9 +617,52 @@ impl Server {
                         extra_labels: vec![],
                     },
                 );
-                Some(a)
+                return Some(vec![(uri.clone(), text.to_string(), a)]);
             }
+        };
+        // The package's other open documents, as their editors hold them.
+        let mut others: Vec<(Uri, std::path::PathBuf, String)> = self
+            .docs
+            .iter()
+            .filter(|(u, _)| *u != uri)
+            .filter_map(|(u, doc)| {
+                let p = uri_to_path(u)?;
+                let p = std::fs::canonicalize(&p).unwrap_or(p);
+                sources
+                    .modules
+                    .iter()
+                    .any(|m| m.file == p)
+                    .then(|| (u.clone(), p, doc.text.clone()))
+            })
+            .collect();
+        others.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+
+        let identity = dependencies_identity(&sources);
+        let mut memories = self.memory.borrow_mut();
+        let (had, memory) = memories
+            .entry(sources.root.clone())
+            .or_insert_with(|| (identity, Default::default()));
+        if *had != identity {
+            *had = identity;
+            memory.clear();
         }
+        let mut docs: Vec<(&std::path::Path, &str)> = vec![(path.as_path(), text)];
+        docs.extend(others.iter().map(|(_, p, t)| (p.as_path(), t.as_str())));
+        let reuse = if memory.is_empty() {
+            Reuse::Remember(memory)
+        } else {
+            Reuse::Focus(memory)
+        };
+        let analyses = self.std.analyse_documents(&sources, &docs, reuse);
+
+        let mut texts = vec![(uri.clone(), text.to_string())];
+        texts.extend(others.into_iter().map(|(u, _, t)| (u, t)));
+        let done: Vec<(Uri, String, Analysis)> = texts
+            .into_iter()
+            .zip(analyses)
+            .filter_map(|((u, t), a)| Some((u, t, a?)))
+            .collect();
+        (!done.is_empty()).then_some(done)
     }
 
     fn publish(&self, uri: &Uri) -> Vec<Diagnostic> {
@@ -582,7 +752,9 @@ impl Server {
         match self.std.module_at(uri.as_str()) {
             Some(i) => self.std.analyse_module(i, text),
             None => self
-                .in_package(uri, text)
+                .package_analyses(uri, text)
+                .and_then(|done| done.into_iter().next())
+                .map(|(_, _, a)| a)
                 .unwrap_or_else(|| self.std.analyse(text)),
         }
     }
@@ -1126,6 +1298,22 @@ fn symbol_kind(kind: meadow_find::Kind) -> SymbolKind {
 /// `file:///C:/x` and strips to `/C:/x` — which is not a path Windows can open,
 /// and every lookup built on it silently finds nothing rather than failing.
 /// That is [`path_to_uri`] read backwards, and the two have to agree.
+/// Which compiled dependencies `sources` was loaded with: the same until one
+/// of them is built again, which is when everything remembered of the
+/// package stops holding.
+fn dependencies_identity(sources: &PackageSources) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    for (alias, dep) in &sources.deps {
+        alias.hash(&mut h);
+        (std::rc::Rc::as_ptr(dep) as usize).hash(&mut h);
+    }
+    if let Some(procs) = &sources.procs {
+        (std::rc::Rc::as_ptr(procs) as *const () as usize).hash(&mut h);
+    }
+    h.finish()
+}
+
 fn uri_to_path(uri: &Uri) -> Option<std::path::PathBuf> {
     let s = uri.as_str().strip_prefix("file://")?;
     // Percent-decoding, on bytes rather than characters: an editor escapes a
