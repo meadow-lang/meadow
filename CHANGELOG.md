@@ -23,6 +23,13 @@ beyond the last release is under _Unreleased_.
   the float primitives (`_primAddF x y`), since there `+` is the integers'
   primitive.
 
+### Fixed
+
+- In an editor, a declaration a procedural derive is written for is not a
+  link to itself from its keyword: what `@derive(Lexer)` wrote spanned the
+  whole declaration, so `data` went to the type, and a rename of the type
+  would have written over all of it. Only names are links now.
+
 ## 0.4.0 - 2026-10-24
 
 Meadow on phones: Silo builds a program, or a library an app loads, for
@@ -98,7 +105,7 @@ is doing.
   runtime's TLS is rustls, so nothing has to be installed where a program
   runs.
 - `Std.Http`, HTTP/1.1 in the standard library. A server: `serve host port
-  handler`, a `handler : Request -> Response ! Eff` answering each request on
+handler`, a `handler : Request -> Response ! Eff` answering each request on
   a thread of the connection's own, with keep-alive, chunked bodies and
   `serveTls` for HTTPS; `serveOn` and `serveOne` for a listener of the
   program's own. A client: `get`, `post` and `request`, over `http://` or
@@ -226,7 +233,7 @@ scripts.
   `build` asks the back end for.
 - Property tests and fuzzing in the standard library. `Std.Test.Property`
   checks a property on a hundred values a generator makes -- `forAll gen
-  prop`, or `check` where the property draws for itself -- and fails with the
+prop`, or `check` where the property draws for itself -- and fails with the
   smallest case it found. A generator is a function that draws numbers
   (`between`, `bool`, `vector`, `element`, `oneOf`, `maybe`, `char`, `text`),
   so one of your own is any function that calls them, and it shrinks as they
