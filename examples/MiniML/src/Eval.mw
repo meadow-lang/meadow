@@ -39,17 +39,17 @@ use Std.Exn (raise, toResult)
 fun lookupCell env name =
   match L.lookupAssoc name env with
   | Just cell -> cell
-  | None -> raise (S.concat "unbound at run time: " name)
+  | None -> raise "unbound at run time: ${name}"
 
 fun asInt v =
   match v with
   | Value.Int n -> n
-  | other -> raise (S.concat "expected a number, got " (showValue other))
+  | other -> raise "expected a number, got ${showValue other}"
 
 fun asBool v =
   match v with
   | Value.Bool b -> b
-  | other -> raise (S.concat "expected a boolean, got " (showValue other))
+  | other -> raise "expected a boolean, got ${showValue other}"
 
 fun applyOp op l r =
   if op == "+" then Value.Int (asInt l + asInt r)
@@ -62,7 +62,7 @@ fun applyOp op l r =
   else if op == ">" then Value.Bool (asInt l > asInt r)
   else if op == "<=" then Value.Bool (asInt l <= asInt r)
   else if op == ">=" then Value.Bool (asInt l >= asInt r)
-  else raise (S.concat "unknown operator: " op)
+  else raise "unknown operator: ${op}"
 
 fun eval env e =
   match e with
@@ -75,7 +75,7 @@ fun eval env e =
       let av = eval env a in
       (match fv with
        | Value.Closure param body closed -> eval ((param, newRef av) :: closed) body
-       | other -> raise (S.concat "not a function: " (showValue other)))
+       | other -> raise "not a function: ${showValue other}")
   | Expr.Let name rhs body -> eval ((name, newRef (eval env rhs)) :: env) body
   | Expr.LetRec name param rhs body ->
       -- Tie the knot: a cell first, then the closure that captures the

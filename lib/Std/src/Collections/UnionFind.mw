@@ -1,0 +1,375 @@
+-- Std.Collections.UnionFind: disjoint sets, for code inside a `runSt`.
+--
+--   use Std.St as St
+--   use Std.Collections.UnionFind as UF
+--
+--   fun islands n edges =
+--     runSt (\() ->
+--       let uf = UF.make n () in
+--       let _ = V.forEach (\e -> let _ = UF.union (fst e) (snd e) uf in ()) edges in
+--       UF.count uf)
+--
+-- A union-find keeps a set of elements split into groups, and answers two
+-- questions fast: which group is this element in (`find`), and join these two
+-- groups into one (`union`). It is what Kruskal's spanning tree, connected
+-- components, and type inference by unification are built on.
+--
+-- Elements are numbers, handed out in order: `make n x` makes `0` to `n - 1`,
+-- and each `add` answers the next one. Each group is named by one of its own
+-- elements, its representative, which is what `find` answers; two elements are
+-- in the same group exactly when `find` gives them the same representative.
+-- Which element a group is named by can change when it is joined to another,
+-- so a representative is worth comparing, not keeping.
+--
+-- Every group also holds a value of the caller's: `value` reads it and
+-- `setValue` replaces it, and `unionWith` says what the joined group holds.
+-- Unification keeps what a type variable has been solved to there; a plain
+-- partition holds `()` and never looks.
+--
+-- Underneath it is a forest, one tree per group, each element pointing at its
+-- parent and the representative at itself. Two things keep the trees flat,
+-- and together they make any sequence of operations take time that is, for
+-- any input there will ever be, linear in its length: `union` hangs the
+-- smaller tree under the larger (union by size), so no tree is deeper than
+-- the logarithm of its size; and `find` points every element it passes
+-- straight at the representative (path compression), so the next `find` from
+-- any of them is one step.
+--
+-- That is mutation, which is why this lives in a `runSt`, like a
+-- `Std.Collections.HashTable`: a `find` that only reads is a `find` that
+-- walks the same path every time. What leaves the `runSt` is what was read
+-- out -- a count, a representative, `groups` -- never the structure.
+--
+-- An element must be one this structure made: a number below `size` that is
+-- not negative. Nothing checks, and another number answers nonsense.
+
+use Std.St as St
+use Std.Collections.Vector as V
+use Std.Collections.Vector (vecFromArray)
+
+-- The parent of each element, the size of each tree (read only at a
+-- representative), and each group's value (likewise); then how many elements
+-- there are and how many groups. The arrays have room to spare, so they are in
+-- cells: growing replaces them.
+use UnionFind.*
+@pub data UnionFind s a
+  = Forest
+    (StRef s (StArray s Int))
+    (StRef s (StArray s Int))
+    (StRef s (StArray s a))
+    (StRef s Int)
+    (StRef s Int)
+
+-- A union-find with no elements yet.
+@pub fun new () : UnionFind a b ! { St a | e } =
+  Forest
+    (St.newRef (St.newArray 0 0))
+    (St.newRef (St.newArray 0 0))
+    (St.newRef (St.thaw #[]))
+    (St.newRef 0)
+    (St.newRef 0)
+
+-- The elements `0` to `n - 1`, each in a group of its own holding `x`.
+@pub fun make (n : Int) (x : a) : UnionFind b a ! { St b | e } =
+  let parents = St.newArray n 0 in
+  let _ = St.forRange 0 n (\i -> St.set parents i i) in
+  Forest
+    (St.newRef parents)
+    (St.newRef (St.newArray n 1))
+    (St.newRef (St.newArray n x))
+    (St.newRef n)
+    (St.newRef n)
+
+-- A new element, in a group of its own holding `x`. It is the number `size`
+-- was before.
+@pub fun add (x : a) (uf : UnionFind b a) : Int ! { St b | e } =
+  match uf with
+  | Forest parentsRef sizesRef valuesRef n groupCount ->
+      let i = St.getRef n in
+      let _ = if i < St.length (St.getRef parentsRef) then () else grow x uf in
+      let _ = St.set (St.getRef parentsRef) i i in
+      let _ = St.set (St.getRef sizesRef) i 1 in
+      let _ = St.set (St.getRef valuesRef) i x in
+      let _ = St.setRef n (i + 1) in
+      let _ = St.setRef groupCount (St.getRef groupCount + 1) in
+      i
+
+-- Twice the room, or eight to start with. `x` fills the new values' slots
+-- until `add` writes them: an `StArray` has to be made holding something.
+fun grow x uf =
+  match uf with
+  | Forest parentsRef sizesRef valuesRef n groupCount ->
+      let cap = St.length (St.getRef parentsRef) in
+      let newCap = if cap < 4 then 8 else cap * 2 in
+      let _ = St.setRef parentsRef (copied (St.getRef parentsRef) newCap 0) in
+      let _ = St.setRef sizesRef (copied (St.getRef sizesRef) newCap 0) in
+      St.setRef valuesRef (copied (St.getRef valuesRef) newCap x)
+
+fun copied old newCap fill =
+  let fresh = St.newArray newCap fill in
+  let _ = St.forRange 0 (St.length old) (\i -> St.set fresh i (St.get old i)) in
+  fresh
+
+-- How many elements there are.
+@pub fun size (uf : UnionFind a b) : Int ! { St a | e } =
+  match uf with
+  | Forest parentsRef sizesRef valuesRef n groupCount -> St.getRef n
+
+-- How many groups there are: `size` to begin with, one fewer for each `union`
+-- that joined two.
+@pub fun count (uf : UnionFind a b) : Int ! { St a | e } =
+  match uf with
+  | Forest parentsRef sizesRef valuesRef n groupCount -> St.getRef groupCount
+
+-- --- finding -----------------------------------------------------------------
+
+-- The representative of `i`'s group. Every element on the way there is left
+-- pointing straight at it.
+@pub fun find (i : Int) (uf : UnionFind a b) : Int ! { St a | e } =
+  match uf with
+  | Forest parentsRef sizesRef valuesRef n groupCount -> root (St.getRef parentsRef) i
+
+-- Recursion is safe here: union by size keeps every path shorter than the
+-- logarithm of the number of elements, before compression shortens it.
+fun root parents i =
+  let p = St.get parents i in
+  if p == i then i
+  else
+    let r = root parents p in
+    let _ = St.set parents i r in
+    r
+
+-- Whether `i` and `j` are in the same group.
+@pub fun same (i : Int) (j : Int) (uf : UnionFind a b) : Bool ! { St a | e } =
+  find i uf == find j uf
+
+-- How many elements are in `i`'s group, `i` among them.
+@pub fun sizeOf (i : Int) (uf : UnionFind a b) : Int ! { St a | e } =
+  match uf with
+  | Forest parentsRef sizesRef valuesRef n groupCount -> St.get (St.getRef sizesRef) (find i uf)
+
+-- What `i`'s group holds.
+@pub fun value (i : Int) (uf : UnionFind a b) : b ! { St a | e } =
+  match uf with
+  | Forest parentsRef sizesRef valuesRef n groupCount -> St.get (St.getRef valuesRef) (find i uf)
+
+-- Make `i`'s group hold `x`.
+@pub fun setValue (i : Int) (x : a) (uf : UnionFind b a) : () ! { St b | e } =
+  match uf with
+  | Forest parentsRef sizesRef valuesRef n groupCount -> St.set (St.getRef valuesRef) (find i uf) x
+
+-- --- joining -----------------------------------------------------------------
+
+-- Join `i`'s group and `j`'s, and answer whether they were two: `False`, and
+-- nothing changes, if they were already one. The joined group holds what
+-- `i`'s held.
+@pub fun union (i : Int) (j : Int) (uf : UnionFind a b) : Bool ! { St a | e } =
+  unionWith (\x y -> x) i j uf
+
+-- `union`, where the joined group holds `f` of what `i`'s group held and what
+-- `j`'s did. `f` is not called if they were already one.
+@pub fun unionWith (f : a -> a -> a ! { St b | e }) (i : Int) (j : Int) (uf : UnionFind b a)
+    : Bool ! { St b | e } =
+  match uf with
+  | Forest parentsRef sizesRef valuesRef n groupCount ->
+      let ri = find i uf in
+      let rj = find j uf in
+      if ri == rj then False
+      else
+        let parents = St.getRef parentsRef in
+        let sizes = St.getRef sizesRef in
+        let values = St.getRef valuesRef in
+        let joined = f (St.get values ri) (St.get values rj) in
+        -- The smaller tree goes under the larger, so no path grows unless the
+        -- group it is in at least doubles. On a tie, `i`'s stays on top.
+        let (top, under) = if St.get sizes ri < St.get sizes rj then (rj, ri) else (ri, rj) in
+        let _ = St.set parents under top in
+        let _ = St.set sizes top (St.get sizes ri + St.get sizes rj) in
+        let _ = St.set values top joined in
+        let _ = St.setRef groupCount (St.getRef groupCount - 1) in
+        True
+
+-- --- whole structures --------------------------------------------------------
+
+-- Every group, as its elements in increasing order, and the groups in order of
+-- their smallest elements.
+@pub fun groups (uf : UnionFind a b) : [[Int]] ! { St a | e } =
+  let n = size uf in
+  let slot = St.newArray n (0 - 1) in
+  let out = St.newRef V.empty in
+  let _ =
+    St.forRange 0 n (\i ->
+      let r = find i uf in
+      let k = St.get slot r in
+      if k >= 0 then St.modifyRef out (\gs -> V.updateAt gs k (\g -> V.pushBack g i))
+      else
+        let _ = St.set slot r (V.length (St.getRef out)) in
+        St.modifyRef out (\gs -> V.pushBack gs [i]))
+  in St.getRef out
+
+-- --- tests -------------------------------------------------------------------
+
+use Std.Test (assertEq, assertTrue, assertFalse)
+
+-- How many steps `i` is from its representative, without compressing
+-- anything: the measure of what `find` is meant to keep short.
+fun depth i uf =
+  match uf with
+  | Forest parentsRef sizesRef valuesRef n groupCount -> steps (St.getRef parentsRef) i 0
+
+fun steps parents i acc =
+  let p = St.get parents i in
+  if p == i then acc else steps parents p (acc + 1)
+
+-- The parent of `i`, exactly as it is stored.
+fun parentOf i uf =
+  match uf with
+  | Forest parentsRef sizesRef valuesRef n groupCount -> St.get (St.getRef parentsRef) i
+
+@test fun eachElementStartsAlone () =
+  runSt (\() ->
+    let uf = make 5 () in
+    let a = assertEq (size uf) 5 "five elements" in
+    let b = assertEq (count uf) 5 "in five groups" in
+    let c = assertEq (V.map (\i -> find i uf) (V.range 0 5)) [0, 1, 2, 3, 4] "each its own" in
+    let d = assertFalse (same 0 1 uf) "none together" in
+    assertEq (sizeOf 3 uf) 1 "of one each")
+
+@test fun anEmptyOneHasNothing () =
+  runSt (\() ->
+    let uf = new () in
+    let a = assertEq (size uf) 0 "no elements" in
+    let b = assertEq (count uf) 0 "no groups" in
+    let c = assertEq (groups uf) [] "nothing to list" in
+    let none = make 0 "x" in
+    assertEq (count none) 0 "made with none")
+
+@test fun unionJoinsAndSameSees () =
+  runSt (\() ->
+    let uf = make 6 () in
+    let a = assertTrue (union 0 1 uf) "0 and 1 were apart" in
+    let b = assertTrue (union 2 3 uf) "2 and 3 were apart" in
+    let c = assertTrue (union 1 3 uf) "so were their groups" in
+    let d = assertTrue (same 0 2 uf) "0 reaches 2 through 1 and 3" in
+    let e = assertFalse (same 0 4 uf) "but not 4" in
+    let f = assertEq (count uf) 3 "{0 1 2 3}, {4}, {5}" in
+    let g = assertEq (sizeOf 2 uf) 4 "four in 2's group" in
+    assertEq (groups uf) [[0, 1, 2, 3], [4], [5]] "the groups")
+
+@test fun aSecondUnionChangesNothing () =
+  runSt (\() ->
+    let uf = make 3 () in
+    let a = assertTrue (union 0 1 uf) "joined" in
+    let b = assertFalse (union 1 0 uf) "already one" in
+    let c = assertFalse (union 0 0 uf) "an element and itself" in
+    let d = assertEq (count uf) 2 "still two groups" in
+    assertEq (sizeOf 0 uf) 2 "and still two in it")
+
+@test fun addHandsOutTheNextNumbers () =
+  runSt (\() ->
+    let uf = new () in
+    -- Enough to grow the arrays several times over.
+    let ids = V.map (\i -> add (i * 10) uf) (V.range 0 100) in
+    let a = assertEq ids (V.range 0 100) "0, 1, 2, ... in order" in
+    let b = assertEq (count uf) 100 "each alone" in
+    let c = assertEq (value 42 uf) 420 "holding what it was added with" in
+    let _ = St.forRange 1 100 (\i -> union 0 i uf) in
+    let d = assertEq (count uf) 1 "joined into one" in
+    let more = add 7 uf in
+    let e = assertEq more 100 "the next after that" in
+    assertFalse (same 0 more uf) "and alone")
+
+@test fun valuesFollowTheirGroups () =
+  runSt (\() ->
+    let uf = new () in
+    let a = add 1 uf in
+    let b = add 10 uf in
+    let c = add 100 uf in
+    let _ = unionWith (\x y -> x + y) a b uf in
+    let x = assertEq (value a uf) 11 "joined with f" in
+    let y = assertEq (value b uf) 11 "the same group, the same value" in
+    let _ = setValue b 5 uf in
+    let z = assertEq (value a uf) 5 "set through the other element" in
+    let _ = union c a uf in
+    let w = assertEq (value b uf) 100 "union keeps the first's" in
+    let called = St.newRef 0 in
+    let _ = unionWith (\p q -> let _ = St.modifyRef called (\k -> k + 1) in p) a c uf in
+    assertEq (St.getRef called) 0 "f is not called on one group")
+
+@test fun findCompressesThePath () =
+  runSt (\() ->
+    -- Joining equal-sized trees, the first on top, grows a tree one level per
+    -- doubling: pairs, then pairs of pairs, and so on, leave 0 at the bottom
+    -- of 0 -> 1 -> 3 -> 7 -> 15.
+    let uf = make 16 () in
+    let _ = St.forRange 0 8 (\i -> union (2 * i + 1) (2 * i) uf) in
+    let _ = St.forRange 0 4 (\i -> union (4 * i + 3) (4 * i + 1) uf) in
+    let _ = St.forRange 0 2 (\i -> union (8 * i + 7) (8 * i + 3) uf) in
+    let _ = union 15 7 uf in
+    let a = assertEq (depth 0 uf) 4 "0 is four steps down" in
+    let r = find 0 uf in
+    let b = assertEq r 15 "the representative" in
+    let c = assertEq (depth 0 uf) 1 "and now one" in
+    let d = assertEq (parentOf 1 uf) 15 "so is everything it passed" in
+    let e = assertEq (parentOf 3 uf) 15 "all the way up" in
+    assertEq (parentOf 7 uf) 15 "which was already one step")
+
+@test fun unionBySizeKeepsTreesShallow () =
+  runSt (\() ->
+    -- Each new element joined to the group so far, the new one first. Were
+    -- the first always put on top, that would make one path as long as the
+    -- group; union by size puts the larger group on top instead, so every
+    -- element stays one step from the representative.
+    let n = 1000 in
+    let uf = make n () in
+    let _ = St.forRange 1 n (\i -> union i (i - 1) uf) in
+    let deepest = St.newRef 0 in
+    let _ =
+      St.forRange 0 n (\i ->
+        St.modifyRef deepest (\d -> let k = depth i uf in if k > d then k else d))
+    in
+    let a = assertTrue (St.getRef deepest <= 1) "never more than one step" in
+    assertEq (sizeOf 0 uf) n "all in one")
+
+@test fun manyElementsAgreeWithANaiveModel () =
+  runSt (\() ->
+    -- The same unions on a union-find and on a plain array of labels, where a
+    -- union relabels every element of one group. They must agree on `same`
+    -- for every pair, and on the count, after every step.
+    let n = 200 in
+    let uf = make n () in
+    let label = St.newArray n 0 in
+    let _ = St.forRange 0 n (\i -> St.set label i i) in
+    let groupsLeft = St.newRef n in
+    let wrong = St.newRef 0 in
+    let _ =
+      St.forRange 0 600 (\k ->
+        let i = (k * 37 + 11) % n in
+        let j = (k * k * 13 + 5) % n in
+        let li = St.get label i in
+        let lj = St.get label j in
+        let joined = union i j uf in
+        let _ =
+          if li == lj then ()
+          else
+            let _ = St.modifyRef groupsLeft (\g -> g - 1) in
+            St.forRange 0 n (\x -> if St.get label x == lj then St.set label x li else ())
+        in
+        let _ = if joined == (li != lj) then () else St.modifyRef wrong (\w -> w + 1) in
+        if count uf == St.getRef groupsLeft then () else St.modifyRef wrong (\w -> w + 1))
+    in
+    let _ =
+      St.forRange 0 n (\i ->
+        St.forRange 0 n (\j ->
+          if same i j uf == (St.get label i == St.get label j) then ()
+          else St.modifyRef wrong (\w -> w + 1)))
+    in assertEq (St.getRef wrong) 0 "no disagreement")
+
+@test fun connectedComponents () =
+  let comps =
+    runSt (\() ->
+      let uf = make 8 () in
+      let edges = [(0, 1), (1, 2), (3, 4), (5, 6), (6, 7), (7, 5)] in
+      let _ = V.forEach (\e -> match e with | (a, b) -> let _ = union a b uf in ()) edges in
+      groups uf)
+  in assertEq comps [[0, 1, 2], [3, 4], [5, 6, 7]] "three components"

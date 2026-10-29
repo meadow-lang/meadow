@@ -96,6 +96,10 @@ pub const MODULES: &[(&str, &str)] = &[
         "Collections.HashTable",
         include_str!("../../../lib/Std/src/Collections/HashTable.mw"),
     ),
+    (
+        "Collections.UnionFind",
+        include_str!("../../../lib/Std/src/Collections/UnionFind.mw"),
+    ),
     ("Compact", include_str!("../../../lib/Std/src/Compact.mw")),
     ("Thread", include_str!("../../../lib/Std/src/Thread.mw")),
     ("Stm", include_str!("../../../lib/Std/src/Stm.mw")),

@@ -22,21 +22,23 @@
   | If Expr Expr Expr
   | Bin String Expr Expr
 
--- A type. `Ty.Var` is a *mutable cell*, which is what makes this Algorithm J
--- rather than Algorithm W: unification writes the answer into the variable
+-- A type. `Ty.Var` is a type variable, by its number in the union-find that
+-- inference keeps, which is what makes this Algorithm J rather than
+-- Algorithm W: unification writes the answer into the variable's group
 -- instead of building a substitution to apply later.
-@pub(pkg) data Ty = Int | Bool | Fun Ty Ty | Var (Ref Tv)
+@pub(pkg) data Ty = Int | Bool | Fun Ty Ty | Var Int
 
--- What a type variable currently knows about itself.
+-- What a group of type variables, unified together, knows about itself.
 --
--- `Unbound id level` -- not yet solved. The `level` is the `let`-nesting depth
+-- `Unbound level` -- not yet solved. The `level` is the `let`-nesting depth
 -- at which it was created, and it is how generalization stays cheap: a variable
 -- may be quantified exactly when its level is deeper than the binding being
 -- generalized, which is checkable without scanning the environment.
 --
--- `Link t` -- solved, and every reader follows the link.
-@pub(pkg) data Tv = Unbound Int Int | Link Ty
+-- `Bound t` -- solved, to `t`, which is never a variable itself: two variables
+-- unified are one group, not one bound to the other.
+@pub(pkg) data Tv = Unbound Int | Bound Ty
 
--- A type scheme: `forall ids. ty`. The ids are the `Unbound` ids that were
--- generalized; `instantiate` swaps each for a fresh variable.
+-- A type scheme: `forall ids. ty`. The ids are the unsolved variables that
+-- were generalized; `instantiate` swaps each for a fresh variable.
 @pub(pkg) data Scheme = Forall (Vector Int) Ty

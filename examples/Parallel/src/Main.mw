@@ -23,7 +23,6 @@ use Std.Time (timed, nanosToMillis, formatDuration)
 use Std.Collections.Vector as V
 use Std.Collections.HashMap as H
 use Std.Compact as C
-use Std.String as S
 use Std.Num.Int as I
 
 -- --- counting primes ---------------------------------------------------------
@@ -70,32 +69,24 @@ fun sumAt table (from : Int) (to : Int) =
 
 -- --- main --------------------------------------------------------------------
 
-fun report label ns = println (S.concatAll [label, formatDuration (nanosToMillis ns)])
+fun report label ns = println "${label}${formatDuration (nanosToMillis ns)}"
 
 fun main () =
   let limit = toInt 400000 in
-  let _ = println (S.concatAll ["== primes below ", S.fromInt limit]) in
+  let _ = println "== primes below ${limit}" in
   let (one, oneNs) = timed (\() -> countPrimes 0 limit) in
-  let _ = report (S.concatAll ["one thread:     ", S.fromInt one, " primes, "]) oneNs in
+  let _ = report "one thread:     ${one} primes, " oneNs in
   let (many, manyNs) = timed (\() -> countPrimesInParallel 0 limit 32) in
-  let _ = report (S.concatAll ["32 chunks:      ", S.fromInt many, " primes, "]) manyNs in
+  let _ = report "32 chunks:      ${many} primes, " manyNs in
 
   let _ = println "== eight threads reading one compacted table" in
   let table = C.make (primeTable 200000) in
   let size = H.size (C.get table) in
-  let _ =
-    println
-      (S.concatAll [
-         S.fromInt size,
-         " primes in a region of ",
-         S.fromInt (C.size table / 1024),
-         " KiB"
-       ])
-  in
+  let _ = println "${size} primes in a region of ${C.size table / 1024} KiB" in
   let pieces = chunks 1 (size + 1) 8 in
   let sums = Thread.parMap (\c -> match c with | (a, b) -> sumAt (C.get table) a b) pieces in
   let total = V.foldl (\a b -> a + b) 0 sums in
-  println (S.concatAll ["sum of every prime below 200000: ", S.fromInt total])
+  println "sum of every prime below 200000: ${total}"
 
 -- --- tests -------------------------------------------------------------------
 

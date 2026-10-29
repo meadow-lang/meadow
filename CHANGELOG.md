@@ -36,6 +36,14 @@ beyond the last release is under _Unreleased_.
   the float primitives (`_primAddF x y`), since there `+` is the integers'
   primitive.
 
+### Added
+
+- `Std.Collections.UnionFind`: disjoint sets inside a `runSt`, with union
+  by size and path compression. `make`, `add`, `find`, `union`, `same`,
+  `count` and `groups`, and a value per group that `unionWith` merges, which
+  is what unification wants; the MiniML example's type checker is built on
+  it.
+
 ## 0.4.0 - 2026-10-24
 
 Meadow on phones: Silo builds a program, or a library an app loads, for

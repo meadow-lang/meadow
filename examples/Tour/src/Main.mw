@@ -12,7 +12,7 @@
 --   generic code that works on any of them;
 -- * sequences and maps;
 -- * local mutation that does not leak, with `runSt`;
--- * strings, and `++`.
+-- * strings, with `${…}` holes for what goes in them.
 
 mod Shapes
 
@@ -56,30 +56,25 @@ fun wordCounts (text : String) : H.HashMap String Int =
 fun main () =
   let _ = println "== shapes: data types, records, matching" in
   let shapes = [Circle 1.0, Rect 2.0 3.0, Rect 2.0 2.0, Triangle 3.0 4.0 5.0, Rect 0.0 4.0] in
-  let _ = V.forEach (\s -> println (describe s ++ " with area " ++ show (area s))) shapes in
-  let _ = println ("degenerate: " ++ show (V.filter (\d -> d != None) (V.map degenerate shapes))) in
+  let _ = V.forEach (\s -> println "${describe s} with area ${area s:?}") shapes in
+  let _ = println "degenerate: ${V.filter (\d -> d != None) (V.map degenerate shapes):?}" in
   let _ =
     println
-      ("distance from (0, 0) to (3, 4): "
-         ++ show (distance { x = 0.0, y = 0.0 } { x = 3.0, y = 4.0 }))
+      "distance from (0, 0) to (3, 4): ${distance { x = 0.0, y = 0.0 } { x = 3.0, y = 4.0 }:?}"
   in
 
   let _ = println "== numbers" in
-  let _ = println ("factorial 30 as an Int, wrapping: " ++ show (factorial 30)) in
-  let _ = println ("factorial 30 as a BigInt, exact: " ++ show (factorial (toBigInt 30))) in
-  let _ = println ("200 + 100 as a UInt8: " ++ show (toUInt8 200 + 100)) in
-  let _ = println ("a third as a Float32 and a Float: " ++ show (toFloat32 1.0 / 3.0, 1.0 / 3.0)) in
+  let _ = println "factorial 30 as an Int, wrapping: ${factorial 30}" in
+  let _ = println "factorial 30 as a BigInt, exact: ${factorial (toBigInt 30)}" in
+  let _ = println "200 + 100 as a UInt8: ${toUInt8 200 + 100}" in
+  let _ = println "a third as a Float32 and a Float: ${(toFloat32 1.0 / 3.0, 1.0 / 3.0):?}" in
 
   let _ = println "== local mutation" in
-  let _ = println ("primes below 50: " ++ show (primesBelow 50)) in
+  let _ = println "primes below 50: ${primesBelow 50:?}" in
 
   let _ = println "== sequences and maps" in
   let counts = wordCounts "the cat and the hat and the bat" in
-  println
-    ("\"the\" appears "
-       ++ show (H.getOr 0 "the" counts)
-       ++ " times, \"cat\" "
-       ++ show (H.getOr 0 "cat" counts))
+  println "\"the\" appears ${H.getOr 0 "the" counts} times, \"cat\" ${H.getOr 0 "cat" counts}"
 
 -- --- tests -------------------------------------------------------------------
 

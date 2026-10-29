@@ -15,7 +15,6 @@
 -- threads ever share anything that can change, and nothing here needs a lock.
 
 use Std.Thread as Thread
-use Std.String as S
 use Std.Collections.Vector as V
 use Std.Maybe.Maybe.*
 
@@ -61,11 +60,11 @@ fun longest answers =
 
 fun describeLongest answers =
   match longest answers with
-  | (n, steps) -> S.concatAll ["longest: ", S.fromInt n, " takes ", S.fromInt steps, " steps"]
+  | (n, steps) -> "longest: ${n} takes ${steps} steps"
 
 fun describeFib t =
   match t with
-  | (n, task) -> S.concatAll ["fib ", S.fromInt n, " = ", S.fromInt (Thread.await task)]
+  | (n, task) -> "fib ${n} = ${Thread.await task}"
 
 -- --- a pipeline --------------------------------------------------------------
 
@@ -102,7 +101,7 @@ fun fib (n : Int) = if n < 2 then n else fib (n - 1) + fib (n - 2)
 fun main () =
   let _ = println "== a worker pool of 4, over 1..10000" in
   let answers = pool 4 (V.range 1 10001) in
-  let _ = println (S.concatAll ["answered ", S.fromInt (V.len answers), " jobs"]) in
+  let _ = println "answered ${V.len answers} jobs" in
   let _ = println (describeLongest answers) in
 
   let _ = println "== a pipeline: square, add one, halve" in
