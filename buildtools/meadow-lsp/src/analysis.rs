@@ -1083,6 +1083,21 @@ impl Analysis {
     /// and go-to-definition, which are asked about a place, and its
     /// diagnostics; it loses the lenses and hints, which are put on places
     /// unasked.
+    ///
+    /// And the references the macro wrote rather than passed on. Those span
+    /// the whole call -- for a `@derive`, the whole declaration, keyword and
+    /// all -- so every character of it went to whatever they named, and an
+    /// editor offered a link on `data`; a rename would have written the new
+    /// name over all of it. What was written in the file keeps its own span,
+    /// which is a name and nothing more.
+    /// Whether `span` of this document is a name as written: one word, as
+    /// against the whole of a macro call that something it wrote stands at.
+    fn is_a_name(&self, span: Span) -> bool {
+        self.source
+            .get(span.start as usize..span.end as usize)
+            .is_some_and(|t| !t.is_empty() && !t.contains(char::is_whitespace))
+    }
+
     fn leave_out_expansions(&mut self, calls: &[Span]) {
         if calls.is_empty() {
             return;
@@ -1092,6 +1107,20 @@ impl Analysis {
         let inside = |at: u32| calls.iter().any(|c| c.start <= at && at <= c.end);
         self.functions.retain(|f| !inside(f.span.start));
         self.binders.retain(|h| !inside(h.offset));
+        let keep: Vec<bool> = self
+            .refs
+            .iter()
+            .map(|(s, _)| !inside(s.start) || self.is_a_name(*s))
+            .collect();
+        let mut keep = keep.into_iter();
+        self.refs.retain(|_| keep.next().unwrap_or(true));
+        let keep: Vec<bool> = self
+            .name_refs
+            .iter()
+            .map(|(s, _, _)| !inside(s.start) || self.is_a_name(*s))
+            .collect();
+        let mut keep = keep.into_iter();
+        self.name_refs.retain(|_| keep.next().unwrap_or(true));
     }
 }
 
@@ -2024,10 +2053,12 @@ impl Analysis {
             .min_by_key(|(s, v)| (s.end - s.start, !self.defs.contains_key(v)))
             .map(|(_, v)| *v)
             .or_else(|| {
-                // Standing on the definition itself counts as referring to it.
+                // Standing on the definition itself counts as referring to it
+                // -- on its name. One a macro wrote stands at the whole call,
+                // and is somewhere to go, not something to stand on.
                 self.defs
                     .iter()
-                    .filter(|(_, l)| covers(l.span, offset))
+                    .filter(|(_, l)| covers(l.span, offset) && self.is_a_name(l.span))
                     .min_by_key(|(_, l)| l.span.end - l.span.start)
                     .map(|(v, _)| *v)
             })
