@@ -745,19 +745,37 @@ fn repl(input: &str) -> String {
 fn the_repl_shows_a_definition_in_each_ir() {
     let defined = "fun sumTo (m : Int) : Int = let rec go n acc = if n == 0 then acc else go (n - 1) (acc + n) in go m 0\n";
     let all = repl(&format!("{defined}:ir sumTo\n:q\n"));
-    let at = |what: &str| {
-        all.find(what)
-            .unwrap_or_else(|| panic!("no `{what}` in:\n{all}"))
-    };
-    // In the order a program passes through them.
-    assert!(at("-- core") < at("-- cut") && at("-- cut") < at("-- axcut"));
+    // With no terminal to open the viewer on, its pages are printed, each
+    // under its title, in the order a program passes through them.
+    let titles: Vec<String> = ir_pages(&all).into_iter().map(|(t, _)| t).collect();
+    let mut expected = vec!["Core", "Cut", "AxCut", "Bytecode"];
+    if cfg!(target_arch = "x86_64") {
+        expected.push("Machine code (x86-64)");
+    } else if cfg!(target_arch = "aarch64") {
+        expected.push("Machine code (AArch64)");
+    }
+    expected.push("LLVM IR");
+    assert_eq!(titles, expected, "{all}");
+    // A page is the definition's own, its local function's included, and
+    // not the rest of the program.
+    for (title, text) in ir_pages(&all) {
+        match title.as_str() {
+            "AxCut" => {
+                assert!(text.contains("-- sumTo (L"), "{text}");
+                assert!(text.contains("-- sumToLocal"), "the loop: {text}");
+            }
+            "Bytecode" => assert!(text.starts_with("; sumTo"), "{text}"),
+            "LLVM IR" => {
+                assert!(text.contains("@mw.L.repl_1.sumTo.1("), "{text}");
+                assert!(!text.contains("define i32 @main"), "{text}");
+            }
+            _ => {}
+        }
+    }
     // One of them, asked for by name, with no heading: the definition's
     // value, and the definition its local function is lifted to.
     let cut = repl(&format!("{defined}:ir cut sumTo\n:q\n"));
-    assert!(
-        !cut.contains("-- cut") && !cut.contains("-- axcut"),
-        "{cut}"
-    );
+    assert!(!cut.contains("==="), "{cut}");
     let from = cut.find("val meadow:").expect("the definition's value");
     let text = format!("cut 0\n\n{}", &cut[from..]);
     let read = meadow_cut::parse(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
@@ -765,4 +783,108 @@ fn the_repl_shows_a_definition_in_each_ir() {
     assert_eq!(read.defs.len(), 1, "the local function, at the top: {text}");
     // And something not defined is said to be.
     assert!(repl(":ir nope\n:q\n").contains("nothing called `nope` is defined"));
+}
+
+/// The pages `:ir` printed, by their titles.
+fn ir_pages(out: &str) -> Vec<(String, String)> {
+    let mut pages: Vec<(String, String)> = Vec::new();
+    for line in out.lines() {
+        if let Some(title) = line
+            .strip_prefix("=== ")
+            .and_then(|l| l.strip_suffix(" ==="))
+        {
+            pages.push((title.to_string(), String::new()));
+        } else if let Some((_, text)) = pages.last_mut() {
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    pages
+}
+
+#[test]
+fn the_repl_shows_the_last_entry_in_each_ir_each_coloured_for_it() {
+    use meadow::viewer::{Class, Notation};
+    assert!(
+        repl(":ir\n:q\n").contains("nothing to show yet"),
+        "before any entry"
+    );
+    // An expression, then something with no code of its own: `:ir` is the
+    // expression's still.
+    let all = repl("1 + 2\ndata Pair = Pair Int Int\n:ir\n:q\n");
+    let pages = ir_pages(&all);
+    assert!(pages.len() >= 5, "{all}");
+    for (title, text) in &pages {
+        let notation = match title.as_str() {
+            "Core" => Notation::Core,
+            "Cut" => Notation::Cut,
+            "AxCut" => Notation::AxCut,
+            "Bytecode" => Notation::Bytecode,
+            "LLVM IR" => Notation::Llvm,
+            t if t.starts_with("Machine code") => Notation::Asm,
+            t => panic!("a page called {t}"),
+        };
+        // Every byte of every line is in a piece, and what the pieces are
+        // says what each IR is made of.
+        let mut found: Vec<(Class, String)> = Vec::new();
+        for line in text.lines() {
+            let mut at = 0;
+            for (class, range) in notation.pieces(line) {
+                assert_eq!(range.start, at, "{title}: {line}");
+                at = range.end;
+                found.push((class, line[range].to_string()));
+            }
+            assert_eq!(at, line.len(), "{title}: {line}");
+        }
+        let has = |class: Class, piece: &str| {
+            found
+                .iter()
+                .any(|(c, s)| *c == class && s.starts_with(piece))
+        };
+        let expect: &[(Class, &str)] = match notation {
+            Notation::Core => &[(Class::Type, "@Int"), (Class::Number, "1")],
+            Notation::Cut => &[
+                (Class::Keyword, "val"),
+                (Class::Global, "meadow:"),
+                (Class::Type, "i64"),
+                (Class::Keyword, "halt"),
+            ],
+            Notation::AxCut => &[
+                (Class::Comment, "-- it"),
+                (Class::Keyword, "extern"),
+                (Class::Keyword, "invoke"),
+            ],
+            Notation::Bytecode => &[
+                (Class::Comment, "; it"),
+                (Class::Address, ""),
+                (Class::Keyword, ""),
+                (Class::Local, "r"),
+            ],
+            Notation::Asm => &[
+                (Class::Global, "fn_pc"),
+                (Class::Address, ""),
+                (Class::Keyword, ""),
+            ],
+            Notation::Llvm => &[
+                (Class::Keyword, "define"),
+                (Class::Global, "@mw.L."),
+                (Class::Local, "%a0"),
+                (Class::Type, "i64"),
+                (Class::Label, "entry:"),
+            ],
+            Notation::Text => &[],
+        };
+        for (class, piece) in expect {
+            assert!(
+                has(*class, piece),
+                "{title}: no {class:?} `{piece}` in {found:?}"
+            );
+        }
+    }
+    // One IR of the last entry, printed as it is.
+    let llvm = repl("1 + 2\n:ir llvm\n:q\n");
+    assert!(llvm.contains("define ") && !llvm.contains("==="), "{llvm}");
+    // A name that is an IR's is the definition's when one has it.
+    let named = repl("def cut = 5\n:ir cut\n:q\n");
+    assert!(named.contains("=== Core ==="), "{named}");
 }

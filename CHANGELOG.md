@@ -51,6 +51,18 @@ beyond the last release is under _Unreleased_.
   else, and a program that cannot tie a knot carries neither collector.
   `MEADOW_SILO_CYCLES` says what the traces did. `docs/SILO.md`, "Cycles", is
   the design.
+- The REPL's `:ir` opens a full-screen viewer of the last entry -- or, with
+  a name, of a definition -- with a page for each form the compiler puts it
+  in, in the order a program passes through them: core, Cut, AxCut, Glade's
+  bytecode, the machine code Glade's JIT makes of it, and the LLVM IR a Silo
+  build compiles. Each page is the entry's own part of the program, its
+  local functions and continuations included, coloured for its IR. `Tab` and
+  `Shift-Tab` turn the page; the arrows, `j`/`k`, `PgUp`/`PgDn` and
+  `Home`/`End` scroll, a long line sideways rather than wrapped; `q` or `Esc`
+  gives the prompt back as it was. With no terminal to draw on, the pages
+  are printed one after another under their titles, and `:ir <which>
+  <name>` -- `core`, `cut`, `axcut`, `bytecode`, `native` or `llvm` -- still
+  prints one as it is, for a script to read.
 
 ### Fixed
 

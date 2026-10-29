@@ -24,6 +24,7 @@ pub mod format;
 pub mod git;
 pub mod incremental;
 pub mod init;
+pub mod ir;
 pub mod linker;
 pub mod listing;
 pub mod lock;
@@ -40,6 +41,7 @@ pub mod stdlib;
 pub mod test;
 pub mod tour;
 pub mod update;
+pub mod viewer;
 pub mod workspace;
 
 pub use meadow_compiler::{OptLevel, Options, Strictness};

@@ -17,7 +17,7 @@
 use itertools::Either;
 use meadow::runtime;
 use meadow::tour;
-use meadow::{complete, finder, stdlib};
+use meadow::{complete, finder, ir, stdlib, viewer};
 use meadow_compiler::{
     AstModule, CompiledPackage, Options, ast, compile_unit, core, diagnostics, hir,
     intern::InternedString,
@@ -840,12 +840,14 @@ const COMMANDS: &[(&str, &str)] = &[
         "list what is defined, and what a later definition shadowed",
     ),
     (
-        ":ir <name>",
-        "a definition in each of the compiler's IRs: core, Cut and AxCut",
+        ":ir",
+        "the last entry in every IR the compiler puts it in, a page each; Tab turns the page",
     ),
+    (":ir <name>", "a definition, the same way"),
     (
         ":ir <which> <name>",
-        "in one of them: `core`, `cut` or `axcut`",
+        "one of them, printed as it is: core, cut, axcut, bytecode, native or llvm \
+         (with no name, the last entry's)",
     ),
     (":reset", "forget everything defined so far"),
     (
@@ -986,6 +988,10 @@ pub struct Session {
     /// The `use`s that names chosen with `Ctrl-F` need, to run ahead of the
     /// line they were chosen for.
     needs: Arc<Mutex<Vec<String>>>,
+    /// The last entry that defined or evaluated something, as it was typed,
+    /// and which of the prefix's packages it was compiled to: what `:ir`
+    /// shows when it is not given a name.
+    last: Option<(String, usize)>,
 }
 
 /// What every entry's program is built from, kept between entries: the
@@ -1047,6 +1053,7 @@ impl Session {
             finder: Arc::default(),
             std_decls,
             needs: Arc::default(),
+            last: None,
         }
     }
 
@@ -1259,6 +1266,7 @@ impl Session {
                             self.cache = self.std_cache.clone();
                             self.line = self.std_len as u32;
                             self.uses.clear();
+                            self.last = None;
                             println!("(reset)");
                         }
                         ":module" => self.list_module(),
@@ -1347,9 +1355,7 @@ impl Session {
                             self.handle(trimmed[5..].trim(), Mode::Run, true);
                         }
                         _ if trimmed.starts_with(":ir ") => self.show_ir(trimmed[3..].trim()),
-                        ":ir" => println!(
-                            "(:ir <name>, or :ir core|cut|axcut <name>: the name of something defined)"
-                        ),
+                        ":ir" => self.show_ir(""),
                         _ if trimmed.starts_with(":t ") || trimmed.starts_with(":t\n") => {
                             self.handle(trimmed[2..].trim(), Mode::TypeOnly, false);
                         }
@@ -1586,6 +1592,11 @@ impl Session {
         }
 
         if mode == Mode::Run && !had_error {
+            // An entry with code of its own is what `:ir` shows next; a `use`
+            // or a type has none.
+            if !compiled.defs.is_empty() {
+                self.last = Some((input.to_string(), self.prefix.len()));
+            }
             // Thread this entry into later lines (including redefinitions of `it`).
             self.prefix.push(compiled);
             self.line += 1;
@@ -1614,64 +1625,73 @@ impl Session {
             .find(|d| &*d.name == name || hir::spell_name(&d.name) == name)
     }
 
-    /// `:ir name`, or `:ir which name`: the definition in each of the
-    /// compiler's IRs, in the order a program passes through them, or in the
-    /// one asked for.
+    /// `:ir`, `:ir name` or `:ir which name`: the last entry, or the
+    /// definition called `name`, in each of the compiler's IRs, a page for
+    /// each in the order a program passes through them -- or in the one
+    /// asked for, printed as it is, which is what a script wants.
+    ///
+    /// The pages are shown in a viewer that takes the screen until it is
+    /// closed, so that a long IR can be read and set beside the others; with
+    /// no terminal to draw on, they are printed one after another.
     fn show_ir(&mut self, asked: &str) {
+        let asked = asked.trim();
+        // `:ir which name`, and `:ir which` for the last entry's -- unless
+        // `which` is the name of something defined, which is what it then
+        // means.
         let (which, name) = match asked.split_once(char::is_whitespace) {
-            Some((w @ ("core" | "cut" | "axcut"), name)) => (Some(w), name.trim()),
+            Some((w, name)) if ir::FORMS.contains(&w) => (Some(w), name.trim()),
+            _ if ir::FORMS.contains(&asked) && self.definition(asked).is_none() => {
+                (Some(asked), "")
+            }
             _ => (None, asked),
         };
-        if self.definition(name).is_none() {
-            println!("(nothing called `{name}` is defined)");
+        let (heading, shown) = if name.is_empty() {
+            match &self.last {
+                Some((text, at)) if *at < self.prefix.len() => (
+                    text.clone(),
+                    self.prefix[*at].defs.iter().map(|d| d.var).collect(),
+                ),
+                _ => {
+                    println!(
+                        "(nothing to show yet: enter an expression or a definition, and `:ir` \
+                         shows it)"
+                    );
+                    return;
+                }
+            }
+        } else {
+            match self.definition(name) {
+                Some(d) => (name.to_string(), vec![d.var]),
+                None => {
+                    println!("(nothing called `{name}` is defined)");
+                    return;
+                }
+            }
+        };
+        let program = self.program_reaching(&shown);
+        let pages = ir::pages(&program, &shown, self.opts.opt, which);
+        if which.is_some() {
+            for p in &pages {
+                print!("{}", p.text);
+            }
             return;
         }
-        use yansi::Paint as _;
-        for ir in ["core", "cut", "axcut"] {
-            if which.is_some_and(|w| w != ir) {
-                continue;
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            if let Err(e) = viewer::view(&heading, pages) {
+                eprintln!("error: the viewer could not draw: {e}");
             }
-            if which.is_none() {
-                println!("{}", format!("-- {ir}").dim());
-            }
-            match ir {
-                "core" => self.show_core(name),
-                "cut" => self.show_cut(name),
-                _ => self.show_axcut(name),
-            }
+        } else {
+            print!("{}", viewer::print(&pages));
         }
     }
 
-    /// The definition as the front end left it, before the
-    /// passes that run on a whole program.
-    fn show_core(&self, name: &str) {
-        let Some(d) = self.definition(name) else {
-            println!("(nothing called `{name}` is defined)");
-            return;
-        };
-        let alone = core::Program {
-            defs: vec![d.clone()],
-            entry: None,
-            ctor_fields: Default::default(),
-            variants: Default::default(),
-            origins: Default::default(),
-        };
-        print!("{}", alone.pretty());
-    }
-
-    /// The definition as Cut -- its value, and a definition to
-    /// each local function of it that calls itself -- as core is lowered to
-    /// it for showing. A program is not compiled through Cut yet: what the
-    /// runtimes are handed is `:axcut`'s.
-    fn show_cut(&mut self, name: &str) {
-        let Some(d) = self.definition(name) else {
-            println!("(nothing called `{name}` is defined)");
-            return;
-        };
-        let var = d.var;
+    /// The definitions of the prefix that `shown` reach, themselves among
+    /// them, with every constructor table: the program they are lowered in.
+    fn program_reaching(&mut self, shown: &[core::Var]) -> core::Program {
         self.cache.catch_up(&self.prefix);
-        let keep = core::prune::reach_all(&[&self.cache.deps], Some(var));
-        let program = core::Program {
+        let keep = core::prune::reach_all(&[&self.cache.deps], shown.iter().copied());
+        core::Program {
             defs: self
                 .prefix
                 .iter()
@@ -1683,70 +1703,6 @@ impl Session {
             ctor_fields: self.cache.ctor_fields.clone(),
             variants: self.cache.variants.clone(),
             origins: Default::default(),
-        };
-        let lowered = meadow_seq::cut::to_cut(&program);
-        let Some(symbol) = lowered.symbols.get(&var) else {
-            return;
-        };
-        let listing = meadow_cut::print::listing(&lowered.program);
-        // Its own declaration, and those made of its local functions, which
-        // are named for it.
-        let local = symbol.path.last().map(|n| format!("{n}#l"));
-        let its = |of: &meadow_cut::Symbol| {
-            of == symbol
-                || (of.package == symbol.package
-                    && of.path.len() == symbol.path.len()
-                    && of.path[..of.path.len().saturating_sub(1)]
-                        == symbol.path[..symbol.path.len().saturating_sub(1)]
-                    && of
-                        .path
-                        .last()
-                        .zip(local.as_ref())
-                        .is_some_and(|(n, l)| n.starts_with(l.as_str())))
-        };
-        for s in &listing.segments {
-            if let meadow_cut::print::Part::Decl(of) = &s.part
-                && its(of)
-            {
-                println!("{}\n", &listing.text[s.start..s.end]);
-            }
-        }
-    }
-
-    /// Every block the definition is lowered to as AxCut, in the
-    /// program that reaches it -- as the runtimes are handed it, after the
-    /// passes over core, at this session's optimisation level.
-    fn show_axcut(&mut self, name: &str) {
-        let Some(d) = self.definition(name) else {
-            println!("(nothing called `{name}` is defined)");
-            return;
-        };
-        let (var, canonical) = (d.var, d.name);
-        self.cache.catch_up(&self.prefix);
-        let keep = core::prune::reach_all(&[&self.cache.deps], Some(var));
-        let program = core::Program {
-            defs: self
-                .prefix
-                .iter()
-                .flat_map(|p| &p.defs)
-                .filter(|d| keep.contains(&d.var))
-                .cloned()
-                .collect(),
-            entry: None,
-            ctor_fields: self.cache.ctor_fields.clone(),
-            variants: self.cache.variants.clone(),
-            origins: Default::default(),
-        };
-        let lowered = meadow_seq::lower_program(&program, self.opts.opt);
-        let mut shown = false;
-        for block in lowered.program.defs.iter().filter(|b| b.name == canonical) {
-            println!("-- {} (L{})\n{}", block.name, block.label.0, block.block);
-            shown = true;
-        }
-        if !shown {
-            println!(
-                "(`{name}` is lowered to no block of its own: it was inlined where it is used)"
-            );
         }
     }
 
