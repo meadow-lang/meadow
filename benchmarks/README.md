@@ -177,6 +177,11 @@ see [Caveats](#caveats-in-order-of-how-much-they-matter).
 | ⇉ pipeline   | 62ms (4.3×)   | 42ms (2.8×)   | **15ms**     | ✗            | 16ms (1.1×)  | 730ms (49.8×) | 98ms (6.7×)   | 218ms (14.9×)  | 143ms (9.8×)  |
 | _startup_    | 5ms           | 4ms           | 3ms          | 3ms          | 6ms          | 10ms          | 65ms          | 27ms           | 37ms          |
 
+The default runtime's `fib`, `binarytrees`, `wordfreq` and `rbtree` have moved
+since this table was taken -- see [the tenth
+round](#the-tenth-round-x86-64-and-the-nurserys-bet). In a run of the whole
+suite afterwards, `binarytrees` was 769ms on `meadow` against GHC's 349ms.
+
 **Absolute times move about 20% between runs of the whole suite on this
 machine**, so do not read one run against another, and do not read this table
 against the one that was here before it: that was a 10-core Apple silicon
@@ -355,15 +360,19 @@ this row is a `split` primitive, which takes three of the seven calls away. Pyth
 `collections.Counter` do it in 69ms, and that is the number to be embarrassed
 by.
 
-**The default runtime's `binarytrees` and `wordfreq` on this machine are the
-nursery, not the compiler.** The nursery is 2MB, and each green thread has one,
-so it is sized for having many of them. On this machine that is too small for
-a benchmark that allocates 67 million nodes on one thread: `MEADOW_GC_NURSERY`
-at 32MB takes `binarytrees` from 2.41s to 1.44s and `wordfreq` from 481ms to
-339ms, and the copying collector, which has no nursery to size, gets 1.45s
-without being asked. The marking threads make no difference at all. What that
-wants is a nursery that grows with what a thread actually allocates rather than
-one number for every thread; the column above is the default, untuned.
+**The default runtime's `binarytrees` on this machine looked like the
+nursery, and was not.** `MEADOW_GC_NURSERY` at 32MB took it from 2.41s to
+1.44s, and the copying collector, which has no nursery to size, got 1.45s --
+but because both promote fewer trees, and on x86-64 every read of a promoted
+node was going to the interpreter. With that fixed ([the tenth
+round](#the-tenth-round-x86-64-and-the-nurserys-bet)) the 2MB default runs it
+in 749ms, 16MB in 565ms, and 32MB in 909ms: a nursery that has not reached
+its largest promotes nothing, and copies the long-lived tree at every
+collection while it grows. `wordfreq` is 303ms at the default and 240ms at
+16MB. The nursery is 2MB, and each green thread has one, so it is sized for
+having many of them and for `benches/Latency`'s pauses; a nursery that grows
+with what a thread actually allocates and keeps is still what this wants, and
+the column above is the default, untuned.
 
 `binarytrees` is worth reading for its own sake. It is nothing but
 allocate-walk-discard, and the ordering is not the one the rest of the table
@@ -495,6 +504,95 @@ and long-lived, and this benchmark's data is none of those.
 
 Changes that came out of profiling this suite, in rounds. Each was measured
 before and after, and the numbers are in [Results](#results).
+
+### The tenth round: x86-64, and the nursery's bet
+
+`binarytrees` on the default runtime was 2.36s on this machine against
+GHC's 290ms, and this file put that down to the nursery. A profile said
+otherwise. Two fifths of the run was the interpreter: 35 million tag tests
+and field reads handed back by native code (`MEADOW_TRAPS=1`), every one of
+them on a tree that had lived long enough to be promoted. The third round
+taught native code to read the old generation through the block tables --
+on arm64, where those rounds were done. On x86-64 a tag test or a field of
+an old object still went to `meadow_exec`, and a bigger nursery only helped
+because it promoted fewer trees. Now x86-64 walks the tables too.
+
+The sixth round's calling convention had not come across either. On x86-64
+every chain wrote the fixed registers back to memory and every warm entry
+read them again, and every call and every return rebuilt the register file
+in memory in a loop. It now does what arm64 does: `r0`–`r4` stay in
+`r8`–`r11` and `r15` from one function to the next, and a call or a return
+puts its arguments there and jumps to the method's entry. Arithmetic,
+comparisons and moves are done in those registers rather than through
+`rax`, a frame's slot is one load and an add, and a tag test and the field
+reads after it find the object once (`Emit::KEEPS_FOUND`) -- for an old
+object that was three dependent loads per instruction.
+
+Then the collector. A survivor is kept young for one collection before it
+is promoted, which is a bet that it is about to die, and a tree bigger than
+the nursery loses the bet every time: everything survives that collection
+and the next, and was copied twice. The heap now watches the bet
+(`Heap::tenure`) and promotes at once while it keeps losing. Promoting an
+object is one copy rather than a block lookup per slot, and promotion asks
+for the cache line it is about to write, since the old generation's free
+lines were last touched long ago.
+
+Where `binarytrees`' processor time went, by `perf` on the Linux build of
+the same code (the marking threads' share is on other cores), and what
+`meadow run --gc-stats` says of the collections:
+
+```text
+                                  before      after
+  interpreter, for native code      38%         0%
+  native code                       35%        55%
+  nursery collections               17%        29%
+  marking (other threads)            7%        13%
+
+  run, on the JIT                 1976 ms     784 ms
+    paused for collections        344 ms     248 ms
+  collections                       1100        921
+  copied within the nursery      402 MiB     46 MiB
+  promoted                       337 MiB    370 MiB
+  longest pause                  1.95 ms    1.69 ms
+```
+
+Alternated, the two compilers' executables run in turn on this machine:
+
+| task        | before | after      |
+| ----------- | ------ | ---------- |
+| fib         | 34.6ms | **20.5ms** |
+| binarytrees | 1.96s  | **752ms**  |
+| matmul      | 128ms  | 127ms      |
+| wordfreq    | 373ms  | **302ms**  |
+| rbtree      | 8.18s  | **3.58s**  |
+| mandelbrot  | 103ms  | 100ms      |
+| contention  | 101ms  | 97ms       |
+| pipeline    | 74ms   | 61ms       |
+
+In the suite's own run of every language afterwards:
+
+| task        | meadow       | meadow-silo  | rust         | c            | go           | haskell   | java         | python        | js           |
+| ----------- | ------------ | ------------ | ------------ | ------------ | ------------ | --------- | ------------ | ------------- | ------------ |
+| binarytrees | 769ms (2.2×) | 670ms (1.9×) | 1.93s (5.5×) | 1.70s (4.9×) | 1.42s (4.1×) | **349ms** | 538ms (1.5×) | 7.57s (21.7×) | 842ms (2.4×) |
+
+`benches/Latency`, which is what the nursery's size is for, kept its tail --
+the slowest request about a millisecond, the 99th-percentile pause 0.92ms
+either way -- and spent 310ms paused where it spent 400.
+
+What still separates `binarytrees` from GHC is the convention and the
+layout, not the allocator, which is a bump in both. Counted by callgrind,
+Glade's native code spends about 190 instructions building and walking each
+node -- 300 before this round -- where GHC's whole program, collector and
+all, spends about 40: every call pushes a frame with two header words, a return looks its
+target's entry up in a table, a tag test checks the generation and for an
+old object walks the block tables where GHC reads a tagged pointer, and the
+step counter and `live` are kept up throughout -- on five fixed registers,
+where arm64 has thirteen. Every object has a header of two words where
+GHC's has one, so the same trees are 1.8 GiB of allocation against 1.3 GiB,
+and the collector copies that much more. And the nursery is bounded for
+short pauses, so a tree bigger than it is promoted into the old generation
+and marked there, where GHC's 4 MiB nursery feeds a copying second
+generation collected rarely, for as long as it takes.
 
 ### The ninth round: two at a time
 
