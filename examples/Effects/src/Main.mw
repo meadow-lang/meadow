@@ -27,7 +27,6 @@ use Std.Random (between, withSeed)
 use Std.Time (now, withClock)
 use Std.Console (withInput, withOutput, readLine)
 use Std.Collections.Vector as V
-use Std.String as S
 use Std.Maybe.Maybe.*
 
 -- --- our own effects ---------------------------------------------------------
@@ -42,8 +41,7 @@ effect Ask {
 }
 
 -- Logging to the terminal.
-fun printingLogs act =
-  handle act () with { log line k -> let _ = println (S.concat "[log] " line) in k (), }
+fun printingLogs act = handle act () with { log line k -> let _ = println "[log] ${line}" in k (), }
 
 -- Logging into a list, returned beside the result.
 fun collectingLogs act =
@@ -74,18 +72,14 @@ fun checkout basket =
     V.foldl
       (\total item ->
         let _ = put (get () + 1) in
-        let _ = log (S.concatAll ["item ", S.fromInt item]) in
+        let _ = log "item ${item}" in
         total + item)
       0
       basket
   in
-  let _ =
-    if subtotal > limit then
-      raise (S.concatAll ["order of ", S.fromInt subtotal, " is over the limit"])
-    else 0
-  in
+  let _ = if subtotal > limit then raise "order of ${subtotal} is over the limit" else 0 in
   let total = subtotal + subtotal * rate / 100 in
-  let _ = log (S.concatAll ["total ", S.fromInt total]) in
+  let _ = log "total ${total}" in
   total
 
 -- Every handler at once: settings, logging, a counter, and failure as a value.
@@ -108,7 +102,7 @@ fun greeter () =
   let _ = println "What is your name?" in
   match readLine () with
   | None -> println "Nobody there."
-  | Just name -> println (S.concatAll ["Hello, ", name, "!"])
+  | Just name -> println "Hello, ${name}!"
 
 -- --- an effect each implementation chooses -----------------------------------
 --
@@ -168,19 +162,19 @@ fun main () =
       withSettings settings (\() ->
         runState (toInt 0) (\() -> toResult (\() -> checkout [10, 20, 30]))))
   in
-  let _ = println (S.concat "result and items counted: " (show result)) in
+  let _ = println "result and items counted: ${result:?}" in
 
   let _ = println "== the same checkout, collecting its log instead" in
   let (outcome, lines) = runCheckout settings [50, 60] in
-  let _ = println (S.concat "outcome: " (show outcome)) in
-  let _ = println (S.concat "log: " (show lines)) in
+  let _ = println "outcome: ${outcome:?}" in
+  let _ = println "log: ${lines:?}" in
 
   let _ = println "== a dice game with a seed and a frozen clock: the same every run" in
   let _ = println (withClock 1000 (\() -> withSeed 42 (\() -> game ()))) in
 
   let _ = println "== the greeter, fed its input and with its output captured" in
   let (u, printed) = withOutput (\() -> withInput ["Ada"] (\() -> greeter ())) in
-  println (S.concat "it printed: " (show printed))
+  println "it printed: ${printed:?}"
 
 -- --- tests -------------------------------------------------------------------
 

@@ -26,7 +26,6 @@
 use Std.Stm as Stm
 use Std.Thread as Thread
 use Std.Collections.Vector as V
-use Std.String as S
 use Std.Maybe.Maybe.*
 
 -- --- a bank ------------------------------------------------------------------
@@ -93,10 +92,8 @@ fun main () =
   let movers = V.map (\i -> Thread.spawn (\() -> shuffle accounts i 2000)) (V.range 0 4) in
   let auditor = Thread.spawn (\() -> audit accounts 400 500) in
   let _ = Thread.awaitAll movers in
-  let _ =
-    println (S.concatAll ["readings with the wrong total: ", S.fromInt (Thread.await auditor)])
-  in
-  let _ = println (S.concatAll ["balances at the end: ", show (balances accounts)]) in
+  let _ = println "readings with the wrong total: ${Thread.await auditor}" in
+  let _ = println "balances at the end: ${balances accounts:?}" in
 
   let _ = println "== a transfer that waits for the money" in
   let poor = Stm.newTVarIO (toInt 0) in
@@ -104,9 +101,7 @@ fun main () =
   let waiting = Thread.spawn (\() -> transfer poor rich 50) in
   let _ = Stm.atomically (\() -> Stm.writeTVar poor 80) in
   let _ = Thread.await waiting in
-  let _ =
-    println (S.concatAll ["after the deposit it went through: ", show (balances [poor, rich])])
-  in
+  let _ = println "after the deposit it went through: ${balances [poor, rich]:?}" in
 
   let _ = println "== two bounded queues, one consumer taking from either" in
   let urgent = newQueue 2 in
@@ -119,7 +114,7 @@ fun main () =
   in
   let taken = V.map (\i -> Stm.atomically (\() -> popEither urgent normal)) (V.range 1 10) in
   let _ = Thread.await producer in
-  println (S.concatAll ["took, in the order they came: ", show taken])
+  println "took, in the order they came: ${taken:?}"
 
 -- --- tests -------------------------------------------------------------------
 

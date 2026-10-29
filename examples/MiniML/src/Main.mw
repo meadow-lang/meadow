@@ -44,14 +44,14 @@ fun typeOfSource src = match parse src with | Err e -> Err e | Ok ast -> typeOf 
 -- terminal.
 @pub(pkg) fun replLine src =
   match parse src with
-  | Err e -> S.concat "parse error: " e
+  | Err e -> "parse error: ${e}"
   | Ok ast ->
       match typeOf ast with
-      | Err e -> S.concat "type error: " e
+      | Err e -> "type error: ${e}"
       | Ok ty ->
           match run ast with
-          | Err e -> S.concat "run-time error: " e
-          | Ok v -> S.concatAll [v, " : ", ty]
+          | Err e -> "run-time error: ${e}"
+          | Ok v -> "${v} : ${ty}"
 
 fun loop () =
   match prompt "> " with
