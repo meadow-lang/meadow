@@ -23,6 +23,40 @@ beyond the last release is under _Unreleased_.
   the float primitives (`_primAddF x y`), since there `+` is the integers'
   primitive.
 
+### Added
+
+- Glade builds a library of what a package exports to C, as Silo does:
+  `MeadowBoot build --runtime glade` for a package of `@export` functions, or
+  `meadow cut --runtime glade` for a program of Cut with exports, makes
+  `Name.dll`, `libName.so` or `libName.dylib` in `target/<profile>/native/`.
+  Its C functions take and answer the C types Silo's do, so a Silo program
+  calls Glade's code through `Std.Ffi` -- and a Glade program calls it too.
+  A call that fails answers zero and leaves its message for
+  `Std.Ffi.failure`, as Silo's does. Each call runs with a heap of its own:
+  the top-level values a call makes are made again by the next. For this
+  system only; a library for another is Silo's.
+- `Std.Collections.UnionFind`: disjoint sets inside a `runSt`, with union
+  by size and path compression. `make`, `add`, `find`, `union`, `same`,
+  `count` and `groups`, and a value per group that `unionWith` merges, which
+  is what unification wants; the MiniML example's type checker is built on
+  it.
+- Silo finds a program's garbage cycles by concurrent tracing, unless the
+  build asks for trial deletion with `cycles = "trial"` in a
+  `[profile.<name>]` of `Meadow.toml` or `MEADOW_CYCLES=trial`. A trace of a
+  thread's heap takes its roots in one short pause, marks on a thread of its
+  own while the program runs, and sweeps a slice at a time, freeing every
+  cycle counting left -- including the ones trial deletion missed, whose
+  `Ref` was let go of while the cycle was still held, and without the long
+  pause trial deletion took over a large one. Counting still frees everything
+  else, and a program that cannot tie a knot carries neither collector.
+  `MEADOW_SILO_CYCLES` says what the traces did. `docs/SILO.md`, "Cycles", is
+  the design.
+
+### Fixed
+
+- `MEADOW_SILO_POISON` and `MEADOW_SILO_LEAKS` together counted every
+  poisoned block as left behind at exit.
+
 ## 0.4.0 - 2026-10-24
 
 Meadow on phones: Silo builds a program, or a library an app loads, for

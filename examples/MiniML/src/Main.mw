@@ -7,7 +7,7 @@
 --
 --   Syntax.mw   the expression and type trees
 --   Parser.mw   source text to `Expr`, with `Std.String.Parse`
---   Infer.mw    Hindley-Milner, Algorithm J, with `Mut` for type variables
+--   Infer.mw    Hindley-Milner, Algorithm J, with a union-find for type variables
 --   Eval.mw     a tree-walking interpreter, with `Mut` to tie `let rec`
 --
 -- Each module is its own namespace, as in Rust: the package is the compilation
@@ -44,14 +44,14 @@ fun typeOfSource src = match parse src with | Err e -> Err e | Ok ast -> typeOf 
 -- terminal.
 @pub(pkg) fun replLine src =
   match parse src with
-  | Err e -> S.concat "parse error: " e
+  | Err e -> "parse error: ${e}"
   | Ok ast ->
       match typeOf ast with
-      | Err e -> S.concat "type error: " e
+      | Err e -> "type error: ${e}"
       | Ok ty ->
           match run ast with
-          | Err e -> S.concat "run-time error: " e
-          | Ok v -> S.concatAll [v, " : ", ty]
+          | Err e -> "run-time error: ${e}"
+          | Ok v -> "${v} : ${ty}"
 
 fun loop () =
   match prompt "> " with
@@ -104,6 +104,14 @@ fun loop () =
 
 @test fun infersPolymorphicIdentity () =
   assertEq (typeOfSource "fun x -> x") (Ok "(t0 -> t0)") "identity"
+
+@test fun unifiedVariablesAreOne () =
+  -- Both branches of the `if` have one type, so `x` and `y` do: their
+  -- variables are joined into one group, printed by its representative.
+  assertEq
+    (map typeOfSource ["fun x y -> if true then x else y", "fun f -> fun x -> f (f x)"])
+    [Ok "(t0 -> (t0 -> t0))", Ok "((t1 -> t1) -> (t1 -> t1))"]
+    "joined variables"
 
 @test fun letIsGeneralized () =
   -- `id` is used at two different types, which only works if the `let`

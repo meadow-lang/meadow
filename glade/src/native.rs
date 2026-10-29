@@ -743,9 +743,7 @@ impl Vm<'_> {
                         // Safety: as above.
                         Build::Str(unsafe { ffi::read_text(int(self, t[0])?, int(self, t[1])?) })
                     }
-                    // Only a library Silo builds is called by C: nothing here
-                    // has failed in such a call.
-                    "ffiFailure" => Build::Str(String::new()),
+                    "ffiFailure" => Build::Str(crate::aot::take_failure().unwrap_or_default()),
                     _ => return Ok(None),
                 }
             }
