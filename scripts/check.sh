@@ -100,10 +100,11 @@ cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- fmt --check
 # differently -- a module at a time, macros and all, with what the editor
 # fetched -- so a package can build cleanly and still be marked throughout in
 # an editor. Left out: the inputs of MeadowBoot's lexer and parser tests,
-# which are fragments, some wrong on purpose. The release workflow runs the
-# same with each binary it builds.
+# which are fragments, some wrong on purpose, and the package its `@cfg`
+# rename test reads, which is wrong on purpose everywhere but Windows. The
+# release workflow runs the same with each binary it builds.
 step "meadow lsp --check (every Meadow source an editor opens)"
-mapfile -t sources < <(git ls-files '*.mw' | grep -v -e '^bootstrap/tests/lex/' -e '^bootstrap/tests/parse/')
+mapfile -t sources < <(git ls-files '*.mw' | grep -v -e '^bootstrap/tests/lex/' -e '^bootstrap/tests/parse/' -e '^bootstrap/tests/rename/Cfg/')
 cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- lsp --check "${sources[@]}"
 
 # --- the editor extension ----------------------------------------------------
