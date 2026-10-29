@@ -16,7 +16,9 @@
 //! does. What has survived one nursery collection already is **promoted** into
 //! the old generation at the next, so nothing is copied back and forth for long,
 //! and the nursery has a fixed largest size -- [`GcConfig::nursery`] -- so a
-//! nursery collection has a fixed longest pause.
+//! nursery collection has a fixed longest pause. While what is kept young keeps
+//! surviving to be promoted anyway, survivors are promoted at once instead:
+//! see `Heap::tenure`.
 //!
 //! Until a heap fills its largest nursery, nothing is promoted and the nursery
 //! just grows: most green threads never keep enough alive to need an old
