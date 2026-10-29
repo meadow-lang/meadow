@@ -127,6 +127,8 @@ pub struct Resolved {
     pub threads: Option<usize>,
     /// `nursery` from the manifest, in bytes: `--nursery`'s default.
     pub nursery: Option<u64>,
+    /// `cycles` from the manifest: how Silo finds cycles.
+    pub cycles: Option<meadow_llvm::Cycles>,
     /// `leaks = true` from the manifest: `--leaks`'s default.
     pub leaks: bool,
     /// `target` from the manifest: `--target`'s default.
@@ -149,6 +151,7 @@ impl Resolved {
             runtime: crate::aot::Runtime::Glade,
             threads: None,
             nursery: None,
+            cycles: None,
             leaks: false,
             target: None,
         }
@@ -200,6 +203,7 @@ impl Resolved {
             runtime,
             threads: flags.threads.or(from_manifest.threads),
             nursery: from_manifest.nursery,
+            cycles: from_manifest.cycles,
             leaks: flags.leaks.or(from_manifest.leaks).unwrap_or(false),
             target: flags.target.or(from_manifest.target),
         }

@@ -548,6 +548,7 @@ fn process(op: &str, arg: Val) -> Option<Build> {
                 crate::profile::finish();
                 crate::prims::report();
                 crate::cycles::report();
+                crate::trace::report();
                 std::process::exit(code as i32)
             }
             other => fail(format!(

@@ -541,6 +541,7 @@ fn prim(p: Prim, a: &[Val], d: &[i64]) -> Word {
             Some(r) => {
                 let (v, vd) = arg(1).bits();
                 heap::share(v, vd);
+                crate::trace::log(heap::field(r, 0));
                 heap::erase(heap::field(r, 0), heap::field_desc(r, 0));
                 heap::set_field(r, 0, v, vd);
                 0
@@ -588,6 +589,7 @@ fn prim(p: Prim, a: &[Val], d: &[i64]) -> Word {
             }
             let (v, vd) = arg(2).bits();
             heap::share(v, vd);
+            crate::trace::log(heap::field(arr, i));
             heap::erase(heap::field(arr, i), heap::field_desc(arr, i));
             heap::note_stored(arr, v, vd);
             heap::set_word(arr, 2 + i, v);
@@ -705,6 +707,7 @@ fn prim(p: Prim, a: &[Val], d: &[i64]) -> Word {
             match arg(0).block(heap::DATA) {
                 Some(obj) if i < heap::len(obj) => {
                     let (v, vd) = arg(2).bits();
+                    crate::trace::log(heap::field(obj, i));
                     heap::erase(heap::field(obj, i), heap::field_desc(obj, i));
                     heap::share(v, vd);
                     heap::set_field(obj, i, v, vd);
@@ -1058,6 +1061,7 @@ pub extern "C" fn meadow_st_set(a: Word, i: Word, x: Word, d: i64) -> Word {
         return fail(format!("stSetArray: index {i} out of bounds (len {n})"));
     }
     heap::share(x, d);
+    crate::trace::log(heap::field(arr, i));
     heap::erase(heap::field(arr, i), heap::field_desc(arr, i));
     heap::note_stored(arr, x, d);
     heap::set_word(arr, 2 + i, x);
@@ -1278,6 +1282,7 @@ pub extern "C" fn meadow_update(r: Word, at: i64, of: i64, v: Word, vd: i64) -> 
     let i = 2 * at as usize + 1;
     heap::share(v, vd);
     if unshared(r) {
+        crate::trace::log(heap::field(r, i));
         heap::erase(heap::field(r, i), heap::field_desc(r, i));
         heap::set_field(r, i, v, vd);
         return r;

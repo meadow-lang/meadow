@@ -51,8 +51,10 @@ pub fn emitted(path: &Path, what: &str) -> Result<String, String> {
         "llvm" => {
             let program = lowered(path)?;
             let conv = aot::Target::host()?.call_conv();
-            let units = meadow_llvm::compile_split(&program, meadow_llvm::UNIT, conv)
-                .map_err(|e| format!("{}: {}", path.display(), e.msg))?;
+            let units = meadow_llvm::with_cycles(aot::cycles()?, || {
+                meadow_llvm::compile_split(&program, meadow_llvm::UNIT, conv)
+            })
+            .map_err(|e| format!("{}: {}", path.display(), e.msg))?;
             for (i, u) in units.iter().enumerate() {
                 if i > 0 {
                     let _ = writeln!(out, "\n; ---- unit {} ----\n", u.name);

@@ -446,6 +446,10 @@ struct TargetArgs {
     /// `nursery = "…"` in a profile. Silo has no nursery.
     #[arg(long, value_name = "SIZE", value_parser = meadow::profile::nursery_size)]
     nursery: Option<u64>,
+    /// How a Silo program finds its cycles, from the profile: see
+    /// `aot::cycles`.
+    #[arg(skip)]
+    cycles: Option<meadow_llvm::Cycles>,
     /// After running, report the blocks the program left behind: what it
     /// still held at exit, by kind, and what held them. Silo counts by
     /// reference, so this is where a cycle shows up. `leaks = true` in a
@@ -484,6 +488,7 @@ impl TargetArgs {
             runtime: profile.runtime,
             threads: self.threads.or(profile.threads),
             nursery: self.nursery.or(profile.nursery),
+            cycles: profile.cycles,
             leaks: self.leaks || profile.leaks,
             features: self.features.clone(),
             no_default_features: self.no_default_features,
@@ -506,6 +511,14 @@ impl TargetArgs {
         if self.leaks {
             // Safety: as above.
             unsafe { std::env::set_var("MEADOW_SILO_LEAKS", "1") };
+        }
+        // The profile's collector for cycles, unless the environment named
+        // one: the native build reads it there (`aot::cycles`).
+        if let Some(c) = self.cycles
+            && std::env::var_os("MEADOW_CYCLES").is_none()
+        {
+            // Safety: as above.
+            unsafe { std::env::set_var("MEADOW_CYCLES", c.name()) };
         }
     }
 
@@ -622,6 +635,8 @@ impl ProfileArgs {
             nursery: None,
             leaks: None,
             target: None,
+            // Said with `MEADOW_CYCLES`, or in a profile: no switch.
+            cycles: None,
         }
     }
 
