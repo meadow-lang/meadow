@@ -6,10 +6,12 @@
 //! iterations this call has made, and `rax`, `rcx`, `rdx`, `rsi`, `rdi`,
 //! `xmm0` and `xmm1` for the instruction being done.
 //!
-//! `r8` to `r11` and `r15` hold the bytecode registers a function pins (see
-//! [`super::Emit::configure`]): loaded after the prologue, written to memory
-//! before every call and return, and loaded again after every call. Nothing
-//! else touches them.
+//! `r8` to `r11` and `r15` hold bytecode registers `r0` to `r4`, in every
+//! function alike -- the fixed registers -- so that one function goes on to
+//! another with nothing moved, as on arm64: they are loaded from the register
+//! file where the machine enters native code (the prologue, before the warm
+//! entry), written to it before every call into the interpreter and every
+//! return, and loaded again after every call. Nothing else touches them.
 
 use super::{Emit, FloatOp, IntOp, Label, Operand, UnaryOp, layout, thin};
 use meadow_bytecode::{Cond, Pc, Reg};
@@ -228,6 +230,40 @@ impl Asm {
         self.bytes(&[0xFF, 0xE0]); // jmp rax
     }
 
+    /// `rcx = ` the method entry for the pc in `esi`, or on to `none` if it
+    /// has none, or this call has made [`super::CHAINS`] jumps already. The
+    /// table is there whenever native code runs at all. After it, the entry
+    /// wants the arguments in `r[0..argc]`, in registers, and the object's
+    /// first word's address in `rdx`; it loads the captures itself.
+    fn method_entry(&mut self, none: Label) {
+        self.load(RCX, RBX, layout::NATIVE_METHODS);
+        self.bytes(&[0x48, 0x8B, 0x0C, 0xF1]); // mov rcx, [rcx + rsi*8]
+        self.bytes(&[0x48, 0x85, 0xC9]); // test rcx, rcx
+        self.jcc(CC_E, none);
+        self.budget(none);
+    }
+
+    /// The `argc` arguments at `r[base]` down to `r[0..argc]`, lowest first:
+    /// with `base` above zero every one moves below where it was, so none is
+    /// overwritten before it is read. Through `rax`, which is all it touches
+    /// besides the registers themselves.
+    fn args_down(&mut self, base: Reg, argc: u32) {
+        if base == 0 {
+            return;
+        }
+        for j in 0..argc {
+            let from = base as u32 + j;
+            match (self.pinned(j), self.pinned(from)) {
+                (Some(d), Some(s)) => self.mov_rr(d, s),
+                (Some(d), None) => self.load(d, R12, Self::slot(from)),
+                (None, _) => {
+                    self.get(RAX, from);
+                    self.save(RAX, R12, Self::slot(j));
+                }
+            }
+        }
+    }
+
     /// Return `status` with the register file as it is in memory.
     fn ret_as_is(&mut self, status: u32) {
         self.flush_steps();
@@ -297,25 +333,17 @@ impl Asm {
         }
     }
 
-    /// `rax = r[x]`, and on to `slow` unless that is a nursery address; then
-    /// `rdx` the object's first slot, `rsi` its first word, `ecx` its kind.
-    fn nursery(&mut self, x: Reg, slow: Label) {
-        self.get(RAX, x as u32);
-        self.bytes(&[0x48, 0x3D]); // cmp rax, OLD_BASE
-        self.bytes(&crate::old::OLD_BASE.to_le_bytes());
-        self.jcc(CC_AE, slow);
-        self.load(2, RBX, layout::BASE); // rdx
-        self.bytes(&[0x48, 0x8D, 0x14, 0xC2]); // lea rdx, [rdx + rax*8]
-        self.bytes(&[0x48, 0x8B, 0x32]); // mov rsi, [rdx]
-        self.bytes(&[0x40, 0x0F, 0xB6, 0xCE]); // movzx ecx, sil
-    }
-
-    /// [`Asm::nursery`] for an object in either generation: `rdx` its first
+    /// `rax = r[x]`, an object in either generation, and then `rdx` its first
     /// word's address, `rsi` that word, `ecx` its kind -- one in the nursery
     /// the short way, one in the old generation through the block tables.
-    /// Only a compact region goes to `slow`. A long-lived closure is an old
-    /// one: a parser combinator defined at the top level, say, which every
-    /// call of the parser it builds goes through.
+    /// Only a compact region goes to `slow`.
+    ///
+    /// Everything that reads an object goes through here, as on arm64, and
+    /// not only the calls. A long-lived closure is an old one -- a parser
+    /// combinator defined at the top level, say -- and so is any data that
+    /// has lived long enough to be promoted: a tag test or a field read of a
+    /// tree that survived two collections used to go to the interpreter, and
+    /// that was 35 million trips through `meadow_exec` in `binarytrees`.
     fn anywhere(&mut self, x: Reg, slow: Label) {
         let old = self.label();
         let found = self.label();
@@ -419,7 +447,7 @@ impl Asm {
 
 impl Emit for Asm {
     const FIXED: usize = PIN_REGS.len();
-    const WARM: usize = 33;
+    const WARM: usize = 33 + 8 * PIN_REGS.len();
 
     fn new() -> Asm {
         Asm {
@@ -452,9 +480,7 @@ impl Emit for Asm {
         self.short = opt >= OptLevel::O1;
         self.chain = opt >= OptLevel::O1;
         // The fixed registers, in general registers only: floats are not kept
-        // apart here. They are still written back before every chain and
-        // loaded at every warm entry, which the arm64 code no longer needs
-        // to do.
+        // apart here.
         self.pins = (0..PIN_REGS.len() as Reg).zip(PIN_REGS).collect();
     }
 
@@ -471,13 +497,14 @@ impl Emit for Asm {
         self.load(R12, RBX, layout::REGS);
         self.bytes(&[0x45, 0x31, 0xED]); // xor r13d, r13d
         self.bytes(&[0x45, 0x31, 0xF6]); // xor r14d, r14d
+        self.reload();
         // A chained function arrives here, with the frame, the machine, its
-        // register file, the steps and the loop count of the one it came from.
+        // register file, the fixed registers, the steps and the loop count of
+        // the one it came from.
         assert_eq!(self.offset() - start, Self::WARM, "the warm entry moved");
         if let Some(warm) = warm {
             self.bind(warm);
         }
-        self.reload();
         self.ret_eax = None;
     }
 
@@ -490,7 +517,8 @@ impl Emit for Asm {
         if let Some(live) = live {
             self.save_imm(RBX, layout::LIVE, live);
         }
-        self.spill();
+        // The fixed registers go on in their registers: written back only on
+        // the way out to the machine.
         let out = self.label();
         self.budget(out);
         match to {
@@ -505,6 +533,7 @@ impl Emit for Asm {
             }
         }
         self.bind(out);
+        self.spill();
         self.save_imm(RBX, layout::PC, pc);
         self.ret_as_is(crate::abi::JUMPED);
     }
@@ -848,7 +877,7 @@ impl Emit for Asm {
     }
 
     fn tag_test(&mut self, x: Reg, tag: u32, miss: Label, slow: Label) {
-        self.nursery(x, slow);
+        self.anywhere(x, slow);
         self.bytes(&[0x85, 0xC9]); // test ecx, ecx: Data
         self.jcc(CC_NE, miss);
         self.bytes(&[0x8B, 0x4A, 0x08]); // mov ecx, [rdx + 8]: meta
@@ -858,7 +887,7 @@ impl Emit for Asm {
     }
 
     fn field(&mut self, a: Reg, b: Reg, i: u32, slow: Label) {
-        self.nursery(b, slow);
+        self.anywhere(b, slow);
         self.bytes(&[0x83, 0xF9, crate::heap::Kind::Array as u8]); // cmp ecx, Array
         self.jcc(CC_A, slow);
         self.length();
@@ -896,9 +925,22 @@ impl Emit for Asm {
         // Everything falls into the scalar loop.
     }
 
-    fn stub(&mut self, _captures: u32, _params: u32, _warm: Label) -> bool {
-        // No method entries here: every call rebuilds the register file.
-        false
+    fn stub(&mut self, captures: u32, params: u32, warm: Label) -> bool {
+        let argc = params - captures;
+        // The arguments up past the captures, highest first, so that none is
+        // overwritten before it has moved.
+        for j in (0..argc).rev() {
+            self.mov_rr(PIN_REGS[(captures + j) as usize], PIN_REGS[j as usize]);
+        }
+        // The captures follow the header, which is longer than two words past
+        // `compact::INLINE_DESCS` of them: see `object::write_header`.
+        let hdr = meadow_rt::compact::header_slots(false, captures as usize) as u32;
+        for i in 0..captures {
+            self.load(PIN_REGS[i as usize], 2, (hdr + i) * 8); // [rdx + field i]
+        }
+        self.save_imm(RBX, layout::LIVE, params);
+        self.jump(warm);
+        true
     }
 
     fn invoke_known(
@@ -973,16 +1015,16 @@ impl Emit for Asm {
             self.jump(slow);
             return;
         }
-        // The register file is rebuilt in memory below.
-        self.spill();
         let object = self.label();
         let rebuild = self.label();
+        let generic = self.label();
+        let generic_frame = self.label();
         // A return: the object is in the current chunk of the frame stack.
         // Everything in a stack chunk is a frame, so its kind needs no test;
         // its slot is one load from the chunk's base; its return pc is its
         // `meta`, and its one method is #0, so there is no table to look up.
         // A frame in a chunk below has chunks to release on the way down,
-        // which the interpreter does: it is not a nursery address below.
+        // which the interpreter does: it fails the kind test below.
         self.get(RAX, obj as u32);
         self.bytes(&[0x8B, 0x8B]); // mov ecx, [rbx + FCUR]
         self.bytes(&layout::FCUR.to_le_bytes());
@@ -996,16 +1038,28 @@ impl Emit for Asm {
         self.bytes(&[0x48, 0x29, 0xCA]); // sub rdx, rcx
         self.load(RSI, RBX, layout::FBASE);
         self.bytes(&[0x48, 0x8D, 0x14, 0xD6]); // lea rdx, [rsi + rdx*8]
-        self.bytes(&[0x48, 0x8B, 0x32]); // mov rsi, [rdx]
-        self.length();
+        self.bytes(&[0x8B, 0x72, 0x08]); // mov esi, [rdx + 8]
+        if self.chain {
+            // Returning pops the frame: the stack's top goes back to its
+            // slot. Then on to the method entry, as for a call below, which
+            // loads the captures from where the frame still is.
+            self.method_entry(generic_frame);
+            self.bytes(&[0x89, 0x83]); // mov [rbx + FSP], eax
+            self.bytes(&layout::FSP.to_le_bytes());
+            self.args_down(base, argc);
+            self.bytes(&[0xFF, 0xE1]); // jmp rcx
+        }
+        // The general path wants the header and the length, which a return
+        // to a method entry did not need.
+        self.bind(generic_frame);
+        self.bytes(&[0x48, 0x8B, 0x3A]); // mov rdi, [rdx]
+        self.bytes(&[0x48, 0xC1, 0xEF, 0x20]); // shr rdi, 32: the length
         self.bytes(&[0x48, 0x83, 0xFF, 0x18]); // cmp rdi, 24
         self.jcc(CC_A, slow);
-        self.bytes(&[0x8B, 0x72, 0x08]); // mov esi, [rdx + 8]
-        // Returning pops the frame: the stack's top goes back to its slot.
         self.bytes(&[0x89, 0x83]); // mov [rbx + FSP], eax
         self.bytes(&layout::FSP.to_le_bytes());
         self.jump(rebuild);
-        // A call: a closure in the nursery.
+        // A call: a closure, wherever it is.
         self.bind(object);
         self.anywhere(obj, slow);
         self.bytes(&[0x83, 0xF9, crate::heap::Kind::Closure as u8]); // cmp ecx, Closure
@@ -1026,7 +1080,17 @@ impl Emit for Asm {
         self.bytes(&(method as u32).to_le_bytes());
         self.load(RSI, RBX, layout::METHOD_PCS);
         self.bytes(&[0x8B, 0x34, 0x86]); // mov esi, [rsi + rax*4]
+        if self.chain {
+            self.method_entry(generic);
+            self.args_down(base, argc);
+            self.bytes(&[0xFF, 0xE1]); // jmp rcx
+        }
+        self.bind(generic);
+        // The general path: the register file rebuilt in memory, as the
+        // interpreter does it, from `rdx` the object, `rdi` its length and
+        // `esi` the method's pc.
         self.bind(rebuild);
+        self.spill();
         // The captures follow a header of two words, and one more for every
         // sixteen fields past the eighth, whose descriptors no longer fit the
         // second (see `object::write_header`; a closure and a frame are never
@@ -1068,6 +1132,9 @@ impl Emit for Asm {
             self.bytes(&[0x48, 0x8B, 0x04, 0xF0]); // mov rax, [rax + rsi*8]
             self.bytes(&[0x48, 0x85, 0xC0]); // test rax, rax
             self.jcc(CC_E, out);
+            // The register file was rebuilt in memory: the next function
+            // expects the fixed registers in their registers.
+            self.reload();
             self.enter_warm();
             self.bind(out);
         }

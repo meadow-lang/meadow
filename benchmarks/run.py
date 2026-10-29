@@ -329,8 +329,8 @@ def measure(argv, cwd, reps):
 
 
 STARTUP = {
-    "meadow-silo": 'use Std.Console (println)\n\ndef main = println "0"\n',
-    "meadow": 'use Std.Console (println)\n\ndef main = println "0"\n',
+    "meadow-silo": 'use Std.Console (println)\n\nfun main () = println "0"\n',
+    "meadow": 'use Std.Console (println)\n\nfun main () = println "0"\n',
     "rust": 'fn main() { println!("0"); }\n',
     "c": '#include <stdio.h>\nint main(void) { printf("0\\n"); return 0; }\n',
     "cpp": '#include <cstdio>\nint main() { std::printf("0\\n"); }\n',
