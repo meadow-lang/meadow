@@ -294,6 +294,12 @@ pub struct Heap {
     cur_meta: Option<std::sync::Arc<crate::trace::Chunk>>,
     /// The concurrent trace of this heap: see [`crate::trace`].
     pub(crate) trace: crate::trace::State,
+    /// Under tracing: how many blocks in use can be part of a cycle -- a
+    /// `Ref`, or a mutable array that may hold references ([`MUTABLE`]). Every
+    /// cycle has one, so a heap with none has no cycle to trace for. Counted
+    /// as such a block is made and as it is freed; a block reused as another
+    /// kind is never counted off, which only ever makes this too high.
+    pub(crate) mutables: usize,
 }
 
 impl Heap {
@@ -321,6 +327,7 @@ impl Heap {
             chunk_meta: Vec::new(),
             cur_meta: None,
             trace: crate::trace::State::new(),
+            mutables: 0,
         }
     }
 }
@@ -754,7 +761,7 @@ impl Heap {
             // Safety: a clean block, whose word 1 is the next.
             h.clean[words] = unsafe { *p.add(1) } as *mut Word;
             if h.trace.black {
-                crate::trace::blacken(&h.chunk_meta, p as Word);
+                crate::trace::blacken(&h.chunk_meta, &mut h.trace.hint, p as Word);
             }
             return p as Word;
         }
@@ -1145,6 +1152,10 @@ impl Heap {
             return;
         }
         self.live -= 1;
+        // Safety: the block's header, which nothing has written over yet.
+        if crate::cycles::tracing() && unsafe { *p.add(1) } & MUTABLE != 0 {
+            self.mutables = self.mutables.saturating_sub(1);
+        }
         if poisoning()
             && (!poison_collector_only() || crate::cycles::running() || crate::trace::sweeping())
         {
@@ -1330,6 +1341,7 @@ pub fn build(kind: u64, meta: u32, fields: &[Word], descs: &[i64]) -> Word {
     let v = acquire(2 + dw + n);
     set_word(v, 0, (n as u64) << 32);
     set_word(v, 1, kind | mutable(kind) | (u64::from(meta) << 32));
+    count_mutable(v);
     for w in 0..dw {
         let mut bits = 0u64;
         for (j, d) in descs.iter().enumerate().skip(16 * w).take(16) {
@@ -1359,7 +1371,17 @@ pub fn build_uniform(kind: u64, meta: u32, n: usize, d: i64) -> Word {
             | UNIFORM
             | (u64::from(meta) << 32),
     );
+    count_mutable(v);
     v
+}
+
+/// Count the block just made at `v`, if it is one a cycle can run through:
+/// see [`Heap::mutables`].
+#[inline]
+pub(crate) fn count_mutable(v: Word) {
+    if crate::cycles::tracing() && word(v, 1) & MUTABLE != 0 {
+        with(|h| h.mutables += 1);
+    }
 }
 
 /// A string of `bytes`, eight to a word.

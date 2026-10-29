@@ -187,6 +187,7 @@ impl Parcel {
                 // block it copied is about that heap's candidate list, not
                 // this one's: a fresh block here has never been a candidate.
                 heap::set_word(v, 1, b.words[1] & !heap::MARKS);
+                heap::count_mutable(v);
                 // A compact arrives naming the region it always named, and
                 // that block holds two references into it: its own, given up
                 // when the block dies, and the one its field holds, given up

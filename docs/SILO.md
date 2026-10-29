@@ -306,13 +306,19 @@ program still reach? -- which every cycle, of any size and however it came to
 be garbage, fails. What it needs is the roots, and a way to keep tracing while
 the program changes the heap under it.
 
-**When.** A heap that can hold a cycle starts a trace when it has doubled since
-the last one ended, from 4,096 blocks; most programs that tie knots tie few,
-and a trace walks what is live, so this keeps its work in proportion to the
-program's. A heap is a green thread's (`crate::ctx`), and so is a trace: each
-thread's heap is traced on its own, with its own roots, which is what one heap
-per thread -- nothing shared, everything that crosses copied -- makes
-possible.
+**When.** A heap starts a trace once it has grown, since the last one ended,
+by as much as that one found live -- from 4,096 blocks. A trace walks what is
+live, so this keeps its work in proportion to the program's. It is measured
+from what the trace marked, not from what is in use when it ends: that
+counts as live the garbage made while it ran, which only the next trace can
+free, and every trace would wait longer than the last. And a heap with no
+block a cycle could run through in use -- no `Ref`, no mutable array that may
+hold references -- has no cycle to find, however large it is, and skips the
+trace: a program that can tie a knot by what it is compiled from, and never
+does, never marks its heap. A heap is a green thread's (`crate::ctx`), and so
+is a trace: each thread's heap is traced on its own, with its own roots,
+which is what one heap per thread -- nothing shared, everything that crosses
+copied -- makes possible.
 
 **The roots, and the one pause.** A trace starts inside `meadow_acquire`
 called from compiled code, before the new block is taken: the one point at
@@ -365,10 +371,15 @@ can then only mark too much, never lead it astray.
   waits, unused, until the marking ends, so the marker never reads a block
   that has become another.
 
-**The end.** Marking is done when the marker has nothing left and the program
-has logged nothing more since -- asked under one lock, from the program's
-side, as it allocates. Then a sweep, on the program's thread, a slice per
-allocation. An unmarked block in the heap as it was is garbage -- nothing
+**The end.** Once the marker has done all it was given, the program's thread
+marks what it has logged since and ends the marking: what it logged is a
+batch at most, and waiting instead for a moment when it had logged nothing
+would wait forever on a program that keeps rewriting its `Ref`s. And if the
+program has allocated as much as was live before the marker is through --
+the marker is behind, or busy with another thread's heap -- the program's
+thread stops it and finishes the marking itself, so that a trace ends however
+busy the marker is, and what it holds back meanwhile is bounded. Then a
+sweep, on the program's thread, a slice per allocation. An unmarked block in the heap as it was is garbage -- nothing
 reached it when the roots were taken, and nothing can reach garbage after --
 and every such block is either in a cycle or held only by one. The sweep
 first finds them all, then for each gives up its references to blocks that are
@@ -388,7 +399,26 @@ memory it is, without giving up the fields it no longer has.
 can: a bit set as each block is carved from a chunk; the barrier's load and
 branch at each store into a block and each reuse; during a trace, a mark at
 each allocation and the memory counting frees held until it ends; and the
-marking itself, on another core.
+marking itself, on another core. Against trial deletion it also saves the
+test at every decrement of a mutable block.
+
+Measured against trial deletion on the Windows desktop, each built with
+`--runtime silo`, best of five whole runs:
+
+The benchmarks of `benchmarks/` run the same under either, `binarytrees`
+13% faster under tracing for the test it leaves out: they tie no knot at run
+time, and no trace starts. Where knots are tied:
+
+| program | trial deletion | tracing |
+|---|---|---|
+| two million knots, each let go of at once | 187 ms | 107 ms |
+| a live ring of 200,000 `Ref`s, a million knots made and let go of around it | 249 ms | 67 ms; the longest pause 0.007 ms against 4.1 |
+| the same, twenty million knots | 2.0 s | 1.3 s |
+
+What tracing pays for that is memory. It frees garbage a trace at a time,
+where trial deletion frees a knot as soon as it looks at it: under a stream
+of cyclic garbage the heap holds what was made since the last trace, and the
+last program above peaks at 47 MB where trial deletion keeps to 26.
 
 **What it does not catch.** A cycle that runs through the frames of a
 suspended continuation -- a `Ref` holding a continuation whose frames hold the

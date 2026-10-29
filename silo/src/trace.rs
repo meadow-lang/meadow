@@ -56,7 +56,7 @@ const CHECK_EVERY: u32 = 64;
 /// What one slice of the sweep looks at: words of a chunk's map of block
 /// starts, or garbage blocks freed.
 const SLICE_WORDS: usize = 256;
-const SLICE_BLOCKS: usize = 256;
+const SLICE_BLOCKS: usize = 1024;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -196,10 +196,13 @@ impl Chunk {
         self.starts[w].load(Ordering::Acquire) & b != 0
     }
 
-    /// Mark the block at `at`: whether this was the first time.
+    /// Mark the block at `at`: whether this was the first time. Most blocks
+    /// a trace comes to are marked already, and asking is cheaper than
+    /// writing.
     pub fn mark(&self, at: usize) -> bool {
         let (w, b) = self.place(at);
-        self.marks[w].fetch_or(b, Ordering::AcqRel) & b == 0
+        let m = &self.marks[w];
+        m.load(Ordering::Acquire) & b == 0 && m.fetch_or(b, Ordering::AcqRel) & b == 0
     }
 
     fn marked(&self, at: usize) -> bool {
@@ -212,19 +215,24 @@ impl Chunk {
     }
 
     /// The start of the block `at` is inside, looking back no further than
-    /// the largest block a size class has.
+    /// the largest block a size class has: a word of the map at a time.
     fn start_at_or_before(&self, at: usize) -> Option<usize> {
-        let mut p = at & !7;
-        for _ in 0..heap::CLASSES {
-            if p < self.start {
+        let i = (at - self.start) / 8;
+        let lowest = i.saturating_sub(heap::CLASSES);
+        let (mut w, b) = (i / 64, i % 64);
+        // This word's bits at and below `i`.
+        let mut bits = self.starts[w].load(Ordering::Acquire) & (u64::MAX >> (63 - b));
+        loop {
+            if bits != 0 {
+                let j = 64 * w + 63 - bits.leading_zeros() as usize;
+                return (j >= lowest).then_some(self.start + 8 * j);
+            }
+            if w == 0 || 64 * w <= lowest {
                 return None;
             }
-            if self.is_start(p) {
-                return Some(p);
-            }
-            p -= 8;
+            w -= 1;
+            bits = self.starts[w].load(Ordering::Acquire);
         }
-        None
     }
 
     fn clear_marks(&self) {
@@ -250,15 +258,55 @@ fn load(v: Word, i: usize) -> Word {
 /// too large for one, each with a mark.
 pub struct Snapshot {
     chunks: Vec<Arc<Chunk>>,
+    /// Where each of `chunks` begins and ends, beside them: what a search
+    /// reads, without going through to each chunk.
+    spans: Vec<(usize, usize)>,
+    /// The chunk the last search found: a block's fields mostly point near
+    /// it, so the next search mostly finds the same one.
+    hint: std::sync::atomic::AtomicUsize,
     large: Vec<(usize, usize)>,
     large_marks: Box<[AtomicBool]>,
+    /// The lowest address any of it has, and one past the highest: most words
+    /// of a stack are outside, and are passed over on that alone.
+    lo: usize,
+    hi: usize,
 }
 
 impl Snapshot {
+    fn new(chunks: Vec<Arc<Chunk>>, large: Vec<(usize, usize)>) -> Snapshot {
+        let ends = chunks
+            .iter()
+            .map(|c| (c.start, c.end()))
+            .chain(large.iter().map(|&(s, w)| (s, s + 8 * w)));
+        let (lo, hi) = ends.fold((usize::MAX, 0), |(lo, hi), (s, e)| (lo.min(s), hi.max(e)));
+        Snapshot {
+            lo,
+            hi,
+            spans: chunks.iter().map(|c| (c.start, c.end())).collect(),
+            chunks,
+            hint: std::sync::atomic::AtomicUsize::new(0),
+            large_marks: (0..large.len()).map(|_| AtomicBool::new(false)).collect(),
+            large,
+        }
+    }
+
     fn chunk_of(&self, at: usize) -> Option<&Chunk> {
-        let i = self.chunks.partition_point(|c| c.start <= at);
-        let c = self.chunks.get(i.checked_sub(1)?)?;
-        (at < c.end()).then_some(&**c)
+        let h = self.hint.load(Ordering::Relaxed);
+        if let Some(&(s, e)) = self.spans.get(h)
+            && s <= at
+            && at < e
+        {
+            return Some(&self.chunks[h]);
+        }
+        let i = self
+            .spans
+            .partition_point(|(s, _)| *s <= at)
+            .checked_sub(1)?;
+        if at >= self.spans[i].1 {
+            return None;
+        }
+        self.hint.store(i, Ordering::Relaxed);
+        Some(&self.chunks[i])
     }
 
     fn large_at(&self, at: usize) -> Option<usize> {
@@ -339,6 +387,12 @@ impl Snapshot {
 /// checked to be a block first, and nothing past the block is read: a word
 /// read wrong can mark too much, and never anything worse.
 fn scan(snap: &Snapshot, v: Word, gray: &mut Vec<Word>) {
+    scan_from(snap, v, 0, gray);
+}
+
+/// [`scan`], from field `from` on: what a block waiting to be erased still
+/// holds, its fields before `from` given up already.
+fn scan_from(snap: &Snapshot, v: Word, from: usize, gray: &mut Vec<Word>) {
     let Some(end) = snap.bounds(v) else { return };
     let w0 = load(v, 0);
     let w1 = load(v, 1);
@@ -358,7 +412,7 @@ fn scan(snap: &Snapshot, v: Word, gray: &mut Vec<Word>) {
         return;
     }
     let n = len.min(room - first);
-    for i in 0..n {
+    for i in from..n {
         let d = if uniform {
             ((w1 >> heap::DESC_SHIFT) & 15) as i64
         } else {
@@ -377,9 +431,13 @@ fn scan(snap: &Snapshot, v: Word, gray: &mut Vec<Word>) {
     }
 }
 
-/// Mark from `work` -- references to mark -- and `gray` -- marked blocks whose
-/// fields are still to look at -- until there is nothing left.
-fn mark_all(snap: &Snapshot, work: Vec<Word>, gray: &mut Vec<Word>) {
+/// Mark from `work` -- references to mark -- `partial` -- marked blocks whose
+/// fields from a place on are still to look at -- and `gray` -- marked blocks
+/// whose fields are still to look at -- until there is nothing left.
+fn mark_all(snap: &Snapshot, work: Vec<Word>, partial: Vec<(Word, usize)>, gray: &mut Vec<Word>) {
+    for (v, from) in partial {
+        scan_from(snap, v, from, gray);
+    }
     for w in work {
         if snap.mark(w) {
             gray.push(w);
@@ -404,6 +462,9 @@ struct Inner {
     work: Vec<Word>,
     /// Marked blocks still to look at, when the marker was stopped part-way.
     gray: Vec<Word>,
+    /// Blocks waiting to be erased, marked, and the field each still holds
+    /// from: theirs to look at, as the program goes on.
+    partial: Vec<(Word, usize)>,
     state: Run,
     /// The heap is going, or its thread wants the trace finished itself.
     cancel: bool,
@@ -457,16 +518,23 @@ fn marker() {
 
 fn run(m: &Mark) {
     loop {
-        let (work, mut gray) = {
+        let (work, mut gray, partial) = {
             let mut i = lock(&m.inner);
-            if i.cancel || (i.work.is_empty() && i.gray.is_empty()) {
+            if i.cancel || (i.work.is_empty() && i.gray.is_empty() && i.partial.is_empty()) {
                 i.state = Run::Idle;
                 m.changed.notify_all();
                 return;
             }
             i.state = Run::Active;
-            (std::mem::take(&mut i.work), std::mem::take(&mut i.gray))
+            (
+                std::mem::take(&mut i.work),
+                std::mem::take(&mut i.gray),
+                std::mem::take(&mut i.partial),
+            )
         };
+        for (v, from) in partial {
+            scan_from(&m.snap, v, from, &mut gray);
+        }
         for w in work {
             if m.snap.mark(w) {
                 gray.push(w);
@@ -490,14 +558,18 @@ fn run(m: &Mark) {
 impl Mark {
     /// Stop the marker on this heap and take what it had left: once this
     /// answers, nothing but the caller reads the snapshot's blocks.
-    fn stop(&self) -> (Vec<Word>, Vec<Word>) {
+    fn stop(&self) -> (Vec<Word>, Vec<Word>, Vec<(Word, usize)>) {
         let mut i = lock(&self.inner);
         i.cancel = true;
         while i.state == Run::Active {
             i = self.changed.wait(i).unwrap_or_else(|p| p.into_inner());
         }
         i.state = Run::Idle;
-        (std::mem::take(&mut i.work), std::mem::take(&mut i.gray))
+        (
+            std::mem::take(&mut i.work),
+            std::mem::take(&mut i.gray),
+            std::mem::take(&mut i.partial),
+        )
     }
 }
 
@@ -518,6 +590,10 @@ pub struct State {
     /// that every allocation from compiled code looks in.
     at: usize,
     polls: u32,
+    /// The chunk the last block made black was in: see [`blacken`].
+    pub(crate) hint: usize,
+    /// Words of stack the trace's roots were scanned from.
+    stack_words: usize,
     /// Allocations a trace may mark through before the program's thread
     /// finishes it itself: see [`check`].
     patience: u32,
@@ -542,6 +618,9 @@ struct Sweep {
     /// Garbage freed, its memory held until the sweep is through: an address
     /// one garbage block names is not handed out while another may name it.
     held: Vec<(*mut Word, usize)>,
+    /// Blocks of the snapshot the trace marked: what was live when the roots
+    /// were taken.
+    kept: usize,
 }
 
 enum Step {
@@ -566,6 +645,8 @@ impl State {
             phase: Phase::Idle,
             at: FLOOR,
             polls: 0,
+            hint: 0,
+            stack_words: 0,
             patience: 0,
             began: None,
         }
@@ -610,14 +691,25 @@ pub fn sweeping() -> bool {
 }
 
 /// Mark the block at `p`, which was just taken, if it is in a chunk of the
-/// trace in progress: new blocks are black.
-pub(crate) fn blacken(chunks: &[Arc<Chunk>], p: Word) {
+/// trace in progress: new blocks are black. `hint` is the chunk the last
+/// block was in, which the next mostly is.
+pub(crate) fn blacken(chunks: &[Arc<Chunk>], hint: &mut usize, p: Word) {
     let at = p as usize;
-    let i = chunks.partition_point(|c| c.start <= at);
-    if let Some(c) = i.checked_sub(1).and_then(|i| chunks.get(i))
-        && at < c.end()
-        && c.traced()
-    {
+    let near = chunks.get(*hint).filter(|c| c.start <= at && at < c.end());
+    let c = match near {
+        Some(c) => c,
+        None => {
+            let Some(i) = chunks.partition_point(|c| c.start <= at).checked_sub(1) else {
+                return;
+            };
+            if at >= chunks[i].end() {
+                return;
+            }
+            *hint = i;
+            &chunks[i]
+        }
+    };
+    if c.traced() {
         c.mark(at);
     }
 }
@@ -657,7 +749,7 @@ pub extern "C" fn meadow_satb_reuse(c: *mut Ctx, token: Word) {
             }
         }
     }
-    blacken(&h.chunk_meta, token);
+    blacken(&h.chunk_meta, &mut h.trace.hint, token);
 }
 
 /// The runtime's own barrier: `old` is about to be overwritten in a block
@@ -701,7 +793,16 @@ fn advance(c: *mut Ctx) {
         Phase::Sweeping(_) => 2,
     };
     match phase {
-        0 => start(c, false),
+        0 => {
+            // No block that a cycle could run through is in use: there is no
+            // cycle to find, however many blocks there are.
+            let h = unsafe { &mut (*c).heap };
+            if h.mutables == 0 {
+                h.trace.at = (2 * h.live_blocks()).max(FLOOR);
+                return;
+            }
+            start(c, false)
+        }
         1 => {
             let t = unsafe { &mut (*c).heap.trace };
             t.polls = t.polls.wrapping_add(1);
@@ -719,7 +820,10 @@ fn advance(c: *mut Ctx) {
 
 /// Take the roots and start marking: the one pause. `now` marks here, on this
 /// thread, and sweeps, rather than handing the trace to the marker -- what a
-/// collection the program waits for does.
+/// collection the program waits for does, which is asked for where the
+/// program's frames hold nothing of the heap's (a thread's end, the exit), and
+/// so takes no roots from the stacks: a stale word there would only keep a
+/// dead cycle alive past the end.
 fn start(c: *mut Ctx, now: bool) {
     let began = std::time::Instant::now();
     // Safety: the running thread's heap and context, borrowed in turn.
@@ -729,13 +833,12 @@ fn start(c: *mut Ctx, now: bool) {
     }
     let mut large: Vec<(usize, usize)> = h.large.iter().map(|(a, w)| (*a, *w)).collect();
     large.sort_unstable();
-    let snap = Snapshot {
-        chunks: h.chunk_meta.clone(),
-        large_marks: (0..large.len()).map(|_| AtomicBool::new(false)).collect(),
-        large,
-    };
+    let snap = Snapshot::new(h.chunk_meta.clone(), large);
     let mut work = Vec::new();
-    let scanned = stopped(|sp| stacks(c, sp, &snap, &mut work, now));
+    h.trace.stack_words = 0;
+    let t_stacks = std::time::Instant::now();
+    let scanned = stopped(|sp| stacks(c, sp, &snap, &mut work, !now));
+    let stack_nanos = t_stacks.elapsed().as_nanos() as u64;
     if !scanned {
         // Somewhere the roots cannot all be found: try again later, rather
         // than free what a frame holds.
@@ -777,24 +880,29 @@ fn start(c: *mut Ctx, now: bool) {
     let h = unsafe { &mut (*c).heap };
     // What is waiting to be erased is dead, and counting frees it; but it
     // still holds what it has not given up yet, which must not be freed
-    // under it. Marked, and its remaining fields followed.
+    // under it. Marked here, and its remaining fields left to the marker: a
+    // dead block is only ever erased, never written, and one may be an
+    // array of millions.
+    let t_pending = std::time::Instant::now();
+    let pending = h.pending.len() as u64;
+    let mut partial = Vec::with_capacity(h.pending.len());
     for &(p, from) in &h.pending {
         let v = p as Word;
         snap.mark(v);
-        if heap::kind(v) == heap::STRING || heap::kind(v) == heap::BIGINT {
-            continue;
-        }
-        for i in from..heap::len(v) {
-            if heap::field_desc(v, i) == desc::REF {
-                work.push(heap::field(v, i));
-            }
-        }
+        partial.push((v, from));
     }
+    let pending_nanos = t_pending.elapsed().as_nanos() as u64;
+    tally(|t| {
+        t.stack_nanos = t.stack_nanos.max(stack_nanos);
+        t.pending_nanos = t.pending_nanos.max(pending_nanos);
+        t.pending_most = t.pending_most.max(pending);
+    });
     let m = Arc::new(Mark {
         snap,
         inner: Mutex::new(Inner {
             work: Vec::new(),
             gray: Vec::new(),
+            partial: Vec::new(),
             state: if now { Run::Idle } else { Run::Queued },
             cancel: false,
         }),
@@ -816,34 +924,41 @@ fn start(c: *mut Ctx, now: bool) {
     });
     if now {
         let mut gray = Vec::new();
-        mark_all(&m.snap, work, &mut gray);
+        mark_all(&m.snap, work, partial, &mut gray);
         finish(c);
     } else {
-        lock(&m.inner).work = work;
+        {
+            let mut i = lock(&m.inner);
+            i.work = work;
+            i.partial = partial;
+        }
         enqueue(m);
     }
 }
 
 /// Scan every stack the thread has, from where each stopped -- the innermost
 /// from `sp` -- for references into the heap: whether they could all be
-/// found. `quiet` is a collection asked for from the runtime, which may run
-/// on no stack the thread knows; there the frames hold nothing of the heap's.
-fn stacks(c: *mut Ctx, sp: usize, snap: &Snapshot, work: &mut Vec<Word>, quiet: bool) -> bool {
+/// found. Without `running`, the stacks of what is running are left out --
+/// what a collection the program waits for asks -- but not those of the
+/// continuations and the parked segments, whose frames still hold what they
+/// will give back.
+fn stacks(c: *mut Ctx, sp: usize, snap: &Snapshot, work: &mut Vec<Word>, running: bool) -> bool {
     // Safety: the running thread's context.
     let cx = unsafe { &*c };
     let mut ranges: Vec<(usize, usize)> = Vec::new();
-    match (cx.levels.last(), cx.os_level) {
-        (Some(l), _) => ranges.push((sp, l.base)),
-        (None, Some(o)) => ranges.push((sp, o.base)),
-        (None, None) if quiet => {}
-        (None, None) => return false,
-    }
-    let outer = cx.levels.len().saturating_sub(1);
-    ranges.extend(cx.levels[..outer].iter().map(|l| (l.stopped, l.base)));
-    if !cx.levels.is_empty()
-        && let Some(o) = cx.os_level
-    {
-        ranges.push((o.stopped, o.base));
+    if running {
+        match (cx.levels.last(), cx.os_level) {
+            (Some(l), _) => ranges.push((sp, l.base)),
+            (None, Some(o)) => ranges.push((sp, o.base)),
+            (None, None) => return false,
+        }
+        let outer = cx.levels.len().saturating_sub(1);
+        ranges.extend(cx.levels[..outer].iter().map(|l| (l.stopped, l.base)));
+        if !cx.levels.is_empty()
+            && let Some(o) = cx.os_level
+        {
+            ranges.push((o.stopped, o.base));
+        }
     }
     for p in &cx.parked {
         ranges.push((p.level.stopped, p.level.base));
@@ -858,11 +973,14 @@ fn stacks(c: *mut Ctx, sp: usize, snap: &Snapshot, work: &mut Vec<Word>, quiet: 
             return false;
         }
         let mut at = (lo + 7) & !7;
+        // Safety: the running thread's heap, for this count alone.
+        unsafe { (*c).heap.trace.stack_words += (hi - at) / 8 };
         while at + 8 <= hi {
             // Safety: a word of a stack this thread runs on, between where it
             // stopped and where it begins: in use, and mapped.
             let w = unsafe { std::ptr::read_volatile(at as *const Word) };
-            if heap::is_block(w)
+            if (w as usize) >= snap.lo
+                && (w as usize) < snap.hi
                 && let Some(v) = snap.containing(w)
             {
                 work.push(v);
@@ -896,21 +1014,21 @@ fn check(c: *mut Ctx) {
         // behind, or another heap has it: this thread finishes the marking,
         // so that a trace ends however busy the marker is, and what it holds
         // back meanwhile is bounded.
-        let (mut work, mut gray) = m.stop();
+        let (mut work, mut gray, partial) = m.stop();
         work.append(&mut logged);
-        mark_all(&m.snap, work, &mut gray);
+        mark_all(&m.snap, work, partial, &mut gray);
         finish(c);
         tally(|t| t.helped += 1);
         return;
     }
     let mut i = lock(&m.inner);
-    if i.state == Run::Idle && i.work.is_empty() && i.gray.is_empty() {
+    if i.state == Run::Idle && i.work.is_empty() && i.gray.is_empty() && i.partial.is_empty() {
         // Taken from the marker: only this thread queues it, and this
         // thread is here.
         i.state = Run::Active;
         drop(i);
         let mut gray = Vec::new();
-        mark_all(&m.snap, logged, &mut gray);
+        mark_all(&m.snap, logged, Vec::new(), &mut gray);
         lock(&m.inner).state = Run::Idle;
         finish(c);
         return;
@@ -933,6 +1051,9 @@ fn finish(c: *mut Ctx) {
         return;
     };
     meadow_marking.fetch_sub(1, Ordering::SeqCst);
+    if let Some(b) = h.trace.began {
+        tally(|t| t.mark_nanos += b.elapsed().as_nanos() as u64);
+    }
     h.trace.limbo_on = false;
     // A large block goes back to the system, and its address may come back as
     // another: held until the sweep is through, so that the sweep never takes
@@ -955,6 +1076,7 @@ fn finish(c: *mut Ctx) {
         doomed: Vec::new(),
         tokens: HashSet::new(),
         held,
+        kept: 0,
     }));
 }
 
@@ -989,7 +1111,11 @@ fn sweep(c: *mut Ctx, words: usize, blocks: usize) -> bool {
                     let b = bits.trailing_zeros() as usize;
                     bits &= bits - 1;
                     let v = (ch.start + 8 * (64 * word + b)) as Word;
-                    if heap::is_free(v) || ch.marked(v as usize) {
+                    if heap::is_free(v) {
+                        continue;
+                    }
+                    if ch.marked(v as usize) {
+                        s.kept += 1;
                         continue;
                     }
                     s.doomed.push(v);
@@ -1008,8 +1134,9 @@ fn sweep(c: *mut Ctx, words: usize, blocks: usize) -> bool {
             if chunk >= snap.chunks.len() {
                 while large < snap.large.len() && left > 0 {
                     let (at, _) = snap.large[large];
-                    if !snap.large_marks[large].load(Ordering::Acquire) && h.large.contains_key(&at)
-                    {
+                    if snap.large_marks[large].load(Ordering::Acquire) {
+                        s.kept += 1;
+                    } else if h.large.contains_key(&at) {
                         s.doomed.push(at as Word);
                     }
                     large += 1;
@@ -1092,10 +1219,18 @@ fn end_sweep(c: *mut Ctx) {
         h.clean_block(p, words);
     }
     SWEEPING.with(|w| w.set(false));
-    h.trace.at = (2 * h.live_blocks()).max(FLOOR);
+    // The next trace once the heap has grown by as much again as this one
+    // found live -- and by an eighth of the stack it scanned, so that a
+    // program deep in a recursion does not pay for its stack at every few
+    // thousand blocks. Not twice what is in use now: that counts as live the
+    // garbage made while this trace ran, which only the next can free, and
+    // every trace would wait longer than the last.
+    let work = s.kept + h.trace.stack_words / 8;
+    h.trace.at = h.live_blocks() + work.max(FLOOR);
     if let Some(b) = h.trace.began.take() {
         tally(|t| t.nanos += b.elapsed().as_nanos() as u64);
     }
+    tally(|t| t.sweep_nanos = t.nanos.saturating_sub(t.mark_nanos));
 }
 
 // --- collections the program waits for ----------------------------------------
@@ -1121,9 +1256,9 @@ fn finish_here(c: *mut Ctx) {
             Phase::Idle => return,
             Phase::Marking(m) => {
                 let m = m.clone();
-                let (mut work, mut gray) = m.stop();
+                let (mut work, mut gray, partial) = m.stop();
                 work.append(&mut h.trace.satb);
-                mark_all(&m.snap, work, &mut gray);
+                mark_all(&m.snap, work, partial, &mut gray);
                 finish(c);
             }
             Phase::Sweeping(_) => while !sweep(c, usize::MAX, usize::MAX) {},
@@ -1156,6 +1291,14 @@ pub struct Tally {
     pub helped: u64,
     /// Traces put off because a stack's roots could not all be found.
     pub put_off: u64,
+    /// From the roots to the end of marking, and from there to swept.
+    pub mark_nanos: u64,
+    pub sweep_nanos: u64,
+    /// The longest any pause spent on the stacks, and on what waits to be
+    /// erased; and the most that waited.
+    pub stack_nanos: u64,
+    pub pending_nanos: u64,
+    pub pending_most: u64,
 }
 
 static TALLY: Mutex<Tally> = Mutex::new(Tally {
@@ -1166,6 +1309,11 @@ static TALLY: Mutex<Tally> = Mutex::new(Tally {
     nanos: 0,
     helped: 0,
     put_off: 0,
+    mark_nanos: 0,
+    sweep_nanos: 0,
+    stack_nanos: 0,
+    pending_nanos: 0,
+    pending_most: 0,
 });
 
 fn tally(f: impl FnOnce(&mut Tally)) {
@@ -1198,6 +1346,17 @@ pub fn report() {
         t.pause_nanos as f64 / 1e6,
         t.longest as f64 / 1e6,
         t.nanos as f64 / 1e6
+    );
+    eprintln!(
+        "aot: of that, {:.3} ms marking and {:.3} ms sweeping",
+        t.mark_nanos as f64 / 1e6,
+        t.sweep_nanos as f64 / 1e6
+    );
+    eprintln!(
+        "aot: the longest on stacks {:.3} ms, on what waits to be erased {:.3} ms ({} at most)",
+        t.stack_nanos as f64 / 1e6,
+        t.pending_nanos as f64 / 1e6,
+        t.pending_most
     );
     if t.put_off > 0 {
         eprintln!(
