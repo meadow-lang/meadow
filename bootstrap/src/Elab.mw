@@ -134,8 +134,7 @@ pass! {
           (\x acc -> newCoreTermCtor out here "List.Cons" [x, acc] typ)
           (newCoreTermCtor out here "List.Nil" [] typ)
           items
-    | Expr.Cons { ref, raw args, typ } ->
-        constructed out cx here ref (consArgs src out cx ref args) typ
+    | Expr.Cons { ref, raw args, typ } -> consBuilt src out cx here ref args typ
     | Expr.Record { fields, base, typ } ->
         (match base with
          | None ->
@@ -144,7 +143,20 @@ pass! {
                here
                (V.map (\f -> newCoreField out here (fst f) (snd f)) fields)
                typ
-         | Just b -> V.foldl (\t f -> newCoreTermExtend out here t (fst f) (snd f) typ) b fields)
+         -- The fields first, as they are written first, and then the
+         -- record they extend.
+         | Just b ->
+             inOrder
+               out
+               cx
+               here
+               (V.pushBack (V.map snd fields) b)
+               (V.range 0 (V.len fields + 1))
+               (\vs ->
+                 V.foldl
+                   (\t f -> newCoreTermExtend out here t (fst f) (snd f) typ)
+                   (V.getOr b vs (V.len fields))
+                   (V.zip (V.map fst fields) (V.take vs (V.len fields)))))
     | ExprField { name, value } -> (name, value)
     | Update { base, fields, typ } ->
         V.foldl (\t f -> newCoreTermExtend out here t (fst f) (snd f) typ) base fields
@@ -849,9 +861,10 @@ fun etaCtor out (cx : Low s) (m : Meta) (name : String) (wants : Int) have (t : 
            (etaCtor out cx m name (wants - 1) (V.pushBack have (newCoreTermVar out m v arg)) rest)
            t)
 
--- What a constructor is given, in the order it holds them: one with named
--- fields given a record has each field's value, by its name.
-fun consArgs src out (cx : Low s) (id : Int) args =
+-- A constructor applied to what it is given, at type `t`. One with named
+-- fields given a record has each field's value, by its name, in the order
+-- it holds them -- and evaluated in the order they are written.
+fun consBuilt src out (cx : Low s) (m : Meta) (id : Int) args (t : Type) =
   match (H.lookup id cx.fields, V.get args 0) with
   | (Just labels, Just r) ->
       if V.len args == 1 and kindBareExpr src r == BareExprKind.Record then
@@ -859,14 +872,67 @@ fun consArgs src out (cx : Low s) (id : Int) args =
            V.map
              (\f -> (bareNameText src (bareExprFieldName src f), bareExprFieldValue src f))
              (bareExprRecordFields src r)
-         in V.concatMap
-              (\l ->
-                match V.find (\g -> fst g == l) given with
-                | Just g -> [emitExpr src out cx (snd g)]
-                | None -> [])
-              labels)
-      else V.map (\a -> emitExpr src out cx a) args
-  | _ -> V.map (\a -> emitExpr src out cx a) args
+         in
+         let held = V.filter (\l -> V.any (\g -> fst g == l) given) labels in
+         let values =
+           V.concatMap
+             (\l ->
+               match V.find (\g -> fst g == l) given with
+               | Just g -> [emitExpr src out cx (snd g)]
+               | None -> [])
+             held
+         in
+         let written =
+           V.foldl
+             (\acc g ->
+               if V.elem (fst g) held and not (V.elem (fst g) (V.map fst acc)) then
+                 V.pushBack acc (fst g, V.len (V.takeWhile (\l -> l != fst g) held))
+               else acc)
+             []
+             given
+         in inOrder out cx m values (V.map snd written) (\vs -> constructed out cx m id vs t))
+      else constructed out cx m id (V.map (\a -> emitExpr src out cx a) args) t
+  | _ -> constructed out cx m id (V.map (\a -> emitExpr src out cx a) args) t
+
+-- `build` of `values`, in their own order, with them evaluated in the order
+-- `order` lists their places in, as `meadow_core`'s `in_order` has it: each
+-- but the last in that order bound to a variable first, in that order,
+-- unless it is a variable, a literal or a function, whose place makes no
+-- difference. The last is evaluated in its place, after every other.
+fun inOrder out (cx : Low s) (m : Meta) values (order : [Int]) build =
+  let early = V.take order (V.len order - 1) in
+  let bound =
+    V.foldl
+      (\acc i ->
+        match V.get values i with
+        | Just v -> if settled out v then acc else V.pushBack acc (i, fresh cx, v)
+        | None -> acc)
+      []
+      early
+  in
+  let args =
+    V.map
+      (\i ->
+        let v = V.getOr (unit out m) values i in
+        match V.find (\b -> fst3 b == i) bound with
+        | Just b -> newCoreTermVar out m (snd3 b) (tyCoreTerm out v)
+        | None -> v)
+      (V.range 0 (V.len values))
+  in V.foldr
+       (\b acc -> newCoreTermLet out m (snd3 b) (thd3 b) acc (tyCoreTerm out acc))
+       (build args)
+       bound
+
+-- A term whose place among others makes no difference to what they do.
+fun settled out (t : CoreTerm) =
+  let k = kindCoreTerm out t in
+  k == CoreTermKind.Var or k == CoreTermKind.Const or k == CoreTermKind.Lam
+
+fun fst3 (a, _, _) = a
+
+fun snd3 (_, b, _) = b
+
+fun thd3 (_, _, c) = c
 
 -- The same of a pattern: a field it does not name is anything.
 fun consPats src out (cx : Low s) (m : Meta) (id : Int) args =
