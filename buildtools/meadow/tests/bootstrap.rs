@@ -1223,7 +1223,14 @@ fn grouped(text: &str, table: &HashMap<InternedString, hir::Fixity>) -> String {
 
 #[test]
 fn every_source_groups_its_operators_as_meadow_rename_groups_them() {
-    let files = sources(&["lib", "examples", "benches", "bootstrap", "glade", "silo"]);
+    // MeadowBoot finds a file's operators by building its package: a file of
+    // no package -- a glade case kept in a file of its own -- is the lexer's
+    // and the parser's alone.
+    let files: Vec<PathBuf> =
+        sources(&["lib", "examples", "benches", "bootstrap", "glade", "silo"])
+            .into_iter()
+            .filter(|f| package_of(f).is_some())
+            .collect();
     let std = repo().join("lib").join("Std");
     let theirs = per_file("fixity", &files);
     let lib = declared_in(&HashMap::new(), &std);
@@ -1853,21 +1860,33 @@ fn every_source_renames_as_meadow_rename_renames_it() {
 // --- evaluating: the CEK machine ------------------------------------------------
 
 /// The programs `glade/tests/differential.rs` checks every back end with: the
-/// string literal given to each `agree(…)` there. Read from that file, so a
-/// case added there is one here.
+/// string literal given to each `agree(…)` there, or the file beside it that
+/// an `agree` of `include_str!` names. Read from that file, so a case added
+/// there is one here.
 fn glade_programs() -> Vec<String> {
     // Read as the compiler reads a Rust file: a checkout on Windows has
     // `\r\n` line endings, and a `\r` left in a case's text -- before the
     // newline a `\` continues a string over, say -- makes it a different
     // program, or none.
-    let text = std::fs::read_to_string(repo().join("glade/tests/differential.rs"))
-        .expect("the glade cases")
-        .replace("\r\n", "\n");
+    let read = |name: &str| {
+        std::fs::read_to_string(repo().join("glade/tests").join(name))
+            .expect("the glade cases")
+            .replace("\r\n", "\n")
+    };
+    let text = read("differential.rs");
     let mut out = Vec::new();
     let mut rest = text.as_str();
     while let Some(at) = rest.find("agree(") {
         rest = &rest[at + "agree(".len()..];
-        if let Some((lit, after)) = rust_string(rest.trim_start()) {
+        let arg = rest.trim_start();
+        if let Some(file) = arg
+            .strip_prefix("include_str!")
+            .and_then(|a| a.strip_prefix('('))
+            && let Some((name, after)) = rust_string(file)
+        {
+            out.push(read(&name));
+            rest = after;
+        } else if let Some((lit, after)) = rust_string(arg) {
             out.push(lit);
             rest = after;
         }

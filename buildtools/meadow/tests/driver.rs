@@ -271,6 +271,123 @@ fn a_program_gives_up_on_standard_error_on_every_engine() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A program whose every construct prints the order its parts are evaluated
+/// in -- each part numbered in the order it is written -- and whether the
+/// first of two failures is the one a handler sees. See "Evaluation order"
+/// in `docs/TUTORIAL.md`; `glade/tests/evaluation_order.mw` is the same
+/// without the standard library, for the engines run as a library.
+const EVALUATION_ORDER: &str = r#"use Std.Exn (Exn, raise, toResult)
+
+data Pair = Pair Int Int
+
+use Pair.*
+
+record Point = { x : Int, y : Int }
+
+effect Ask { ask : Int -> Int }
+
+fun at (n : Int) v = let u = print "${n}" in v
+
+fun check (name : String) f = let u = print "${name}: " in let v = f () in println ""
+
+fun sub (a : Int) (b : Int) = a - b
+
+fun both u : Int ! { Exn String | e } = raise "a" + raise "b"
+
+fun args u : Int ! { Exn String | e } = sub (raise "first") (raise "second")
+
+fun main () : () ! Eff =
+  let u = println "${toResult (\() -> both ()):?} ${toResult (\() -> args ()):?}" in
+  let u = check "operands" (\() -> at 1 10 - at 2 3 * at 3 2) in
+  let u = check "operators" (\() -> (at 1 "a" ++ at 2 "b", at 3 1 == at 4 1, at 5 2 ^ at 6 3)) in
+  let u = check "cons" (\() -> at 1 1 :: at 2 [2;]) in
+  let u = check "call" (\() -> (at 1 sub) (at 2 10) (at 3 3)) in
+  let u = check "body" (\() -> at 3 (sub (at 1 10) (at 2 3))) in
+  let u = check "constructor" (\() -> Pair (at 1 1) (at 2 2)) in
+  let u = check "tuple" (\() -> (at 1 1, at 2 2, at 3 3)) in
+  let u = check "vector" (\() -> [at 1 1, at 2 2, at 3 3]) in
+  let u = check "list" (\() -> [at 1 1; at 2 2; at 3 3]) in
+  let u = check "array" (\() -> #[at 1 1, at 2 2]) in
+  let u = check "range" (\() -> [at 1 1..at 2 3]) in
+  let u = check "record" (\() -> Point { y = at 1 2, x = at 2 1 }) in
+  let u = check "anonymous" (\() -> { y = at 1 2, x = at 2 1 }) in
+  let u = check "update" (\() -> { (at 1 (Point { x = 0, y = 0 })) | y = at 2 5, x = at 3 4 }) in
+  let u = check "extension" (\() -> { z = at 1 3 | at 2 { x = 1 } }) in
+  let u = check "string" (\() -> "${at 1 1}${at 2 2}") in
+  let u = check "let" (\() -> let a = at 1 1 in let b = at 2 2 in let c = at 3 3 in at 4 a) in
+  let u = check "if" (\() -> if at 1 True then at 2 1 else at 9 2) in
+  let u =
+    check "match" (\() ->
+      match at 1 3 with
+      | 1 -> at 9 0
+      | n if at 2 False -> at 9 0
+      | n if at 3 True -> at 4 n
+      | _ -> at 9 0)
+  in
+  let u = check "and or" (\() -> (at 1 False and at 9 True) or (at 2 True or at 9 True)) in
+  let u = check "pipes" (\() -> (at 2 10 |> at 1 (\n -> n + 1), at 3 (\n -> n + 1) <| at 4 10)) in
+  let u =
+    check "handler" (\() ->
+      handle at 1 0 + ask (at 2 1) + at 5 0 with {
+        ask n k -> let a = at 3 () in let r = k (at 4 n) in let b = at 7 () in r,
+        return v -> let a = at 6 () in v
+      })
+  in
+  ()
+"#;
+
+/// What [`EVALUATION_ORDER`] prints: the same on every engine, at every
+/// level, or something is evaluated out of turn somewhere.
+const EVALUATED_IN_ORDER: &str = r#"Err("a") Err("first")
+operands: 123
+operators: 123456
+cons: 12
+call: 123
+body: 123
+constructor: 12
+tuple: 123
+vector: 123
+list: 123
+array: 12
+range: 12
+record: 12
+anonymous: 12
+update: 123
+extension: 12
+string: 12
+let: 1234
+if: 12
+match: 1234
+and or: 12
+pipes: 1234
+handler: 1234567
+"#;
+
+#[test]
+fn every_engine_evaluates_in_the_order_the_program_is_written() {
+    let dir = scratch("evaluation-order");
+    let root = package(&dir, "evaluation-order", EVALUATION_ORDER);
+    for profile in [&[][..], &["--release"]] {
+        for engine in [
+            &[][..],
+            &["--backend", "vm"],
+            &["--backend", "jit"],
+            &["--backend", "aot"],
+            &["--cek"],
+            &["--runtime", "silo"],
+        ] {
+            let mut args = vec!["run"];
+            args.extend_from_slice(profile);
+            args.extend_from_slice(engine);
+            args.push(".");
+            let (ok, out, err) = meadow(&root, &args);
+            assert!(ok, "{args:?}: {err}");
+            assert_eq!(out.replace("\r\n", "\n"), EVALUATED_IN_ORDER, "{args:?}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn bytes_are_written_as_they_are() {
     let dir = scratch("bytes");

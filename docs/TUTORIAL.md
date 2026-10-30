@@ -4427,6 +4427,90 @@ A file whose brackets do not match is only indented.
 | `-` (prefix)                                            |            | negation, tighter than any infix |
 | _juxtaposition_                                         |            | function application, tightest   |
 
+### Evaluation order
+
+A program is evaluated in the order it is written: from left to right, and
+everything an expression is made of before the expression itself.
+
+- **Operators**: the left operand, then the right, whichever way the operator
+  groups -- `a - b * c` is `a`, `b`, `c`, and so is `a :: b :: c`. `and` and
+  `or` evaluate their right side only when the left has not decided.
+- **Calls**: the function, then its arguments from left to right, then the
+  body. A curried call `f a b` is one call -- `f`, `a`, `b`, then the body --
+  since a call that is not complete yet does nothing: where `f a` would
+  perform something, the type checker asks for `(f a) b`, two calls, the
+  first done before `b` is evaluated.
+- **Pipes** are the calls they stand for: `x |> f` and `f <| x` are both
+  `f x`, the function first. A pipeline's stages are almost always
+  partial applications, which do nothing, so this only shows when working
+  out a stage performs something itself.
+- **Constructors, tuples, arrays, vectors, lists and ranges**: their parts
+  from left to right.
+- **Records**: the fields in the order written, whatever order the type
+  declares them in. `{ r | x = v }` evaluates `r`, then the new values;
+  `{ x = v | r }` the new fields, then `r`.
+- **Strings**: the holes of `"${a}${b}"` from left to right.
+- **`let x = e in body`**: `e`, then `body`, whether `body` uses `x` or not.
+- **`if`**: the condition, then the branch it chooses, and not the other.
+- **`match`**: the value matched, then the arms from the top. Each arm's
+  pattern is tried from left to right -- a [view](#view-patterns) is applied
+  when it is reached, once -- then its guard; the first arm whose pattern
+  matches and whose guard holds is the one whose body runs.
+- **Functions** run their bodies when they are called, every time. An
+  operator section is a function: `(say "x" 1 + _)` prints each time it is
+  applied, not where it is written.
+- **Handlers**: an operation's argument, then the clause. `k v` evaluates `v`,
+  and resumes the body where it stopped; the body runs to its end, through the
+  `return` clause, before `k v` returns to the clause (see
+  [Continuations](#continuations-what-k-is)).
+
+```meadow
+record Point = { x : Int, y : Int }
+
+fun say s v = let _ = println s in v
+
+fun main () =
+  let p = Point { y = say "y" 2, x = say "x" 1 } in
+  let n = (say "f" (\a b -> a - b)) (say "a" 10) (say "b" 3) in
+  println (p.x + n)
+```
+
+```
+y
+x
+f
+a
+b
+8
+```
+
+This is part of the language, not of one compiler, because a program can see
+it. Every effect -- `Console`, `Exn`, `State`, one of your own -- happens in the
+order the program performs it, so what a handler sees is the program's choice,
+never the compiler's:
+
+```meadow
+use Std.Exn (Exn, raise, toResult)
+
+fun both () : Int ! { Exn String | e } = raise "a" + raise "b"
+
+fun main () = println "${toResult both:?}"
+```
+
+```
+Err("a")
+```
+
+That is `Err("a")` on Glade's VM, its JIT and its native code, on Silo and on
+the CEK machine, at every optimization level, and the same is true of what
+`catch` catches and of the order a program prints in.
+
+Code whose type performs nothing cannot tell what order it ran in, and that is
+what leaves the compiler free to reorder it, share it, or run it in parallel.
+A fault -- dividing by zero, say -- cannot tell either, since it is not an
+effect: nothing catches it, it ends the thread it happens in, and an `await`
+of that thread fails with it.
+
 ### Always in scope
 
 Without any `use`, from the prelude:
@@ -4507,3 +4591,5 @@ a worked example.
 - `Std.Test` is not in the prelude — `use Std.Test (assertEq)`.
 - A qualifier comes only from `as`: after `use Std.Collections.List`, it is
   `length`, not `List.length`.
+- `x |> f` is `f x`, so `f` is evaluated first: where working out `f`
+  performs something, that happens before `x` is evaluated.

@@ -79,6 +79,15 @@ beyond the last release is under _Unreleased_.
   else, and a program that cannot tie a knot carries neither collector.
   `MEADOW_SILO_CYCLES` says what the traces did. `docs/SILO.md`, "Cycles", is
   the design.
+- The language reference says in what order a program is evaluated -- as it
+  is written, from left to right, each part of an expression before the
+  expression -- and why that is part of the language: an effect happens in
+  the order the program performs it, so `raise "a" + raise "b"` is
+  `Err("a")` under `toResult` wherever it runs. `docs/TUTORIAL.md`,
+  "Evaluation order". One program checks it on every engine at every
+  optimization level -- Glade's VM, JIT and native code, Silo, the CEK and
+  AxCut machines, and MeadowBoot's CEK machine -- and another through
+  `meadow run` with each backend, in debug and release.
 
 ### Fixed
 
@@ -106,6 +115,15 @@ beyond the last release is under _Unreleased_.
   link to itself from its keyword: what `@derive(Lexer)` wrote spanned the
   whole declaration, so `data` went to the type, and a rename of the type
   would have written over all of it. Only names are links now.
+- A constructor given its fields by name out of their declared order,
+  `Point { y = …, x = … }`, evaluated them in the declared order, and a
+  record extended, `{ x = v | r }`, evaluated `r` before `v`. Both are
+  evaluated as they are written now, as an anonymous record and an update
+  already were -- in MeadowBoot too.
+- A release build that inlined a generic function answering one of its
+  arguments, `(id f) x`, lost the type of a function it answered: the
+  AxCut machine refused the program, holding a closure in a name of no
+  known representation.
 
 ## 0.4.0 - 2026-10-24
 
