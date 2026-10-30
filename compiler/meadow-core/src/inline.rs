@@ -123,9 +123,10 @@ pub fn program(p: &Program) -> Program {
         if bodies.is_empty() && loops.is_empty() {
             break;
         }
+        let originals = originals(&out);
         let mut changed = false;
         for d in &mut out.defs {
-            let next = term(&d.term, &bodies, &loops, &mut fresh);
+            let next = term(&d.term, &bodies, &originals, &loops, &mut fresh);
             changed |= next != d.term;
             d.term = next;
         }
@@ -807,13 +808,20 @@ fn fresh_copy(t: &Term, fresh: &mut Fresh) -> Term {
 fn term(
     t: &Term,
     bodies: &HashMap<Var, Body>,
+    originals: &HashMap<Var, Original>,
     loops: &HashMap<Var, Loop>,
     fresh: &mut Fresh,
 ) -> Term {
     rewrite::term(
         t,
         &mut |t| match call(&t, bodies) {
-            Some((body, tys, args)) => enter(body, tys, args, fresh),
+            Some((f, body, tys, written, args)) => {
+                let entered = enter(body, tys, args, fresh);
+                match originals.get(&f) {
+                    Some(original) => original.arguments(entered, &written),
+                    None => entered,
+                }
+            }
             None => match loop_call(&t, loops) {
                 Some((l, tys, args, dropped)) => {
                     let d = spine_head(&t).expect("a loop call has a head");
@@ -826,9 +834,14 @@ fn term(
     )
 }
 
-/// `t` as a saturated call to something worth inlining: what to inline, the
-/// types it is called at, and its arguments in order.
-fn call<'b>(t: &Term, bodies: &'b HashMap<Var, Body>) -> Option<(&'b Body, Vec<Ty>, Vec<Term>)> {
+/// `t` as a saturated call to something worth inlining: what it calls, what
+/// to inline, the types it is called at, the types the call wrote down -- the
+/// original's, for a specialized copy -- and its arguments in order.
+#[allow(clippy::type_complexity)]
+fn call<'b>(
+    t: &Term,
+    bodies: &'b HashMap<Var, Body>,
+) -> Option<(Var, &'b Body, Vec<Ty>, Vec<Ty>, Vec<Term>)> {
     let mut args = Vec::new();
     let mut tys: Vec<Ty> = Vec::new();
     let mut head = t;
@@ -854,13 +867,80 @@ fn call<'b>(t: &Term, bodies: &'b HashMap<Var, Body>) -> Option<(&'b Body, Vec<T
                 if args.len() != body.params.len() {
                     return None;
                 }
+                let written = tys.clone();
                 let tys = body.instantiation(tys)?;
                 args.reverse();
-                return Some((body, tys, args));
+                return Some((*v, body, tys, written, args));
             }
             _ => return None,
         }
     }
+}
+
+/// What a release copy was copied from takes: that definition's type
+/// binders, and its parameters' types over them.
+///
+/// The copy's own parameters are `#Ref` wherever a binder that is not a
+/// number was, which says how such an argument is held and nothing of what
+/// it is. Lowering recovers what it needs from where the value is taken
+/// apart -- but a function is not taken apart, it is applied: `(id f) x`,
+/// with `id` inlined, is a `#Ref` applied to `x`, and what that answers has
+/// no type at all. The call wrote down the types the original is at, and
+/// those say.
+struct Original {
+    binders: Vec<TyVar>,
+    params: Vec<Ty>,
+}
+
+impl Original {
+    /// `entered`, a call to the copy inlined -- the `let`s of its parameters
+    /// around its body -- with each parameter the copy has as `#Ref` given
+    /// the type the original has it at, at the types `written`.
+    fn arguments(&self, entered: Term, written: &[Ty]) -> Term {
+        if written.len() != self.binders.len() {
+            return entered;
+        }
+        let map: HashMap<u32, Ty> = self
+            .binders
+            .iter()
+            .map(|b| b.id)
+            .zip(written.iter().cloned())
+            .collect();
+        fn go(t: Term, params: &[Ty], map: &HashMap<u32, Ty>) -> Term {
+            match (t, params.split_first()) {
+                (Term::Let(v, poly, rhs, body), Some((original, rest))) => {
+                    let poly = match &poly.ty {
+                        Ty::Con(n, args) if &**n == specialize::REF && args.is_empty() => {
+                            Poly::mono(subst_rigid(original, map))
+                        }
+                        _ => poly,
+                    };
+                    let body = go(Arc::unwrap_or_clone(body), rest, map);
+                    Term::Let(v, poly, rhs, Arc::new(body))
+                }
+                (t, _) => t,
+            }
+        }
+        go(entered, &self.params, &map)
+    }
+}
+
+/// [`Original`] for each release copy whose original is still there to say.
+fn originals(p: &Program) -> HashMap<Var, Original> {
+    let defs: HashMap<Var, &Def> = p.defs.iter().map(|d| (d.var, d)).collect();
+    p.origins
+        .iter()
+        .filter_map(|(copy, of)| {
+            let body = function(&defs.get(of)?.term)?;
+            Some((
+                *copy,
+                Original {
+                    binders: body.binders,
+                    params: body.params.into_iter().map(|(_, ty)| ty).collect(),
+                },
+            ))
+        })
+        .collect()
 }
 
 /// The body at these types, with its parameters bound to the arguments.
