@@ -321,6 +321,75 @@ fn an_executable_that_is_gone_is_linked_again() {
 
 // --- what Silo runs ------------------------------------------------------------
 
+/// Run `main` -- a module of a package built for Silo -- with `meadow run
+/// --release`, answering whether it succeeded and what it said on stderr.
+fn on_silo(name: &str, main: &str) -> (bool, String) {
+    let dir = std::env::temp_dir().join(format!("meadow-silo-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).expect("a scratch package");
+    std::fs::write(
+        dir.join("Meadow.toml"),
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n\n[profile.release]\nruntime = \"silo\"\n"
+        ),
+    )
+    .expect("a manifest");
+    std::fs::write(dir.join("src/Main.mw"), main).expect("a module");
+    let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
+        .args(["run", "--release"])
+        .arg(&dir)
+        .output()
+        .expect("the meadow binary runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// A cancelled thread stops at an operation the runtime answers, as at a
+/// thread operation -- here the clock, asked over and over under a handler of
+/// its own -- and one waiting on a socket is woken; on Silo as on Glade
+/// (`tests/threads.rs`).
+#[test]
+fn silo_stops_a_cancelled_thread_at_an_operation_and_wakes_it_from_a_socket() {
+    let (ok, stderr) = on_silo(
+        "Clock",
+        "use Std.Thread as T
+use Std.Time (monotonic)
+
+effect Ask { ask : () -> Int }
+
+fun loop (n : Int) = if monotonic () < 0 then n else loop (n + ask ())
+
+fun main () =
+  let t = T.spawn (\\() -> handle loop 0 with { ask u k -> k 1 }) in
+  let _ = T.yieldNow () in
+  let _ = T.cancel t in
+  println (T.await t)
+",
+    );
+    assert!(!ok && stderr.contains("cancelled"), "{stderr}");
+    let (ok, stderr) = on_silo(
+        "Socket",
+        "use Std.Thread as T
+use Std.Net as Net
+use Std.Time (sleep)
+
+fun main () =
+  match Net.listen \"127.0.0.1\" 0 with
+  | Err why -> println why
+  | Ok l ->
+      let t = T.spawn (\\() -> match Net.accept l with | Ok _ -> \"accepted\" | Err why -> why) in
+      let _ = T.yieldNow () in
+      let _ = sleep 50 in
+      let _ = T.cancel t in
+      println (T.await t)
+",
+    );
+    assert!(!ok && stderr.contains("cancelled"), "{stderr}");
+}
+
 /// What a Silo program writes after its last newline: kept. The process is
 /// the emitted module's `main`, not Rust's, so nothing flushed stdout's
 /// buffer at exit and the end of the output was lost.

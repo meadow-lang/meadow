@@ -40,6 +40,40 @@
 --
 -- A failure in a thread fails that thread, and `await` fails with the same
 -- message. Nothing else is affected.
+--
+-- A thread can be asked to stop, with `cancel`. Where it stops depends on what
+-- it is doing:
+--
+-- * At an operation, softly. Its next operation the runtime answers -- one of
+--   this module's, the wait of a transaction's `retry`, or one of `Console`,
+--   `Fs`, `Net`, `Time`, `Random`, `Process`, `Log` or `Test` -- fails with
+--   "cancelled", as a thread fails at a division by zero. A thread waiting in
+--   one -- on a channel, on another thread, on a socket -- is woken to fail. A
+--   worker loop that does any I/O stops at its next step, with nobody having
+--   had to remember to check.
+-- * At a preemption point, hard. A thread that performs nothing -- a pure
+--   loop -- is ended where the runtime would have preempted it, a little
+--   while after the cancel: long enough for one that was about to perform an
+--   operation, or to ask, to stop there instead.
+--
+-- Either way `await` of it fails with "cancelled", and nothing of the thread
+-- runs after: handlers have nothing to run on the way out, and no handler --
+-- `Std.Exn`'s `catch` among them -- can catch the failure and carry on. That
+-- is safe because threads share nothing mutable, so a thread stopped part way
+-- leaves nobody else's state half made. And no code is ever cut short between
+-- two of its operations in a way it could notice, so no cleanup has to guard
+-- against a cancel arriving in the middle of it, and there is nothing to mask.
+--
+-- A thread that would rather stop on its own terms asks, with `cancelled`.
+-- Told yes, it has taken the cancel on itself: it is no longer ended at a
+-- preemption point, and may return what it has -- which is then what `await`
+-- answers. Cancelling a thread that has finished changes nothing, and asking
+-- twice is asking once.
+--
+-- Two limits. An operation made in place -- a file read, `Time.sleep` -- runs
+-- to its end first; the thread fails at the operation after. And a socket
+-- wait the thread is woken from carries on, on its own I/O thread, until it
+-- ends; what it answers is dropped.
 
 use Std.Collections.Vector as V
 use Std.Collections.Vector (vecFromArray)
@@ -65,6 +99,17 @@ use Std.Collections.Vector (vecFromArray)
 -- The oldest value sent and not yet received, waiting for one if there is none.
 -- Each value goes to exactly one receiver.
 @pub fun receive (ch : Channel a) : a ! { Thread | e } = channelReceive ch
+
+-- Ask a thread to stop: it fails with "cancelled" at its next operation the
+-- runtime answers, at once if it is waiting in one, or soon after at a
+-- preemption point if it performs none. Returns at once. A thread that has
+-- finished is left as it was.
+@pub fun cancel (t : Task a) : () ! { Thread | e } = threadCancel t
+
+-- Whether this thread has been asked to stop. The one operation that does not
+-- fail when it has; told yes, the thread is no longer ended at a preemption
+-- point, so a long computation that asks can end early with what it has.
+@pub fun cancelled () : Bool ! { Thread | e } = threadCancelled ()
 
 -- --- built on those ----------------------------------------------------------
 
@@ -144,6 +189,35 @@ effect Tally {
 }
 
 fun countUp (n : Int) = if n == 0 then () else let _ = tally n in countUp (n - 1)
+
+@test fun cancellingAFinishedThreadChangesNothing () =
+  let t = spawn (\() -> fib 10) in
+  let first = await t in
+  let _ = cancel t in
+  let _ = cancel t in
+  assertEq (first, await t) (55, 55) "the answer is kept"
+
+@test fun aThreadThatAsksStopsWhenAsked () =
+  let t =
+    spawn (\() ->
+      let rec spin (n : Int) = if cancelled () then n else spin (n + 1) in
+      spin 0)
+  in
+  let _ = cancel t in
+  assertTrue (await t >= 0) "it returned what it had"
+
+@test fun nobodyIsCancelledUnasked () =
+  let t = spawn (\() -> cancelled ()) in
+  assertEq (await t, cancelled ()) (False, False) "neither thread was asked"
+
+@test fun cancelledReceiversLeaveTheMessageAlone () =
+  -- Every reader is cancelled, waiting or not yet started; none of them may
+  -- take what is sent after, so it is still there for this thread.
+  let gate = newChannel () in
+  let readers = V.map (\i -> spawn (\() -> receive gate + i)) (V.range (toInt 0) 100) in
+  let _ = V.forEach (\t -> cancel t) readers in
+  let _ = send gate (toInt 42) in
+  assertEq (receive gate) 42 "nobody else took it"
 
 @test fun aThreadMayHandleItsOwnEffects () =
   -- `Tally` is not one the runtime answers, so the thread handles it itself,

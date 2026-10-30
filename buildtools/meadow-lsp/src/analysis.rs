@@ -708,6 +708,78 @@ impl Std {
     /// Only the open document's spans are recorded in full: the rest of the
     /// package is indexed for go-to-definition and nothing else, and its
     /// diagnostics belong to files the editor did not ask about.
+    /// What [`Std::analyse_package`] reports of each file of the package,
+    /// opened as it is on disk: one compile of the whole package, which is
+    /// what each file's analysis compiles, and each file's own errors from
+    /// it, with its own from reading and parsing it.
+    pub fn package_diagnostics(
+        &self,
+        sources: &PackageSources,
+    ) -> Vec<(std::path::PathBuf, Vec<Diagnostic>)> {
+        let mut found: Vec<(std::path::PathBuf, String, Vec<Diagnostic>)> = Vec::new();
+        let mut modules: Vec<AstModule> = Vec::new();
+        for m in &sources.modules {
+            let name = InternedString::from(m.file.display().to_string());
+            let source = Source::new(SourceKind::File(name), m.text.as_str().into());
+            let lex = tokenize(source);
+            let (ast, perrs) = parser::parse(m.name, source, &lex.tokens);
+            let mut diagnostics = lex.errors;
+            for e in &perrs {
+                diagnostics.push(meadow_compiler::diagnostics::from_parse_error(
+                    &name.to_string(),
+                    e,
+                ));
+            }
+            found.push((m.file.clone(), name.to_string(), diagnostics));
+            if let Some(ast) = ast {
+                modules.push(AstModule {
+                    path: m.path.clone(),
+                    name: m.name,
+                    ast,
+                    source,
+                });
+            }
+        }
+        let mut views: Vec<meadow_compiler::Dep<'_>> = self
+            .packages
+            .iter()
+            .map(meadow_compiler::Dep::new)
+            .collect();
+        views.extend(
+            sources
+                .deps
+                .iter()
+                .map(|(alias, pkg)| meadow_compiler::Dep::named(*alias, pkg.as_ref())),
+        );
+        let (_, unit_diags) = match &sources.procs {
+            Some(procs) => meadow_compiler::compile_unit_with_procs(
+                sources.name,
+                sources.name,
+                sources.name,
+                1,
+                modules,
+                &views,
+                Options::debug(),
+                0,
+                procs.as_ref(),
+            ),
+            None => meadow_compiler::compile_unit_in_package(
+                sources.name,
+                sources.name,
+                1,
+                modules,
+                &views,
+                Options::debug(),
+            ),
+        };
+        for d in unit_diags {
+            if let Some((.., ds)) = found.iter_mut().find(|(_, name, _)| *name == d.filename) {
+                ds.push(d);
+            }
+        }
+        found.into_iter().map(|(file, _, ds)| (file, ds)).collect()
+    }
+
     pub fn analyse_package(
         &self,
         sources: &PackageSources,

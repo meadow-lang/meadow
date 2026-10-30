@@ -185,6 +185,10 @@ pub struct Vm<'p> {
     /// Is a scheduler running this machine? Without one there is nobody to
     /// carry out a request, and a thread operation is an error.
     pub(crate) scheduled: bool,
+    /// Whether this thread has been asked to stop, where the scheduler runs
+    /// it: an operation the runtime answers looks first (`native_op`). See
+    /// `meadow_core::thread`.
+    pub(crate) cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Top-level values this thread has evaluated, by definition -- see
     /// `meadow_core::globals`. Collector roots. Each thread has its own, as it
     /// has its own heap.
@@ -327,6 +331,26 @@ pub(crate) enum Request {
     StmWait {
         dst: Reg,
     },
+    /// Ask thread `task` to stop: see `meadow_core::thread`.
+    Cancel {
+        task: u32,
+    },
+    /// Whether this thread has been asked to stop, into `dst`.
+    Cancelled {
+        dst: Reg,
+    },
+}
+
+impl Request {
+    /// Does a cancelled thread fail here? At every thread operation but the
+    /// question itself; not at the wake-up a commit asks for, which is the
+    /// end of a transaction already made, nor at a call into the world.
+    pub(crate) fn notices_cancel(&self) -> bool {
+        !matches!(
+            self,
+            Request::Cancelled { .. } | Request::StmWake { .. } | Request::Block { .. }
+        )
+    }
 }
 
 /// Replacements for the console — see [`Vm::io`]. `Send`, since a green
@@ -379,6 +403,7 @@ impl<'p> Vm<'p> {
             request: None,
             blocking: None,
             scheduled: false,
+            cancel: None,
             globals: Vec::new(),
             literals: Vec::new(),
             world: None,
@@ -1079,6 +1104,14 @@ impl<'p> Vm<'p> {
         let Some(&(effect, op)) = self.program.ops.get(i.imm as usize) else {
             return err(format!("no operation {}", i.imm));
         };
+        // Where a cancelled thread stops, as at a thread operation.
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            return err(meadow_rt::thread::CANCELLED);
+        }
         let arg = self.value(i.b, 0);
         if &*effect == "Test" && &*op == "fail" {
             return err(self.show(arg));

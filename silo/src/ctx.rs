@@ -130,6 +130,9 @@ pub struct Ctx {
     /// Inside a call C made into a library, on a segment of its own: a
     /// failure ends the call, not the process. See `crate::sched::export_run`.
     pub guarded: bool,
+    /// Whether the thread has been asked to stop, and where it waits: shared
+    /// with its task, where a canceller finds it. See `crate::sched::Ctl`.
+    pub cancel: std::sync::Arc<crate::sched::Ctl>,
 }
 
 // Safety: a context is used by one OS thread at a time -- the one running its
@@ -161,6 +164,7 @@ impl Ctx {
             spill: vec![0; unsafe { meadow_spill_words }.max(0) as usize],
             tid,
             guarded: false,
+            cancel: Default::default(),
         });
         c.spill_at = c.spill.as_mut_ptr();
         c
@@ -171,12 +175,15 @@ impl Drop for Ctx {
     fn drop(&mut self) {
         self.regions.settle();
         // Dropping a suspended segment unwinds it, which a runtime that aborts
-        // on a panic cannot do: they are let go, and their memory with them.
+        // on a panic cannot do: they are reset instead, never resumed, and
+        // their stacks given back. A thread that failed inside a handler --
+        // a cancelled one, waiting under it -- leaves its segments here.
         for s in self.suspended.drain(..).flatten() {
-            std::mem::forget(s);
+            crate::segments::abandon(s.top);
+            s.nested.into_iter().for_each(crate::segments::abandon);
         }
         for s in self.parked.drain(..) {
-            std::mem::forget(s);
+            crate::segments::abandon(s);
         }
     }
 }

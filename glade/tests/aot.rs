@@ -332,3 +332,27 @@ fn threads_run_natively_too() {
                def result = let t = threadSpawn (\\() -> fib 18) in (fib 17, threadAwait t)";
     assert_eq!(agrees("threads", src), "(1597, 2584)");
 }
+
+#[test]
+fn a_cancelled_thread_fails_natively_too() {
+    // Waiting on a channel when it is cancelled, or not there yet: either
+    // way it fails, and `await` with it.
+    let src = "def result =
+                 let ch = channelNew () in
+                 let t = threadSpawn (\\() -> channelReceive ch + toInt 1) in
+                 let _ = threadCancel t in
+                 let _ = channelSend ch (toInt 1) in
+                 threadAwait t";
+    assert_eq!(agrees("cancel", src), meadow_core::thread::CANCELLED);
+    // One that asks stops of its own accord, and one that has finished is
+    // left as it was.
+    let src = "fun spin (n : Int) = if threadCancelled () then n else spin (n + 1)
+               def result =
+                 let done = threadSpawn (\\() -> toInt 7) in
+                 let first = threadAwait done in
+                 let t = threadSpawn (\\() -> spin 0) in
+                 let _ = threadCancel t in
+                 let _ = threadCancel done in
+                 (threadAwait t >= 0, first, threadAwait done, threadCancelled ())";
+    assert_eq!(agrees("cancel_asked", src), "(True, 7, 7, False)");
+}

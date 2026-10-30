@@ -4041,6 +4041,37 @@ The rules that make this safe:
   same message.
 - **If every thread is waiting and none can wake another, that is a
   deadlock**, reported as an error.
+- **A thread can be asked to stop.** `Thread.cancel t` returns at once, and
+  `t` fails with "cancelled" at its next operation the runtime answers -- a
+  `receive`, an `await`, a `println`, a read of the clock -- or, if it is
+  waiting in one, straight away. A thread in a loop that performs nothing is
+  ended a moment later, where the runtime would have preempted it. `await` of
+  a cancelled thread fails with the same message. A thread that would rather
+  finish on its own terms asks `Thread.cancelled ()` and returns what it has.
+
+```meadow
+use Std.Thread as Thread
+
+fun main () =
+  let jobs = Thread.newChannel () in
+  let worker = Thread.spawn (\() ->
+    let rec work (n : Int) = let _ = Thread.receive jobs in work (n + 1) in
+    work 0) in
+  let _ = Thread.send jobs "one" in
+  let _ = Thread.cancel worker in
+  println "the worker stops at its next receive"
+```
+
+```
+the worker stops at its next receive
+```
+
+Nothing of a cancelled thread runs after it stops, and no handler inside it
+can catch the failure, so code never has to guard its cleanup against a
+cancel arriving half way through: there is no exception to mask, because a
+thread is only ever stopped at an operation it performs, or in pure code that
+has nothing to clean up. Threads share nothing mutable, so a thread stopped
+part way through leaves nobody else's state half made.
 
 `Thread` is an effect in the types, but unlike the others here it cannot be
 handled: the operations are the runtime's. On the VM, threads run in parallel
