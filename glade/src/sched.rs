@@ -69,6 +69,16 @@
 //! a canceller that looks there finds nobody, which is right, since that
 //! thread is running and will see the flag itself.
 //!
+//! # Sleeping
+//!
+//! A `Time.sleep` is a request too ([`Request::Sleep`]): the thread is filed
+//! on the run's timer ([`Timers`]), and the worker runs another. One timer
+//! thread, started with the first sleep, wakes each sleeper when its time
+//! comes onto the shared queue. A sleeper counts with the calls into the world
+//! as pending -- a thread that will wake -- from before it is filed until
+//! whoever takes it out (the timer, or a canceller, who finds it by its
+//! `Ctl` as any waiting thread) has made it active again.
+//!
 //! # Fairness, deadlock and the end
 //!
 //! A thread runs for [`SLICE`] instructions and then goes to the back of its
@@ -363,6 +373,9 @@ fn run_all(
         io: Mutex::new(IoQueue::default()),
         io_ready: Condvar::new(),
         io_pending: AtomicUsize::new(0),
+        timers: Mutex::new(Timers::default()),
+        timer_ready: Condvar::new(),
+        timing: AtomicBool::new(false),
     };
     lock(&shared.locals[0]).push_back(main);
     // The calling thread is worker 0. The others start with the first `spawn`,
@@ -439,6 +452,8 @@ enum Parked<'p> {
     Stm(std::sync::Weak<Mutex<Option<(Box<Fiber<'p>>, Reg)>>>),
     /// On a call into the world, which an I/O thread makes.
     Io(std::sync::Weak<Mutex<Option<(Box<Fiber<'p>>, Reg)>>>),
+    /// In `Time.sleep`, on the timer.
+    Sleep(std::sync::Weak<Mutex<Option<(Box<Fiber<'p>>, Reg)>>>),
 }
 
 impl<'p> Ctl<'p> {
@@ -548,9 +563,52 @@ struct Shared<'p> {
     /// an I/O thread to make it.
     io: Mutex<IoQueue<'p>>,
     io_ready: Condvar,
-    /// Calls made or to be made: a thread waiting on one is not deadlocked,
-    /// whatever else is waiting.
+    /// Calls made or to be made, and threads asleep on the timer: a thread
+    /// waiting on one is not deadlocked, whatever else is waiting.
     io_pending: AtomicUsize,
+    /// Threads in `Time.sleep`, by when each wakes, for [`timer_thread`].
+    timers: Mutex<Timers<'p>>,
+    timer_ready: Condvar,
+    /// Has the timer thread been started? With the first sleep.
+    timing: AtomicBool,
+}
+
+/// The sleeping threads, soonest first.
+#[derive(Default)]
+struct Timers<'p> {
+    due: std::collections::BinaryHeap<Due<'p>>,
+    /// Breaks ties between threads that wake at the same moment: in the
+    /// order they went to sleep.
+    next: u64,
+}
+
+/// A thread asleep until `until` -- unless a cancel takes it out of its slot
+/// first, and the timer finds the slot empty.
+struct Due<'p> {
+    until: std::time::Instant,
+    seq: u64,
+    slot: WaitSlot<'p>,
+}
+
+impl PartialEq for Due<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        (self.until, self.seq) == (other.until, other.seq)
+    }
+}
+
+impl Eq for Due<'_> {}
+
+impl PartialOrd for Due<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Due<'_> {
+    /// Reversed, so that the heap's greatest is the soonest.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (other.until, other.seq).cmp(&(self.until, self.seq))
+    }
 }
 
 #[derive(Default)]
@@ -599,6 +657,10 @@ impl<'p> Shared<'p> {
         {
             let _io = lock(&self.io);
             self.io_ready.notify_all();
+        }
+        {
+            let _timers = lock(&self.timers);
+            self.timer_ready.notify_all();
         }
         let _guard = lock(&self.sleep);
         self.wake.notify_all();
@@ -948,9 +1010,15 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
                     // Finished, or asked already: nothing to do.
                     if let Some(ctl) = ctl.filter(|c| !c.cancelled.swap(true, Ordering::SeqCst)) {
                         let at = std::mem::take(&mut *lock(&ctl.parked));
+                        let sleeping = matches!(at, Parked::Sleep(_));
                         if let Some(mut w) = self.unpark(task, at) {
                             w.wake = Wake::Fail(meadow_rt::thread::CANCELLED.into());
                             self.schedule_next(w);
+                            // Taken from the timer, which now finds it gone:
+                            // counted off here, once it is active again.
+                            if sleeping {
+                                sh.io_pending.fetch_sub(1, Ordering::SeqCst);
+                            }
                         }
                     }
                     Some(fiber)
@@ -986,6 +1054,35 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
                         scope.spawn(move || io_thread(sh));
                     } else {
                         sh.io_ready.notify_one();
+                    }
+                    sh.release();
+                    None
+                }
+                Request::Sleep { until, dst } => {
+                    // Pending before it is filed where a canceller can take it
+                    // out, since whoever takes it out counts it off.
+                    sh.io_pending.fetch_add(1, Ordering::SeqCst);
+                    let slot: WaitSlot<'p> = Arc::new(Mutex::new(Some((fiber, dst))));
+                    let cancelled = {
+                        let held = lock(&slot);
+                        let (f, _) = held.as_ref().expect("just put there");
+                        f.ctl.park(Parked::Sleep(Arc::downgrade(&slot)))
+                    };
+                    if cancelled {
+                        let (mut fiber, _) = lock(&slot).take().expect("not filed yet");
+                        sh.io_pending.fetch_sub(1, Ordering::SeqCst);
+                        fiber.wake = Wake::Fail(meadow_rt::thread::CANCELLED.into());
+                        return Some(fiber);
+                    }
+                    {
+                        let mut timers = lock(&sh.timers);
+                        let seq = timers.next;
+                        timers.next += 1;
+                        timers.due.push(Due { until, seq, slot });
+                        sh.timer_ready.notify_one();
+                    }
+                    if !sh.timing.swap(true, Ordering::SeqCst) {
+                        scope.spawn(move || timer_thread(sh));
                     }
                     sh.release();
                     None
@@ -1199,6 +1296,12 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
                 let (f, _) = lock(&slot).take()?;
                 Some(f)
             }
+            // Left on the timer, which wakes nobody when it comes due.
+            Parked::Sleep(slot) => {
+                let slot = slot.upgrade()?;
+                let (f, _) = lock(&slot).take()?;
+                Some(f)
+            }
         }
     }
 
@@ -1262,6 +1365,50 @@ fn io_thread(sh: &Shared) {
         }
         sh.io_pending.fetch_sub(1, Ordering::SeqCst);
         sh.nudge();
+    }
+}
+
+/// Wake each sleeping thread when its time comes, handing it back to the
+/// workers on the shared queue; until the run ends. One for the run, started
+/// by the first `Time.sleep`.
+fn timer_thread(sh: &Shared) {
+    let mut timers = lock(&sh.timers);
+    loop {
+        if sh.done.load(Ordering::SeqCst) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let until = match timers.due.peek() {
+            None => None,
+            Some(d) if d.until > now => Some(d.until - now),
+            Some(_) => {
+                let due = timers.due.pop().expect("just peeked");
+                // A thread cancelled in its sleep has been taken out already,
+                // and counted off by whoever took it.
+                if let Some((mut f, dst)) = lock(&due.slot).take() {
+                    f.wake = Wake::Set(dst, crate::value::Value::Unit);
+                    // Active again before it stops counting as pending -- see
+                    // `Shared::release`.
+                    sh.active.fetch_add(1, Ordering::SeqCst);
+                    lock(&sh.global).push_back(f);
+                    sh.io_pending.fetch_sub(1, Ordering::SeqCst);
+                    sh.nudge();
+                }
+                continue;
+            }
+        };
+        timers = match until {
+            None => sh
+                .timer_ready
+                .wait(timers)
+                .unwrap_or_else(|p| p.into_inner()),
+            Some(d) => {
+                sh.timer_ready
+                    .wait_timeout(timers, d)
+                    .unwrap_or_else(|p| p.into_inner())
+                    .0
+            }
+        };
     }
 }
 

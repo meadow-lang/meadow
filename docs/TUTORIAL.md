@@ -4048,6 +4048,10 @@ The rules that make this safe:
   ended a moment later, where the runtime would have preempted it. `await` of
   a cancelled thread fails with the same message. A thread that would rather
   finish on its own terms asks `Thread.cancelled ()` and returns what it has.
+- **Sleeping costs nothing but the wait.** `Time.sleep` parks the thread on
+  the runtime's timer, so the cores go on running the other threads, a
+  program may have thousands asleep at once, and a cancel wakes a sleeper
+  straight away.
 
 ```meadow
 use Std.Thread as Thread

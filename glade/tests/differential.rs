@@ -2234,6 +2234,110 @@ fn many_threads_cancelled_at_once_all_let_go() {
     assert_eq!(threads_agree(src), cancelled());
 }
 
+// --- sleeping on the scheduler ---------------------------------------------------
+
+// `Time.sleep` with no handler parks the thread on the scheduler's timer:
+// see `docs/CANCELLATION.md`. The worker runs other threads meanwhile, a
+// sleeper is not a deadlock, and a cancel wakes one at once.
+
+const TIME: &str = "effect Time { sleep : Int -> () }\n";
+
+#[test]
+fn a_sleeping_thread_holds_up_no_worker() {
+    // Ten thousand threads sleeping a fifth of a second each: on one worker,
+    // one after another, that would be over half an hour.
+    let src = format!(
+        "{TIME}use Ts.*\ndata Ts = End | More (Task Int) Ts
+         fun sleepers (n : Int) acc = if n == 0 then acc else
+           sleepers (n - 1) (More (threadSpawn (\\() -> let _ = sleep 200 in n)) acc)
+         fun sumAll ts acc = match ts with | End -> acc | More t rest -> sumAll rest (acc + threadAwait t)
+         def result = sumAll (sleepers 10000 End) 0"
+    );
+    let prog = program(&src);
+    let began = std::time::Instant::now();
+    let want = meadow_eval::run(&prog)
+        .map(|v| v.to_string())
+        .map_err(|e| e.msg);
+    assert_eq!(want, Ok("50005000".to_string()));
+    let lowered = meadow_seq::lower_program(&prog, meadow_core::OptLevel::O1);
+    let image = meadow_codegen::compile(&lowered.program).expect("codegen");
+    for workers in [1, 8] {
+        let got = meadow_glade::sched::run_with(&image, image.entry.unwrap(), FUEL, workers)
+            .result
+            .map_err(|e| e.msg);
+        assert_eq!(want, got, "CEK vs VM with {workers} workers");
+    }
+    let jit = meadow_glade::jit::Native::jit(&image, 1, meadow_core::OptLevel::O1).expect("jit");
+    let got = meadow_glade::sched::run_native(&image, Some(&jit), image.entry.unwrap(), FUEL, 1)
+        .result
+        .map_err(|e| e.msg);
+    assert_eq!(want, got, "CEK vs JIT");
+    // Four runs of a fifth of a second, and making the threads.
+    let took = began.elapsed();
+    assert!(took < std::time::Duration::from_secs(60), "took {took:?}");
+}
+
+#[test]
+fn a_sleeper_is_something_that_will_wake() {
+    // `main` waits on a thread that is asleep: nothing is running, and it is
+    // not a deadlock.
+    let src = format!(
+        "{TIME}def result =
+           let t = threadSpawn (\\() -> let _ = sleep 30 in toInt 7) in
+           threadAwait t"
+    );
+    assert_eq!(threads_agree(&src), Ok("7".into()));
+    // Nor is a receive that a sleeper will answer.
+    let src = format!(
+        "{TIME}def result =
+           let ch = channelNew () in
+           let t = threadSpawn (\\() -> let _ = sleep 30 in channelSend ch (toInt 5)) in
+           channelReceive ch + toInt 1"
+    );
+    assert_eq!(threads_agree(&src), Ok("6".into()));
+    // `main` may sleep itself, and so may a thread no handler is around.
+    let src = format!("{TIME}def result = let _ = sleep 20 in let _ = sleep 0 in toInt 3");
+    assert_eq!(threads_agree(&src), Ok("3".into()));
+}
+
+#[test]
+fn a_sleeping_thread_is_woken_by_a_cancel() {
+    // An hour's sleep: only the cancel can end it in time.
+    let src = format!(
+        "{TIME}def result =
+           let t = threadSpawn (\\() -> let _ = sleep 3600000 in toInt 1) in
+           let _ = sleep 20 in
+           let _ = threadCancel t in
+           threadAwait t"
+    );
+    let began = std::time::Instant::now();
+    assert_eq!(threads_agree(&src), cancelled());
+    // Cancelled before it went to sleep, it does not.
+    let src = format!(
+        "{TIME}def result =
+           let t = threadSpawn (\\() -> let _ = sleep 3600000 in toInt 1) in
+           let _ = threadCancel t in
+           threadAwait t"
+    );
+    assert_eq!(threads_agree(&src), cancelled());
+    // A sleeper woken this way is not counted as one that will still wake:
+    // what is left waiting is a deadlock, said at once.
+    let src = format!(
+        "{TIME}def result =
+           let ch = channelNew () in
+           let t = threadSpawn (\\() -> let _ = sleep 3600000 in toInt 1) in
+           let _ = sleep 20 in
+           let _ = threadCancel t in
+           channelReceive ch"
+    );
+    assert_eq!(
+        threads_agree(&src),
+        Err(meadow_core::thread::DEADLOCK.into())
+    );
+    let took = began.elapsed();
+    assert!(took < std::time::Duration::from_secs(120), "took {took:?}");
+}
+
 // --- typed instructions --------------------------------------------------------
 
 // Operands the compiler knows are both `Int`, or both `Float`, run as typed

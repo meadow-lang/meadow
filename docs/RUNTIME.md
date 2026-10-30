@@ -1156,6 +1156,15 @@ reason to return. When the thread resumes, its pc is the instruction after the
 primitive. If that isn't a block entry, the interpreter runs from there until
 it reaches one, and native code takes over again.
 
+Two operations of the world are made the same way, because they wait. A
+socket call that may wait (an accept, a read) is a `Request::Block`: the
+worker hands it to an I/O thread and runs other threads. A `Time.sleep` is a
+`Request::Sleep`: the thread is filed on the run's timer, a heap of
+deadlines that one timer thread watches, and is put back on the shared queue
+when its time comes. A sleeper counts with the I/O calls as a thread that
+will wake, so threads waiting on it are not a deadlock, and a cancel takes it
+off the timer at once (`docs/CANCELLATION.md`).
+
 **Every thread shares one native table.** The JIT's `Native` is borrowed by
 every `Vm` in the run, and its table entries are atomics. A block compiled
 because one thread made it hot becomes native for all threads, and it is

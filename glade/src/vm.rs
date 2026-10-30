@@ -182,6 +182,10 @@ pub struct Vm<'p> {
     /// A native operation's call that may wait, left by it for `native_op`
     /// to make a request of -- see [`Request::Block`].
     pub(crate) blocking: Option<Work>,
+    /// When a `Time.sleep` just made ends, left for `native_op` to make a
+    /// request of: a scheduled thread waits on the scheduler's timer rather
+    /// than on its worker -- see [`Request::Sleep`].
+    pub(crate) sleep_until: Option<std::time::Instant>,
     /// Is a scheduler running this machine? Without one there is nobody to
     /// carry out a request, and a thread operation is an error.
     pub(crate) scheduled: bool,
@@ -331,6 +335,12 @@ pub(crate) enum Request {
     StmWait {
         dst: Reg,
     },
+    /// Wait until `until` -- a `Time.sleep` -- on the scheduler's timer, off
+    /// the worker, which runs another thread meanwhile; `()` into `dst`.
+    Sleep {
+        until: std::time::Instant,
+        dst: Reg,
+    },
     /// Ask thread `task` to stop: see `meadow_core::thread`.
     Cancel {
         task: u32,
@@ -402,6 +412,7 @@ impl<'p> Vm<'p> {
             host: None,
             request: None,
             blocking: None,
+            sleep_until: None,
             scheduled: false,
             cancel: None,
             globals: Vec::new(),
@@ -1124,6 +1135,8 @@ impl<'p> Vm<'p> {
                         job: Job(work),
                         dst: i.a,
                     });
+                } else if let Some(until) = self.sleep_until.take() {
+                    self.request = Some(Request::Sleep { until, dst: i.a });
                 }
                 Ok(())
             }

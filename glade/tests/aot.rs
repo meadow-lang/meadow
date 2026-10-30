@@ -368,3 +368,26 @@ fn a_cancelled_thread_fails_natively_too() {
                  (threadAwait t >= 0, first, threadAwait done, threadCancelled ())";
     assert_eq!(agrees("cancel_asked", src), "(True, 7, 7, False)");
 }
+
+#[test]
+fn a_sleeping_thread_waits_on_the_timer_natively_too() {
+    // A thousand sleepers on the scheduler's timer, and one woken by a cancel
+    // an hour before its time.
+    let src = "effect Time { sleep : Int -> () }
+               use Ts.*\ndata Ts = End | More (Task Int) Ts
+               fun sleepers (n : Int) acc = if n == 0 then acc else
+                 sleepers (n - 1) (More (threadSpawn (\\() -> let _ = sleep 100 in n)) acc)
+               fun sumAll ts acc = match ts with | End -> acc | More t rest -> sumAll rest (acc + threadAwait t)
+               def result = sumAll (sleepers 1000 End) 0";
+    assert_eq!(agrees("sleepers", src), "500500");
+    let src = "effect Time { sleep : Int -> () }
+               def result =
+                 let t = threadSpawn (\\() -> let _ = sleep 3600000 in toInt 1) in
+                 let _ = sleep 20 in
+                 let _ = threadCancel t in
+                 threadAwait t";
+    assert_eq!(
+        agrees("cancel_sleeper", src),
+        meadow_core::thread::CANCELLED
+    );
+}

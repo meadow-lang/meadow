@@ -39,8 +39,8 @@ beyond the last release is under _Unreleased_.
   `Std.Thread.cancelled ()` asks, for a computation that would rather stop
   on its own terms. Cancelling a finished thread does nothing. On the CEK
   machine, Glade (the VM, the JIT and executables) and Silo; the design is in
-  `meadow_rt::thread`. An operation made in place, such as a file read or
-  `Time.sleep`, runs to its end before the thread stops.
+  `meadow_rt::thread`. An operation made in place, such as a file read, runs
+  to its end before the thread stops.
 - The REPL's `:ir` opens a full-screen viewer of the last entry -- or, with
   a name, of a definition -- with a page for each form the compiler puts it
   in, in the order a program passes through them: core, Cut, AxCut, Glade's
@@ -104,6 +104,17 @@ beyond the last release is under _Unreleased_.
   optimization level -- Glade's VM, JIT and native code, Silo, the CEK and
   AxCut machines, and MeadowBoot's CEK machine -- and another through
   `meadow run` with each backend, in debug and release.
+- `Time.sleep` waits on the scheduler's timer instead of on the core running
+  the thread. Other threads go on running in the meantime, so a program can
+  have ten thousand threads asleep at once on a few workers. A sleeping
+  thread that is cancelled is woken at once and fails "cancelled", as a
+  thread waiting on a channel is. A thread that is asleep will wake, so
+  threads waiting on it are not a deadlock. This works on the CEK machine,
+  on Glade (the VM, the JIT and executables) and on Silo. A machine that no
+  scheduler runs still sleeps in place: a procedural macro's, or a Silo
+  program that never spawns. `docs/CANCELLATION.md` is the design, for this
+  and for what follows from it: cleanup that runs as a thread ends, sockets
+  closed with the thread that held them, and timeouts.
 
 ### Fixed
 

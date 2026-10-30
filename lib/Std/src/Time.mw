@@ -34,7 +34,9 @@ use Std.Collections.Vector (vecFromArray)
 @pub effect Time {
   now : () -> Int,
   monotonic : () -> Int,
-  -- Do nothing for this many milliseconds. Zero or less returns at once.
+  -- Do nothing for this many milliseconds. Zero or less returns at once. The
+  -- thread waits on the runtime's timer, holding up no other thread, and a
+  -- cancel (`Std.Thread.cancel`) wakes it.
   sleep : Int -> (),
 }
 

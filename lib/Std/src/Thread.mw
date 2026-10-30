@@ -70,10 +70,14 @@
 -- answers. Cancelling a thread that has finished changes nothing, and asking
 -- twice is asking once.
 --
--- Two limits. An operation made in place -- a file read, `Time.sleep` -- runs
--- to its end first; the thread fails at the operation after. And a socket
--- wait the thread is woken from carries on, on its own I/O thread, until it
--- ends; what it answers is dropped.
+-- A thread in `Time.sleep` waits on the runtime's timer, not on a core, so
+-- it is woken by a cancel like any waiting thread, and a program may have
+-- thousands of them asleep at once.
+--
+-- Two limits. An operation made in place -- a file read, a child process run
+-- to its end -- runs to its end first; the thread fails at the operation
+-- after. And a socket wait the thread is woken from carries on, on its own
+-- I/O thread, until it ends; what it answers is dropped.
 
 use Std.Collections.Vector as V
 use Std.Collections.Vector (vecFromArray)
@@ -129,6 +133,7 @@ use Std.Collections.Vector (vecFromArray)
 -- --- tests -------------------------------------------------------------------
 
 use Std.Test (assertEq, assertTrue)
+use Std.Time (sleep)
 
 fun fib (n : Int) = if n < 2 then n else fib (n - 1) + fib (n - 2)
 
@@ -183,6 +188,12 @@ fun fib (n : Int) = if n < 2 then n else fib (n - 1) + fib (n - 2)
 @test fun manyThreads () =
   let ts = V.map (\i -> spawn (\() -> i + 1)) (V.range (toInt 0) 1000) in
   assertEq (V.foldl (\acc t -> acc + await t) 0 ts) 500500 "a thousand threads"
+
+@test fun manySleepersAtOnce () =
+  -- Asleep on the runtime's timer, not on the test's two workers: a tenth of
+  -- a second in all, not ten.
+  let ts = V.map (\i -> spawn (\() -> let _ = sleep 50 in i)) (V.range (toInt 0) 200) in
+  assertEq (V.foldl (\acc t -> acc + await t) 0 ts) 19900 "every sleeper woke"
 
 effect Tally {
   tally : Int -> ()

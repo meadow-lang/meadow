@@ -132,3 +132,40 @@ fn a_thread_cancelled_while_it_waits_on_a_socket_is_woken() {
         assert_eq!(run_main_std(src, engine), "cancelled", "{engine}");
     }
 }
+
+// --- sleeping ----------------------------------------------------------------
+
+#[test]
+fn a_sleeping_thread_is_woken_by_a_cancel() {
+    // An hour's `Time.sleep`, on the scheduler's timer: the cancel wakes it.
+    let src = "use Std.Thread as T
+               use Std.Time (sleep)
+               def result =
+                 let t = T.spawn (\\() -> let _ = sleep 3600000 in \"slept\") in
+                 let _ = sleep 20 in
+                 let _ = T.cancel t in
+                 T.await t
+";
+    for engine in ENGINES {
+        assert_eq!(run_main_std(src, engine), "cancelled", "{engine}");
+    }
+}
+
+#[test]
+fn many_sleepers_share_the_workers() {
+    // A thousand threads asleep at once, each a tenth of a second: together
+    // they take about that long, however few the workers.
+    let src = "use Std.Thread as T
+               use Std.Time (sleep)
+               use Std.Collections.Vector as V
+               def result =
+                 let ts = V.map (\\i -> T.spawn (\\() -> let _ = sleep 100 in i)) (V.range (toInt 0) 1000) in
+                 V.foldl (\\acc t -> acc + T.await t) 0 ts
+";
+    let began = std::time::Instant::now();
+    for engine in ENGINES {
+        assert_eq!(run_main_std(src, engine), "499500", "{engine}");
+    }
+    let took = began.elapsed();
+    assert!(took < std::time::Duration::from_secs(120), "took {took:?}");
+}

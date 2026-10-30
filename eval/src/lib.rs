@@ -424,6 +424,10 @@ struct Machine<'a> {
     seen: bool,
     /// A preemption point has passed since it was cancelled: the next ends it.
     armed: bool,
+    /// Is the scheduler running it? Then a `Time.sleep` waits on the
+    /// scheduler, which runs the other threads meanwhile; without one -- a
+    /// procedural macro's machine -- there is nothing else to run.
+    scheduled: bool,
 }
 
 /// What a thread operation asks of the scheduler.
@@ -440,6 +444,8 @@ enum Request {
     Block(Box<dyn FnOnce() -> NetAnswer + Send>),
     Cancel(u32),
     Cancelled,
+    /// A `Time.sleep`, until then.
+    Sleep(std::time::Instant),
 }
 
 impl Request {
@@ -466,6 +472,7 @@ impl<'a> Machine<'a> {
             cancel: Rc::default(),
             seen: false,
             armed: false,
+            scheduled: false,
         }
     }
 }
@@ -1403,6 +1410,18 @@ impl<'a> Machine<'a> {
                 let result = native_random(&op, arg)?;
                 self.ctrl = Control::Ret(result);
                 return Ok(());
+            }
+            if &*effect == "Time" && &*op == "sleep" && self.scheduled {
+                if let Value::Int(ms) = arg {
+                    // On the scheduler, which runs the other threads while
+                    // this one sleeps, and wakes it to fail if it is cancelled.
+                    self.ctrl = Control::Ret(Value::Unit);
+                    if ms > 0 {
+                        let d = std::time::Duration::from_millis(ms as u64);
+                        self.request = Some(Request::Sleep(std::time::Instant::now() + d));
+                    }
+                    return Ok(());
+                }
             }
             if &*effect == "Time" {
                 let result = native_time(&op, arg)?;
@@ -3528,7 +3547,8 @@ struct ChannelSlot<'a> {
 /// rather than copied -- values here are immutable and reference-counted, and
 /// [`sendable`] has already refused anything a copy would not be equal to.
 /// See `meadow_core::thread` for what the engines agree on.
-fn schedule(main: Machine<'_>) -> Result<Value, RuntimeError> {
+fn schedule(mut main: Machine<'_>) -> Result<Value, RuntimeError> {
+    main.scheduled = true;
     let mut tasks: Vec<TaskSlot> = vec![TaskSlot {
         cancelled: main.cancel.clone(),
         ..TaskSlot::default()
@@ -3552,17 +3572,41 @@ fn schedule(main: Machine<'_>) -> Result<Value, RuntimeError> {
         }
     }
     let _stop = StopCalls(waits.clone());
+    // Threads in `Time.sleep`: when each wakes, soonest first, and the
+    // sleepers by the order they went to sleep in. A cancel takes a sleeper
+    // out of `asleep` and leaves its time behind, which then wakes nobody.
+    let mut due: std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, u64)>> =
+        std::collections::BinaryHeap::new();
+    let mut asleep: HashMap<u64, Waiting> = HashMap::new();
+    let mut slept = 0u64;
 
     loop {
-        // Every answer in, waiting for one only when nothing else can run.
+        // Every answer in, and every sleeper whose time has come; waiting for
+        // one or the other only when nothing else can run.
         let mut came = Vec::new();
         while let Ok(a) = answered.try_recv() {
             came.push(a);
         }
-        if came.is_empty() && ready.is_empty() && pending > 0 {
-            if let Ok(a) = answered.recv() {
-                came.push(a);
+        wake_sleepers(&mut due, &mut asleep, &mut ready);
+        if came.is_empty() && ready.is_empty() {
+            let next = due.peek().map(|std::cmp::Reverse((at, _))| *at);
+            let left =
+                |at: std::time::Instant| at.saturating_duration_since(std::time::Instant::now());
+            match next {
+                None if pending > 0 => {
+                    if let Ok(a) = answered.recv() {
+                        came.push(a);
+                    }
+                }
+                Some(at) if pending > 0 => {
+                    if let Ok(a) = answered.recv_timeout(left(at)) {
+                        came.push(a);
+                    }
+                }
+                Some(at) => std::thread::sleep(left(at)),
+                None => {}
             }
+            wake_sleepers(&mut due, &mut asleep, &mut ready);
         }
         for (slot, a) in came {
             if let Some((mut w, wt)) = calling[slot].take() {
@@ -3572,6 +3616,10 @@ fn schedule(main: Machine<'_>) -> Result<Value, RuntimeError> {
             }
         }
         let Some((mut m, task)) = ready.pop_front() else {
+            // Something will still wake: a call, or a sleeper.
+            if pending > 0 || !asleep.is_empty() {
+                continue;
+            }
             break;
         };
         loop {
@@ -3629,7 +3677,14 @@ fn schedule(main: Machine<'_>) -> Result<Value, RuntimeError> {
                                     &mut parked,
                                     &mut calling,
                                     &mut pending,
-                                );
+                                )
+                                .or_else(|| {
+                                    let seq = asleep
+                                        .iter()
+                                        .find(|(_, (_, wt))| *wt == t)
+                                        .map(|(seq, _)| *seq)?;
+                                    asleep.remove(&seq)
+                                });
                                 if let Some((mut w, wt)) = woken {
                                     w.failed = Some(core::thread::CANCELLED.into());
                                     ready.push_back((w, wt));
@@ -3644,7 +3699,7 @@ fn schedule(main: Machine<'_>) -> Result<Value, RuntimeError> {
                     }
                     Request::Spawn(f) => {
                         let id = tasks.len() as u32;
-                        let child = Machine::new(
+                        let mut child = Machine::new(
                             Control::Ret(f),
                             vec![K::EvalArg {
                                 arg: Arc::new(core::Term::Lit(core::Lit::Unit)),
@@ -3652,6 +3707,7 @@ fn schedule(main: Machine<'_>) -> Result<Value, RuntimeError> {
                             }],
                             m.fields,
                         );
+                        child.scheduled = true;
                         tasks.push(TaskSlot {
                             cancelled: child.cancel.clone(),
                             ..TaskSlot::default()
@@ -3673,6 +3729,12 @@ fn schedule(main: Machine<'_>) -> Result<Value, RuntimeError> {
                     Request::Yield => {
                         m.ctrl = Control::Ret(Value::Unit);
                         ready.push_back((m, task));
+                        break;
+                    }
+                    Request::Sleep(until) => {
+                        due.push(std::cmp::Reverse((until, slept)));
+                        asleep.insert(slept, (m, task));
+                        slept += 1;
                         break;
                     }
                     Request::Block(call) => {
@@ -3808,6 +3870,25 @@ fn unpark<'a>(
         .iter_mut()
         .find(|p| matches!(p, Some((_, wt)) if *wt == t))
         .and_then(Option::take)
+}
+
+/// Put every sleeper whose time has come on the queue, soonest first, and
+/// forget the times of those a cancel took out.
+fn wake_sleepers<'a>(
+    due: &mut std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, u64)>>,
+    asleep: &mut HashMap<u64, Waiting<'a>>,
+    ready: &mut VecDeque<(Machine<'a>, u32)>,
+) {
+    let now = std::time::Instant::now();
+    while let Some(&std::cmp::Reverse((at, seq))) = due.peek() {
+        if at > now && asleep.contains_key(&seq) {
+            break;
+        }
+        due.pop();
+        if let Some(w) = asleep.remove(&seq) {
+            ready.push_back(w);
+        }
+    }
 }
 
 /// Record a thread's result, and wake whoever awaits it.

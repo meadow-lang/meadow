@@ -36,6 +36,10 @@
 //! when the thread is woken some other way, and a canceller looking there
 //! then finds nobody -- rightly, since that thread is running.
 //!
+//! A `Time.sleep` parks too, with the time it wakes at, and is filed on the
+//! timer ([`sleep`]) rather than with anything another thread does: one timer
+//! thread puts each sleeper back to run when its time comes.
+//!
 //! A transaction keeps its writes in a log, one level per `orElse`, and
 //! reads a `TVar` only if nothing has written it since the transaction began.
 //! Its commit checks that everything it read is as it was, and publishes its
@@ -92,6 +96,8 @@ enum Parked {
     Wait(u64),
     /// On a call into the world, which an I/O thread makes.
     Io(std::sync::Weak<Mutex<Option<Box<Green>>>>),
+    /// In `Time.sleep`, on the timer.
+    Sleep(std::sync::Weak<Mutex<Option<Box<Green>>>>),
 }
 
 impl Ctl {
@@ -198,6 +204,18 @@ fn unpark(tid: usize, at: Parked) {
                 .and_then(|s| s.lock().unwrap_or_else(|p| p.into_inner()).take());
             if let Some(g) = g {
                 ready(g, fail());
+            }
+        }
+        // Left on the timer, which wakes nobody when it comes due; counted
+        // off here, as the timer would have.
+        Parked::Sleep(slot) => {
+            let g = slot
+                .upgrade()
+                .and_then(|s| s.lock().unwrap_or_else(|p| p.into_inner()).take());
+            if let Some(g) = g {
+                let mut w = world();
+                w.calls -= 1;
+                wake(&mut w, g, fail());
             }
         }
     }
@@ -946,6 +964,38 @@ fn file(mut g: Box<Green>, request: Option<Request>) {
                 IO_READY.notify_one();
             }
         }
+        Some(Request::Sleep(until)) => {
+            // Pending before it is filed where a canceller can take it out,
+            // since whoever takes it out counts it off.
+            world().calls += 1;
+            let slot = Arc::new(Mutex::new(Some(g)));
+            let cancelled = {
+                let held = slot.lock().unwrap_or_else(|p| p.into_inner());
+                let g = held.as_ref().expect("just put there");
+                g.ctx.cancel.park(Parked::Sleep(Arc::downgrade(&slot)))
+            };
+            if cancelled {
+                let g = slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+                let mut w = world();
+                w.calls -= 1;
+                wake(
+                    &mut w,
+                    g.expect("not filed yet"),
+                    Wake::Fail(meadow_rt::thread::CANCELLED.into()),
+                );
+                return;
+            }
+            let mut t = timers();
+            let seq = t.next;
+            t.next += 1;
+            t.due.push(Due { until, seq, slot });
+            TIMER_READY.notify_one();
+            if !TIMING.swap(true, Ordering::SeqCst) {
+                let _ = std::thread::Builder::new()
+                    .name("meadow sleeps".into())
+                    .spawn(timer_thread);
+            }
+        }
         Some(Request::Failed(msg)) => {
             let tid = g.ctx.tid;
             // Never resumed, and not unwound.
@@ -1014,6 +1064,109 @@ fn io_thread() {
             wake(&mut w, g, Wake::Nothing);
         }
     }
+}
+
+// --- sleeping ------------------------------------------------------------------
+//
+// A `Time.sleep` on the scheduler parks its thread on a timer instead of
+// sleeping on the worker, which runs other threads meanwhile: ten thousand
+// sleeping threads hold up no worker, and a cancel wakes one at once. A
+// sleeping thread is counted with the calls into the world (`World::calls`),
+// as a thread that will wake. One timer thread for the process, started by
+// the first sleep.
+
+/// The sleeping threads, soonest first.
+#[derive(Default)]
+struct Timers {
+    due: std::collections::BinaryHeap<Due>,
+    /// Breaks ties between threads that wake at the same moment: in the
+    /// order they went to sleep.
+    next: u64,
+}
+
+/// A thread asleep until `until` -- unless a cancel takes it out of its slot
+/// first, and the timer finds the slot empty.
+struct Due {
+    until: std::time::Instant,
+    seq: u64,
+    slot: Arc<Mutex<Option<Box<Green>>>>,
+}
+
+impl PartialEq for Due {
+    fn eq(&self, other: &Self) -> bool {
+        (self.until, self.seq) == (other.until, other.seq)
+    }
+}
+
+impl Eq for Due {}
+
+impl PartialOrd for Due {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Due {
+    /// Reversed, so that the heap's greatest is the soonest.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (other.until, other.seq).cmp(&(self.until, self.seq))
+    }
+}
+
+static TIMERS: LazyLock<Mutex<Timers>> = LazyLock::new(|| Mutex::new(Timers::default()));
+static TIMER_READY: Condvar = Condvar::new();
+/// Whether the timer thread has been started.
+static TIMING: AtomicBool = AtomicBool::new(false);
+
+fn timers() -> MutexGuard<'static, Timers> {
+    TIMERS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Wake each sleeping thread when its time comes.
+fn timer_thread() {
+    let mut t = timers();
+    loop {
+        let now = std::time::Instant::now();
+        let until = match t.due.peek() {
+            None => None,
+            Some(d) if d.until > now => Some(d.until - now),
+            Some(_) => {
+                let due = t.due.pop().expect("just peeked");
+                drop(t);
+                // A thread cancelled in its sleep has been taken out already,
+                // and counted off by whoever took it.
+                let g = due.slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+                if let Some(g) = g {
+                    let mut w = world();
+                    w.calls -= 1;
+                    wake(&mut w, g, Wake::Nothing);
+                }
+                t = timers();
+                continue;
+            }
+        };
+        t = match until {
+            None => TIMER_READY.wait(t).unwrap_or_else(|p| p.into_inner()),
+            Some(d) => {
+                TIMER_READY
+                    .wait_timeout(t, d)
+                    .unwrap_or_else(|p| p.into_inner())
+                    .0
+            }
+        };
+    }
+}
+
+/// `Time.sleep` for `ms` milliseconds: on the scheduler's timer, where this
+/// is one of its threads, or here and now.
+pub fn sleep(ms: u64) {
+    let d = std::time::Duration::from_millis(ms);
+    if !STARTED.load(Ordering::SeqCst) || !ctx::present() || segments::innermost().is_none() {
+        std::thread::sleep(d);
+        return;
+    }
+    // Woken when the time comes, or to fail: cancelled while it slept.
+    let _ = delivered(park(Request::Sleep(std::time::Instant::now() + d)));
 }
 
 /// `work`'s answer: made by an I/O thread while this thread waits, where it

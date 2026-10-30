@@ -898,6 +898,93 @@ fn threads_ended_at_safe_points_leave_nothing_behind() {
     answers_cancelling("cancel_loopers", src, "708440", &[]);
 }
 
+// --- sleeping on the scheduler ---------------------------------------------------
+//
+// `Time.sleep` parks its thread on the scheduler's timer, holding up no
+// worker: see `docs/CANCELLATION.md`.
+
+const TIME: &str = "effect Time { sleep : Int -> () }\n";
+
+#[test]
+fn ten_thousand_sleepers_hold_up_no_worker() {
+    // A fifth of a second each: one after another on one worker, that would
+    // be over half an hour.
+    let src = format!(
+        "{TIME}use Ts.*\ndata Ts = End | More (Task Int) Ts
+         fun sleepers (n : Int) acc = if n == 0 then acc else
+           sleepers (n - 1) (More (threadSpawn (\\() -> let _ = sleep 200 in n)) acc)
+         fun sumAll ts acc = match ts with | End -> acc | More t rest -> sumAll rest (acc + threadAwait t)
+         def result = sumAll (sleepers 10000 End) 0"
+    );
+    let began = std::time::Instant::now();
+    answers_cancelling("sleepers", &src, "50005000", &[]);
+    for stderr in answers_cancelling(
+        "sleepers_poisoned",
+        &src,
+        "50005000",
+        &[("MEADOW_SILO_POISON", "ptr")],
+    ) {
+        poison_clean(&stderr);
+    }
+    let took = began.elapsed();
+    assert!(took < std::time::Duration::from_secs(120), "took {took:?}");
+}
+
+#[test]
+fn a_sleeping_thread_is_woken_by_a_cancel() {
+    let began = std::time::Instant::now();
+    // An hour's sleep, which only the cancel ends in time; and one cancelled
+    // before it goes to sleep.
+    for (name, pause) in [
+        ("cancel_sleeper", "let _ = sleep 20 in"),
+        ("cancel_sleeper_early", ""),
+    ] {
+        fails_cancelling(
+            name,
+            &format!(
+                "{TIME}def result =
+                   let t = threadSpawn (\\() -> let _ = sleep 3600000 in toInt 1) in
+                   {pause}
+                   let _ = threadCancel t in
+                   threadAwait t"
+            ),
+            meadow_core::thread::CANCELLED,
+        );
+    }
+    // A sleeper woken so is no longer one that will wake: what is left
+    // waiting is a deadlock, said at once.
+    for (ok, _, stderr) in run_cancelling(
+        "cancel_sleeper_deadlock",
+        &format!(
+            "{TIME}def result =
+               let ch = channelNew () in
+               let t = threadSpawn (\\() -> let _ = sleep 3600000 in toInt 1) in
+               let _ = sleep 20 in
+               let _ = threadCancel t in
+               channelReceive ch"
+        ),
+        &[],
+    ) {
+        assert!(!ok);
+        assert!(stderr.contains("deadlock"), "{stderr}");
+    }
+    // While a sleeper is asleep, nobody else running is not a deadlock.
+    answers_cancelling(
+        "sleeper_not_deadlock",
+        &format!(
+            "{TIME}def result =
+               let ch = channelNew () in
+               let t = threadSpawn (\\() -> let _ = sleep 30 in channelSend ch (toInt 5)) in
+               let _ = threadAwait t in
+               channelReceive ch + toInt 1"
+        ),
+        "6",
+        &[],
+    );
+    let took = began.elapsed();
+    assert!(took < std::time::Duration::from_secs(120), "took {took:?}");
+}
+
 // --- cycles ------------------------------------------------------------------
 //
 // Counting alone leaves a cycle behind, so the runtime collects them by trial

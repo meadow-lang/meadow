@@ -79,12 +79,21 @@
 //! cancelling once. A wait already answered when the request comes keeps its
 //! answer; the thread stops at its next operation.
 //!
+//! A `Time.sleep` that no handler answers is a wait on the scheduler's timer,
+//! not on the OS thread: the worker runs other threads meanwhile, so a
+//! program may have thousands asleep at once, and a sleeping thread that is
+//! cancelled is woken to fail at once, as a waiting one is. A sleeper is one
+//! that will wake, so threads waiting on it are not a deadlock. Where no
+//! scheduler runs the machine -- a procedural macro's, or a Silo program that
+//! never spawns -- there is nothing else to run, and it sleeps in place.
+//!
 //! What cannot be woken: an operation the runtime makes in place, on the OS
-//! thread running the thread -- a file read, a `Time.sleep` -- runs to its
-//! end, and the thread fails at the operation after it. A wait on a socket is
-//! made on an I/O thread of its own, so the thread is woken at once; the call
-//! itself goes on to its end, and what it answers is dropped. A socket the
-//! thread opened stays open: it is the run's, not the thread's heap's.
+//! thread running the thread -- a file read, a child process run to its end
+//! -- runs to its end, and the thread fails at the operation after it. A wait
+//! on a socket is made on an I/O thread of its own, so the thread is woken at
+//! once; the call itself goes on to its end, and what it answers is dropped. A
+//! socket the thread opened stays open: it is the run's, not the thread's
+//! heap's. `docs/CANCELLATION.md` is the design for what comes next.
 
 /// The error for a value that cannot be passed to another thread.
 pub fn unsendable(what: &str) -> String {

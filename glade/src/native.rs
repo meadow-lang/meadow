@@ -923,6 +923,13 @@ impl Vm<'_> {
             // changing under it.
             "monotonic" => Build::int(ORIGIN.get_or_init(Instant::now).elapsed().as_nanos() as i64),
             "sleep" => match arg {
+                // A thread a scheduler runs waits on its timer, holding up no
+                // worker, and a cancel wakes it (`Request::Sleep`); with no
+                // scheduler there is nothing else to run, and it sleeps here.
+                Value::Int(ms) if ms > 0 && self.scheduled => {
+                    self.sleep_until = Some(Instant::now() + Duration::from_millis(ms as u64));
+                    Build::unit()
+                }
                 Value::Int(ms) if ms > 0 => {
                     std::thread::sleep(Duration::from_millis(ms as u64));
                     Build::unit()

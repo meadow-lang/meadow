@@ -37,6 +37,9 @@ pub enum Request {
     /// I/O thread to make, so that the worker runs another thread meanwhile:
     /// see `crate::sched::blocking`.
     Block(Box<dyn FnOnce() + Send>),
+    /// A `Time.sleep`, until then, on the scheduler's timer: see
+    /// `crate::sched::sleep`.
+    Sleep(std::time::Instant),
 }
 
 /// What a thread is woken with.
