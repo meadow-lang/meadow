@@ -4052,6 +4052,10 @@ The rules that make this safe:
   the runtime's timer, so the cores go on running the other threads, a
   program may have thousands asleep at once, and a cancel wakes a sleeper
   straight away.
+- **A thread's sockets end with it.** A listener or a connection belongs to
+  the thread that opened it, and is closed when that thread ends, however it
+  ends. One sent to another thread, or captured by a function it spawns,
+  belongs to that thread instead.
 
 ```meadow
 use Std.Thread as Thread

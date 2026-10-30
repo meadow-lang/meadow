@@ -99,9 +99,14 @@
 //! thread running the thread -- a file read, a child process run to its end
 //! -- runs to its end, and the thread fails at the operation after it. A wait
 //! on a socket is made on an I/O thread of its own, so the thread is woken at
-//! once; the call itself goes on to its end, and what it answers is dropped. A
-//! socket the thread opened stays open: it is the run's, not the thread's
-//! heap's. `docs/CANCELLATION.md` is the design for what comes next.
+//! once; the call itself goes on to its end, and what it answers is dropped.
+//!
+//! A socket belongs to the thread that opened it, and is closed when that
+//! thread ends, however it ends, once its releases have run: the call it was
+//! woken from finds it closed. One handed to another thread -- in a spawned
+//! function, a message, an answer -- is that thread's from then on, and one
+//! put in a `TVar` or a `Compact` is nobody's. See [`crate::net`] and
+//! `docs/CANCELLATION.md`.
 
 /// The error for a value that cannot be passed to another thread.
 pub fn unsendable(what: &str) -> String {

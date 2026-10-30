@@ -2512,7 +2512,9 @@ def played : [(String, String)] =
     ("vnode-leaf", "VNode.Leaf"),
     ("vnode-branch", "VNode.Branch"),
     ("false", "Bool.False"),
-    ("file-meta", "FileMeta.FileMeta")
+    ("file-meta", "FileMeta.FileMeta"),
+    ("listener", "Std.Net.Listener.Listener"),
+    ("stream", "Std.Net.Stream.Stream")
   ]
 
 -- `roles { ... }` for the types `datas` declares.

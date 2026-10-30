@@ -1033,6 +1033,7 @@ fn file(mut g: Box<Green>, request: Option<Request>) {
         }
         Some(Request::Failed(msg)) => {
             let tid = g.ctx.tid;
+            meadow_rt::net::close_owned(g.ctx.owner);
             // Never resumed, and not unwound.
             // Safety: nothing will resume it.
             unsafe { g.co.0.force_reset() };
@@ -1210,6 +1211,9 @@ pub fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) ->
     if !STARTED.load(Ordering::SeqCst) || !ctx::present() || segments::innermost().is_none() {
         return work();
     }
+    // Made on an I/O thread, for this thread: what it opens is this one's.
+    let owner = owner();
+    let work = move || meadow_rt::net::owning(owner, work);
     let slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
     let into = slot.clone();
     let woken = park(Request::Block(Box::new(move || {
@@ -1219,6 +1223,11 @@ pub fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) ->
     let _ = delivered(woken);
     let answer = slot.lock().unwrap_or_else(|p| p.into_inner()).take();
     answer.unwrap_or_else(|| crate::fail("a call into the world came back without its answer"))
+}
+
+/// Whose the sockets the running thread opens are: see `meadow_rt::net`.
+pub(crate) fn owner() -> u64 {
+    if ctx::present() { cx().owner } else { 0 }
 }
 
 /// Put a thread back on the queue, with what it was woken with: the
@@ -1463,6 +1472,9 @@ pub fn prim(p: Prim, args: &[Val]) -> Word {
                 heap::erase(v, answer);
                 // A release that fails does not come back.
                 let out = wind_down(out);
+                // What it answers was handed on as it was lifted; the sockets
+                // it still holds go with it.
+                meadow_rt::net::close_owned(cx().owner);
                 heap::finish();
                 Box::into_raw(Box::new(out)) as Word
             });

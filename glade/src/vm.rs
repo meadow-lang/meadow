@@ -205,6 +205,10 @@ pub struct Vm<'p> {
     /// A release taken back to run in place has just begun, for the
     /// scheduler: it is given its own grace if the thread is cancelled.
     pub(crate) release_began: bool,
+    /// Whose the sockets this thread opens are (`meadow_rt::net::owning`):
+    /// closed when it ends. 0 on a machine no scheduler runs, whose sockets
+    /// are nobody's.
+    pub(crate) owner: u64,
     /// Top-level values this thread has evaluated, by definition -- see
     /// `meadow_core::globals`. Collector roots. Each thread has its own, as it
     /// has its own heap.
@@ -406,6 +410,15 @@ impl<'p> Vm<'p> {
 
     /// A machine whose heap is `heap` -- one made to collect a particular way.
     pub fn with_heap(program: &'p Program, heap: Heap) -> Vm<'p> {
+        let mut vm = Vm::bare(program, heap);
+        vm.heap.socket_tags = [
+            vm.role_tag(meadow_rt::roles::Role::Listener),
+            vm.role_tag(meadow_rt::roles::Role::Stream),
+        ];
+        vm
+    }
+
+    fn bare(program: &'p Program, heap: Heap) -> Vm<'p> {
         Vm {
             program,
             heap,
@@ -431,6 +444,7 @@ impl<'p> Vm<'p> {
             exits: Vec::new(),
             next_exit: 0,
             release_began: false,
+            owner: 0,
             globals: Vec::new(),
             literals: Vec::new(),
             world: None,
@@ -481,6 +495,7 @@ impl<'p> Vm<'p> {
         self.heap
             .reserve(Heap::size_of(Kind::Closure, 1) + Heap::size_of(Kind::Data, 0) + body.len());
         let f = self.heap.import(body);
+        self.adopt(body);
         self.enter(f, answer, "a thread")
     }
 
@@ -554,7 +569,15 @@ impl<'p> Vm<'p> {
     pub(crate) fn deliver_parcel(&mut self, dst: Reg, parcel: &crate::heap::Parcel) {
         self.ensure(parcel.len());
         let v = self.heap.import(parcel);
+        self.adopt(parcel);
         self.set(dst, v);
+    }
+
+    /// The sockets in `parcel`, arrived here, are this thread's now.
+    fn adopt(&self, parcel: &crate::heap::Parcel) {
+        for &id in parcel.sockets() {
+            meadow_rt::net::hand_on(id, self.owner);
+        }
     }
 
     /// A new handle object -- a channel or a thread -- in register `dst`.

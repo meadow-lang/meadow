@@ -292,6 +292,9 @@ pub struct Parcel {
     slots: Vec<Word>,
     root: Value,
     regions: Vec<Arc<Region>>,
+    /// The sockets inside, by handle: handed to nobody as the parcel is made,
+    /// and to the thread it is opened in. See `meadow_rt::net`.
+    sockets: Vec<i64>,
 }
 
 impl std::fmt::Debug for Parcel {
@@ -313,6 +316,11 @@ impl Parcel {
 
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
+    }
+
+    /// The sockets inside: see [`Parcel::sockets`].
+    pub fn sockets(&self) -> &[i64] {
+        &self.sockets
     }
 }
 
@@ -492,6 +500,11 @@ pub struct Heap {
     /// deep recursion that allocates is quadratic. (GHC does the same with a
     /// dirty bit per stack chunk.) See [`Heap::minor`].
     clean_chunks: std::collections::HashSet<Addr>,
+    /// The tags of the program's constructors for a socket -- a listener and
+    /// a stream (`Role::Listener`, `Role::Stream`) -- or `u32::MAX` where it
+    /// declares none: what a value that leaves this heap is looked through
+    /// for, so that the socket goes with it. See `meadow_rt::net`.
+    pub(crate) socket_tags: [u32; 2],
     config: GcConfig,
     /// The nursery, and its other half for collecting into.
     space: Vec<Word>,
@@ -666,6 +679,7 @@ impl Heap {
             free_chunks: Vec::new(),
             detached: Vec::new(),
             clean_chunks: std::collections::HashSet::new(),
+            socket_tags: [u32::MAX; 2],
         };
         heap.sync();
         heap
@@ -2002,6 +2016,7 @@ impl Heap {
             slots: Vec::new(),
             root: v,
             regions: Vec::new(),
+            sockets: Vec::new(),
         };
         let Value::Obj(a) = v else {
             return Ok(parcel);
@@ -2045,6 +2060,11 @@ impl Heap {
             Kind::MutArray => return Err(Unsendable::MutArray),
             Kind::Resume | Kind::Frame | Kind::Stack => return Err(Unsendable::Continuation),
             Kind::Compact => self.carry(parcel, h.meta),
+            Kind::Data if self.socket_tags.contains(&h.meta) && h.len == 1 => {
+                let id = self.field_word(a, 0) as i64;
+                meadow_rt::net::hand_on(id, 0);
+                parcel.sockets.push(id);
+            }
             _ => {}
         }
         // Copied word for word: the header's descriptors say what the fields
@@ -2291,6 +2311,12 @@ impl Heap {
             _ => meta,
         };
         let fields = self.fields(a);
+        // A socket in a region every thread may read belongs to nobody.
+        if kind == Kind::Data && self.socket_tags.contains(&meta) {
+            if let [Value::Int(id)] = fields[..] {
+                meadow_rt::net::hand_on(id, 0);
+            }
+        }
         let c = contents.alloc(kind, meta, &fields);
         copies.insert(a, c);
         Ok(c)

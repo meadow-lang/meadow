@@ -31,6 +31,9 @@ pub struct Parcel {
     tasks: Vec<u32>,
     /// And the `TVar`s it carries a handle to, by their cells' addresses.
     vars: Vec<usize>,
+    /// The sockets inside, by handle: handed to nobody as the parcel is made,
+    /// and to the thread it is opened in. See `meadow_rt::net`.
+    sockets: Vec<i64>,
 }
 
 // Safety: what a parcel holds is a copy belonging to no heap, and a region it
@@ -57,6 +60,7 @@ impl Clone for Parcel {
             regions: self.regions.clone(),
             tasks: self.tasks.clone(),
             vars: self.vars.clone(),
+            sockets: self.sockets.clone(),
         }
     }
 }
@@ -74,6 +78,25 @@ impl Drop for Parcel {
             crate::sched::let_go_var(*v);
         }
     }
+}
+
+/// The handle of the socket block `b` is -- one of `Std.Net`'s listeners or
+/// streams, by its constructor's role -- if it is one.
+pub(crate) fn socket(b: Word) -> Option<i64> {
+    static TAGS: std::sync::OnceLock<[u32; 2]> = std::sync::OnceLock::new();
+    let tags = TAGS.get_or_init(|| {
+        use meadow_rt::roles::Role;
+        [
+            crate::value::tag(crate::show::role(Role::Listener)),
+            crate::value::tag(crate::show::role(Role::Stream)),
+        ]
+    });
+    (heap::is_block(b)
+        && heap::kind(b) == heap::DATA
+        && heap::len(b) == 1
+        && tags.contains(&heap::meta(b))
+        && heap::field_desc(b, 0) == desc::INT)
+        .then(|| heap::field(b, 0) as i64)
 }
 
 #[derive(Clone)]
@@ -96,6 +119,7 @@ impl Parcel {
         let mut regions = Vec::new();
         let mut tasks = Vec::new();
         let mut vars = Vec::new();
+        let mut sockets = Vec::new();
         if d != desc::REF || !heap::is_block(v) {
             return Ok(Parcel {
                 root: (v, d),
@@ -103,6 +127,7 @@ impl Parcel {
                 regions,
                 tasks,
                 vars,
+                sockets,
             });
         }
         let mut todo = vec![v];
@@ -124,6 +149,10 @@ impl Parcel {
                 crate::sched::held_var(heap::field(b, 0) as usize);
                 vars.push(heap::field(b, 0) as usize);
                 continue;
+            }
+            if let Some(id) = socket(b) {
+                meadow_rt::net::hand_on(id, 0);
+                sockets.push(id);
             }
             // A compact crosses as itself: its region belongs to no thread,
             // so the block is carried whole -- the pointer into the region
@@ -164,11 +193,22 @@ impl Parcel {
             regions,
             tasks,
             vars,
+            sockets,
         })
     }
 
     /// The value, put into the running thread's heap: owned by the caller.
     pub fn open(&self) -> Word {
+        // What it carries of sockets is the opening thread's now.
+        let owner = if crate::ctx::present() {
+            // Safety: the running thread's context.
+            unsafe { (*crate::ctx::get()).owner }
+        } else {
+            0
+        };
+        for &id in &self.sockets {
+            meadow_rt::net::hand_on(id, owner);
+        }
         if self.blocks.is_empty() {
             return self.root.0;
         }

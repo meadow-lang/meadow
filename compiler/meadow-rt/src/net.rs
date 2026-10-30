@@ -22,11 +22,11 @@
 //! authority where it is given one -- a service's own, inside a company or a
 //! test. A server is given its certificate chain and key as PEM files.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
@@ -45,6 +45,9 @@ struct Entry {
     closed: AtomicBool,
     /// The stream's timeout, as `set_timeout` gave it.
     timeout: Mutex<Option<Duration>>,
+    /// The thread it belongs to (see [`owning`]), or 0 for none: closed when
+    /// that thread ends.
+    owner: AtomicU64,
 }
 
 enum Socket {
@@ -130,6 +133,7 @@ fn insert(sock: Socket, timeout: Option<Duration>) -> i64 {
         sock,
         closed: AtomicBool::new(false),
         timeout: Mutex::new(timeout),
+        owner: AtomicU64::new(OWNER.with(Cell::get)),
     };
     table().insert(id, Arc::new(entry));
     id
@@ -186,6 +190,118 @@ fn patiently(
             }
             Err(e) => return Err(said(e)),
         }
+    }
+}
+
+// --- who a socket belongs to -------------------------------------------------
+//
+// A socket belongs to the green thread that opened it -- by `listen`,
+// `accept`, `connect`, or a TLS handshake, whose stream takes the plain one's
+// place -- and is closed when that thread ends, whichever way, after its
+// releases have run: a thread shares nothing mutable, so what it holds and
+// did not hand on is out of everyone's reach once it is over, and keeping the
+// socket open would only keep its port and its peer waiting for the run to
+// end. A socket handed on -- in a spawned function, a message or an answer,
+// which the runtimes see as they copy it (`roles::Role::Listener`,
+// `roles::Role::Stream`) -- belongs to the thread it arrives in; one put where
+// every thread may read it, a `TVar` or a `Compact`, to nobody. See
+// `docs/CANCELLATION.md`.
+
+/// Meadow's constructors for a socket: `Std.Net`'s, each around its handle.
+/// What the front end declares for [`crate::roles::Role::Listener`] and
+/// [`crate::roles::Role::Stream`].
+pub const LISTENER: &str = "Std.Net.Listener.Listener";
+pub const STREAM: &str = "Std.Net.Stream.Stream";
+
+thread_local! {
+    /// Whose sockets this OS thread opens now: see [`owning`].
+    static OWNER: Cell<u64> = const { Cell::new(0) };
+}
+
+/// A new owner, for a green thread: never 0, and never given twice in a
+/// process, where many runs may be going at once.
+pub fn new_owner() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The calls each owner has under way, and the owners that ended while one
+/// was: a thread woken from a socket wait by a cancel ends while the call goes
+/// on, on its I/O thread, and what that call opens when it comes back -- an
+/// accepted connection -- belongs to nobody alive. It is closed as the call
+/// ends. Kept only while a call is under way, so it stays small.
+#[derive(Default)]
+struct Calls {
+    under_way: HashMap<u64, u32>,
+    ended: std::collections::HashSet<u64>,
+}
+
+fn calls() -> MutexGuard<'static, Calls> {
+    static CALLS: OnceLock<Mutex<Calls>> = OnceLock::new();
+    CALLS
+        .get_or_init(|| Mutex::new(Calls::default()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// `f`, with what it opens belonging to `owner`: the call a green thread
+/// makes, wherever the runtime makes it.
+pub fn owning<T>(owner: u64, f: impl FnOnce() -> T) -> T {
+    if owner != 0 {
+        *calls().under_way.entry(owner).or_default() += 1;
+    }
+    let was = OWNER.with(|o| o.replace(owner));
+    let out = f();
+    OWNER.with(|o| o.set(was));
+    if owner != 0 {
+        let orphaned = {
+            let mut c = calls();
+            let n = c.under_way.get_mut(&owner).map(|n| {
+                *n -= 1;
+                *n
+            });
+            if n == Some(0) {
+                c.under_way.remove(&owner);
+            }
+            n == Some(0) && c.ended.remove(&owner)
+        };
+        if orphaned {
+            close_held(owner);
+        }
+    }
+    out
+}
+
+/// Socket `id` belongs to `owner` now (0: to nobody), if it is open.
+pub fn hand_on(id: i64, owner: u64) {
+    if let Some(e) = table().get(&id) {
+        e.owner.store(owner, Ordering::SeqCst);
+    }
+}
+
+/// Close every socket `owner` holds: its thread has ended. A call of its
+/// still under way closes what it opens as it ends.
+pub fn close_owned(owner: u64) {
+    if owner == 0 {
+        return;
+    }
+    {
+        let mut c = calls();
+        if c.under_way.contains_key(&owner) {
+            c.ended.insert(owner);
+        }
+    }
+    close_held(owner);
+}
+
+fn close_held(owner: u64) {
+    let ids: Vec<i64> = table()
+        .iter()
+        .filter(|(_, e)| e.owner.load(Ordering::SeqCst) == owner)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in ids {
+        close(id);
     }
 }
 

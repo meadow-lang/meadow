@@ -21,6 +21,16 @@
 -- the program's threads, which go on running the others. So a server that
 -- answers many connections at once gives each a thread of its own
 -- (`Std.Thread.spawn`), as `Std.Http`'s does.
+--
+-- A socket belongs to the thread that opened it -- listened, accepted,
+-- connected, or shook hands for TLS -- and the runtime closes it when that
+-- thread ends, however it ends, if nothing closed it before: a cancelled
+-- server's port is free again at once, and its peers see the end. Handed to
+-- another thread -- in a function it spawns, a message, its answer -- it
+-- is that thread's from then on, so an accepting thread can give each
+-- connection to a worker of its own, and a worker that is cancelled takes
+-- its connection with it. One kept in a `TVar` or a `Compact`, where any
+-- thread may read it, is nobody's, and stays open until it is closed.
 
 use Std.Collections.Vector as V
 use Std.Collections.Vector (Vector, vecFromArray)

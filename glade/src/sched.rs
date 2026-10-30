@@ -466,6 +466,7 @@ impl<'p> Fiber<'p> {
         });
         f.vm.cancel = Some(f.ctl.cancelled.clone());
         f.vm.held_off = f.ctl.held_off.clone();
+        f.vm.owner = meadow_rt::net::new_owner();
         f
     }
 }
@@ -1395,6 +1396,9 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
             }
         }
         Self::collect(sh, &mut fiber);
+        // What it answered has been handed on as it was exported; the sockets
+        // it still holds go with it.
+        meadow_rt::net::close_owned(fiber.vm.owner);
         let out = fiber.ending.take().expect("the thread has ended");
         if fiber.task == 0 {
             let mut stats = lock(&sh.stats);
