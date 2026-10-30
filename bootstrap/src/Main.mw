@@ -262,6 +262,12 @@ cli! {
       clientProcessId
         : Option Int "Ignored: the editor's process id" as "clientProcessId" value "PID"
       fetch : Flag "Fetch what a package depends on when a file of it is opened, as a build would"
+      check
+        : Option
+          [String]
+          "Serve nothing: print every error the server would mark in each `.mw` file under these paths, and exit 1 if there is one"
+          value
+          "PATH"
     }
     | dap "Run the debug adapter, speaking the Debug Adapter Protocol over stdin and stdout" {}
     | fmt "Re-indent `.mw` sources in place" {

@@ -1121,8 +1121,8 @@ starve other threads.
 
 ### Thread operations, from any backend
 
-`spawn`, `await`, `yieldNow`, `newChannel`, `send`, `receive`, STM commit and
-STM wait are **primitives**. A primitive can't carry out a thread operation
+`spawn`, `await`, `yieldNow`, `newChannel`, `send`, `receive`, `cancel`,
+`cancelled`, STM commit and STM wait are **primitives**. A primitive can't carry out a thread operation
 itself, because the channels and other threads belong to the scheduler. So it
 leaves a `Request` in the machine and stops:
 

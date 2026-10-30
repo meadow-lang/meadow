@@ -1107,6 +1107,7 @@ impl Vm<'_> {
             // crosses to another thread is exported first, while this thread
             // still has it -- see `meadow_core::thread`.
             ThreadSpawn | ThreadAwait | ThreadYield | ChannelNew | ChannelSend | ChannelReceive
+            | ThreadCancel | ThreadCancelled
                 if !self.scheduled =>
             {
                 return err("green threads need the scheduler; this machine is running on its own");
@@ -1139,6 +1140,15 @@ impl Vm<'_> {
             ChannelReceive => {
                 let channel = self.handle(arg(self, 0), Kind::Channel, "a channel")?;
                 self.request = Some(crate::vm::Request::Receive { channel, dst });
+                Value::Unit
+            }
+            ThreadCancel => {
+                let task = self.handle(arg(self, 0), Kind::Task, "a thread")?;
+                self.request = Some(crate::vm::Request::Cancel { task });
+                Value::Unit
+            }
+            ThreadCancelled => {
+                self.request = Some(crate::vm::Request::Cancelled { dst });
                 Value::Unit
             }
         };

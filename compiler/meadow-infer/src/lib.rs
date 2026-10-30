@@ -851,7 +851,12 @@ impl Arena {
                 let at = self.slot_level(id);
                 let saved = std::mem::replace(&mut self.level, at);
                 let field = self.fresh();
-                let new_rest = self.fresh_row();
+                // The rest is the same kind of row: an effect's tail stays an
+                // effect's, or it prints, and quantifies, as a record's.
+                let new_rest = match self.slot_kind(id) {
+                    VarKind::Effect => self.fresh_effect(),
+                    _ => self.fresh_row(),
+                };
                 self.level = saved;
                 // What is left of the row keeps the promise.
                 self.require_lacks(new_rest.clone(), &lacks)?;
@@ -4891,6 +4896,18 @@ fn prim_scheme(name: &str) -> Option<Scheme> {
             preds: Vec::new(),
             quant: vec![VarKind::Type, VarKind::Effect],
             ty: Type::func_eff(vec![Type::channel(Bound(0))], Bound(0), thread_row(1)),
+        },
+        "threadCancel" => Scheme {
+            lacks: Vec::new(),
+            preds: Vec::new(),
+            quant: vec![VarKind::Type, VarKind::Effect],
+            ty: Type::func_eff(vec![Type::task(Bound(0))], Type::unit(), thread_row(1)),
+        },
+        "threadCancelled" => Scheme {
+            lacks: Vec::new(),
+            preds: Vec::new(),
+            quant: vec![VarKind::Effect],
+            ty: Type::func_eff(vec![Type::unit()], Type::bool(), thread_row(0)),
         },
         "stmNew" => Scheme {
             lacks: Vec::new(),

@@ -25,6 +25,22 @@ beyond the last release is under _Unreleased_.
 
 ### Added
 
+- Threads can be cancelled: `Std.Thread.cancel t` asks `t` to stop, and
+  `await t` then fails with "cancelled". A cancelled thread stops softly at
+  its next operation the runtime answers -- a thread operation, the wait of a
+  `retry`, or an operation of `Console`, `Fs`, `Net`, `Time`, `Random`,
+  `Process`, `Log` or `Test` -- and is woken to stop if it is waiting on a
+  channel, another thread, a `retry` or a socket. One that performs nothing
+  is ended at a preemption point a little after the cancel, so no thread can
+  ignore one. No code is interrupted between two of its operations in a way
+  it could notice, and no handler can catch the failure, so there is no
+  asynchronous exception to guard cleanup against or mask; threads share
+  nothing mutable, so ending one leaves nobody else's state half made.
+  `Std.Thread.cancelled ()` asks, for a computation that would rather stop
+  on its own terms. Cancelling a finished thread does nothing. On the CEK
+  machine, Glade (the VM, the JIT and executables) and Silo; the design is in
+  `meadow_rt::thread`. An operation made in place, such as a file read or
+  `Time.sleep`, runs to its end before the thread stops.
 - Glade builds a library of what a package exports to C, as Silo does:
   `MeadowBoot build --runtime glade` for a package of `@export` functions, or
   `meadow cut --runtime glade` for a program of Cut with exports, makes
@@ -71,8 +87,19 @@ beyond the last release is under _Unreleased_.
 
 ### Fixed
 
+- A function that performs two effects whose rows met in inference read
+  with its effect's tail as a record's -- `forall r. () -> () ! { Ask, Tell |
+  r }` -- in an editor's hover and wherever a type is shown, and was
+  quantified as one. It is `e`, as for any other effect.
 - `MEADOW_SILO_POISON` and `MEADOW_SILO_LEAKS` together counted every
   poisoned block as left behind at exit.
+- Under `MEADOW_SILO_POISON`, a Silo thread that failed gave its heap's
+  memory back, and the blocks it had freed were said to be written after
+  they were freed by whichever thread was given the memory next, or the check
+  at exit read memory that was gone and crashed.
+- A Silo thread that failed inside a handler kept the stacks of the handlers'
+  segments for the rest of the run, and the leak check counted them as live.
+  They are given back with the thread.
 - The language server answers for one file of a large package without
   compiling the whole package on every change. It infers the module being
   edited and reuses what earlier compiles found for the rest, while what

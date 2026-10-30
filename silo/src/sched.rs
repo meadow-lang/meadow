@@ -21,6 +21,21 @@
 //! what it waits on, or puts it straight back if that is already there: no
 //! wake-up can fall between the thread deciding to wait and its waiting.
 //!
+//! A thread asked to stop (`meadow_core::thread`) fails at its next thread
+//! operation, which looks at its [`Ctl`] first, or at its next operation of
+//! the world's (`crate::native`). One that makes neither is ended at a safe
+//! point: while any thread is cancelled and not yet ended, the flag the safe
+//! points read stays up, so that the thread comes to [`meadow_preempted`]
+//! even with nothing else to run; the first time marks it, and one at least a
+//! tick of the timer later ends it, unless it has asked and been told. A
+//! thread already waiting is found and woken to fail. Filing it, the worker
+//! says in its `Ctl` where it waits and then looks at the flag, under the
+//! lock of what it waits on; a canceller sets the flag and then reads where.
+//! So either the canceller finds it there, under that same lock, or the thread
+//! saw the flag and was not filed. Where is only a hint: nothing clears it
+//! when the thread is woken some other way, and a canceller looking there
+//! then finds nobody -- rightly, since that thread is running.
+//!
 //! A transaction keeps its writes in a log, one level per `orElse`, and
 //! reads a `TVar` only if nothing has written it since the transaction began.
 //! Its commit checks that everything it read is as it was, and publishes its
@@ -36,7 +51,7 @@ use corosensei::stack::DefaultStack;
 use corosensei::{Coroutine, CoroutineResult, Yielder};
 use meadow_rt::{Prim, desc};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 
 /// A thread's stack: reserved, and committed as it is touched.
@@ -50,10 +65,150 @@ struct Green {
     co: SendSegment,
 }
 
+/// A thread's cancellation: whether it has been asked to stop, and where it
+/// last waited. See the module docs.
+#[derive(Default)]
+pub struct Ctl {
+    cancelled: AtomicBool,
+    parked: Mutex<Parked>,
+    /// It asked whether it had been cancelled, and was told so: it stops of
+    /// its own accord, and is not ended at a safe point. Its own alone.
+    seen: AtomicBool,
+    /// The timer's [`TICKS`], plus one, when a safe point first found it
+    /// cancelled; `0` until then. Its own alone.
+    armed: AtomicU64,
+}
+
+/// Where a thread last waited.
+#[derive(Default, Clone)]
+enum Parked {
+    #[default]
+    Nowhere,
+    /// On the thread with this number, in `await`.
+    Await(usize),
+    /// On the channel at this address.
+    Receive(usize),
+    /// In `retry`, under this key of the scheduler's `waiting`.
+    Wait(u64),
+    /// On a call into the world, which an I/O thread makes.
+    Io(std::sync::Weak<Mutex<Option<Box<Green>>>>),
+}
+
+impl Ctl {
+    /// The thread is about to wait `at`: say so, then answer whether it has
+    /// been cancelled, in which case it must not wait. Called with what it
+    /// waits on locked.
+    fn park(&self, at: Parked) -> bool {
+        *self.parked.lock().unwrap_or_else(|p| p.into_inner()) = at;
+        self.cancelled()
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+/// Fail the running thread if it has been asked to stop: what every thread
+/// operation does first, and every operation the runtime answers
+/// (`crate::native`).
+pub(crate) fn notice_cancel() {
+    if ctx::present() && cx().cancel.cancelled() {
+        crate::fail(meadow_rt::thread::CANCELLED)
+    }
+}
+
+/// Bits of [`meadow_preempt`]: the timer asks the running threads to give way
+/// ...
+const GIVE_WAY: u8 = 1;
+/// ... or a thread has been cancelled and has not ended, and may be one that
+/// makes no operation: every safe point looks, until it has.
+const ENDING: u8 = 2;
+
+/// Threads cancelled and not yet ended. Changed under the scheduler's lock.
+static CANCELLED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Times the timer has ticked: what a cancelled thread's grace is counted in.
+static TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// A safe point: end the running thread if it was cancelled and has neither
+/// noticed nor asked -- a thread that makes no operation, which nothing else
+/// would stop. Not at the first safe point after the cancel, which only marks
+/// it, but at one at least a whole tick of the timer later: a thread that is
+/// about to perform an operation, or to ask, does so and stops softly. Not
+/// where the runtime's own call into the program has nowhere to suspend to,
+/// either: it is ended at a safe point after that call returns.
+fn end_if_cancelled() {
+    if !ctx::present() || segments::innermost().is_none() {
+        return;
+    }
+    let c = &cx().cancel;
+    if cx().tid == 0 || !c.cancelled() || c.seen.load(Ordering::Relaxed) {
+        return;
+    }
+    let now = TICKS.load(Ordering::Relaxed);
+    match c.armed.load(Ordering::Relaxed) {
+        0 => c.armed.store(now + 1, Ordering::Relaxed),
+        at if now > at => crate::fail(meadow_rt::thread::CANCELLED),
+        _ => {}
+    }
+}
+
+/// Take thread `tid` out of where it waits, `at`, and wake it to fail; if it
+/// is still there.
+fn unpark(tid: usize, at: Parked) {
+    let fail = || Wake::Fail(meadow_rt::thread::CANCELLED.into());
+    match at {
+        Parked::Nowhere => {}
+        Parked::Await(on) => {
+            let mut w = world();
+            let Some(task) = w.tasks.get_mut(on) else {
+                return;
+            };
+            if let Some(i) = task.waiters.iter().position(|g| g.ctx.tid == tid) {
+                let g = task.waiters.remove(i);
+                wake(&mut w, g, fail());
+            }
+        }
+        Parked::Receive(c) => {
+            // Safety: the address of a channel that lives for the whole run.
+            let c = unsafe { &*(c as *const Chan) };
+            let g = {
+                let mut state = chan_state(c);
+                let i = state.receivers.iter().position(|g| g.ctx.tid == tid);
+                i.and_then(|i| state.receivers.remove(i))
+            };
+            // The channel's lock let go first: it comes before the scheduler's.
+            if let Some(g) = g {
+                ready(g, fail());
+            }
+        }
+        Parked::Wait(key) => {
+            // Its key stays on the `TVar`s it read, and a commit that finds
+            // it gone wakes nobody.
+            let mut w = world();
+            if let Some(g) = w.waiting.remove(&key) {
+                wake(&mut w, g, fail());
+            }
+        }
+        // The call is made all the same, if it has begun; what it answers
+        // finds nobody waiting, and is dropped.
+        Parked::Io(slot) => {
+            let g = slot
+                .upgrade()
+                .and_then(|s| s.lock().unwrap_or_else(|p| p.into_inner()).take());
+            if let Some(g) = g {
+                ready(g, fail());
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct Task {
     outcome: Option<Result<Arc<Parcel>, String>>,
     waiters: Vec<Box<Green>>,
+    /// The thread's, while it runs: see [`Ctx::cancel`].
+    ctl: Option<Arc<Ctl>>,
     /// Nothing can `await` it any more -- every `Task` of it has gone -- so
     /// what it answers is not kept: see [`held`].
     nobody: bool,
@@ -625,8 +780,9 @@ fn tick() {
         if w.done {
             return;
         }
+        TICKS.fetch_add(1, Ordering::Relaxed);
         if !w.ready.is_empty() {
-            meadow_preempt.store(1, Ordering::Relaxed);
+            meadow_preempt.fetch_or(GIVE_WAY, Ordering::Relaxed);
         }
     }
 }
@@ -636,9 +792,19 @@ fn tick() {
 ///
 /// The flag is cleared here rather than by the timer, so that one thread
 /// giving way answers one timer tick: the others carry on until the next.
+///
+/// A thread cancelled and not yet ended keeps the flag up meanwhile, and so
+/// every thread comes here at every safe point, where the cancelled one is
+/// ended ([`end_if_cancelled`]) and the others carry straight on.
 #[unsafe(no_mangle)]
 pub extern "C" fn meadow_preempted() {
-    meadow_preempt.store(0, Ordering::Relaxed);
+    end_if_cancelled();
+    // Read before it is written, so that threads passing safe points while
+    // only `ENDING` is up do not all write the one byte.
+    if meadow_preempt.load(Ordering::Relaxed) & GIVE_WAY == 0 {
+        return;
+    }
+    meadow_preempt.fetch_and(!GIVE_WAY, Ordering::Relaxed);
     // Nothing waiting, or nowhere to suspend to (the runtime's own calls into
     // the program, which run to the end): carry on.
     if world().ready.is_empty() || segments::innermost().is_none() {
@@ -657,6 +823,12 @@ fn wake(w: &mut World, mut g: Box<Green>, with: Wake) {
 /// awaits it.
 fn finish(w: &mut World, tid: usize, out: Result<Parcel, String>) {
     let out = out.map(Arc::new);
+    if let Some(ctl) = w.tasks[tid].ctl.take()
+        && ctl.cancelled()
+        && CANCELLED.fetch_sub(1, Ordering::SeqCst) == 1
+    {
+        meadow_preempt.fetch_and(!ENDING, Ordering::SeqCst);
+    }
     let waiters = std::mem::take(&mut w.tasks[tid].waiters);
     if !w.tasks[tid].nobody {
         w.tasks[tid].outcome = Some(out.clone());
@@ -687,17 +859,25 @@ fn file(mut g: Box<Green>, request: Option<Request>) {
                     let m = m.clone();
                     wake(&mut w, g, Wake::Fail(m));
                 }
+                None if g.ctx.cancel.park(Parked::Await(t)) => {
+                    wake(&mut w, g, Wake::Fail(meadow_rt::thread::CANCELLED.into()));
+                }
                 None => w.tasks[t].waiters.push(g),
             }
         }
         Some(Request::Receive(c)) => {
             // Safety: the address of a channel that lives for the whole run.
+            let at = c;
             let c = unsafe { &*(c as *const Chan) };
             let mut state = chan_state(c);
             match state.messages.pop_front() {
                 Some(p) => {
                     drop(state);
                     ready(g, Wake::Value(p));
+                }
+                None if g.ctx.cancel.park(Parked::Receive(at)) => {
+                    drop(state);
+                    ready(g, Wake::Fail(meadow_rt::thread::CANCELLED.into()));
                 }
                 None => state.receivers.push_back(g),
             }
@@ -723,6 +903,11 @@ fn file(mut g: Box<Green>, request: Option<Request>) {
             let mut w = world();
             let key = w.next_wait;
             w.next_wait += 1;
+            if g.ctx.cancel.park(Parked::Wait(key)) {
+                drop(held);
+                wake(&mut w, g, Wake::Fail(meadow_rt::thread::CANCELLED.into()));
+                return;
+            }
             for c in &cells {
                 c.waiters
                     .lock()
@@ -733,10 +918,24 @@ fn file(mut g: Box<Green>, request: Option<Request>) {
             w.waiting.insert(key, g);
         }
         Some(Request::Block(call)) => {
+            let slot = Arc::new(Mutex::new(Some(g)));
+            let cancelled = {
+                let held = slot.lock().unwrap_or_else(|p| p.into_inner());
+                let g = held.as_ref().expect("just put there");
+                g.ctx.cancel.park(Parked::Io(Arc::downgrade(&slot)))
+            };
+            if cancelled {
+                let g = slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+                ready(
+                    g.expect("not filed yet"),
+                    Wake::Fail(meadow_rt::thread::CANCELLED.into()),
+                );
+                return;
+            }
             // Counted before the worker counts the thread out: see `work`.
             world().calls += 1;
             let mut io = io();
-            io.calls.push_back((g, call));
+            io.calls.push_back((slot, call));
             if io.calls.len() > io.idle {
                 // Every I/O thread is busy waiting on a call of its own.
                 drop(io);
@@ -774,7 +973,9 @@ static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 
 #[derive(Default)]
 struct IoQueue {
-    calls: VecDeque<(Box<Green>, Box<dyn FnOnce() + Send>)>,
+    /// Each call, and the thread waiting on it -- which a cancel may take
+    /// out first, leaving the slot empty.
+    calls: VecDeque<(Arc<Mutex<Option<Box<Green>>>>, Box<dyn FnOnce() + Send>)>,
     /// I/O threads waiting for a call.
     idle: usize,
 }
@@ -788,7 +989,7 @@ fn io() -> MutexGuard<'static, IoQueue> {
 
 fn io_thread() {
     loop {
-        let (g, call) = {
+        let (slot, call) = {
             let mut io = io();
             loop {
                 if let Some(c) = io.calls.pop_front() {
@@ -799,10 +1000,19 @@ fn io_thread() {
                 io.idle -= 1;
             }
         };
-        call();
+        let waiting =
+            |s: &Mutex<Option<Box<Green>>>| s.lock().unwrap_or_else(|p| p.into_inner()).take();
+        // A thread cancelled before its call was made: not made at all; and
+        // one cancelled while it was being made does not get what it answered.
+        if slot.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
+            call();
+        }
+        let g = waiting(&slot);
         let mut w = world();
         w.calls -= 1;
-        wake(&mut w, g, Wake::Nothing);
+        if let Some(g) = g {
+            wake(&mut w, g, Wake::Nothing);
+        }
     }
 }
 
@@ -892,7 +1102,53 @@ fn delivered(wake: Wake) -> Word {
 pub fn prim(p: Prim, args: &[Val]) -> Word {
     use Prim::*;
     let arg = |i: usize| args[i];
+    if matches!(
+        p,
+        ThreadSpawn
+            | ThreadAwait
+            | ThreadYield
+            | ChannelNew
+            | ChannelSend
+            | ChannelReceive
+            | ThreadCancel
+            | StmWait
+    ) {
+        notice_cancel();
+    }
     match p {
+        ThreadCancel => {
+            let t = handle(arg(0), heap::TASK, "a thread", "cancel");
+            // Finished, the thread has no `Ctl` any more: nothing to do; and
+            // asked already, once is enough. Under the scheduler's lock, as
+            // the thread's end is, so that it is counted as ending exactly
+            // when it is. The lock is let go before anything can fail.
+            let found = world().tasks.get(t).map(|task| {
+                task.ctl.clone().filter(|c| {
+                    let first = !c.cancelled.swap(true, Ordering::SeqCst);
+                    if first {
+                        CANCELLED.fetch_add(1, Ordering::SeqCst);
+                        meadow_preempt.fetch_or(ENDING, Ordering::SeqCst);
+                    }
+                    first
+                })
+            });
+            let Some(ctl) = found else {
+                crate::fail(&format!("cancel: there is no thread {t}"))
+            };
+            if let Some(ctl) = ctl {
+                let at = std::mem::take(&mut *ctl.parked.lock().unwrap_or_else(|p| p.into_inner()));
+                unpark(t, at);
+            }
+            0
+        }
+        ThreadCancelled => {
+            let c = &cx().cancel;
+            let cancelled = c.cancelled();
+            if cancelled {
+                c.seen.store(true, Ordering::Relaxed);
+            }
+            u64::from(cancelled)
+        }
         ThreadSpawn => {
             let body = parcel(arg(0));
             let answer = match args.get(1) {
@@ -919,6 +1175,7 @@ pub fn prim(p: Prim, args: &[Val]) -> Word {
                 ctx: Ctx::new(tid),
                 co,
             });
+            w.tasks[tid].ctl = Some(g.ctx.cancel.clone());
             wake(&mut w, g, Wake::Nothing);
             held(tid as u32);
             heap::build(heap::TASK, tid as u32, &[0], &[desc::INT])
@@ -1159,7 +1416,8 @@ pub fn prim(p: Prim, args: &[Val]) -> Word {
             if txn.reads.is_empty() {
                 crate::fail("deadlock: a transaction retried having read nothing")
             }
-            park(Request::Wait(txn.reads));
+            // Woken by a write, or to fail: cancelled while it waited.
+            let _ = delivered(park(Request::Wait(txn.reads)));
             0
         }
         _ => unreachable!("{p:?} is not a thread primitive"),

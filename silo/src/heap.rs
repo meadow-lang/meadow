@@ -488,6 +488,16 @@ impl Drop for Heap {
         }
         // What this heap still held goes with it.
         crate::memory::LIVE.fetch_sub(self.held, std::sync::atomic::Ordering::Relaxed);
+        // Under poisoning, a block this heap freed is checked at exit and must
+        // never be handed out again -- not even by the next heap given this
+        // memory -- so the memory stays. A thread that fails goes this way,
+        // a cancelled one too, and its blocks were said to be written after
+        // they were freed, by whichever thread was given them next.
+        if poisoning() {
+            self.chunks.clear();
+            self.large.clear();
+            return;
+        }
         let words = |n: usize| std::alloc::Layout::array::<Word>(n).expect("a block fits memory");
         for (p, n) in self.chunks.drain(..) {
             crate::memory::HEAPS.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
