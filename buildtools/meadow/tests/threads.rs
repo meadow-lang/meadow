@@ -132,3 +132,123 @@ fn a_thread_cancelled_while_it_waits_on_a_socket_is_woken() {
         assert_eq!(run_main_std(src, engine), "cancelled", "{engine}");
     }
 }
+
+// --- sleeping ----------------------------------------------------------------
+
+#[test]
+fn a_sleeping_thread_is_woken_by_a_cancel() {
+    // An hour's `Time.sleep`, on the scheduler's timer: the cancel wakes it.
+    let src = "use Std.Thread as T
+               use Std.Time (sleep)
+               def result =
+                 let t = T.spawn (\\() -> let _ = sleep 3600000 in \"slept\") in
+                 let _ = sleep 20 in
+                 let _ = T.cancel t in
+                 T.await t
+";
+    for engine in ENGINES {
+        assert_eq!(run_main_std(src, engine), "cancelled", "{engine}");
+    }
+}
+
+#[test]
+fn many_sleepers_share_the_workers() {
+    // A thousand threads asleep at once, each a tenth of a second: together
+    // they take about that long, however few the workers.
+    let src = "use Std.Thread as T
+               use Std.Time (sleep)
+               use Std.Collections.Vector as V
+               def result =
+                 let ts = V.map (\\i -> T.spawn (\\() -> let _ = sleep 100 in i)) (V.range (toInt 0) 1000) in
+                 V.foldl (\\acc t -> acc + T.await t) 0 ts
+";
+    let began = std::time::Instant::now();
+    for engine in ENGINES {
+        assert_eq!(run_main_std(src, engine), "499500", "{engine}");
+    }
+    let took = began.elapsed();
+    assert!(took < std::time::Duration::from_secs(120), "took {took:?}");
+}
+
+// --- releases and time limits ------------------------------------------------
+
+#[test]
+fn the_cleanup_api_holds_releases_to_what_the_runtime_answers() {
+    let out = schemes_std(
+        "use Std.Thread as T\ndef b = T.bracket\ndef f = T.finally\ndef d = T.defer\n\
+         def r = T.race\ndef t = T.timeout\n",
+    );
+    for want in [
+        "b : forall a e b. (() -> a ! { Thread | e }) -> (a -> () ! Eff) -> (a -> b ! { Thread | e }) -> b ! { Thread | e }",
+        "f : forall a e. (() -> () ! Eff) -> (() -> a ! { Thread | e }) -> a ! { Thread | e }",
+        "d : forall e. (() -> () ! Eff) -> () ! { Thread | e }",
+        "r : forall a b e. (() -> a ! Eff) -> (() -> b ! Eff) -> Either a b ! { Thread | e }",
+        "t : forall a e. Int -> (() -> a ! Eff) -> Maybe a ! { Thread | e }",
+    ] {
+        assert!(out.contains(want), "{want}\n{out}");
+    }
+    // A release performing an effect only the program handles would have
+    // nobody to answer it on the way out of a failure.
+    let src = "use Std.Thread as T\n\
+               effect Note { note : String -> () }\n\
+               def result = handle T.finally (\\() -> note \"done\") (\\() -> toInt 1) with { note s k -> k () }\n";
+    assert_eq!(
+        errors_std_with(src, meadow::Options::debug().entry("result")),
+        "type mismatch: the effect `Note` is not allowed here"
+    );
+}
+
+#[test]
+fn releases_run_as_brackets_end_and_as_threads_do() {
+    let src = "use Std.Thread as T
+               fun note log (n : Int) = setRef log (getRef log * 10 + n)
+               def result =
+                 let log = newRef (toInt 0) in
+                 let s = T.bracket (\\() -> 1) (\\n -> note log n) (\\a ->
+                   T.bracket (\\() -> 2) (\\n -> note log n) (\\b -> a + b)) in
+                 let told = T.newChannel () in
+                 let never = T.newChannel () in
+                 let failing = T.spawn (\\() -> T.finally (\\() -> T.send told \"failed\") (\\() -> toInt 1 / toInt 0)) in
+                 let f = T.receive told in
+                 let waiting = T.spawn (\\() -> T.finally (\\() -> T.send told \"cancelled\") (\\() -> T.receive never)) in
+                 let _ = T.cancel waiting in
+                 (s, getRef log, f, T.receive told)
+";
+    for engine in ENGINES {
+        assert_eq!(
+            run_main_std(src, engine),
+            "(3, 21, \"failed\", \"cancelled\")",
+            "{engine}"
+        );
+    }
+}
+
+#[test]
+fn a_time_limit_answers_in_time_or_stops_what_is_slow() {
+    // A slow action is cancelled where it sleeps, its release runs before
+    // `timeout` returns, and nothing of it is left: the run ends.
+    let src = "use Std.Thread as T
+               use Std.Time (sleep)
+               def result =
+                 let told = T.newChannel () in
+                 let fast = T.timeout 60000 (\\() -> toInt 6 * 7) in
+                 let slow = T.timeout 20 (\\() -> T.finally (\\() -> T.send told \"stopped\") (\\() -> let _ = sleep 3600000 in toInt 0)) in
+                 (fast, slow, T.receive told)
+";
+    for engine in ENGINES {
+        assert_eq!(
+            run_main_std(src, engine),
+            "(Just(42), None, \"stopped\")",
+            "{engine}"
+        );
+    }
+    // A race fails as its first thread to end did.
+    let src = "use Std.Thread as T
+               def result =
+                 let never = T.newChannel () in
+                 T.race (\\() -> toInt 1 / toInt 0) (\\() -> T.receive never)
+";
+    for engine in ENGINES {
+        assert_eq!(run_main_std(src, engine), "division by zero", "{engine}");
+    }
+}

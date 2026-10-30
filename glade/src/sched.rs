@@ -69,6 +69,30 @@
 //! a canceller that looks there finds nobody, which is right, since that
 //! thread is running and will see the flag itself.
 //!
+//! # Sleeping
+//!
+//! A `Time.sleep` is a request too ([`Request::Sleep`]): the thread is filed
+//! on the run's timer ([`Timers`]), and the worker runs another. One timer
+//! thread, started with the first sleep, wakes each sleeper when its time
+//! comes onto the shared queue. A sleeper counts with the calls into the world
+//! as pending -- a thread that will wake -- from before it is filed until
+//! whoever takes it out (the timer, or a canceller, who finds it by its
+//! `Ctl` as any waiting thread) has made it active again.
+//!
+//! # Releases on the way out
+//!
+//! A thread's code that halts or fails is not the end of the thread while
+//! its release stack (`Vm::exits`) holds anything: [`Worker::settle`] keeps
+//! how it ended in [`Fiber::ending`] and starts the newest release in the
+//! same machine, under no handlers ([`Vm::start_release`]), and each release
+//! that halts or fails brings it back for the next, until the stack is empty
+//! and the thread completes with what its code answered -- or with the first
+//! failure, if a release failed where the code had not. From the first of
+//! them, its `Ctl` counts it as held off for good: no cancel check stops it
+//! and no canceller wakes it, and a release still running at its
+//! [`RELEASE_GRACE`]th preemption point in a cancelled thread is ended there,
+//! as one more failure. See `docs/CANCELLATION.md`.
+//!
 //! # Fairness, deadlock and the end
 //!
 //! A thread runs for [`SLICE`] instructions and then goes to the back of its
@@ -363,6 +387,9 @@ fn run_all(
         io: Mutex::new(IoQueue::default()),
         io_ready: Condvar::new(),
         io_pending: AtomicUsize::new(0),
+        timers: Mutex::new(Timers::default()),
+        timer_ready: Condvar::new(),
+        timing: AtomicBool::new(false),
     };
     lock(&shared.locals[0]).push_back(main);
     // The calling thread is worker 0. The others start with the first `spawn`,
@@ -396,9 +423,34 @@ struct Fiber<'p> {
     /// It asked whether it had been cancelled, and was told so: it stops of
     /// its own accord, and is not ended at a preemption point.
     seen: bool,
-    /// It has been preempted once since it was cancelled: the next ends it.
-    armed: bool,
+    /// Times it has been preempted since it was cancelled, or since the
+    /// release it runs began: at [`GRACE`] -- [`RELEASE_GRACE`] for a
+    /// release -- it is ended there.
+    strikes: u32,
+    /// How its own code ended, once it has, while the releases left on its
+    /// stack run: what it then answers -- unless a release fails where it
+    /// had succeeded. See `docs/CANCELLATION.md`.
+    ending: Option<Result<Answer, Error>>,
 }
+
+/// What a thread's code answered, kept while its releases run.
+enum Answer {
+    /// `main`'s, rendered, and itself where it is not an object.
+    Main {
+        shown: String,
+        answer: Option<crate::value::Value>,
+    },
+    /// Another thread's, exported for whoever awaits it.
+    Parcel(Parcel),
+}
+
+/// Preemption points a cancelled thread gets, to stop of its own accord,
+/// before it is ended at one.
+const GRACE: u32 = 2;
+
+/// The same for each release a cancelled thread runs: it has work it must
+/// finish, but must not keep the thread for ever. See `docs/CANCELLATION.md`.
+const RELEASE_GRACE: u32 = 16;
 
 impl<'p> Fiber<'p> {
     fn new(vm: Vm<'p>, task: u32, wake: Wake) -> Box<Fiber<'p>> {
@@ -409,9 +461,11 @@ impl<'p> Fiber<'p> {
             wake,
             ctl,
             seen: false,
-            armed: false,
+            strikes: 0,
+            ending: None,
         });
         f.vm.cancel = Some(f.ctl.cancelled.clone());
+        f.vm.held_off = f.ctl.held_off.clone();
         f
     }
 }
@@ -421,6 +475,9 @@ impl<'p> Fiber<'p> {
 struct Ctl<'p> {
     /// Its machine reads it too, at every operation the runtime answers.
     cancelled: Arc<AtomicBool>,
+    /// Releases it runs, and its way out: a cancel is held off while there
+    /// are any. Its machine counts them.
+    held_off: Arc<std::sync::atomic::AtomicU32>,
     parked: Mutex<Parked<'p>>,
 }
 
@@ -439,6 +496,8 @@ enum Parked<'p> {
     Stm(std::sync::Weak<Mutex<Option<(Box<Fiber<'p>>, Reg)>>>),
     /// On a call into the world, which an I/O thread makes.
     Io(std::sync::Weak<Mutex<Option<(Box<Fiber<'p>>, Reg)>>>),
+    /// In `Time.sleep`, on the timer.
+    Sleep(std::sync::Weak<Mutex<Option<(Box<Fiber<'p>>, Reg)>>>),
 }
 
 impl<'p> Ctl<'p> {
@@ -447,11 +506,21 @@ impl<'p> Ctl<'p> {
     /// waits on locked.
     fn park(&self, at: Parked<'p>) -> bool {
         *lock(&self.parked) = at;
-        self.cancelled.load(Ordering::SeqCst)
+        self.stops()
     }
 
     fn cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn held_off(&self) -> bool {
+        self.held_off.load(Ordering::SeqCst) > 0
+    }
+
+    /// Does a cancel stop it at an operation, or wake it from a wait? Not
+    /// while it is held off.
+    fn stops(&self) -> bool {
+        self.cancelled() && !self.held_off()
     }
 }
 
@@ -548,9 +617,52 @@ struct Shared<'p> {
     /// an I/O thread to make it.
     io: Mutex<IoQueue<'p>>,
     io_ready: Condvar,
-    /// Calls made or to be made: a thread waiting on one is not deadlocked,
-    /// whatever else is waiting.
+    /// Calls made or to be made, and threads asleep on the timer: a thread
+    /// waiting on one is not deadlocked, whatever else is waiting.
     io_pending: AtomicUsize,
+    /// Threads in `Time.sleep`, by when each wakes, for [`timer_thread`].
+    timers: Mutex<Timers<'p>>,
+    timer_ready: Condvar,
+    /// Has the timer thread been started? With the first sleep.
+    timing: AtomicBool,
+}
+
+/// The sleeping threads, soonest first.
+#[derive(Default)]
+struct Timers<'p> {
+    due: std::collections::BinaryHeap<Due<'p>>,
+    /// Breaks ties between threads that wake at the same moment: in the
+    /// order they went to sleep.
+    next: u64,
+}
+
+/// A thread asleep until `until` -- unless a cancel takes it out of its slot
+/// first, and the timer finds the slot empty.
+struct Due<'p> {
+    until: std::time::Instant,
+    seq: u64,
+    slot: WaitSlot<'p>,
+}
+
+impl PartialEq for Due<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        (self.until, self.seq) == (other.until, other.seq)
+    }
+}
+
+impl Eq for Due<'_> {}
+
+impl PartialOrd for Due<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Due<'_> {
+    /// Reversed, so that the heap's greatest is the soonest.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (other.until, other.seq).cmp(&(self.until, self.seq))
+    }
 }
 
 #[derive(Default)]
@@ -599,6 +711,10 @@ impl<'p> Shared<'p> {
         {
             let _io = lock(&self.io);
             self.io_ready.notify_all();
+        }
+        {
+            let _timers = lock(&self.timers);
+            self.timer_ready.notify_all();
         }
         let _guard = lock(&self.sleep);
         self.wake.notify_all();
@@ -872,15 +988,27 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
         let sh = self.shared;
         match stop {
             Stop::Preempted => {
+                // A release taken back to run in place: its own grace. A
+                // thread that has taken the cancel on itself keeps it so.
+                if fiber.vm.release_began {
+                    fiber.vm.release_began = false;
+                    fiber.strikes = 0;
+                }
                 // A cancelled thread that makes no operation is ended at its
                 // second preemption point after the cancel, unless it asked:
-                // at least a slice's grace to stop of its own accord.
+                // at least a slice's grace to stop of its own accord. A
+                // release it runs is given longer, and only it is ended.
                 if fiber.ctl.cancelled() && !fiber.seen && fiber.task != 0 {
-                    if fiber.armed {
+                    fiber.strikes += 1;
+                    let grace = if fiber.ctl.held_off() {
+                        RELEASE_GRACE
+                    } else {
+                        GRACE
+                    };
+                    if fiber.strikes >= grace {
                         let msg = meadow_rt::thread::CANCELLED.into();
                         return self.settle(scope, fiber, Stop::Failed(Error { msg }));
                     }
-                    fiber.armed = true;
                 }
                 self.requeue(fiber);
                 None
@@ -891,47 +1019,36 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
                 }));
                 None
             }
+            // The thread's own code is over -- or a release it runs on the
+            // way out is: run the next, or end it.
             Stop::Halted(v) => {
-                Self::collect(sh, &mut fiber);
-                if fiber.task == 0 {
-                    if !matches!(v, crate::value::Value::Obj(_)) {
-                        *lock(&sh.answer) = Some(v);
-                    }
-                    let shown = fiber.vm.show(v);
-                    {
-                        let mut stats = lock(&sh.stats);
-                        stats.add(&fiber.vm.heap);
-                        stats.heap_slots = fiber.vm.heap.capacity();
-                        stats.region_slots = fiber.vm.heap.region_slots();
-                        stats.old_slots = fiber.vm.heap.old_slots();
-                        stats.old_live = fiber.vm.heap.old_live();
-                    }
-                    sh.finish(Ok(shown));
-                } else {
-                    // Exported with the thread's own heap, which goes away with it.
-                    let outcome = fiber
-                        .vm
-                        .heap
-                        .export(v)
-                        .map_err(|why| meadow_rt::thread::unsendable(why.describe()));
-                    lock(&sh.stats).add(&fiber.vm.heap);
-                    self.complete(fiber.task, outcome);
-                    sh.release();
+                if fiber.ending.is_none() {
+                    let out = if fiber.task == 0 {
+                        let answer = (!matches!(v, crate::value::Value::Obj(_))).then_some(v);
+                        Ok(Answer::Main {
+                            shown: fiber.vm.show(v),
+                            answer,
+                        })
+                    } else {
+                        // Exported with the thread's own heap, which goes away with it.
+                        fiber
+                            .vm
+                            .heap
+                            .export(v)
+                            .map(Answer::Parcel)
+                            .map_err(|why| Error {
+                                msg: meadow_rt::thread::unsendable(why.describe()),
+                            })
+                    };
+                    Self::ended(&mut fiber, out);
                 }
-                None
+                self.wind_down(fiber)
             }
             Stop::Failed(e) => {
-                Self::collect(sh, &mut fiber);
-                lock(&sh.stats).add(&fiber.vm.heap);
-                if fiber.task == 0 {
-                    sh.finish(Err(e));
-                } else {
-                    self.complete(fiber.task, Err(e.msg));
-                    sh.release();
-                }
-                None
+                Self::ended(&mut fiber, Err(e));
+                self.wind_down(fiber)
             }
-            Stop::Requested(request) if request.notices_cancel() && fiber.ctl.cancelled() => {
+            Stop::Requested(request) if request.notices_cancel() && fiber.ctl.stops() => {
                 fiber.wake = Wake::Fail(meadow_rt::thread::CANCELLED.into());
                 Some(fiber)
             }
@@ -946,11 +1063,22 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
                         t.outcome.is_none().then(|| t.ctl.clone())
                     };
                     // Finished, or asked already: nothing to do.
-                    if let Some(ctl) = ctl.filter(|c| !c.cancelled.swap(true, Ordering::SeqCst)) {
+                    // Held off -- running a release -- it is not woken: it
+                    // stops at its first operation once it is not.
+                    if let Some(ctl) = ctl
+                        .filter(|c| !c.cancelled.swap(true, Ordering::SeqCst))
+                        .filter(|c| !c.held_off())
+                    {
                         let at = std::mem::take(&mut *lock(&ctl.parked));
+                        let sleeping = matches!(at, Parked::Sleep(_));
                         if let Some(mut w) = self.unpark(task, at) {
                             w.wake = Wake::Fail(meadow_rt::thread::CANCELLED.into());
                             self.schedule_next(w);
+                            // Taken from the timer, which now finds it gone:
+                            // counted off here, once it is active again.
+                            if sleeping {
+                                sh.io_pending.fetch_sub(1, Ordering::SeqCst);
+                            }
                         }
                     }
                     Some(fiber)
@@ -986,6 +1114,35 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
                         scope.spawn(move || io_thread(sh));
                     } else {
                         sh.io_ready.notify_one();
+                    }
+                    sh.release();
+                    None
+                }
+                Request::Sleep { until, dst } => {
+                    // Pending before it is filed where a canceller can take it
+                    // out, since whoever takes it out counts it off.
+                    sh.io_pending.fetch_add(1, Ordering::SeqCst);
+                    let slot: WaitSlot<'p> = Arc::new(Mutex::new(Some((fiber, dst))));
+                    let cancelled = {
+                        let held = lock(&slot);
+                        let (f, _) = held.as_ref().expect("just put there");
+                        f.ctl.park(Parked::Sleep(Arc::downgrade(&slot)))
+                    };
+                    if cancelled {
+                        let (mut fiber, _) = lock(&slot).take().expect("not filed yet");
+                        sh.io_pending.fetch_sub(1, Ordering::SeqCst);
+                        fiber.wake = Wake::Fail(meadow_rt::thread::CANCELLED.into());
+                        return Some(fiber);
+                    }
+                    {
+                        let mut timers = lock(&sh.timers);
+                        let seq = timers.next;
+                        timers.next += 1;
+                        timers.due.push(Due { until, seq, slot });
+                        sh.timer_ready.notify_one();
+                    }
+                    if !sh.timing.swap(true, Ordering::SeqCst) {
+                        scope.spawn(move || timer_thread(sh));
                     }
                     sh.release();
                     None
@@ -1199,7 +1356,76 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
                 let (f, _) = lock(&slot).take()?;
                 Some(f)
             }
+            // Left on the timer, which wakes nobody when it comes due.
+            Parked::Sleep(slot) => {
+                let slot = slot.upgrade()?;
+                let (f, _) = lock(&slot).take()?;
+                Some(f)
+            }
         }
+    }
+
+    /// The thread's own code ended with `out` -- or a release it ran on the
+    /// way out did. It answers how its own code ended, unless a release
+    /// failed where it had succeeded: the first failure, then.
+    fn ended(fiber: &mut Fiber<'p>, out: Result<Answer, Error>) {
+        match (&fiber.ending, out) {
+            (None, out) => {
+                // On its way out: a cancel is held off for good.
+                fiber.ctl.held_off.fetch_add(1, Ordering::SeqCst);
+                fiber.ending = Some(out);
+            }
+            (Some(Ok(_)), Err(e)) => fiber.ending = Some(Err(e)),
+            _ => {}
+        }
+    }
+
+    /// Run the newest release left on the thread's stack, handing the thread
+    /// back to run it; or, with none left, end the thread with what it
+    /// answers. See `docs/CANCELLATION.md`.
+    fn wind_down(&mut self, mut fiber: Box<Fiber<'p>>) -> Option<Box<Fiber<'p>>> {
+        let sh = self.shared;
+        while let Some((_, f)) = fiber.vm.exits.pop() {
+            fiber.strikes = 0;
+            fiber.seen = false;
+            fiber.wake = Wake::Go;
+            match fiber.vm.start_release(f) {
+                Ok(()) => return Some(fiber),
+                Err(e) => Self::ended(&mut fiber, Err(e)),
+            }
+        }
+        Self::collect(sh, &mut fiber);
+        let out = fiber.ending.take().expect("the thread has ended");
+        if fiber.task == 0 {
+            let mut stats = lock(&sh.stats);
+            stats.add(&fiber.vm.heap);
+            let result = match out {
+                Ok(Answer::Main { shown, answer }) => {
+                    if let Some(v) = answer {
+                        *lock(&sh.answer) = Some(v);
+                    }
+                    stats.heap_slots = fiber.vm.heap.capacity();
+                    stats.region_slots = fiber.vm.heap.region_slots();
+                    stats.old_slots = fiber.vm.heap.old_slots();
+                    stats.old_live = fiber.vm.heap.old_live();
+                    Ok(shown)
+                }
+                Ok(Answer::Parcel(_)) => unreachable!("main answers as main"),
+                Err(e) => Err(e),
+            };
+            drop(stats);
+            sh.finish(result);
+        } else {
+            lock(&sh.stats).add(&fiber.vm.heap);
+            let outcome = match out {
+                Ok(Answer::Parcel(p)) => Ok(p),
+                Ok(Answer::Main { .. }) => unreachable!("a thread answers as a thread"),
+                Err(e) => Err(e.msg),
+            };
+            self.complete(fiber.task, outcome);
+            sh.release();
+        }
+        None
     }
 
     /// Record a spawned thread's result, and put whoever awaits it on this
@@ -1262,6 +1488,50 @@ fn io_thread(sh: &Shared) {
         }
         sh.io_pending.fetch_sub(1, Ordering::SeqCst);
         sh.nudge();
+    }
+}
+
+/// Wake each sleeping thread when its time comes, handing it back to the
+/// workers on the shared queue; until the run ends. One for the run, started
+/// by the first `Time.sleep`.
+fn timer_thread(sh: &Shared) {
+    let mut timers = lock(&sh.timers);
+    loop {
+        if sh.done.load(Ordering::SeqCst) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let until = match timers.due.peek() {
+            None => None,
+            Some(d) if d.until > now => Some(d.until - now),
+            Some(_) => {
+                let due = timers.due.pop().expect("just peeked");
+                // A thread cancelled in its sleep has been taken out already,
+                // and counted off by whoever took it.
+                if let Some((mut f, dst)) = lock(&due.slot).take() {
+                    f.wake = Wake::Set(dst, crate::value::Value::Unit);
+                    // Active again before it stops counting as pending -- see
+                    // `Shared::release`.
+                    sh.active.fetch_add(1, Ordering::SeqCst);
+                    lock(&sh.global).push_back(f);
+                    sh.io_pending.fetch_sub(1, Ordering::SeqCst);
+                    sh.nudge();
+                }
+                continue;
+            }
+        };
+        timers = match until {
+            None => sh
+                .timer_ready
+                .wait(timers)
+                .unwrap_or_else(|p| p.into_inner()),
+            Some(d) => {
+                sh.timer_ready
+                    .wait_timeout(timers, d)
+                    .unwrap_or_else(|p| p.into_inner())
+                    .0
+            }
+        };
     }
 }
 

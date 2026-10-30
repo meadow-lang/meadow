@@ -1173,6 +1173,15 @@ reason to return. When the thread resumes, its pc is the instruction after the
 primitive. If that isn't a block entry, the interpreter runs from there until
 it reaches one, and native code takes over again.
 
+Two operations of the world are made the same way, because they wait. A
+socket call that may wait (an accept, a read) is a `Request::Block`: the
+worker hands it to an I/O thread and runs other threads. A `Time.sleep` is a
+`Request::Sleep`: the thread is filed on the run's timer, a heap of
+deadlines that one timer thread watches, and is put back on the shared queue
+when its time comes. A sleeper counts with the I/O calls as a thread that
+will wake, so threads waiting on it are not a deadlock, and a cancel takes it
+off the timer at once (`docs/CANCELLATION.md`).
+
 **Every thread shares one native table.** The JIT's `Native` is borrowed by
 every `Vm` in the run, and its table entries are atomics. A block compiled
 because one thread made it hot becomes native for all threads, and it is
@@ -1223,6 +1232,24 @@ The rule has three consequences:
   unfinished, the scheduler reports a deadlock.
 - A panic inside the runtime stops every worker instead of hanging the run
   (`StopOnPanic`).
+
+### Releases on the way out
+
+Each `Vm` keeps a **release stack** (`Vm::exits`): the functions
+`threadDefer` pushed, newest last, which are collector roots like the
+globals. `threadTake` pops one back for `Std.Thread.bracket` to run in place.
+Both are primitives the machine carries out itself, since the stack is the
+thread's own, so they work with or without a scheduler. When a thread's code
+halts or fails, `Worker::settle` keeps how it ended (`Fiber::ending`: `main`'s
+rendered answer, another thread's exported parcel, or the failure) and, while
+anything is left on the stack, starts the newest release with
+`Vm::start_release`. That is the same entry a spawned thread gets, under no
+handlers and with a halt of its own, and whatever the thread's code left in
+the registers and on the frame stack is abandoned. Each release that halts or
+fails brings the scheduler back to the next one, and the thread is completed
+only when the stack is empty. While a release runs, the thread's `Ctl` counts
+it as held off: the cancel checks pass it by, and a canceller does not wake
+it from a wait. See `docs/CANCELLATION.md`.
 
 ### Parallelism, summarized
 

@@ -629,6 +629,23 @@ One is started whenever a call finds none of them free, and a thread waiting
 on a call is not deadlocked, whatever else waits. `meadow-glade` does the
 same, and the CEK machine makes each such call on an OS thread of its own.
 
+**A sleep** waits on a timer rather than on a worker (`sched::sleep`): the
+thread parks with the time it wakes at, and one timer thread, started by the
+first sleep, puts each sleeper back to run when its time comes. A sleeper is
+counted with the calls, as a thread that will wake, and a cancel takes it off
+the timer at once (`docs/CANCELLATION.md`).
+
+**Releases** (`threadDefer`, `Std.Thread.bracket`) are kept on the context's
+release stack (`Ctx::exits`), each a reference the context holds and a root
+of the thread's trace. They run where the thread ends (`sched::wind_down`).
+A thread that returns runs them on its own coroutine before it finishes. One
+that fails runs them right there, on top of the frames that failed, which
+nothing will resume: `fail_thread` winds down first and parks to fail after.
+A release that fails comes back through the same door and the rest run from
+there, so the thread ends with its first failure. `main`, and a program that
+never spawns and so has no scheduler, run theirs the same way before the
+process exits (`sched::last_rites`).
+
 **A heap per thread** (`silo/src/ctx.rs`), so counting needs no atomics and no
 two workers ever touch the same block. What crosses between threads is copied
 (`silo/src/parcel.rs`): the function a thread is spawned with and everything it

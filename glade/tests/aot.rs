@@ -368,3 +368,57 @@ fn a_cancelled_thread_fails_natively_too() {
                  (threadAwait t >= 0, first, threadAwait done, threadCancelled ())";
     assert_eq!(agrees("cancel_asked", src), "(True, 7, 7, False)");
 }
+
+#[test]
+fn a_sleeping_thread_waits_on_the_timer_natively_too() {
+    // A thousand sleepers on the scheduler's timer, and one woken by a cancel
+    // an hour before its time.
+    let src = "effect Time { sleep : Int -> () }
+               use Ts.*\ndata Ts = End | More (Task Int) Ts
+               fun sleepers (n : Int) acc = if n == 0 then acc else
+                 sleepers (n - 1) (More (threadSpawn (\\() -> let _ = sleep 100 in n)) acc)
+               fun sumAll ts acc = match ts with | End -> acc | More t rest -> sumAll rest (acc + threadAwait t)
+               def result = sumAll (sleepers 1000 End) 0";
+    assert_eq!(agrees("sleepers", src), "500500");
+    let src = "effect Time { sleep : Int -> () }
+               def result =
+                 let t = threadSpawn (\\() -> let _ = sleep 3600000 in toInt 1) in
+                 let _ = sleep 20 in
+                 let _ = threadCancel t in
+                 threadAwait t";
+    assert_eq!(
+        agrees("cancel_sleeper", src),
+        meadow_core::thread::CANCELLED
+    );
+}
+
+#[test]
+fn releases_run_natively_too() {
+    // In place as brackets end, newest first; and in a failing thread and a
+    // cancelled one, on their way out.
+    let src = "use Maybe.*\ndata Maybe a = None | Just a
+               fun releaseFrom (key : Int) (after : Bool) =
+                 match threadTake key after with | Just f -> let _ = f () in releaseFrom key True | None -> ()
+               fun bracket acquire release act =
+                 let it = acquire () in
+                 let key = threadDefer (\\() -> release it) in
+                 let out = act it in
+                 let _ = releaseFrom key False in
+                 out
+               fun finally release act = bracket (\\() -> ()) (\\u -> release ()) (\\u -> act ())
+               fun note log (n : Int) = setRef log (getRef log * 10 + n)
+               def result =
+                 let log = newRef (toInt 0) in
+                 let s = bracket (\\() -> 1) (\\n -> note log n) (\\a -> bracket (\\() -> 2) (\\n -> note log n) (\\b -> a + b)) in
+                 let ch = channelNew () in
+                 let never = channelNew () in
+                 let f = threadSpawn (\\() -> finally (\\() -> channelSend ch (toInt 1)) (\\() ->
+                   finally (\\() -> channelSend ch (toInt 2)) (\\() -> toInt 1 / toInt 0))) in
+                 let a = channelReceive ch in
+                 let b = channelReceive ch in
+                 let c = threadSpawn (\\() -> finally (\\() -> channelSend ch (toInt 3)) (\\() -> channelReceive never)) in
+                 let _ = threadYield () in
+                 let _ = threadCancel c in
+                 (s, getRef log, a, b, channelReceive ch)";
+    assert_eq!(agrees("releases", src), "(3, 21, 2, 1, 3)");
+}

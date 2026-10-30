@@ -97,6 +97,9 @@ pub unsafe extern "C" fn meadow_fail(msg: *const u8, len: i64) -> ! {
 /// thread other than `main`, just that thread: see [`sched::fail_thread`].
 pub fn fail(msg: &str) -> ! {
     sched::fail_thread(msg);
+    // `main`'s releases, or those of a program that never spawns, before it
+    // stops: see `docs/CANCELLATION.md`.
+    let msg = sched::last_rites(Some(msg)).unwrap_or_else(|| msg.to_string());
     use std::io::Write;
     let _ = std::io::stdout().flush();
     eprintln!("{msg}");
@@ -166,7 +169,11 @@ pub extern "C" fn meadow_bigint(n: i64) -> Word {
 /// `ctx::threaded`.
 fn run_main(entry: extern "C" fn() -> Word) -> (Box<Ctx>, Word) {
     if ctx::threaded() {
-        let (mut c, v) = sched::main(move || entry());
+        let (mut c, v) = sched::main(move || {
+            let v = entry();
+            mains_releases(v);
+            v
+        });
         ctx::set(&mut *c);
         return (c, v);
     }
@@ -177,8 +184,23 @@ fn run_main(entry: extern "C" fn() -> Word) -> (Box<Ctx>, Word) {
     let base = trace::stopped(|sp| sp);
     c.os_level = Some(trace::Level { base, stopped: 0 });
     let v = entry();
+    mains_releases(v);
     c.os_level = None;
     (c, v)
+}
+
+/// `main` has answered `v`: its releases, before the program ends, with `v`
+/// kept meanwhile as a root of its heap, since they may make a trace run.
+fn mains_releases(v: Word) {
+    // Safety: the emitted module defines it.
+    let d = unsafe { meadow_result_desc };
+    // Safety: `main`'s context, current on this OS thread.
+    let kept = unsafe { &mut (*ctx::get()).kept };
+    let at = kept.len();
+    kept.push((v, d));
+    let _ = sched::last_rites(None);
+    // Safety: as above; the releases may have kept more after it.
+    unsafe { (*ctx::get()).kept.remove(at) };
 }
 
 /// A row of a library's `@meadow_exports`: a C function's name, and the

@@ -182,6 +182,10 @@ pub struct Vm<'p> {
     /// A native operation's call that may wait, left by it for `native_op`
     /// to make a request of -- see [`Request::Block`].
     pub(crate) blocking: Option<Work>,
+    /// When a `Time.sleep` just made ends, left for `native_op` to make a
+    /// request of: a scheduled thread waits on the scheduler's timer rather
+    /// than on its worker -- see [`Request::Sleep`].
+    pub(crate) sleep_until: Option<std::time::Instant>,
     /// Is a scheduler running this machine? Without one there is nobody to
     /// carry out a request, and a thread operation is an error.
     pub(crate) scheduled: bool,
@@ -189,6 +193,18 @@ pub struct Vm<'p> {
     /// it: an operation the runtime answers looks first (`native_op`). See
     /// `meadow_core::thread`.
     pub(crate) cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Releases this thread is running in place, and one more once it is on
+    /// its way out: while there are any, a cancel is held off. Shared with
+    /// the scheduler, where a canceller looks. See `docs/CANCELLATION.md`.
+    pub(crate) held_off: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// The release stack (`Prim::ThreadDefer`): each release's key and
+    /// function, newest last. Collector roots.
+    pub(crate) exits: Vec<(i64, Value)>,
+    /// The key the next release is given.
+    pub(crate) next_exit: i64,
+    /// A release taken back to run in place has just begun, for the
+    /// scheduler: it is given its own grace if the thread is cancelled.
+    pub(crate) release_began: bool,
     /// Top-level values this thread has evaluated, by definition -- see
     /// `meadow_core::globals`. Collector roots. Each thread has its own, as it
     /// has its own heap.
@@ -331,6 +347,12 @@ pub(crate) enum Request {
     StmWait {
         dst: Reg,
     },
+    /// Wait until `until` -- a `Time.sleep` -- on the scheduler's timer, off
+    /// the worker, which runs another thread meanwhile; `()` into `dst`.
+    Sleep {
+        until: std::time::Instant,
+        dst: Reg,
+    },
     /// Ask thread `task` to stop: see `meadow_core::thread`.
     Cancel {
         task: u32,
@@ -402,8 +424,13 @@ impl<'p> Vm<'p> {
             host: None,
             request: None,
             blocking: None,
+            sleep_until: None,
             scheduled: false,
             cancel: None,
+            held_off: Default::default(),
+            exits: Vec::new(),
+            next_exit: 0,
+            release_began: false,
             globals: Vec::new(),
             literals: Vec::new(),
             world: None,
@@ -453,6 +480,33 @@ impl<'p> Vm<'p> {
         self.live = 0;
         self.heap
             .reserve(Heap::size_of(Kind::Closure, 1) + Heap::size_of(Kind::Data, 0) + body.len());
+        let f = self.heap.import(body);
+        self.enter(f, answer, "a thread")
+    }
+
+    /// Put the machine at the start of a release on the thread's way out:
+    /// `f ()`, from the release stack, as a thread begins -- under no
+    /// handlers, answering a halt of its own. What the thread's own code left
+    /// in the registers and on the frame stack is over, and goes. See
+    /// `docs/CANCELLATION.md`.
+    pub(crate) fn start_release(&mut self, f: Value) -> Result<(), Error> {
+        self.live = 0;
+        self.request = None;
+        self.blocking = None;
+        self.sleep_until = None;
+        self.txn = None;
+        self.halted = None;
+        self.failure = None;
+        // Room without collecting, so that `f` stays where it is.
+        self.heap
+            .reserve(Heap::size_of(Kind::Closure, 1) + Heap::size_of(Kind::Data, 0));
+        self.enter(f, desc::UNIT, "a release")
+    }
+
+    /// `f ()` with nothing in the machine but `f`'s captures, `()`, a halt
+    /// answering `answer`, and no handlers. Room for the halt and the empty
+    /// evidence has been reserved.
+    fn enter(&mut self, f: Value, answer: Desc, what: &str) -> Result<(), Error> {
         let halt = Value::Obj(self.heap.alloc(Kind::Closure, 0, &[Value::Int(answer)]));
         let none = match self
             .program
@@ -461,22 +515,25 @@ impl<'p> Vm<'p> {
             .position(|c| &**c == meadow_rt::roles::evidence::NONE)
         {
             Some(tag) => Value::Obj(self.heap.alloc(Kind::Data, tag as u32, &[])),
-            None => return err("the program has no empty evidence to start a thread with"),
+            None => {
+                return err(format!(
+                    "the program has no empty evidence to start {what} with"
+                ));
+            }
         };
-        let f = self.heap.import(body);
         let Some(a) = f.addr().filter(|a| self.heap.kind(*a) == Kind::Closure) else {
             return err(format!(
-                "a thread was started with {}, not a function",
+                "{what} was started with {}, not a function",
                 f.kind()
             ));
         };
         let table = self.heap.meta(a) as usize;
         let Some(&pc) = self.program.methods.get(table).and_then(|t| t.first()) else {
-            return err("a thread's function has no method");
+            return err(format!("{what}'s function has no method"));
         };
         let ncap = self.heap.len(a);
         if ncap + 3 > REGISTERS {
-            return err("a thread's function needs more than 256 registers");
+            return err(format!("{what}'s function needs more than 256 registers"));
         }
         for j in 0..ncap {
             self.regs[j] = self.heap.field_word(a, j);
@@ -1104,11 +1161,13 @@ impl<'p> Vm<'p> {
         let Some(&(effect, op)) = self.program.ops.get(i.imm as usize) else {
             return err(format!("no operation {}", i.imm));
         };
-        // Where a cancelled thread stops, as at a thread operation.
+        // Where a cancelled thread stops, as at a thread operation; not while
+        // a release holds the cancel off.
         if self
             .cancel
             .as_ref()
             .is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+            && self.held_off.load(std::sync::atomic::Ordering::SeqCst) == 0
         {
             return err(meadow_rt::thread::CANCELLED);
         }
@@ -1124,6 +1183,8 @@ impl<'p> Vm<'p> {
                         job: Job(work),
                         dst: i.a,
                     });
+                } else if let Some(until) = self.sleep_until.take() {
+                    self.request = Some(Request::Sleep { until, dst: i.a });
                 }
                 Ok(())
             }
@@ -1297,6 +1358,7 @@ impl<'p> Vm<'p> {
         roots.extend_from_slice(&self.pinned);
         roots.extend(self.globals.iter().flatten().copied());
         roots.extend(self.literals.iter().flatten().copied());
+        roots.extend(self.exits.iter().map(|(_, f)| *f));
 
         if self.heap.overdue() {
             self.heap.collect_all(&mut roots);
@@ -1316,6 +1378,9 @@ impl<'p> Vm<'p> {
         }
         for l in self.literals.iter_mut().flatten() {
             *l = it.next().expect("root count");
+        }
+        for (_, f) in &mut self.exits {
+            *f = it.next().expect("root count");
         }
     }
 

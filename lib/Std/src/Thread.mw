@@ -56,13 +56,14 @@
 --   while after the cancel: long enough for one that was about to perform an
 --   operation, or to ask, to stop there instead.
 --
--- Either way `await` of it fails with "cancelled", and nothing of the thread
--- runs after: handlers have nothing to run on the way out, and no handler --
--- `Std.Exn`'s `catch` among them -- can catch the failure and carry on. That
--- is safe because threads share nothing mutable, so a thread stopped part way
--- leaves nobody else's state half made. And no code is ever cut short between
--- two of its operations in a way it could notice, so no cleanup has to guard
--- against a cancel arriving in the middle of it, and there is nothing to mask.
+-- Either way `await` of it fails with "cancelled", and nothing of the thread's
+-- own code runs after -- only its releases (see "cleanup" below), which is
+-- where it says what to do on the way out. No handler -- `Std.Exn`'s `catch`
+-- among them -- can catch the failure and carry on. That is safe because
+-- threads share nothing mutable, so a thread stopped part way leaves nobody
+-- else's state half made. And no code is ever cut short between two of its
+-- operations in a way it could notice, so no cleanup has to guard against a
+-- cancel arriving in the middle of it, and there is nothing to mask.
 --
 -- A thread that would rather stop on its own terms asks, with `cancelled`.
 -- Told yes, it has taken the cancel on itself: it is no longer ended at a
@@ -70,13 +71,21 @@
 -- answers. Cancelling a thread that has finished changes nothing, and asking
 -- twice is asking once.
 --
--- Two limits. An operation made in place -- a file read, `Time.sleep` -- runs
--- to its end first; the thread fails at the operation after. And a socket
--- wait the thread is woken from carries on, on its own I/O thread, until it
--- ends; what it answers is dropped.
+-- A thread in `Time.sleep` waits on the runtime's timer, not on a core, so
+-- it is woken by a cancel like any waiting thread, and a program may have
+-- thousands of them asleep at once.
+--
+-- Two limits. An operation made in place -- a file read, a child process run
+-- to its end -- runs to its end first; the thread fails at the operation
+-- after. And a socket wait the thread is woken from carries on, on its own
+-- I/O thread, until it ends; what it answers is dropped.
 
 use Std.Collections.Vector as V
 use Std.Collections.Vector (vecFromArray)
+use Std.Either (Either)
+use Std.Either.Either.*
+use Std.Maybe.Maybe.*
+use Std.Time (sleep)
 
 -- Start running `f ()` on a thread of its own.
 @pub fun spawn (f : () -> a ! e) : Task a ! { Thread | r } = threadSpawn f
@@ -126,9 +135,98 @@ use Std.Collections.Vector (vecFromArray)
 @pub fun parMap (f : a -> b ! e) (xs : [a]) : [b] ! { Thread | r } =
   xs |> V.map (\x -> spawn (\() -> f x)) |> awaitAll
 
+-- --- cleanup -----------------------------------------------------------------
+--
+-- What a thread acquires, it can say how to release: a temporary file to
+-- remove, a peer to tell, a lock file to delete. Each thread has a stack of
+-- releases, and one runs at the first of:
+--
+-- * the `bracket` (or `finally`) that registered it ends, which also takes
+--   back whatever was registered inside it and is still there;
+-- * the thread ends, however it ends -- returning, failing, cancelled -- when
+--   the runtime runs every release still on the stack before `await` sees
+--   the end.
+--
+-- Always the newest first. A release performs only what the runtime answers,
+-- as a spawned function does: on the way out of a failure no handler is left
+-- to answer anything else, and the type says so. Run in place, at the end of
+-- its bracket, it sees the handlers around it, of the runtime's effects; on
+-- the way out, the runtime answers it.
+--
+-- A cancel waits for a release: its operations answer, and its waits are not
+-- broken into, so cleanup is not cut short. In a cancelled thread a release
+-- that runs on and on is still ended, a while later than other code, and the
+-- next one runs. A release that fails ends only itself; a thread that had
+-- succeeded then fails with what its release failed with.
+--
+-- A handler that drops the rest of a computation -- `Std.Exn`'s `toResult`,
+-- when something is raised -- leaves the brackets inside it unfinished: what
+-- they registered is released when the bracket around them ends, or the
+-- thread does. So nothing outlives the bracket it was acquired in. Threads
+-- still running when `main` returns stop with the program, and are not
+-- unwound; to have theirs run, cancel and await them first.
+--
+-- `docs/CANCELLATION.md` has the reasons.
+
+-- `act` on what `acquire` gives, and `release` of it afterwards: when `act`
+-- returns, or when the thread ends without its having -- see above.
+@pub fun bracket
+    (acquire : () -> r ! { Thread | e })
+    (release : r -> () ! x)
+    (act : r -> a ! { Thread | e })
+    : a ! { Thread | e } =
+  let it = acquire () in
+  let key = threadDefer (\() -> release it) in
+  let out = act it in
+  let _ = releaseFrom key False in
+  out
+
+-- `act`, and `release` afterwards, however `act` ends.
+@pub fun finally (release : () -> () ! x) (act : () -> a ! { Thread | e }) : a ! { Thread | e } =
+  bracket (\() -> ()) (\u -> release ()) (\u -> act ())
+
+-- `release` at the end of the innermost `bracket` or `finally` around this,
+-- or of the thread if there is none.
+@pub fun defer (release : () -> () ! x) : () ! { Thread | e } = let _ = threadDefer release in ()
+
+-- Take back, newest first, the releases registered since `key` that are still
+-- there, and run each in place; `after` says one taken back has run.
+fun releaseFrom (key : Int) (after : Bool) : () ! { Thread | e } =
+  match threadTake key after with
+  | Just release -> let _ = release () in releaseFrom key True
+  | None -> ()
+
+-- --- racing ------------------------------------------------------------------
+
+-- `f` and `g`, each on a thread of its own: whichever ends first decides, its
+-- answer as `Left` or `Right` -- or, if it failed, `race` fails as it did. The
+-- other is cancelled, and `race` returns once it has run its releases. Since
+-- they run on threads of their own, `f` and `g` may perform only what the
+-- runtime answers, as for `spawn`.
+@pub fun race (f : () -> a ! e) (g : () -> b ! e) : Either a b ! { Thread | r } =
+  finally (\() -> ()) (\() ->
+    let ended = newChannel () in
+    let left = spawn (\() -> finally (\() -> send ended True) f) in
+    let _ = defer (\() -> cancel left) in
+    let right = spawn (\() -> finally (\() -> send ended False) g) in
+    let _ = defer (\() -> cancel right) in
+    let first = receive ended in
+    let _ = if first then cancel right else cancel left in
+    let _ = receive ended in
+    if first then Left (await left) else Right (await right))
+
+-- `Just` what `act` answers, or `None` if it has not answered within `ms`
+-- milliseconds, when it is cancelled. As `race`, `act` runs on a thread of
+-- its own, so it performs only what the runtime answers.
+@pub fun timeout (ms : Int) (act : () -> a ! e) : Maybe a ! { Thread | r } =
+  match race act (\() -> sleep ms) with
+  | Left x -> Just x
+  | Right _ -> None
+
 -- --- tests -------------------------------------------------------------------
 
 use Std.Test (assertEq, assertTrue)
+use Std.Exn (toResult, raise)
 
 fun fib (n : Int) = if n < 2 then n else fib (n - 1) + fib (n - 2)
 
@@ -184,6 +282,12 @@ fun fib (n : Int) = if n < 2 then n else fib (n - 1) + fib (n - 2)
   let ts = V.map (\i -> spawn (\() -> i + 1)) (V.range (toInt 0) 1000) in
   assertEq (V.foldl (\acc t -> acc + await t) 0 ts) 500500 "a thousand threads"
 
+@test fun manySleepersAtOnce () =
+  -- Asleep on the runtime's timer, not on the test's two workers: a tenth of
+  -- a second in all, not ten.
+  let ts = V.map (\i -> spawn (\() -> let _ = sleep 50 in i)) (V.range (toInt 0) 200) in
+  assertEq (V.foldl (\acc t -> acc + await t) 0 ts) 19900 "every sleeper woke"
+
 effect Tally {
   tally : Int -> ()
 }
@@ -229,3 +333,52 @@ fun countUp (n : Int) = if n == 0 then () else let _ = tally n in countUp (n - 1
         handle countUp 4 with { tally n k -> let _ = setRef total (getRef total + n) in k () }
       in getRef total)
   in assertTrue (await t == 10) "handled inside the thread"
+
+-- A note in a log of digits, newest last: what order releases ran in.
+fun note (log : Ref Int) (n : Int) = setRef log (getRef log * 10 + n)
+
+@test fun releasesRunNewestFirstWhenBracketsEnd () =
+  let log = newRef (toInt 0) in
+  let sum =
+    bracket (\() -> 1) (\n -> note log n) (\a ->
+      bracket (\() -> 2) (\n -> note log n) (\b -> let _ = defer (\() -> note log 3) in a + b))
+  in assertEq (sum, getRef log) (3, 321) "inner first, the deferred one before both"
+
+@test fun aReleaseRunsWhenItsThreadFails () =
+  let told = newChannel () in
+  let t =
+    spawn (\() ->
+      finally (\() -> send told "first") (\() ->
+        finally (\() -> send told "second") (\() -> toInt 1 / toInt 0)))
+  in
+  let a = receive told in
+  assertEq (a, receive told) ("second", "first") "both ran, newest first"
+
+@test fun aReleaseRunsWhenItsThreadIsCancelled () =
+  let told = newChannel () in
+  let never = newChannel () in
+  let t = spawn (\() -> finally (\() -> send told "released") (\() -> receive never + toInt 1)) in
+  let _ = cancel t in
+  assertEq (receive told) "released" "the cancelled thread ran its release"
+
+@test fun aDroppedContinuationIsReleasedByTheBracketAroundIt () =
+  -- `toResult` drops the rest of the inner bracket's `act`: its release runs
+  -- when the outer one ends, before the outer's own.
+  let log = newRef (toInt 0) in
+  let _ =
+    finally (\() -> note log 1) (\() ->
+      let r = toResult (\() -> bracket (\() -> ()) (\u -> note log 2) (\u -> raise "dropped")) in
+      note log 3)
+  in assertEq (getRef log) 321 "the dropped one at the end of the one around it"
+
+@test fun aFastActionIsNotTimedOut () =
+  assertEq (timeout 60000 (\() -> fib 10)) (Just 55) "answered in time"
+
+@test fun aSlowActionIsTimedOutAndStopped () =
+  -- Asleep for an hour, unless the cancel wakes it.
+  assertEq (timeout 20 (\() -> let _ = sleep 3600000 in toInt 1)) None "given up on, and woken"
+
+@test fun raceAnswersWhicheverEndsFirst () =
+  let gate = newChannel () in
+  let r = race (\() -> receive gate) (\() -> "quick") in
+  assertEq r (Right "quick") "the one that could end"

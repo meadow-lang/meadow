@@ -722,8 +722,10 @@ fn prim(p: Prim, a: &[Val], d: &[i64]) -> Word {
 
         // --- threads and transactions ---------------------------------------------
         ThreadSpawn | ThreadAwait | ThreadYield | ChannelNew | ChannelSend | ChannelReceive
-        | ThreadCancel | ThreadCancelled | StmNew | StmRead | StmWrite | StmBegin | StmCommit
-        | StmWait | StmNest | StmMerge | StmRollback => crate::sched::prim(p, a),
+        | ThreadCancel | ThreadCancelled | ThreadDefer | ThreadTake | StmNew | StmRead
+        | StmWrite | StmBegin | StmCommit | StmWait | StmNest | StmMerge | StmRollback => {
+            crate::sched::prim(p, a)
+        }
 
         IntAdd | IntSub | IntMul | IntDiv | IntMod | IntEq | IntNe | IntLt | IntLe | IntGt
         | IntGe | FloatAdd | FloatSub | FloatMul | FloatDiv | FloatEq | FloatNe | FloatLt

@@ -101,8 +101,6 @@ pub const MODULES: &[(&str, &str)] = &[
         include_str!("../../../lib/Std/src/Collections/UnionFind.mw"),
     ),
     ("Compact", include_str!("../../../lib/Std/src/Compact.mw")),
-    ("Thread", include_str!("../../../lib/Std/src/Thread.mw")),
-    ("Stm", include_str!("../../../lib/Std/src/Stm.mw")),
     ("State", include_str!("../../../lib/Std/src/State.mw")),
     ("Exn", include_str!("../../../lib/Std/src/Exn.mw")),
     ("Stream", include_str!("../../../lib/Std/src/Stream.mw")),
@@ -155,6 +153,9 @@ pub const MODULES: &[(&str, &str)] = &[
     ("Ffi", include_str!("../../../lib/Std/src/Ffi.mw")),
     // After `Console`, so `time` can print what it measured.
     ("Time", include_str!("../../../lib/Std/src/Time.mw")),
+    // After `Time`, whose sleep a thread waits out a time limit with.
+    ("Thread", include_str!("../../../lib/Std/src/Thread.mw")),
+    ("Stm", include_str!("../../../lib/Std/src/Stm.mw")),
     ("Log", include_str!("../../../lib/Std/src/Log.mw")),
     ("Net", include_str!("../../../lib/Std/src/Net.mw")),
     ("Tls", include_str!("../../../lib/Std/src/Tls.mw")),

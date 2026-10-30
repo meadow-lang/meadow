@@ -57,14 +57,22 @@
 //! taken the cancel on itself: it is not ended at a preemption point, and it
 //! stops where it chooses, or at its next operation.
 //!
-//! Either way the thread is over and runs nothing more of its own, and
-//! `await` of it fails with the same message. Ending a thread in pure code is
-//! safe because threads share nothing mutable: a thread stopped half way
-//! through a computation can leave nobody else's state half made, and it never
-//! sees anything itself. Meadow's handlers have no clause that runs on the way
-//! out, so in neither tier does any of the thread's code run after the cancel
-//! takes hold; what it held outside its heap -- on Silo, the stacks of the
-//! handlers it was inside -- the runtime gives back.
+//! Either way the thread's own code is over, and `await` of it fails with the
+//! same message. Ending a thread in pure code is safe because threads share
+//! nothing mutable: a thread stopped half way through a computation can leave
+//! nobody else's state half made, and it never sees anything itself. What the
+//! thread said to do on the way out still runs: the releases on its release
+//! stack (`threadDefer`, and `Std.Thread`'s `bracket` over it), newest first,
+//! under no handlers, before `await` sees the end -- on every way a thread
+//! ends, a cancel or a failure or returning. A cancel is held off while a
+//! release runs, whether in place at the end of its bracket or on the way out:
+//! its operations answer and its waits are not broken into, so cleanup is not
+//! cut short. In a cancelled thread each release is still ended at a
+//! preemption point, after a longer grace than other code (sixteen points, or
+//! sixteen ticks on Silo), and the next one runs: no release keeps a cancelled
+//! thread for ever by computing. What the thread held outside its heap -- on
+//! Silo, the stacks of the handlers it was inside -- the runtime gives back.
+//! `docs/CANCELLATION.md` is the design.
 //!
 //! None of this is an exception a thread did not ask for. The failure is the
 //! runtime's, not an effect: no handler in the thread, an `Exn` handler
@@ -79,12 +87,21 @@
 //! cancelling once. A wait already answered when the request comes keeps its
 //! answer; the thread stops at its next operation.
 //!
+//! A `Time.sleep` that no handler answers is a wait on the scheduler's timer,
+//! not on the OS thread: the worker runs other threads meanwhile, so a
+//! program may have thousands asleep at once, and a sleeping thread that is
+//! cancelled is woken to fail at once, as a waiting one is. A sleeper is one
+//! that will wake, so threads waiting on it are not a deadlock. Where no
+//! scheduler runs the machine -- a procedural macro's, or a Silo program that
+//! never spawns -- there is nothing else to run, and it sleeps in place.
+//!
 //! What cannot be woken: an operation the runtime makes in place, on the OS
-//! thread running the thread -- a file read, a `Time.sleep` -- runs to its
-//! end, and the thread fails at the operation after it. A wait on a socket is
-//! made on an I/O thread of its own, so the thread is woken at once; the call
-//! itself goes on to its end, and what it answers is dropped. A socket the
-//! thread opened stays open: it is the run's, not the thread's heap's.
+//! thread running the thread -- a file read, a child process run to its end
+//! -- runs to its end, and the thread fails at the operation after it. A wait
+//! on a socket is made on an I/O thread of its own, so the thread is woken at
+//! once; the call itself goes on to its end, and what it answers is dropped. A
+//! socket the thread opened stays open: it is the run's, not the thread's
+//! heap's. `docs/CANCELLATION.md` is the design for what comes next.
 
 /// The error for a value that cannot be passed to another thread.
 pub fn unsendable(what: &str) -> String {

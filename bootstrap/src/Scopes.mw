@@ -367,9 +367,10 @@ def primNames : [String] =
     "setRef", "runSt", "stNewRef", "stGetRef", "stSetRef", "stNewArray", "stGetArray", "stSetArray",
     "stArrayLen", "stFreeze", "stThaw", "compact", "getCompact", "compactAdd", "compactSize",
     "threadSpawn", "threadAwait", "threadYield", "channelNew", "channelSend", "channelReceive",
-    "threadCancel", "threadCancelled", "stmNew", "stmNewIO", "stmRead", "stmWrite", "stmBegin",
-    "stmCommit", "stmWait", "stmNest", "stmMerge", "stmRollback", "concatStrings",
-    "stringByteLength", "stringByteAt", "stringSlice", "stringIndexOf", "stringCompare"
+    "threadCancel", "threadCancelled", "threadDefer", "threadTake", "stmNew", "stmNewIO", "stmRead",
+    "stmWrite", "stmBegin", "stmCommit", "stmWait", "stmNest", "stmMerge", "stmRollback",
+    "concatStrings", "stringByteLength", "stringByteAt", "stringSlice", "stringIndexOf",
+    "stringCompare"
   ]
 
 -- The standard library's modules in the order `meadow` compiles them, each
@@ -380,9 +381,9 @@ def stdOrder : [String] =
     "Num.Int", "Maybe", "Cmp", "Char", "Result", "Num.Bits", "Num.Float", "Bytes", "Yield",
     "Collections", "Collections.Vector", "Collections.List", "Collections.Tree", "Collections.Set",
     "Collections.Map", "Either", "St", "Sort", "Collections.HashMap", "Collections.HashTable",
-    "Compact", "Thread", "Stm", "State", "Exn", "Stream", "Random", "Fs", "Process", "String",
-    "String.Parse", "String.Parse.Char", "String.Parse.Lexer", "Path", "Json", "Macro",
-    "Macro.Parse", "Console", "Macro.Serve", "Time", "Log", "Net", "Tls", "Http", "Bench", "Prelude"
+    "Compact", "State", "Exn", "Stream", "Random", "Fs", "Process", "String", "String.Parse",
+    "String.Parse.Char", "String.Parse.Lexer", "Path", "Json", "Macro", "Macro.Parse", "Console",
+    "Macro.Serve", "Time", "Thread", "Stm", "Log", "Net", "Tls", "Http", "Bench", "Prelude"
   ]
 
 -- The modules every later one of the standard library has unqualified, and so

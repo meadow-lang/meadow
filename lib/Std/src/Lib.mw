@@ -24,8 +24,6 @@
 @pub mod St
 @pub mod Sort
 @pub mod Compact
-@pub mod Thread
-@pub mod Stm
 @pub mod State
 @pub mod Exn
 @pub mod Stream
@@ -40,6 +38,8 @@
 @pub mod Terminal
 @pub mod Ffi
 @pub mod Time
+@pub mod Thread
+@pub mod Stm
 @pub mod Log
 @pub mod Net
 @pub mod Tls

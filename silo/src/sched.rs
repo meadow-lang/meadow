@@ -36,6 +36,18 @@
 //! when the thread is woken some other way, and a canceller looking there
 //! then finds nobody -- rightly, since that thread is running.
 //!
+//! A `Time.sleep` parks too, with the time it wakes at, and is filed on the
+//! timer ([`sleep`]) rather than with anything another thread does: one timer
+//! thread puts each sleeper back to run when its time comes.
+//!
+//! A thread whose code returns or fails runs the releases left on its
+//! release stack (`Ctx::exits`) first, where it is ([`wind_down`]): on its own
+//! coroutine as it returns, or on top of the frames that failed, which
+//! nothing resumes, before it parks to fail. A cancel is held off meanwhile
+//! (`Ctl`'s count), and a release still running [`RELEASE_TICKS`] ticks after
+//! a safe point first found the thread cancelled in it is ended there. See
+//! `docs/CANCELLATION.md`.
+//!
 //! A transaction keeps its writes in a log, one level per `orElse`, and
 //! reads a `TVar` only if nothing has written it since the transaction began.
 //! Its commit checks that everything it read is as it was, and publishes its
@@ -75,8 +87,13 @@ pub struct Ctl {
     /// its own accord, and is not ended at a safe point. Its own alone.
     seen: AtomicBool,
     /// The timer's [`TICKS`], plus one, when a safe point first found it
-    /// cancelled; `0` until then. Its own alone.
+    /// cancelled -- or, cancelled, in the release it runs; `0` until then.
+    /// Its own alone.
     armed: AtomicU64,
+    /// Releases it runs in place, and one more once it is on its way out:
+    /// while there are any, a cancel is held off -- its operations answer and
+    /// its waits are not broken into. See `docs/CANCELLATION.md`.
+    held_off: std::sync::atomic::AtomicU32,
 }
 
 /// Where a thread last waited.
@@ -92,6 +109,8 @@ enum Parked {
     Wait(u64),
     /// On a call into the world, which an I/O thread makes.
     Io(std::sync::Weak<Mutex<Option<Box<Green>>>>),
+    /// In `Time.sleep`, on the timer.
+    Sleep(std::sync::Weak<Mutex<Option<Box<Green>>>>),
 }
 
 impl Ctl {
@@ -100,7 +119,23 @@ impl Ctl {
     /// waits on locked.
     fn park(&self, at: Parked) -> bool {
         *self.parked.lock().unwrap_or_else(|p| p.into_inner()) = at;
-        self.cancelled()
+        self.stops()
+    }
+
+    fn held_off(&self) -> bool {
+        self.held_off.load(Ordering::SeqCst) > 0
+    }
+
+    /// Does a cancel stop it at an operation, or wake it from a wait? Not
+    /// while it is held off.
+    fn stops(&self) -> bool {
+        self.cancelled() && !self.held_off()
+    }
+
+    /// A release begins: in a cancelled thread, its own grace.
+    fn release_begins(&self) {
+        self.armed.store(0, Ordering::Relaxed);
+        self.seen.store(false, Ordering::Relaxed);
     }
 
     fn cancelled(&self) -> bool {
@@ -112,7 +147,7 @@ impl Ctl {
 /// operation does first, and every operation the runtime answers
 /// (`crate::native`).
 pub(crate) fn notice_cancel() {
-    if ctx::present() && cx().cancel.cancelled() {
+    if ctx::present() && cx().cancel.stops() {
         crate::fail(meadow_rt::thread::CANCELLED)
     }
 }
@@ -146,12 +181,18 @@ fn end_if_cancelled() {
         return;
     }
     let now = TICKS.load(Ordering::Relaxed);
+    // A release it runs, held off, gets longer: see `docs/CANCELLATION.md`.
+    let grace = if c.held_off() { RELEASE_TICKS } else { 1 };
     match c.armed.load(Ordering::Relaxed) {
         0 => c.armed.store(now + 1, Ordering::Relaxed),
-        at if now > at => crate::fail(meadow_rt::thread::CANCELLED),
+        at if now >= at + grace => crate::fail(meadow_rt::thread::CANCELLED),
         _ => {}
     }
 }
+
+/// Ticks of the timer a release in a cancelled thread is given before it is
+/// ended at a safe point, where other code is given one.
+const RELEASE_TICKS: u64 = 16;
 
 /// Take thread `tid` out of where it waits, `at`, and wake it to fail; if it
 /// is still there.
@@ -198,6 +239,18 @@ fn unpark(tid: usize, at: Parked) {
                 .and_then(|s| s.lock().unwrap_or_else(|p| p.into_inner()).take());
             if let Some(g) = g {
                 ready(g, fail());
+            }
+        }
+        // Left on the timer, which wakes nobody when it comes due; counted
+        // off here, as the timer would have.
+        Parked::Sleep(slot) => {
+            let g = slot
+                .upgrade()
+                .and_then(|s| s.lock().unwrap_or_else(|p| p.into_inner()).take());
+            if let Some(g) = g {
+                let mut w = world();
+                w.calls -= 1;
+                wake(&mut w, g, fail());
             }
         }
     }
@@ -946,6 +999,38 @@ fn file(mut g: Box<Green>, request: Option<Request>) {
                 IO_READY.notify_one();
             }
         }
+        Some(Request::Sleep(until)) => {
+            // Pending before it is filed where a canceller can take it out,
+            // since whoever takes it out counts it off.
+            world().calls += 1;
+            let slot = Arc::new(Mutex::new(Some(g)));
+            let cancelled = {
+                let held = slot.lock().unwrap_or_else(|p| p.into_inner());
+                let g = held.as_ref().expect("just put there");
+                g.ctx.cancel.park(Parked::Sleep(Arc::downgrade(&slot)))
+            };
+            if cancelled {
+                let g = slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+                let mut w = world();
+                w.calls -= 1;
+                wake(
+                    &mut w,
+                    g.expect("not filed yet"),
+                    Wake::Fail(meadow_rt::thread::CANCELLED.into()),
+                );
+                return;
+            }
+            let mut t = timers();
+            let seq = t.next;
+            t.next += 1;
+            t.due.push(Due { until, seq, slot });
+            TIMER_READY.notify_one();
+            if !TIMING.swap(true, Ordering::SeqCst) {
+                let _ = std::thread::Builder::new()
+                    .name("meadow sleeps".into())
+                    .spawn(timer_thread);
+            }
+        }
         Some(Request::Failed(msg)) => {
             let tid = g.ctx.tid;
             // Never resumed, and not unwound.
@@ -1016,6 +1101,109 @@ fn io_thread() {
     }
 }
 
+// --- sleeping ------------------------------------------------------------------
+//
+// A `Time.sleep` on the scheduler parks its thread on a timer instead of
+// sleeping on the worker, which runs other threads meanwhile: ten thousand
+// sleeping threads hold up no worker, and a cancel wakes one at once. A
+// sleeping thread is counted with the calls into the world (`World::calls`),
+// as a thread that will wake. One timer thread for the process, started by
+// the first sleep.
+
+/// The sleeping threads, soonest first.
+#[derive(Default)]
+struct Timers {
+    due: std::collections::BinaryHeap<Due>,
+    /// Breaks ties between threads that wake at the same moment: in the
+    /// order they went to sleep.
+    next: u64,
+}
+
+/// A thread asleep until `until` -- unless a cancel takes it out of its slot
+/// first, and the timer finds the slot empty.
+struct Due {
+    until: std::time::Instant,
+    seq: u64,
+    slot: Arc<Mutex<Option<Box<Green>>>>,
+}
+
+impl PartialEq for Due {
+    fn eq(&self, other: &Self) -> bool {
+        (self.until, self.seq) == (other.until, other.seq)
+    }
+}
+
+impl Eq for Due {}
+
+impl PartialOrd for Due {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Due {
+    /// Reversed, so that the heap's greatest is the soonest.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (other.until, other.seq).cmp(&(self.until, self.seq))
+    }
+}
+
+static TIMERS: LazyLock<Mutex<Timers>> = LazyLock::new(|| Mutex::new(Timers::default()));
+static TIMER_READY: Condvar = Condvar::new();
+/// Whether the timer thread has been started.
+static TIMING: AtomicBool = AtomicBool::new(false);
+
+fn timers() -> MutexGuard<'static, Timers> {
+    TIMERS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Wake each sleeping thread when its time comes.
+fn timer_thread() {
+    let mut t = timers();
+    loop {
+        let now = std::time::Instant::now();
+        let until = match t.due.peek() {
+            None => None,
+            Some(d) if d.until > now => Some(d.until - now),
+            Some(_) => {
+                let due = t.due.pop().expect("just peeked");
+                drop(t);
+                // A thread cancelled in its sleep has been taken out already,
+                // and counted off by whoever took it.
+                let g = due.slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+                if let Some(g) = g {
+                    let mut w = world();
+                    w.calls -= 1;
+                    wake(&mut w, g, Wake::Nothing);
+                }
+                t = timers();
+                continue;
+            }
+        };
+        t = match until {
+            None => TIMER_READY.wait(t).unwrap_or_else(|p| p.into_inner()),
+            Some(d) => {
+                TIMER_READY
+                    .wait_timeout(t, d)
+                    .unwrap_or_else(|p| p.into_inner())
+                    .0
+            }
+        };
+    }
+}
+
+/// `Time.sleep` for `ms` milliseconds: on the scheduler's timer, where this
+/// is one of its threads, or here and now.
+pub fn sleep(ms: u64) {
+    let d = std::time::Duration::from_millis(ms);
+    if !STARTED.load(Ordering::SeqCst) || !ctx::present() || segments::innermost().is_none() {
+        std::thread::sleep(d);
+        return;
+    }
+    // Woken when the time comes, or to fail: cancelled while it slept.
+    let _ = delivered(park(Request::Sleep(std::time::Instant::now() + d)));
+}
+
 /// `work`'s answer: made by an I/O thread while this thread waits, where it
 /// is one of the scheduler's, or here and now.
 pub fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
@@ -1061,9 +1249,58 @@ pub fn fail_thread(msg: &str) -> bool {
     if !ctx::present() || (cx().tid == 0 && !cx().guarded) || segments::innermost().is_none() {
         return false;
     }
+    // Its releases first, here on top of what failed, which nothing will go
+    // back to: the thread fails with the first failure.
+    let msg = match wind_down(Err(msg.to_string())) {
+        Err(m) => m,
+        Ok(_) => unreachable!("a failure is a failure"),
+    };
     loop {
-        park(Request::Failed(msg.to_string()));
+        park(Request::Failed(msg.clone()));
     }
+}
+
+/// The running thread's code is over, ending with `out` -- or a release it
+/// runs on the way out has failed: run the releases left on its stack,
+/// newest first, under no handlers, and answer how the thread ends. That is
+/// how its own code ended, unless a release failed where it had succeeded:
+/// the first failure, then. A release that fails comes back here, through
+/// [`fail_thread`] or `crate::fail`, and the rest run from there. See
+/// `docs/CANCELLATION.md`.
+pub(crate) fn wind_down(out: Result<Parcel, String>) -> Result<Parcel, String> {
+    let c = cx();
+    match (&c.ending, out) {
+        (None, out) => {
+            // On its way out: a cancel is held off for good, and a
+            // transaction the thread was in is over.
+            c.cancel.held_off.fetch_add(1, Ordering::SeqCst);
+            c.txn = None;
+            c.ending = Some(out);
+        }
+        (Some(Ok(_)), Err(e)) => c.ending = Some(Err(e)),
+        _ => {}
+    }
+    while let Some((_, f)) = cx().exits.pop() {
+        cx().cancel.release_begins();
+        // Safety: a function value of the emitted module, owned by the call.
+        let _ = unsafe { meadow_apply(f, 0, no_evidence()) };
+    }
+    cx().ending.take().expect("the thread has ended")
+}
+
+/// `main` has returned, or the program's last thread failed: its releases,
+/// before the program ends. What the program then fails with, if a release
+/// failed or it already had. Nothing where the failure is in the runtime's
+/// own call into the program, which has nowhere to run more.
+pub(crate) fn last_rites(failed: Option<&str>) -> Option<String> {
+    if !ctx::present() || cx().tid != 0 || (ctx::threaded() && segments::innermost().is_none()) {
+        return failed.map(str::to_string);
+    }
+    let out = match failed {
+        Some(m) => Err(m.to_string()),
+        None => Parcel::of(0, desc::UNIT),
+    };
+    wind_down(out).err()
 }
 
 fn handle(v: Val, kind: u64, what: &str, op: &str) -> usize {
@@ -1135,11 +1372,68 @@ pub fn prim(p: Prim, args: &[Val]) -> Word {
             let Some(ctl) = found else {
                 crate::fail(&format!("cancel: there is no thread {t}"))
             };
-            if let Some(ctl) = ctl {
+            // Held off -- running a release -- it is not woken: it stops at
+            // its first operation once it is not.
+            if let Some(ctl) = ctl.filter(|c| !c.held_off()) {
                 let at = std::mem::take(&mut *ctl.parked.lock().unwrap_or_else(|p| p.into_inner()));
                 unpark(t, at);
             }
             0
+        }
+        // The release stack is the thread's own: no scheduler is asked. See
+        // `docs/CANCELLATION.md`.
+        ThreadDefer => {
+            let f = match arg(0) {
+                Val::Ref(f) => f,
+                other => {
+                    let (w, d) = other.bits();
+                    crate::fail(&format!(
+                        "threadDefer: expected a function, got {}",
+                        crate::show::show(w, d)
+                    ))
+                }
+            };
+            // Kept: the argument is only borrowed.
+            heap::share(f, desc::REF);
+            let c = cx();
+            let key = c.next_exit;
+            c.next_exit += 1;
+            c.exits.push((key, f));
+            key as Word
+        }
+        ThreadTake => {
+            let key = match arg(0) {
+                Val::Int(k) => k,
+                other => {
+                    let (w, d) = other.bits();
+                    crate::fail(&format!(
+                        "threadTake: expected an Int, got {}",
+                        crate::show::show(w, d)
+                    ))
+                }
+            };
+            let c = cx();
+            if matches!(arg(1), Val::Bool(true)) {
+                let _ = c
+                    .cancel
+                    .held_off
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+            }
+            match c.exits.last() {
+                Some((k, _)) if *k >= key => {
+                    let (_, f) = c.exits.pop().expect("just looked");
+                    c.cancel.held_off.fetch_add(1, Ordering::SeqCst);
+                    // Its own grace; a thread that has taken the cancel on
+                    // itself keeps it so.
+                    c.cancel.armed.store(0, Ordering::Relaxed);
+                    // What the stack held is handed on.
+                    value::data(
+                        crate::show::role(meadow_rt::roles::Role::Some),
+                        &[Val::Ref(f)],
+                    )
+                }
+                _ => value::data(crate::show::role(meadow_rt::roles::Role::None), &[]),
+            }
         }
         ThreadCancelled => {
             let c = &cx().cancel;
@@ -1167,6 +1461,8 @@ pub fn prim(p: Prim, args: &[Val]) -> Word {
                 let v = unsafe { meadow_apply(f, 0, no_evidence()) };
                 let out = Parcel::of(v, answer);
                 heap::erase(v, answer);
+                // A release that fails does not come back.
+                let out = wind_down(out);
                 heap::finish();
                 Box::into_raw(Box::new(out)) as Word
             });
@@ -1483,6 +1779,9 @@ pub fn export_run(body: extern "C" fn(*mut std::ffi::c_void), env: *mut std::ffi
         Coroutine::with_stack(stack, move |y: &Yielder<Down, Up>, _: Down| {
             segments::enter_thread(y, base);
             body(env as *mut std::ffi::c_void);
+            // What the call registered and did not release, before it
+            // returns: nothing of one call is left for the next.
+            let _ = wind_down(Parcel::of(0, desc::UNIT));
             segments::leave_thread();
             0
         });
@@ -1512,6 +1811,9 @@ pub fn export_run(body: extern "C" fn(*mut std::ffi::c_void), env: *mut std::ffi
     c.running.truncate(depth);
     c.levels.truncate(levels);
     c.guarded = guarded;
+    // The context lives on for the next call, which starts afresh.
+    c.ending = None;
+    c.cancel.held_off.store(0, Ordering::SeqCst);
     if !in_txn {
         c.txn = None;
     }

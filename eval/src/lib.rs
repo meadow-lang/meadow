@@ -422,8 +422,26 @@ struct Machine<'a> {
     /// It asked, and was told it had been: it stops of its own accord, and is
     /// not ended at a preemption point.
     seen: bool,
-    /// A preemption point has passed since it was cancelled: the next ends it.
-    armed: bool,
+    /// Preemption points passed since it was cancelled, or since the release
+    /// it is running began: at [`GRACE`] -- [`RELEASE_GRACE`] for a release --
+    /// it is ended there. See `meadow_core::thread`.
+    strikes: u32,
+    /// Releases running in place, and one more once the thread is on its way
+    /// out: while there are any a cancel is held off -- its operations answer
+    /// and its waits are not broken into. Shared with its task, where a
+    /// canceller looks. See `docs/CANCELLATION.md`.
+    held_off: Rc<std::cell::Cell<u32>>,
+    /// The release stack: each release's key and function, newest last.
+    exits: Vec<(i64, Value)>,
+    /// The key the next release is given.
+    next_exit: i64,
+    /// How the thread's own code ended, once it has: what it answers when the
+    /// releases left on its stack have run.
+    ending: Option<Result<Value, String>>,
+    /// Is the scheduler running it? Then a `Time.sleep` waits on the
+    /// scheduler, which runs the other threads meanwhile; without one -- a
+    /// procedural macro's machine -- there is nothing else to run.
+    scheduled: bool,
 }
 
 /// What a thread operation asks of the scheduler.
@@ -440,6 +458,8 @@ enum Request {
     Block(Box<dyn FnOnce() -> NetAnswer + Send>),
     Cancel(u32),
     Cancelled,
+    /// A `Time.sleep`, until then.
+    Sleep(std::time::Instant),
 }
 
 impl Request {
@@ -465,10 +485,62 @@ impl<'a> Machine<'a> {
             txn: None,
             cancel: Rc::default(),
             seen: false,
-            armed: false,
+            strikes: 0,
+            held_off: Rc::default(),
+            exits: Vec::new(),
+            next_exit: 0,
+            ending: None,
+            scheduled: false,
         }
     }
+
+    /// Does a cancel stop it at an operation now? Not while it is held off.
+    fn stops(&self) -> bool {
+        self.cancel.get() && self.held_off.get() == 0
+    }
+
+    /// Its own code -- or a release it runs on the way out -- ended with
+    /// `out`. The thread answers how its own code ended, unless a release
+    /// failed where it had succeeded: the first failure, then.
+    fn ended(&mut self, out: Result<Value, String>) {
+        match (&self.ending, out) {
+            (None, out) => {
+                // On its way out: held off for good.
+                self.held_off.set(self.held_off.get() + 1);
+                self.ending = Some(out);
+            }
+            (Some(Ok(_)), Err(e)) => self.ending = Some(Err(e)),
+            _ => {}
+        }
+    }
+
+    /// Start the newest release left on the stack, if there is one, under no
+    /// handlers, as a spawned function starts.
+    fn next_release(&mut self) -> bool {
+        let Some((_, f)) = self.exits.pop() else {
+            return false;
+        };
+        self.ctrl = Control::Ret(f);
+        self.kont = vec![K::EvalArg {
+            arg: Arc::new(core::Term::Lit(core::Lit::Unit)),
+            env: root_env(),
+        }];
+        self.failed = None;
+        self.txn = None;
+        self.request = None;
+        self.strikes = 0;
+        self.seen = false;
+        true
+    }
 }
+
+/// Preemption points a cancelled thread is given to stop of its own accord
+/// before it is ended at one: see `meadow_core::thread`.
+const GRACE: u32 = 2;
+
+/// The same for each release a cancelled thread runs, which has work it must
+/// finish: see `docs/CANCELLATION.md`.
+const RELEASE_GRACE: u32 = 16;
 
 pub fn run(program: &core::Program) -> Result<Value, RuntimeError> {
     let env = load(program)?;
@@ -769,6 +841,30 @@ impl<'a> Machine<'a> {
                 _ => None,
             })?),
             ThreadCancelled => Request::Cancelled,
+            // The release stack is the thread's own: no scheduler needed.
+            ThreadDefer => {
+                let key = self.next_exit;
+                self.next_exit += 1;
+                self.exits.push((key, args[0].clone()));
+                return Ok(Value::Int(key));
+            }
+            ThreadTake => {
+                let key = as_int(&args[0])?;
+                if matches!(args[1], Value::Bool(true)) {
+                    self.held_off.set(self.held_off.get().saturating_sub(1));
+                }
+                return Ok(match self.exits.last() {
+                    Some((k, _)) if *k >= key => {
+                        let (_, f) = self.exits.pop().expect("just looked");
+                        self.held_off.set(self.held_off.get() + 1);
+                        // Its own grace; a thread that has taken the cancel
+                        // on itself keeps it so.
+                        self.strikes = 0;
+                        Value::ctor("Maybe.Just".into(), vec![f])
+                    }
+                    _ => Value::ctor("Maybe.None".into(), vec![]),
+                });
+            }
             StmNew => {
                 storable(&args[0])?;
                 return Ok(Value::TVar(Rc::new(TVarCell {
@@ -1374,7 +1470,7 @@ impl<'a> Machine<'a> {
         let Some(idx) = idx else {
             // An operation the runtime answers is where a cancelled thread
             // stops, as a thread operation is: see `meadow_core::thread`.
-            if self.cancel.get() {
+            if self.stops() {
                 return err(core::thread::CANCELLED);
             }
             // No user handler: the runtime discharges a few built-in effects
@@ -1403,6 +1499,18 @@ impl<'a> Machine<'a> {
                 let result = native_random(&op, arg)?;
                 self.ctrl = Control::Ret(result);
                 return Ok(());
+            }
+            if &*effect == "Time" && &*op == "sleep" && self.scheduled {
+                if let Value::Int(ms) = arg {
+                    // On the scheduler, which runs the other threads while
+                    // this one sleeps, and wakes it to fail if it is cancelled.
+                    self.ctrl = Control::Ret(Value::Unit);
+                    if ms > 0 {
+                        let d = std::time::Duration::from_millis(ms as u64);
+                        self.request = Some(Request::Sleep(std::time::Instant::now() + d));
+                    }
+                    return Ok(());
+                }
             }
             if &*effect == "Time" {
                 let result = native_time(&op, arg)?;
@@ -1827,7 +1935,7 @@ fn run_prim(op: core::Prim, args: Vec<Value>) -> Result<Value, RuntimeError> {
         )),
         // Only the machine can carry these out -- see `Machine::prim`.
         ThreadSpawn | ThreadAwait | ThreadYield | ChannelNew | ChannelSend | ChannelReceive
-        | ThreadCancel | ThreadCancelled => {
+        | ThreadCancel | ThreadCancelled | ThreadDefer | ThreadTake => {
             err("a thread operation reached a primitive with no machine to run it")
         }
         StmNew | StmRead | StmWrite | StmBegin | StmCommit | StmWait | StmNest | StmMerge
@@ -3512,6 +3620,8 @@ struct TaskSlot<'a> {
     waiters: Vec<Waiting<'a>>,
     /// The thread's [`Machine::cancel`].
     cancelled: Rc<std::cell::Cell<bool>>,
+    /// And its [`Machine::held_off`].
+    held_off: Rc<std::cell::Cell<u32>>,
 }
 
 #[derive(Default)]
@@ -3528,9 +3638,11 @@ struct ChannelSlot<'a> {
 /// rather than copied -- values here are immutable and reference-counted, and
 /// [`sendable`] has already refused anything a copy would not be equal to.
 /// See `meadow_core::thread` for what the engines agree on.
-fn schedule(main: Machine<'_>) -> Result<Value, RuntimeError> {
+fn schedule(mut main: Machine<'_>) -> Result<Value, RuntimeError> {
+    main.scheduled = true;
     let mut tasks: Vec<TaskSlot> = vec![TaskSlot {
         cancelled: main.cancel.clone(),
+        held_off: main.held_off.clone(),
         ..TaskSlot::default()
     }];
     let mut ready: VecDeque<(Machine, u32)> = VecDeque::from([(main, 0)]);
@@ -3552,17 +3664,58 @@ fn schedule(main: Machine<'_>) -> Result<Value, RuntimeError> {
         }
     }
     let _stop = StopCalls(waits.clone());
+    // Threads in `Time.sleep`: when each wakes, soonest first, and the
+    // sleepers by the order they went to sleep in. A cancel takes a sleeper
+    // out of `asleep` and leaves its time behind, which then wakes nobody.
+    let mut due: std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, u64)>> =
+        std::collections::BinaryHeap::new();
+    let mut asleep: HashMap<u64, Waiting> = HashMap::new();
+    let mut slept = 0u64;
+    // A thread's code -- or a release it runs on the way out -- has ended:
+    // run the next release left on its stack, or end the thread with what it
+    // answers. `main`'s end is the program's.
+    macro_rules! ended {
+        ($m:ident, $task:ident, $out:expr) => {{
+            $m.ended($out);
+            if $m.next_release() {
+                continue;
+            }
+            let out = $m.ending.take().expect("it has ended");
+            if $task == 0 {
+                return out.map_err(|msg| RuntimeError { msg });
+            }
+            finish(&mut tasks, &mut ready, $task, out);
+            break;
+        }};
+    }
 
     loop {
-        // Every answer in, waiting for one only when nothing else can run.
+        // Every answer in, and every sleeper whose time has come; waiting for
+        // one or the other only when nothing else can run.
         let mut came = Vec::new();
         while let Ok(a) = answered.try_recv() {
             came.push(a);
         }
-        if came.is_empty() && ready.is_empty() && pending > 0 {
-            if let Ok(a) = answered.recv() {
-                came.push(a);
+        wake_sleepers(&mut due, &mut asleep, &mut ready);
+        if came.is_empty() && ready.is_empty() {
+            let next = due.peek().map(|std::cmp::Reverse((at, _))| *at);
+            let left =
+                |at: std::time::Instant| at.saturating_duration_since(std::time::Instant::now());
+            match next {
+                None if pending > 0 => {
+                    if let Ok(a) = answered.recv() {
+                        came.push(a);
+                    }
+                }
+                Some(at) if pending > 0 => {
+                    if let Ok(a) = answered.recv_timeout(left(at)) {
+                        came.push(a);
+                    }
+                }
+                Some(at) => std::thread::sleep(left(at)),
+                None => {}
             }
+            wake_sleepers(&mut due, &mut asleep, &mut ready);
         }
         for (slot, a) in came {
             if let Some((mut w, wt)) = calling[slot].take() {
@@ -3572,44 +3725,39 @@ fn schedule(main: Machine<'_>) -> Result<Value, RuntimeError> {
             }
         }
         let Some((mut m, task)) = ready.pop_front() else {
+            // Something will still wake: a call, or a sleeper.
+            if pending > 0 || !asleep.is_empty() {
+                continue;
+            }
             break;
         };
         loop {
             match m.run_slice() {
+                // A cancelled thread that makes no operation is ended at the
+                // second preemption point after the cancel, unless it has
+                // asked: a slice's grace, to stop of its own accord. A release
+                // it runs, held off, is given longer, and only that release is
+                // ended.
+                Stop::Preempted
+                    if m.cancel.get() && !m.seen && {
+                        m.strikes += 1;
+                        let grace = if m.held_off.get() > 0 {
+                            RELEASE_GRACE
+                        } else {
+                            GRACE
+                        };
+                        m.strikes >= grace
+                    } =>
+                {
+                    ended!(m, task, Err(core::thread::CANCELLED.into()));
+                }
                 Stop::Preempted => {
-                    // A cancelled thread that makes no operation is ended at
-                    // the second preemption point after the cancel, unless it
-                    // has asked: a slice's grace, to stop of its own accord.
-                    if m.cancel.get() && !m.seen {
-                        if m.armed {
-                            finish(
-                                &mut tasks,
-                                &mut ready,
-                                task,
-                                Err(core::thread::CANCELLED.into()),
-                            );
-                            break;
-                        }
-                        m.armed = true;
-                    }
                     ready.push_back((m, task));
                     break;
                 }
-                Stop::Done(v) => {
-                    if task == 0 {
-                        return Ok(v);
-                    }
-                    finish(&mut tasks, &mut ready, task, Ok(v));
-                    break;
-                }
-                Stop::Failed(e) => {
-                    if task == 0 {
-                        return Err(e);
-                    }
-                    finish(&mut tasks, &mut ready, task, Err(e.msg));
-                    break;
-                }
-                Stop::Requested(r) if r.notices_cancel() && m.cancel.get() => {
+                Stop::Done(v) => ended!(m, task, Ok(v)),
+                Stop::Failed(e) => ended!(m, task, Err(e.msg)),
+                Stop::Requested(r) if r.notices_cancel() && m.stops() => {
                     m.failed = Some(core::thread::CANCELLED.into());
                 }
                 Stop::Requested(r) => match r {
@@ -3618,6 +3766,9 @@ fn schedule(main: Machine<'_>) -> Result<Value, RuntimeError> {
                         match tasks.get(t as usize) {
                             None => m.failed = Some(format!("cancel: there is no thread {t}")),
                             Some(slot) if slot.outcome.is_some() || slot.cancelled.get() => {}
+                            // Held off, it is not broken into: it stops at
+                            // its first operation once it is not.
+                            Some(slot) if slot.held_off.get() > 0 => slot.cancelled.set(true),
                             Some(slot) => {
                                 slot.cancelled.set(true);
                                 // Waiting, it is woken to fail; running, it
@@ -3629,7 +3780,14 @@ fn schedule(main: Machine<'_>) -> Result<Value, RuntimeError> {
                                     &mut parked,
                                     &mut calling,
                                     &mut pending,
-                                );
+                                )
+                                .or_else(|| {
+                                    let seq = asleep
+                                        .iter()
+                                        .find(|(_, (_, wt))| *wt == t)
+                                        .map(|(seq, _)| *seq)?;
+                                    asleep.remove(&seq)
+                                });
                                 if let Some((mut w, wt)) = woken {
                                     w.failed = Some(core::thread::CANCELLED.into());
                                     ready.push_back((w, wt));
@@ -3644,7 +3802,7 @@ fn schedule(main: Machine<'_>) -> Result<Value, RuntimeError> {
                     }
                     Request::Spawn(f) => {
                         let id = tasks.len() as u32;
-                        let child = Machine::new(
+                        let mut child = Machine::new(
                             Control::Ret(f),
                             vec![K::EvalArg {
                                 arg: Arc::new(core::Term::Lit(core::Lit::Unit)),
@@ -3652,8 +3810,10 @@ fn schedule(main: Machine<'_>) -> Result<Value, RuntimeError> {
                             }],
                             m.fields,
                         );
+                        child.scheduled = true;
                         tasks.push(TaskSlot {
                             cancelled: child.cancel.clone(),
+                            held_off: child.held_off.clone(),
                             ..TaskSlot::default()
                         });
                         ready.push_back((child, id));
@@ -3673,6 +3833,12 @@ fn schedule(main: Machine<'_>) -> Result<Value, RuntimeError> {
                     Request::Yield => {
                         m.ctrl = Control::Ret(Value::Unit);
                         ready.push_back((m, task));
+                        break;
+                    }
+                    Request::Sleep(until) => {
+                        due.push(std::cmp::Reverse((until, slept)));
+                        asleep.insert(slept, (m, task));
+                        slept += 1;
                         break;
                     }
                     Request::Block(call) => {
@@ -3808,6 +3974,25 @@ fn unpark<'a>(
         .iter_mut()
         .find(|p| matches!(p, Some((_, wt)) if *wt == t))
         .and_then(Option::take)
+}
+
+/// Put every sleeper whose time has come on the queue, soonest first, and
+/// forget the times of those a cancel took out.
+fn wake_sleepers<'a>(
+    due: &mut std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, u64)>>,
+    asleep: &mut HashMap<u64, Waiting<'a>>,
+    ready: &mut VecDeque<(Machine<'a>, u32)>,
+) {
+    let now = std::time::Instant::now();
+    while let Some(&std::cmp::Reverse((at, seq))) = due.peek() {
+        if at > now && asleep.contains_key(&seq) {
+            break;
+        }
+        due.pop();
+        if let Some(w) = asleep.remove(&seq) {
+            ready.push_back(w);
+        }
+    }
 }
 
 /// Record a thread's result, and wake whoever awaits it.

@@ -858,6 +858,7 @@ fn start(c: *mut Ctx, now: bool) {
         }
     }
     work.extend(cx.literals.values().copied());
+    work.extend(cx.exits.iter().map(|(_, f)| *f));
     work.extend(
         cx.kept
             .iter()

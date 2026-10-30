@@ -732,7 +732,7 @@ fn random(op: &str, arg: Val) -> Option<Build> {
 }
 
 fn time(op: &str, arg: Val) -> Option<Build> {
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
     static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     Some(match op {
         "now" => Build::int(
@@ -743,8 +743,10 @@ fn time(op: &str, arg: Val) -> Option<Build> {
         ),
         "monotonic" => Build::int(ORIGIN.get_or_init(Instant::now).elapsed().as_nanos() as i64),
         "sleep" => match arg {
+            // On the scheduler's timer, holding up no worker, where there is
+            // a scheduler: see `crate::sched::sleep`.
             Val::Int(ms) if ms > 0 => {
-                std::thread::sleep(Duration::from_millis(ms as u64));
+                crate::sched::sleep(ms as u64);
                 Build::unit()
             }
             Val::Int(_) => Build::unit(),
