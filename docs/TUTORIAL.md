@@ -136,8 +136,9 @@ Useful commands:
 | -------------- | ---------------------------------------------------------- |
 | `:t <expr>`    | show the type without evaluating                           |
 | `:module`      | list what is defined, and what a later definition shadowed |
-| `:ir NAME`     | a definition in each IR: core, Cut and AxCut               |
-| `:ir cut NAME` | in one of them: `core`, `cut` or `axcut`                   |
+| `:ir`          | the last entry in each IR, a page each; `Tab` turns pages  |
+| `:ir NAME`     | a definition, the same way                                 |
+| `:ir cut NAME` | one of them, printed as it is (`:help` lists them)         |
 | `:reset`       | forget everything defined so far                           |
 | `:time`        | time every entry from now on (`:time` again stops)         |
 | `:time <expr>` | time just this entry                                       |

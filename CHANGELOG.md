@@ -41,6 +41,18 @@ beyond the last release is under _Unreleased_.
   machine, Glade (the VM, the JIT and executables) and Silo; the design is in
   `meadow_rt::thread`. An operation made in place, such as a file read or
   `Time.sleep`, runs to its end before the thread stops.
+- The REPL's `:ir` opens a full-screen viewer of the last entry -- or, with
+  a name, of a definition -- with a page for each form the compiler puts it
+  in, in the order a program passes through them: core, Cut, AxCut, Glade's
+  bytecode, the machine code Glade's JIT makes of it, and the LLVM IR a Silo
+  build compiles. Each page is the entry's own part of the program, its
+  local functions and continuations included, coloured for its IR. `Tab` and
+  `Shift-Tab` turn the page; the arrows, `j`/`k`, `PgUp`/`PgDn` and
+  `Home`/`End` scroll, a long line sideways rather than wrapped; `q` or `Esc`
+  gives the prompt back as it was. With no terminal to draw on, the pages
+  are printed one after another under their titles, and `:ir <which>
+  <name>` -- `core`, `cut`, `axcut`, `bytecode`, `native` or `llvm` -- still
+  prints one as it is, for a script to read.
 - Glade builds a library of what a package exports to C, as Silo does:
   `MeadowBoot build --runtime glade` for a package of `@export` functions, or
   `meadow cut --runtime glade` for a program of Cut with exports, makes
