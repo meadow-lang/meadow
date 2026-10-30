@@ -1456,7 +1456,8 @@ fn prim<'p>(
         // This machine checks the lowering one construct at a time, and has no
         // scheduler. Green threads run on the bytecode VM and the CEK machine,
         // which are checked against each other.
-        ThreadSpawn | ThreadAwait | ThreadYield | ChannelNew | ChannelSend | ChannelReceive => {
+        ThreadSpawn | ThreadAwait | ThreadYield | ChannelNew | ChannelSend | ChannelReceive
+        | ThreadCancel | ThreadCancelled => {
             err("green threads are not supported by the sequent machine")
         }
         StmNew | StmRead | StmWrite | StmBegin | StmCommit | StmWait | StmNest | StmMerge

@@ -4897,6 +4897,18 @@ fn prim_scheme(name: &str) -> Option<Scheme> {
             quant: vec![VarKind::Type, VarKind::Effect],
             ty: Type::func_eff(vec![Type::channel(Bound(0))], Bound(0), thread_row(1)),
         },
+        "threadCancel" => Scheme {
+            lacks: Vec::new(),
+            preds: Vec::new(),
+            quant: vec![VarKind::Type, VarKind::Effect],
+            ty: Type::func_eff(vec![Type::task(Bound(0))], Type::unit(), thread_row(1)),
+        },
+        "threadCancelled" => Scheme {
+            lacks: Vec::new(),
+            preds: Vec::new(),
+            quant: vec![VarKind::Effect],
+            ty: Type::func_eff(vec![Type::unit()], Type::bool(), thread_row(0)),
+        },
         "stmNew" => Scheme {
             lacks: Vec::new(),
             preds: Vec::new(),

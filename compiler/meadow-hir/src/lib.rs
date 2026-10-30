@@ -272,7 +272,9 @@ pub const PRIMS: &[&str] = &[
     "threadYield",
     "channelNew",
     "channelSend",
-    "channelReceive", //
+    "channelReceive",
+    "threadCancel",
+    "threadCancelled", //
     // software transactional memory: the parts `Std.Stm` cannot write itself
     "stmNew",
     "stmNewIO",
@@ -389,6 +391,12 @@ pub struct Module {
     /// before that pass runs, which a consumer should read as "no grouping
     /// information", not "no bindings".
     pub groups: Vec<BindGroup>,
+    /// Each constructor given its fields by name in another order than its
+    /// type declares them -- `Point { y = …, x = … }` -- as the [`Expr::Cons`]
+    /// whose arguments are in the declared order, and the position there of
+    /// each field in the order it was written. The fields are evaluated in
+    /// that order, as everything else is evaluated in the order it is written.
+    pub written_orders: Vec<(NodeId, Vec<u32>)>,
 }
 
 /// One strongly connected component of the top-level binding dependency graph.

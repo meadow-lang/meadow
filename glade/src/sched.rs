@@ -52,6 +52,23 @@
 //! still running. Whoever wakes it attaches the answer as a [`Wake`], and it is
 //! delivered into the thread's registers when it runs again.
 //!
+//! # Cancellation
+//!
+//! A thread asked to stop (see `meadow_core::thread`) fails at its next
+//! operation the runtime answers: a thread operation, which is a request, so
+//! [`Worker::settle`] looks at the thread's [`Ctl`] before it does what was
+//! asked; or one of the world's, where the machine looks itself
+//! (`Vm::cancel`). One that makes neither is ended when it is preempted the
+//! second time after the cancel -- a slice's grace -- unless it has asked and
+//! been told. A thread already waiting has to be found and woken. It said
+//! where it waits in its `Ctl` when it parked, then looked at the flag, under
+//! the lock of what it waits on; the canceller sets the flag and then reads
+//! where. So either the canceller finds it there -- taking the same lock to
+//! take it out -- or the thread saw the flag and did not wait at all. The
+//! place is only a hint: a thread woken some other way leaves it behind, and
+//! a canceller that looks there finds nobody, which is right, since that
+//! thread is running and will see the flag itself.
+//!
 //! # Fairness, deadlock and the end
 //!
 //! A thread runs for [`SLICE`] instructions and then goes to the back of its
@@ -303,11 +320,8 @@ fn run_all(
         Wake::Call(..) => Vm::with_heap(program, Heap::with_capacity(THREAD_INITIAL)),
         _ => Vm::new(program),
     };
-    let mut main = Box::new(Fiber {
-        vm,
-        task: 0,
-        wake: start,
-    });
+    let mut main = Fiber::new(vm, 0, start);
+    let main_ctl = main.ctl.clone();
     main.vm.scheduled = true;
     main.vm.world = Some(world.clone());
     main.vm.use_native(native);
@@ -326,7 +340,10 @@ fn run_all(
         locals: (0..workers).map(|_| Mutex::new(VecDeque::new())).collect(),
         global: Mutex::new(VecDeque::new()),
         channels: RwLock::new(Vec::new()),
-        tasks: RwLock::new(vec![Arc::new(Mutex::new(Task::default()))]),
+        tasks: RwLock::new(vec![Arc::new(Mutex::new(Task {
+            ctl: main_ctl,
+            ..Task::default()
+        }))]),
         world,
         stm_waiters: Mutex::new(std::collections::HashMap::new()),
         active: AtomicUsize::new(1),
@@ -373,6 +390,69 @@ struct Fiber<'p> {
     /// Its number, which is where `await` finds its result. `0` is `main`.
     task: u32,
     wake: Wake,
+    /// Whether it has been asked to stop, and where it waits: shared with
+    /// its [`Task`], where a canceller finds it.
+    ctl: Arc<Ctl<'p>>,
+    /// It asked whether it had been cancelled, and was told so: it stops of
+    /// its own accord, and is not ended at a preemption point.
+    seen: bool,
+    /// It has been preempted once since it was cancelled: the next ends it.
+    armed: bool,
+}
+
+impl<'p> Fiber<'p> {
+    fn new(vm: Vm<'p>, task: u32, wake: Wake) -> Box<Fiber<'p>> {
+        let ctl: Arc<Ctl> = Arc::default();
+        let mut f = Box::new(Fiber {
+            vm,
+            task,
+            wake,
+            ctl,
+            seen: false,
+            armed: false,
+        });
+        f.vm.cancel = Some(f.ctl.cancelled.clone());
+        f
+    }
+}
+
+/// A thread's cancellation: see the module docs.
+#[derive(Default)]
+struct Ctl<'p> {
+    /// Its machine reads it too, at every operation the runtime answers.
+    cancelled: Arc<AtomicBool>,
+    parked: Mutex<Parked<'p>>,
+}
+
+/// Where a thread last waited -- a hint, since nothing clears it when the
+/// thread is woken.
+#[derive(Default)]
+enum Parked<'p> {
+    #[default]
+    Nowhere,
+    /// On the thread with this number, in `await`.
+    Await(u32),
+    /// On the channel with this number.
+    Receive(u32),
+    /// In `retry`. Weak, or a thread left waiting when the run ends would
+    /// hold itself, through its `Ctl`, and its heap would never be let go.
+    Stm(std::sync::Weak<Mutex<Option<(Box<Fiber<'p>>, Reg)>>>),
+    /// On a call into the world, which an I/O thread makes.
+    Io(std::sync::Weak<Mutex<Option<(Box<Fiber<'p>>, Reg)>>>),
+}
+
+impl<'p> Ctl<'p> {
+    /// The thread is about to wait `at`: say so, then answer whether it has
+    /// been cancelled, in which case it must not wait. Called with what it
+    /// waits on locked.
+    fn park(&self, at: Parked<'p>) -> bool {
+        *lock(&self.parked) = at;
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
 }
 
 /// What a thread is given when it runs again.
@@ -405,6 +485,8 @@ struct Task<'p> {
     /// kept -- or the message it failed with.
     outcome: Option<Result<Parcel, String>>,
     waiters: Vec<(Box<Fiber<'p>>, Reg)>,
+    /// The thread's, while it runs: see [`Fiber::ctl`].
+    ctl: Arc<Ctl<'p>>,
 }
 
 #[derive(Default)]
@@ -473,7 +555,9 @@ struct Shared<'p> {
 
 #[derive(Default)]
 struct IoQueue<'p> {
-    calls: VecDeque<(Box<Fiber<'p>>, crate::vm::Work, Reg)>,
+    /// Each call, and the thread waiting on it -- which a cancel may take out
+    /// first, leaving the slot empty.
+    calls: VecDeque<(WaitSlot<'p>, crate::vm::Work)>,
     /// I/O threads waiting for a call.
     idle: usize,
 }
@@ -788,6 +872,16 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
         let sh = self.shared;
         match stop {
             Stop::Preempted => {
+                // A cancelled thread that makes no operation is ended at its
+                // second preemption point after the cancel, unless it asked:
+                // at least a slice's grace to stop of its own accord.
+                if fiber.ctl.cancelled() && !fiber.seen && fiber.task != 0 {
+                    if fiber.armed {
+                        let msg = meadow_rt::thread::CANCELLED.into();
+                        return self.settle(scope, fiber, Stop::Failed(Error { msg }));
+                    }
+                    fiber.armed = true;
+                }
                 self.requeue(fiber);
                 None
             }
@@ -837,14 +931,54 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
                 }
                 None
             }
+            Stop::Requested(request) if request.notices_cancel() && fiber.ctl.cancelled() => {
+                fiber.wake = Wake::Fail(meadow_rt::thread::CANCELLED.into());
+                Some(fiber)
+            }
             Stop::Requested(request) => match request {
+                Request::Cancel { task } => {
+                    let Some(slot) = sh.task(task) else {
+                        fiber.wake = Wake::Fail(format!("cancel: there is no thread {task}"));
+                        return Some(fiber);
+                    };
+                    let ctl = {
+                        let t = lock(&slot);
+                        t.outcome.is_none().then(|| t.ctl.clone())
+                    };
+                    // Finished, or asked already: nothing to do.
+                    if let Some(ctl) = ctl.filter(|c| !c.cancelled.swap(true, Ordering::SeqCst)) {
+                        let at = std::mem::take(&mut *lock(&ctl.parked));
+                        if let Some(mut w) = self.unpark(task, at) {
+                            w.wake = Wake::Fail(meadow_rt::thread::CANCELLED.into());
+                            self.schedule_next(w);
+                        }
+                    }
+                    Some(fiber)
+                }
+                Request::Cancelled { dst } => {
+                    let cancelled = fiber.ctl.cancelled();
+                    fiber.seen |= cancelled;
+                    fiber.wake = Wake::Set(dst, crate::value::Value::Bool(cancelled));
+                    Some(fiber)
+                }
                 Request::Block { job, dst } => {
+                    let slot: WaitSlot<'p> = Arc::new(Mutex::new(Some((fiber, dst))));
+                    let cancelled = {
+                        let held = lock(&slot);
+                        let (f, _) = held.as_ref().expect("just put there");
+                        f.ctl.park(Parked::Io(Arc::downgrade(&slot)))
+                    };
+                    if cancelled {
+                        let (mut fiber, _) = lock(&slot).take().expect("not filed yet");
+                        fiber.wake = Wake::Fail(meadow_rt::thread::CANCELLED.into());
+                        return Some(fiber);
+                    }
                     // Counted as pending before the thread is counted out --
                     // see `Shared::release`.
                     sh.io_pending.fetch_add(1, Ordering::SeqCst);
                     let more = {
                         let mut io = lock(&sh.io);
-                        io.calls.push_back((fiber, job.0, dst));
+                        io.calls.push_back((slot, job.0));
                         io.calls.len() > io.idle
                     };
                     if more {
@@ -857,11 +991,11 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
                     None
                 }
                 Request::Spawn { body, answer, dst } => {
-                    let mut child = Box::new(Fiber {
-                        vm: Vm::with_heap(sh.program, Heap::with_capacity(THREAD_INITIAL)),
-                        task: 0,
-                        wake: Wake::Start(body, answer),
-                    });
+                    let mut child = Fiber::new(
+                        Vm::with_heap(sh.program, Heap::with_capacity(THREAD_INITIAL)),
+                        0,
+                        Wake::Start(body, answer),
+                    );
                     child.vm.scheduled = true;
                     child.vm.use_native(sh.native);
                     child.vm.world = Some(sh.world.clone());
@@ -876,7 +1010,10 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
                     }
                     let id = {
                         let mut tasks = sh.tasks.write().unwrap_or_else(|p| p.into_inner());
-                        tasks.push(Arc::new(Mutex::new(Task::default())));
+                        tasks.push(Arc::new(Mutex::new(Task {
+                            ctl: child.ctl.clone(),
+                            ..Task::default()
+                        })));
                         (tasks.len() - 1) as u32
                     };
                     child.task = id;
@@ -898,6 +1035,10 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
                         }
                         Some(Err(msg)) => {
                             fiber.wake = Wake::Fail(msg.clone());
+                            Some(fiber)
+                        }
+                        None if fiber.ctl.park(Parked::Await(task)) => {
+                            fiber.wake = Wake::Fail(meadow_rt::thread::CANCELLED.into());
                             Some(fiber)
                         }
                         None => {
@@ -976,6 +1117,18 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
                         return Some(fiber);
                     }
                     let slot: WaitSlot<'p> = Arc::new(Mutex::new(Some((fiber, dst))));
+                    let cancelled = {
+                        let held = lock(&slot);
+                        let (f, _) = held.as_ref().expect("just put there");
+                        f.ctl.park(Parked::Stm(Arc::downgrade(&slot)))
+                    };
+                    if cancelled {
+                        drop(waiters);
+                        sh.world.wait_ends();
+                        let (mut fiber, _) = lock(&slot).take().expect("not filed yet");
+                        fiber.wake = Wake::Fail(meadow_rt::thread::CANCELLED.into());
+                        return Some(fiber);
+                    }
                     for (id, _) in &txn.reads {
                         let list = waiters.entry(*id).or_default();
                         list.retain(|w| lock(w).is_some());
@@ -997,6 +1150,10 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
                             fiber.wake = Wake::Deliver(dst, message);
                             Some(fiber)
                         }
+                        None if fiber.ctl.park(Parked::Receive(channel)) => {
+                            fiber.wake = Wake::Fail(meadow_rt::thread::CANCELLED.into());
+                            Some(fiber)
+                        }
                         None => {
                             ch.receivers.push_back((fiber, dst));
                             sh.release();
@@ -1005,6 +1162,43 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
                     }
                 }
             },
+        }
+    }
+
+    /// Take thread `task` out of where it waits, `at`, if it is still there.
+    fn unpark(&self, task: u32, at: Parked<'p>) -> Option<Box<Fiber<'p>>> {
+        let sh = self.shared;
+        match at {
+            Parked::Nowhere => None,
+            Parked::Await(on) => {
+                let slot = sh.task(on)?;
+                let mut t = lock(&slot);
+                let i = t.waiters.iter().position(|(f, _)| f.task == task)?;
+                Some(t.waiters.remove(i).0)
+            }
+            Parked::Receive(on) => {
+                let slot = sh.channel(on)?;
+                let mut ch = lock(&slot);
+                let i = ch.receivers.iter().position(|(f, _)| f.task == task)?;
+                ch.receivers.remove(i).map(|(f, _)| f)
+            }
+            Parked::Stm(slot) => {
+                // Under the lock a commit wakes waiters with, as `StmWake`
+                // takes them; the empty slot it leaves is dropped from the
+                // lists the next time one is filed.
+                let _waiters = lock(&sh.stm_waiters);
+                let slot = slot.upgrade()?;
+                let (f, _) = lock(&slot).take()?;
+                sh.world.wait_ends();
+                Some(f)
+            }
+            // The call is still made, or being made, on its I/O thread, and
+            // still counted as pending until it is; what it answers is dropped.
+            Parked::Io(slot) => {
+                let slot = slot.upgrade()?;
+                let (f, _) = lock(&slot).take()?;
+                Some(f)
+            }
         }
     }
 
@@ -1036,7 +1230,7 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
 fn io_thread(sh: &Shared) {
     let _waits = JoinWaits::new(&sh.waits);
     loop {
-        let (mut fiber, work, dst) = {
+        let (slot, work) = {
             let mut io = lock(&sh.io);
             loop {
                 if sh.done.load(Ordering::SeqCst) {
@@ -1050,9 +1244,22 @@ fn io_thread(sh: &Shared) {
                 io.idle -= 1;
             }
         };
-        fiber.wake = Wake::Built(dst, work());
-        sh.active.fetch_add(1, Ordering::SeqCst);
-        lock(&sh.global).push_back(fiber);
+        // A thread cancelled before its call was made: not made at all; and
+        // one cancelled while it was being made does not get what it answered.
+        let built = if lock(&slot).is_some() {
+            Some(work())
+        } else {
+            None
+        };
+        let fiber = built.and_then(|b| {
+            let (mut f, dst) = lock(&slot).take()?;
+            f.wake = Wake::Built(dst, b);
+            Some(f)
+        });
+        if let Some(fiber) = fiber {
+            sh.active.fetch_add(1, Ordering::SeqCst);
+            lock(&sh.global).push_back(fiber);
+        }
         sh.io_pending.fetch_sub(1, Ordering::SeqCst);
         sh.nudge();
     }

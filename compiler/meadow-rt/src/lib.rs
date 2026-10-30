@@ -270,6 +270,15 @@ pub enum Prim {
     /// `channelReceive : Channel a -> a ! { Thread | e }` -- the oldest value
     /// sent, waiting for one if there is none.
     ChannelReceive,
+    /// `threadCancel : Task a -> () ! { Thread | e }` -- ask a thread to stop.
+    /// It fails, with [`thread::CANCELLED`], at its next operation the runtime
+    /// answers, or at a preemption point if it makes none; one that has
+    /// finished is left as it is. See [`thread`].
+    ThreadCancel,
+    /// `threadCancelled : () -> Bool ! { Thread | e }` -- has this thread been
+    /// asked to stop? The one operation a cancelled thread may make without
+    /// failing; told yes, it is no longer ended at a preemption point.
+    ThreadCancelled,
     // --- software transactional memory (see `stm`) ---
     /// `stmNew : a -> TVar a ! { Stm | e }`, and `stmNewIO`, the same outside a
     /// transaction with `Thread` instead.
@@ -486,6 +495,8 @@ impl Prim {
             Prim::Detach => 123,
             Prim::Reattach => 124,
             Prim::SetField => 125,
+            Prim::ThreadCancel => 126,
+            Prim::ThreadCancelled => 127,
         }
     }
 
@@ -612,6 +623,8 @@ impl Prim {
             123 => Prim::Detach,
             124 => Prim::Reattach,
             125 => Prim::SetField,
+            126 => Prim::ThreadCancel,
+            127 => Prim::ThreadCancelled,
             _ => return None,
         })
     }
@@ -811,6 +824,8 @@ impl Prim {
             "channelNew" => Prim::ChannelNew,
             "channelSend" => Prim::ChannelSend,
             "channelReceive" => Prim::ChannelReceive,
+            "threadCancel" => Prim::ThreadCancel,
+            "threadCancelled" => Prim::ThreadCancelled,
             "stmNew" | "stmNewIO" => Prim::StmNew,
             "stmRead" => Prim::StmRead,
             "stmWrite" => Prim::StmWrite,
@@ -865,6 +880,8 @@ impl Prim {
             | Prim::ThreadYield
             | Prim::ChannelNew
             | Prim::ChannelReceive
+            | Prim::ThreadCancel
+            | Prim::ThreadCancelled
             | Prim::GlobalReady
             | Prim::GlobalGet
             | Prim::StmNew

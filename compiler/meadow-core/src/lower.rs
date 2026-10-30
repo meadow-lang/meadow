@@ -57,6 +57,9 @@ pub struct Lowerer<'a> {
     dicts: Vec<(Var, Ty)>,
     /// Named-field order per constructor, accumulated across `lower_module` calls.
     pub ctor_fields: HashMap<InternedString, Vec<InternedString>>,
+    /// The constructors given their fields out of the declared order, and the
+    /// order they were written in -- see [`hir::Module::written_orders`].
+    written_orders: HashMap<hir::NodeId, Vec<u32>>,
     /// Desugaring invents variables -- a scrutinee to bind, an eta-expansion's
     /// parameters -- and they belong to the unit being lowered, so this carries
     /// on from where resolution left off rather than starting anywhere.
@@ -90,6 +93,7 @@ impl<'a> Lowerer<'a> {
             traits: None,
             dicts: Vec::new(),
             ctor_fields: HashMap::new(),
+            written_orders: HashMap::new(),
             vars,
             locations: None,
         }
@@ -463,6 +467,8 @@ impl<'a> Lowerer<'a> {
 
     pub fn lower_module(&mut self, module: &hir::LModule) -> Vec<Def> {
         let mut defs = Vec::new();
+        self.written_orders
+            .extend(module.value().written_orders.iter().cloned());
         for decl in &module.value().decls {
             match decl.value() {
                 hir::Decl::Bind(bind) => self.lower_bind_toplevel(bind, &mut defs),
@@ -718,30 +724,51 @@ impl<'a> Lowerer<'a> {
             }
             hir::Expr::Cons(label, args) => {
                 let name = *label.value();
+                let ty = self.ty(expr.id);
+                // `Point { y = …, x = … }`: the fields in the order written,
+                // then the constructor of them in the order it holds them.
+                if let Some(order) = self.written_orders.get(&expr.id).cloned() {
+                    let values = args
+                        .iter()
+                        .map(|e| (self.lower_expr(e), self.ty(e.id)))
+                        .collect();
+                    return self.in_order(values, &order, |this, args| this.ctor(name, args, ty));
+                }
                 let lowered: Vec<Term> = args.iter().map(|e| self.lower_expr(e)).collect();
                 match (&*name, lowered.len()) {
                     ("Bool.True", 0) => Term::Lit(Lit::Bool(true)),
                     ("Bool.False", 0) => Term::Lit(Lit::Bool(false)),
-                    _ => self.ctor(name, lowered, self.ty(expr.id)),
+                    _ => self.ctor(name, lowered, ty),
                 }
             }
 
-            hir::Expr::Record(fields, base) => {
-                let lowered: Vec<(InternedString, Term)> = fields
-                    .iter()
-                    .map(|(l, e)| (*l.value(), self.lower_expr(e)))
-                    .collect();
-                match base {
-                    None => Term::Record(lowered),
-                    Some(b) => {
-                        let mut term = self.lower_expr(b);
-                        for (l, e) in lowered {
-                            term = Term::Extend(Arc::new(term), l, Arc::new(e));
-                        }
-                        term
-                    }
+            hir::Expr::Record(fields, base) => match base {
+                None => Term::Record(
+                    fields
+                        .iter()
+                        .map(|(l, e)| (*l.value(), self.lower_expr(e)))
+                        .collect(),
+                ),
+                // `{ x = v | r }`: the fields first, as they are written
+                // first, and then the record they extend.
+                Some(b) => {
+                    let labels: Vec<InternedString> =
+                        fields.iter().map(|(l, _)| *l.value()).collect();
+                    let mut values: Vec<(Term, Ty)> = fields
+                        .iter()
+                        .map(|(_, e)| (self.lower_expr(e), self.ty(e.id)))
+                        .collect();
+                    let n = values.len();
+                    values.push((self.lower_expr(b), self.ty(b.id)));
+                    let order: Vec<u32> = (0..=n as u32).collect();
+                    self.in_order(values, &order, |_, mut parts| {
+                        let base = parts.pop().expect("the record extended");
+                        labels.into_iter().zip(parts).fold(base, |term, (l, e)| {
+                            Term::Extend(Arc::new(term), l, Arc::new(e))
+                        })
+                    })
                 }
-            }
+            },
             hir::Expr::Update(base, fields) => self.lower_update(base, fields),
             hir::Expr::Field(obj, label) => Term::Sel(
                 Arc::new(self.lower_expr(obj)),
@@ -1108,6 +1135,47 @@ impl<'a> Lowerer<'a> {
             .zip(params)
             .rev()
             .fold(body, |acc, (v, t)| Term::Lam(v, t, Arc::new(acc)))
+    }
+
+    /// `build` of `values`, in their own order, with them evaluated in the
+    /// order `order` lists their places in: each but the last bound to a
+    /// variable first, in that order -- unless it is a value already, a
+    /// variable, a literal or a function, whose place makes no difference --
+    /// and the last evaluated in its own place, after all of them.
+    fn in_order(
+        &mut self,
+        values: Vec<(Term, Ty)>,
+        order: &[u32],
+        build: impl FnOnce(&mut Self, Vec<Term>) -> Term,
+    ) -> Term {
+        let mut parts: Vec<Option<(Term, Ty)>> = values.into_iter().map(Some).collect();
+        let mut args: Vec<Term> = Vec::with_capacity(parts.len());
+        let mut bound: Vec<(usize, Var, Ty, Term)> = Vec::new();
+        let early = order.len().saturating_sub(1);
+        for &at in &order[..early] {
+            let at = at as usize;
+            let Some((term, ty)) = parts.get_mut(at).and_then(Option::take) else {
+                continue;
+            };
+            if matches!(term, Term::Var(_) | Term::Lit(_) | Term::Lam(..)) {
+                parts[at] = Some((term, ty));
+            } else {
+                bound.push((at, self.vars.fresh(), ty, term));
+            }
+        }
+        for (at, part) in parts.into_iter().enumerate() {
+            match part {
+                Some((term, _)) => args.push(term),
+                None => {
+                    let v = bound.iter().find(|b| b.0 == at).expect("bound").1;
+                    args.push(Term::Var(v));
+                }
+            }
+        }
+        let body = build(self, args);
+        bound.into_iter().rev().fold(body, |acc, (_, v, ty, e)| {
+            Term::Let(v, Poly::mono(ty), Arc::new(e), Arc::new(acc))
+        })
     }
 
     /// `{ base | x = v }`.

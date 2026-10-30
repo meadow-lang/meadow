@@ -109,6 +109,10 @@ pub struct Resolver {
     /// Where a second declaration of a name was written. Such a declaration is
     /// dropped once reported -- see [`Resolver::resolve_bind`].
     duplicates: std::collections::HashSet<Span>,
+    /// The named-field constructors of the module being resolved that are
+    /// written out of their declared order -- see
+    /// [`hir::Module::written_orders`].
+    written_orders: Vec<(hir::NodeId, Vec<u32>)>,
     /// Type -> its constructors, bare names, in declaration order. What `use`
     /// of a type consults, and what an exhaustiveness message would list.
     ctors_of: HashMap<InternedString, Vec<InternedString>>,
@@ -579,6 +583,7 @@ impl Resolver {
             origins: HashMap::new(),
             decl_spans: HashMap::new(),
             duplicates: std::collections::HashSet::new(),
+            written_orders: Vec::new(),
             ctors_of: HashMap::new(),
             // The effects the language has without a declaration: `Mut` for a
             // `Ref`, `St s` for a `runSt`'s state, `Thread` for green threads.
@@ -2389,12 +2394,14 @@ impl Resolver {
             .iter()
             .map(|decl| self.resolve_decl(decl))
             .collect_vec();
+        let written_orders = std::mem::take(&mut self.written_orders);
         self.node(
             hir::Module {
                 name: module.value().name,
                 decls,
                 // Filled in by `meadow-scc`, which runs over the resolved module.
                 groups: Vec::new(),
+                written_orders,
             },
             module.span,
         )
@@ -4387,8 +4394,23 @@ impl Resolver {
                 name_span,
             );
         }
+        // Where each field written is among the declared ones, in the order
+        // written: what they are evaluated in.
+        let mut written: Vec<u32> = Vec::with_capacity(fields.len());
+        for (l, _) in fields {
+            if let Some(at) = order.iter().position(|f| f == l.value())
+                && !written.contains(&(at as u32))
+            {
+                written.push(at as u32);
+            }
+        }
         let label = self.node(name, name_span);
-        self.node(hir::Expr::Cons(label, exprs), span)
+        let built = self.node(hir::Expr::Cons(label, exprs), span);
+        if written.is_sorted() {
+            return built;
+        }
+        self.written_orders.push((built.id, written));
+        built
     }
 
     fn resolve_named_ctor_pat(

@@ -235,6 +235,18 @@ fn everything_else_goes_through_the_interpreter() {
     assert_eq!(agrees("mixed", src), "(500500, 63, \"hi\", True)");
 }
 
+/// What a program does happens in the order it is written, compiled ahead of
+/// time as much as in the VM: the program `differential.rs` runs on every
+/// engine. See "Evaluation order" in `docs/TUTORIAL.md`.
+#[test]
+fn everything_is_evaluated_in_the_order_it_is_written() {
+    assert_eq!(
+        agrees("order", include_str!("evaluation_order.mw")),
+        "(123, 123, 123, 12, 12, 123, 123, 12, 12, 123, 12, 12, 12, \
+         1234, 12, 1234, 123, 12, 12, 12, 122, 1234567, 12)"
+    );
+}
+
 /// Objects that have been promoted are read, matched on and invoked by native
 /// code, not handed back to the interpreter -- and read *correctly*: the old
 /// generation is separate blocks, reached through a table that moves as blocks
@@ -331,4 +343,28 @@ fn threads_run_natively_too() {
     let src = "fun fib (n : Int) = if n < 2 then n else fib (n - 1) + fib (n - 2)
                def result = let t = threadSpawn (\\() -> fib 18) in (fib 17, threadAwait t)";
     assert_eq!(agrees("threads", src), "(1597, 2584)");
+}
+
+#[test]
+fn a_cancelled_thread_fails_natively_too() {
+    // Waiting on a channel when it is cancelled, or not there yet: either
+    // way it fails, and `await` with it.
+    let src = "def result =
+                 let ch = channelNew () in
+                 let t = threadSpawn (\\() -> channelReceive ch + toInt 1) in
+                 let _ = threadCancel t in
+                 let _ = channelSend ch (toInt 1) in
+                 threadAwait t";
+    assert_eq!(agrees("cancel", src), meadow_core::thread::CANCELLED);
+    // One that asks stops of its own accord, and one that has finished is
+    // left as it was.
+    let src = "fun spin (n : Int) = if threadCancelled () then n else spin (n + 1)
+               def result =
+                 let done = threadSpawn (\\() -> toInt 7) in
+                 let first = threadAwait done in
+                 let t = threadSpawn (\\() -> spin 0) in
+                 let _ = threadCancel t in
+                 let _ = threadCancel done in
+                 (threadAwait t >= 0, first, threadAwait done, threadCancelled ())";
+    assert_eq!(agrees("cancel_asked", src), "(True, 7, 7, False)");
 }
