@@ -51,6 +51,23 @@ beyond the last release is under _Unreleased_.
   else, and a program that cannot tie a knot carries neither collector.
   `MEADOW_SILO_CYCLES` says what the traces did. `docs/SILO.md`, "Cycles", is
   the design.
+- Tail recursion modulo context for every program of Cut, on both runtimes:
+  a call whose answer only goes into a constructor -- `Cons (f x) (map f
+  rest)`, two cells at once, a tuple on the way, a tree's last subtree, or a
+  call to another definition that calls back -- is made a tail call that
+  writes its answer into the cell, built first. So a program MeadowBoot or
+  Idyll compiles builds a list front to back in constant stack, as `meadow
+  run`'s already did: a map over ten million elements runs in less than half
+  the time on either runtime, with a third (Glade) to a half (Silo) less
+  memory, and one over four million
+  records on a thread, which overflowed its stack on Silo, runs. Where the
+  list being mapped is held by nothing else, Silo builds each new cell in
+  the old one's block. A tree, whose recursion is only as deep as the tree,
+  gains nothing, and on Glade is about 12% slower for the write each node
+  now takes. Nothing a program can see changes: the order of evaluation is
+  Cut's, and a program that may resume an operation twice is rewritten only
+  where no handler can capture the recursion. `MEADOW_CUT_TRMC=0` leaves it
+  out, and `docs/CUT.md`, "Tail recursion modulo context", is the design.
 
 ### Fixed
 

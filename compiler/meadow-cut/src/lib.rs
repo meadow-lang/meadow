@@ -20,6 +20,7 @@ pub mod parse;
 pub mod print;
 pub mod pure;
 pub mod specialize;
+pub mod trmc;
 
 pub use parse::parse;
 

@@ -27,7 +27,8 @@ pub fn lowered(path: &Path) -> Result<meadow_seq::Program, String> {
 
 /// What `meadow cut --emit` prints of the program at `path`: `inlined`, the
 /// Cut it is lowered from once its small definitions are inlined
-/// (`meadow_cut::inline`); `axcut`, each definition it is lowered to, under
+/// (`meadow_cut::inline`) and its calls under a constructor made tail calls
+/// (`meadow_cut::trmc`); `axcut`, each definition it is lowered to, under
 /// a line naming it; or `llvm`, the LLVM IR a Silo build of it for this
 /// machine compiles -- each unit, after the first, under a line naming it. A
 /// view of the back end's, for a front end's tools to show: its form is not
@@ -135,7 +136,7 @@ fn image_key(path: &Path) -> Option<(PathBuf, String, u64)> {
     exe.modified().ok()?.hash(&mut h);
     // What changes how a program of Cut is lowered: an image made one way is
     // not what a run asking for the other wants.
-    for knob in ["MEADOW_CUT_INLINE", "MEADOW_CUT_GENERIC"] {
+    for knob in ["MEADOW_CUT_INLINE", "MEADOW_CUT_GENERIC", "MEADOW_CUT_TRMC"] {
         std::env::var(knob).ok().hash(&mut h);
     }
     let root = path
