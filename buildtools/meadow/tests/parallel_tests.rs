@@ -3,19 +3,17 @@
 //! prints stays with that test.
 
 use meadow::{Engine, Options, pipeline, runtime};
-use std::path::PathBuf;
 use std::sync::Mutex;
 
-fn scratch(who: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-partest-{}-{who}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+fn scratch(who: &str) -> meadow_scratch::Scratch {
+    let dir = meadow_scratch::scratch!("meadow-partest-{}-{who}", std::process::id());
     std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::canonicalize(&dir).unwrap()
+    dir.canonical()
 }
 
 /// Twelve tests that each print their own number a few times, with work in
 /// between so that they overlap; every third fails.
-fn package(who: &str) -> PathBuf {
+fn package(who: &str) -> meadow_scratch::Scratch {
     let root = scratch(who);
     std::fs::write(root.join("Meadow.toml"), "[package]\nname = \"Par\"\n").unwrap();
     let mut src = String::from(
@@ -85,7 +83,6 @@ fn tests_run_side_by_side_answer_as_they_do_in_order() {
         let expected: Vec<(usize, bool)> = (0..12).map(|k| (k, k % 3 != 2)).collect();
         assert_eq!(heard, expected, "{engine:?}");
     }
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -121,5 +118,4 @@ fn the_command_keeps_a_passing_tests_output_and_shows_a_failing_ones() {
     // Asked not to keep it, everything a test prints is written.
     let (_, stdout) = run(&["test", "--no-capture", "--test-threads", "1"]);
     assert_eq!(stdout.matches("line from 1\n").count(), 3, "{stdout}");
-    let _ = std::fs::remove_dir_all(&root);
 }

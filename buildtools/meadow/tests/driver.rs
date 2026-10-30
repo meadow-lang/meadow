@@ -5,11 +5,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn scratch(who: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-driver-{}-{who}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn scratch(who: &str) -> meadow_scratch::Scratch {
+    meadow_scratch::scratch!("meadow-driver-{}-{who}", std::process::id())
 }
 
 /// A package at `dir/name` whose `main` is `main`. The directory is called
@@ -93,7 +90,6 @@ fn what_a_thread_kept_in_a_ref_goes_when_the_thread_does() {
     assert!(out.status.success(), "{err}");
     assert_eq!(answer(&String::from_utf8_lossy(&out.stdout)), "51275");
     assert!(err.contains("aot: 0 regions live at exit"), "{err}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Knots tied and let go of: what Silo's collector for cycles is there for.
@@ -166,7 +162,6 @@ fn a_profile_or_the_environment_chooses_how_silo_finds_cycles() {
     let (ok, _, err) = run(Some("refcount"));
     assert!(!ok, "a collector that is not one is refused");
     assert!(err.contains("MEADOW_CYCLES"), "{err}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A hundred `TVar`s, made and read and let go of on five threads, each
@@ -206,7 +201,6 @@ fn a_tvar_nothing_can_reach_lets_its_value_go() {
     assert!(out.status.success(), "{err}");
     assert_eq!(answer(&String::from_utf8_lossy(&out.stdout)), "11150");
     assert!(err.contains("aot: 0 regions live at exit"), "{err}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The last line a run printed.
@@ -235,7 +229,6 @@ fn a_program_gets_what_follows_the_double_dash() {
     let (ok, out, err) = meadow(&root, &["run", "."]);
     assert!(ok, "{err}");
     assert_eq!(answer(&out), "[;]", "and nothing, given nothing");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Prints, says why it gives up on standard error, and stops with status 3:
@@ -268,7 +261,6 @@ fn a_program_gives_up_on_standard_error_on_every_engine() {
         );
         assert!(!out.contains("gave up"), "{engine:?}: and only there");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A program whose every construct prints the order its parts are evaluated
@@ -385,7 +377,6 @@ fn every_engine_evaluates_in_the_order_the_program_is_written() {
             assert_eq!(out.replace("\r\n", "\n"), EVALUATED_IN_ORDER, "{args:?}");
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -409,7 +400,6 @@ fn bytes_are_written_as_they_are() {
         );
         std::fs::remove_file(root.join("out.bin")).unwrap();
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -446,7 +436,6 @@ fn an_image_runs_on_its_own() {
         assert!(out.status.success());
         assert!(String::from_utf8_lossy(&out.stdout).contains(r#"["a"; "b"]"#));
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -466,7 +455,6 @@ fn a_program_that_does_not_compile_is_not_run() {
         !root.join("target/debug/bytecode/Broken.mbc").exists(),
         "and no image is written for it"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `meadow` in `dir`, with `input` on its standard input.
@@ -527,7 +515,6 @@ fun main () = loop 0
             "{backend}: {out}"
         );
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // --- deep programs ------------------------------------------------------------------
@@ -836,7 +823,6 @@ fn a_program_of_cut_runs_on_glade_and_as_an_executable_of_silos() {
     let (ok, out, err) = meadow(&dir, &["cut", "refused.cut"]);
     assert!(!ok && out.is_empty(), "{out}");
     assert!(err.contains("`μ`"), "{err}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// What the REPL prints, given `input` a line at a time.

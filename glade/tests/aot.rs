@@ -30,11 +30,9 @@ fn image(src: &str, opt: meadow_core::OptLevel) -> meadow_bytecode::Program {
     meadow_codegen::compile(&lowered.program).expect("codegen")
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-silo-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A directory of the test's own, removed when it is over.
+fn scratch(name: &str) -> meadow_scratch::Scratch {
+    meadow_scratch::scratch!("meadow-glade-aot-{}-{name}", std::process::id())
 }
 
 /// The runtime as a static library for `arch`, as this build of it made it:
@@ -176,7 +174,7 @@ fn native(name: &str, src: &str, opt: meadow_core::OptLevel, arch: Arch) -> Opti
     }
     .output()
     .expect("the program runs");
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(dir);
     let out = if run.status.success() {
         String::from_utf8_lossy(&run.stdout).trim_end().to_string()
     } else {

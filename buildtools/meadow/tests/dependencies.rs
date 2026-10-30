@@ -8,15 +8,12 @@ use meadow::lock::Lock;
 use meadow::package::{DepSource, Dependency, GitRef, PackageGraph, Resolver};
 use meadow::pipeline;
 use meadow_eval as eval;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 /// A directory of this test's own, emptied first.
-fn scratch(what: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-dep-{}-{what}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    dir
+fn scratch(what: &str) -> meadow_scratch::Scratch {
+    meadow_scratch::scratch!("meadow-dep-{}-{what}", std::process::id())
 }
 
 fn git(args: &[&str]) -> bool {
@@ -29,7 +26,7 @@ fn git(args: &[&str]) -> bool {
 
 /// A one-commit package with the tag `v1.0.0`, as a repository to depend on.
 /// `None` when there is no usable git, which is the signal to skip.
-fn dependency_repo(what: &str, answer: &str) -> Option<PathBuf> {
+fn dependency_repo(what: &str, answer: &str) -> Option<meadow_scratch::Scratch> {
     let dir = scratch(what);
     std::fs::create_dir_all(dir.join("src")).ok()?;
     std::fs::write(
@@ -62,7 +59,7 @@ fn dependency_repo(what: &str, answer: &str) -> Option<PathBuf> {
 }
 
 /// A package depending on `repo` at `v1.0.0`.
-fn app_using(what: &str, repo: &Path) -> PathBuf {
+fn app_using(what: &str, repo: &Path) -> meadow_scratch::Scratch {
     let dir = scratch(what);
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
@@ -88,8 +85,9 @@ fn app_using(what: &str, repo: &Path) -> PathBuf {
 /// runtime library and the extracted standard library are, so setting it would
 /// move those for whatever else is running at the same time.
 fn build_in(app: &Path, cache: &str, set: impl FnOnce(&mut Resolver)) -> pipeline::BuildOutput {
+    let cache = scratch(&format!("cache-{cache}"));
     let mut resolver = Resolver::for_entry(app);
-    resolver.cache = scratch(&format!("cache-{cache}"));
+    resolver.cache = cache.to_path_buf();
     set(&mut resolver);
     pipeline::build_resolved(app, meadow::Options::debug().entry("result"), &mut resolver)
 }
@@ -136,7 +134,7 @@ fn a_second_build_needs_no_network() {
     let cache = scratch("cache-two");
     let first = {
         let mut r = Resolver::for_entry(&app);
-        r.cache = cache.clone();
+        r.cache = cache.to_path_buf();
         pipeline::build_resolved(&app, meadow::Options::debug().entry("result"), &mut r)
     };
     assert!(first.diagnostics.is_empty(), "{:?}", first.diagnostics);
@@ -144,7 +142,7 @@ fn a_second_build_needs_no_network() {
     // The same graph again, offline and against the same cache. What was
     // pinned is already unpacked, so nothing has to be fetched.
     let mut resolver = Resolver::for_entry(&app);
-    resolver.cache = cache;
+    resolver.cache = cache.to_path_buf();
     resolver.net = Net::Offline;
     let graph = PackageGraph::build_all_with(&[&app], &mut resolver)
         .expect("an offline build of what is already cached");
@@ -163,8 +161,9 @@ fn a_locked_build_refuses_a_dependency_that_is_not_pinned() {
     let app = app_using("app3", &repo);
 
     // No lockfile has been written, so there is nothing to build against.
+    let cache = scratch("cache-three");
     let mut resolver = Resolver::for_entry(&app);
-    resolver.cache = scratch("cache-three");
+    resolver.cache = cache.to_path_buf();
     resolver.locked = true;
     let err = PackageGraph::build_all_with(&[&app], &mut resolver)
         .expect_err("`--locked` with nothing pinned");
@@ -328,7 +327,7 @@ fn update_moves_a_branch_forward_and_a_build_does_not() {
     let cache = scratch("cache-five");
     let build = |set: fn(&mut Resolver)| {
         let mut r = Resolver::for_entry(&app);
-        r.cache = cache.clone();
+        r.cache = cache.to_path_buf();
         set(&mut r);
         pipeline::build_resolved(&app, meadow::Options::debug().entry("result"), &mut r)
     };
@@ -381,7 +380,7 @@ fn update_moves_a_branch_forward_and_a_build_does_not() {
 // --- releases ---------------------------------------------------------------
 
 /// A repository whose every release tags a `label` saying which it is.
-fn released_repo(what: &str, releases: &[&str]) -> Option<PathBuf> {
+fn released_repo(what: &str, releases: &[&str]) -> Option<meadow_scratch::Scratch> {
     let dir = scratch(what);
     std::fs::create_dir_all(dir.join("src")).ok()?;
     let d = dir.display().to_string();
@@ -422,7 +421,7 @@ fn released_repo(what: &str, releases: &[&str]) -> Option<PathBuf> {
 
 /// An app wanting `version` of `repo`, with a `main` that shows which release
 /// it was built against.
-fn app_wanting(what: &str, repo: &Path, version: &str) -> PathBuf {
+fn app_wanting(what: &str, repo: &Path, version: &str) -> meadow_scratch::Scratch {
     let dir = scratch(what);
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
@@ -747,7 +746,7 @@ fn a_version_dependency_reads_back_as_one() {
 
 /// A repository whose package is a directory of it, `lib/Greet`, and not all
 /// of it: a monorepo's member.
-fn repo_with_package_under(what: &str) -> Option<PathBuf> {
+fn repo_with_package_under(what: &str) -> Option<meadow_scratch::Scratch> {
     let dir = scratch(what);
     let pkg = dir.join("lib").join("Greet");
     std::fs::create_dir_all(pkg.join("src")).ok()?;
@@ -778,7 +777,7 @@ fn repo_with_package_under(what: &str) -> Option<PathBuf> {
 }
 
 /// A package depending on the package at `subdir` of `repo`.
-fn app_using_subdir(what: &str, repo: &Path, subdir: &str) -> PathBuf {
+fn app_using_subdir(what: &str, repo: &Path, subdir: &str) -> meadow_scratch::Scratch {
     let dir = scratch(what);
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(

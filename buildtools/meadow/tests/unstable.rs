@@ -8,11 +8,10 @@
 //! tests'.
 
 use meadow::pipeline;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-fn scratch(what: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-unstable-{}-{what}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+fn scratch(what: &str) -> meadow_scratch::Scratch {
+    let dir = meadow_scratch::scratch!("meadow-unstable-{}-{what}", std::process::id());
     std::fs::create_dir_all(dir.join("src")).expect("a scratch directory");
     dir
 }
@@ -20,7 +19,7 @@ fn scratch(what: &str) -> PathBuf {
 const MANIFEST: &str = "[package]\nname = \"Calls\"\nversion = \"0.1.0\"\n";
 
 /// A package of the files given, each a name under `src` and its source.
-fn package(what: &str, manifest: &str, files: &[(&str, &str)]) -> PathBuf {
+fn package(what: &str, manifest: &str, files: &[(&str, &str)]) -> meadow_scratch::Scratch {
     let dir = scratch(what);
     std::fs::write(dir.join("Meadow.toml"), manifest).unwrap();
     for (name, source) in files {

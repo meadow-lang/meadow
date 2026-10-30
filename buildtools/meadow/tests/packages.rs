@@ -94,7 +94,7 @@ fn a_manifest_configures_the_build_profiles() {
     use meadow::package::ProfileConfig;
     use meadow::{OptLevel, Profile, Resolved, Strictness};
 
-    let dir = std::env::temp_dir().join("meadow-profile-manifest");
+    let dir = meadow_scratch::scratch!("meadow-profile-manifest-{}", std::process::id());
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/Main.mw"), "def result = 1\n").unwrap();
     std::fs::write(
@@ -168,7 +168,7 @@ fn a_manifest_chooses_the_backend() {
     assert_eq!(release.backend, Backend::Aot);
     assert_eq!(release.fallback().map(|r| r.backend), Some(Backend::Jit));
 
-    let dir = std::env::temp_dir().join("meadow-backend-manifest");
+    let dir = meadow_scratch::scratch!("meadow-backend-manifest-{}", std::process::id());
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/Main.mw"), "def result = 1\n").unwrap();
     std::fs::write(
@@ -218,7 +218,7 @@ fn a_manifest_chooses_the_runtime_and_its_flags() {
     use meadow::package::ProfileConfig;
     use meadow::{Profile, Resolved};
 
-    let dir = std::env::temp_dir().join("meadow-runtime-manifest");
+    let dir = meadow_scratch::scratch!("meadow-runtime-manifest-{}", std::process::id());
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/Main.mw"), "def result = 1\n").unwrap();
     std::fs::write(
@@ -282,7 +282,7 @@ fn a_profile_section_can_ask_to_be_profiled() {
     use meadow::package::ProfileConfig;
     use meadow::profile::{Profile, Resolved};
 
-    let dir = std::env::temp_dir().join("meadow-profiled-manifest");
+    let dir = meadow_scratch::scratch!("meadow-profiled-manifest-{}", std::process::id());
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/Main.mw"), "def result = 1\n").unwrap();
     std::fs::write(
@@ -312,7 +312,7 @@ fn prune_is_on_unless_a_manifest_or_a_flag_says_otherwise() {
     use meadow::package::ProfileConfig;
     use meadow::profile::{Profile, Resolved};
 
-    let dir = std::env::temp_dir().join("meadow-prune-manifest");
+    let dir = meadow_scratch::scratch!("meadow-prune-manifest-{}", std::process::id());
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/Main.mw"), "def result = 1\n").unwrap();
     std::fs::write(
@@ -345,10 +345,9 @@ fn prune_is_on_unless_a_manifest_or_a_flag_says_otherwise() {
 // --- constructors a package re-exports -----------------------------------------
 
 /// A library whose root re-exports a sibling module's type and constructors,
-/// and an app using it as `main` says.
-fn reexporting_pair(what: &str, main: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-reexport-{}-{what}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+/// and an app using it as `main` says: the app, and the directory holding both.
+fn reexporting_pair(what: &str, main: &str) -> (PathBuf, meadow_scratch::Scratch) {
+    let dir = meadow_scratch::scratch!("meadow-reexport-{}-{what}", std::process::id());
     let lib = dir.join("shapes");
     let app = dir.join("app");
     for (path, text) in [
@@ -375,7 +374,7 @@ fn reexporting_pair(what: &str, main: &str) -> PathBuf {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
     }
-    app
+    (app, dir)
 }
 
 fn run_app(app: &Path) -> String {
@@ -396,21 +395,21 @@ fn run_app(app: &Path) -> String {
 #[test]
 fn a_package_root_can_re_export_constructors_flat() {
     // Named in the `use`, as `use Shapes::Square` would be in Rust.
-    let named = reexporting_pair(
+    let (named, _named) = reexporting_pair(
         "named",
         "use Shapes (area, Square)\ndef result = area (Square 4)\n",
     );
     assert_eq!(run_app(&named), "16");
     // A bare `use` brings every one.
-    let all = reexporting_pair("all", "use Shapes\ndef result = area (Rect 2 3)\n");
+    let (all, _all) = reexporting_pair("all", "use Shapes\ndef result = area (Rect 2 3)\n");
     assert_eq!(run_app(&all), "6");
     // Without either, they stay under their type.
-    let qualified = reexporting_pair(
+    let (qualified, _qualified) = reexporting_pair(
         "qualified",
         "use Shapes (area, Shape)\ndef result = area (Shape.Square 3)\n",
     );
     assert_eq!(run_app(&qualified), "9");
-    let unnamed = reexporting_pair(
+    let (unnamed, _unnamed) = reexporting_pair(
         "unnamed",
         "use Shapes (area)\ndef result = area (Square 4)\n",
     );
@@ -422,10 +421,9 @@ fn a_package_root_can_re_export_constructors_flat() {
 }
 
 /// Two libraries, `shapes` and `figures`, each with its own `Shape`, and an
-/// app using both.
-fn two_shapes(what: &str, main: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-two-shapes-{}-{what}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+/// app using both: the app, and the directory holding all three.
+fn two_shapes(what: &str, main: &str) -> (PathBuf, meadow_scratch::Scratch) {
+    let dir = meadow_scratch::scratch!("meadow-two-shapes-{}-{what}", std::process::id());
     let app = dir.join("app");
     let mut files = vec![
         (
@@ -459,13 +457,13 @@ fn two_shapes(what: &str, main: &str) -> PathBuf {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
     }
-    app
+    (app, dir)
 }
 
 #[test]
 fn two_packages_may_each_declare_a_type_of_one_name() {
     // Each package's `Shape` is its own: both work side by side.
-    let both = two_shapes(
+    let (both, _both) = two_shapes(
         "both",
         "use Shapes (shapesArea, shapesUnit)\nuse Figures (figuresArea, figuresUnit)\n\
          def result = (shapesArea shapesUnit, figuresArea figuresUnit)\n",
@@ -473,7 +471,7 @@ fn two_packages_may_each_declare_a_type_of_one_name() {
     assert_eq!(run_app(&both), "(1, 3)");
     // One package's value is no value of the other's type: this used to
     // type-check, and fail with a non-exhaustive match when run.
-    let crossed = two_shapes(
+    let (crossed, _crossed) = two_shapes(
         "crossed",
         "use Shapes (shapesArea)\nuse Figures (figuresUnit)\n\
          def result = shapesArea figuresUnit\n",
@@ -491,13 +489,13 @@ fn two_packages_may_each_declare_a_type_of_one_name() {
     );
     // Named bare, `Shape` is neither's: a dependency's type is in scope only
     // where a `use` brings it.
-    let unnamed = two_shapes("unnamed", "fun f (s : Shape) = s\ndef result = 1\n");
+    let (unnamed, _unnamed) = two_shapes("unnamed", "fun f (s : Shape) = s\ndef result = 1\n");
     assert!(
         run_app(&unnamed).contains("unknown type `Shape`"),
         "{}",
         run_app(&unnamed)
     );
-    let chosen = two_shapes(
+    let (chosen, _chosen) = two_shapes(
         "chosen",
         "use Shapes (Shape, shapesArea)\nfun f (s : Shape) = shapesArea s\n\
          def result = f (Shape.Square 5)\n",
@@ -509,7 +507,7 @@ fn two_packages_may_each_declare_a_type_of_one_name() {
 fn a_type_of_the_package_itself_shadows_one_of_the_same_name_elsewhere() {
     // `Shape` here is the app's, whatever its dependencies declare -- and so
     // is `Parser`, which the standard library's prelude declares too.
-    let local = two_shapes(
+    let (local, _local) = two_shapes(
         "local",
         "data Shape = Dot\ndata Parser = Parser Int\n\
          fun f (s : Shape) = match s with | Shape.Dot -> 7\n\

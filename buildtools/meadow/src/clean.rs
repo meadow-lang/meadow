@@ -93,11 +93,8 @@ pub fn bytes(n: u64) -> String {
 mod tests {
     use super::*;
 
-    fn scratch(who: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("meadow-clean-{}-{who}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(who: &str) -> meadow_scratch::Scratch {
+        meadow_scratch::scratch!("meadow-clean-{}-{who}", std::process::id())
     }
 
     /// A package with a `target` holding something in two profiles.
@@ -122,7 +119,6 @@ mod tests {
         assert!(!root.join("target").exists());
         assert!(root.join("Meadow.toml").is_file(), "the manifest stays");
         assert!(root.join("src/Main.mw").is_file(), "the sources stay");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -132,7 +128,6 @@ mod tests {
         run(&root, Some("debug"), false).expect("clean");
         assert!(!root.join("target/debug").exists());
         assert!(root.join("target/release").exists(), "the other stays");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `--dry-run` measures and reports without removing, which is the only
@@ -145,7 +140,6 @@ mod tests {
         assert_eq!(out.removed, [root.join("target")]);
         assert!(out.bytes >= 1024, "two files of 512 bytes: {}", out.bytes);
         assert!(root.join("target").is_dir(), "still there");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Nothing built yet is not an error; there is simply nothing to do.
@@ -157,7 +151,6 @@ mod tests {
         std::fs::write(root.join("Meadow.toml"), "[package]\nname = \"Fresh\"\n").unwrap();
         let out = run(&root, None, false).expect("clean");
         assert_eq!(out, Cleaned::default());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

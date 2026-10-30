@@ -30,6 +30,7 @@ meadow-seq = { path = "../compiler/meadow-seq" }
 meadow-codegen = { path = "../compiler/meadow-codegen" }
 meadow-eval = { path = "../eval" }
 meadow-bytecode = { path = "../compiler/meadow-bytecode" }
+meadow-scratch = { path = "../compiler/meadow-scratch" }
 
 # Same reasoning as `buildtools`: this crate *is* the inner loop. It matters
 # here too because `cargo test --release` in this workspace is where the VM is

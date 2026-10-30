@@ -137,8 +137,7 @@ fn every_fixture_a_test_names_is_spelled_as_it_is_on_disk() {
 /// A package `Cased` with a module `Alpha` and this `Main`, built; its
 /// diagnostics.
 fn cased(tag: &str, main: &str) -> Vec<String> {
-    let dir = std::env::temp_dir().join(format!("meadow-case-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = meadow_scratch::scratch!("meadow-case-{tag}-{}", std::process::id());
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
         dir.join("Meadow.toml"),

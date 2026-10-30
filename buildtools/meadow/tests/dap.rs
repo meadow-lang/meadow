@@ -4,15 +4,14 @@
 use meadow::dap::session::{Mode, Session, Stop, Variable};
 use std::path::{Path, PathBuf};
 
-/// A program in a directory of its own, and a session over it.
-fn launch(who: &str, src: &str) -> (Session, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("meadow-dap-{}-{who}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+/// A program in a directory of its own, and a session over it; the directory
+/// is removed when the last of the three is dropped.
+fn launch(who: &str, src: &str) -> (Session, PathBuf, meadow_scratch::Scratch) {
+    let dir = meadow_scratch::scratch!("meadow-dap-{}-{who}", std::process::id());
     let file = dir.join("main.mw");
     std::fs::write(&file, src).unwrap();
     let s = Session::launch(&file).unwrap_or_else(|e| panic!("launch: {e}"));
-    (s, file)
+    (s, file, dir)
 }
 
 /// Run until something other than a slice boundary stops it.
@@ -69,7 +68,7 @@ fun main () =
 
 #[test]
 fn it_runs_to_the_end_with_nothing_set() {
-    let (mut s, _) = launch("end", PROGRAM);
+    let (mut s, _, _dir) = launch("end", PROGRAM);
     assert_eq!(
         go(&mut s, Mode::Continue),
         Stop::Exited(Ok("()".to_string()))
@@ -79,7 +78,7 @@ fn it_runs_to_the_end_with_nothing_set() {
 
 #[test]
 fn a_breakpoint_stops_with_the_caller_underneath() {
-    let (mut s, file) = launch("bp", PROGRAM);
+    let (mut s, file, _dir) = launch("bp", PROGRAM);
     assert_eq!(s.set_breakpoints(&file, &[2]), vec![Some(2)]);
     assert_eq!(go(&mut s, Mode::Continue), Stop::Breakpoint);
     let st = stack(&s);
@@ -99,7 +98,7 @@ fn a_breakpoint_stops_with_the_caller_underneath() {
 
 #[test]
 fn a_recursive_function_has_a_frame_per_call() {
-    let (mut s, file) = launch("rec", PROGRAM);
+    let (mut s, file, _dir) = launch("rec", PROGRAM);
     s.set_breakpoints(&file, &[6]);
     assert_eq!(go(&mut s, Mode::Continue), Stop::Breakpoint);
     let names: Vec<String> = stack(&s).into_iter().map(|(n, _)| n).collect();
@@ -111,7 +110,7 @@ fn a_recursive_function_has_a_frame_per_call() {
 
 #[test]
 fn a_line_with_no_code_moves_to_the_next_one_that_has_some() {
-    let (mut s, file) = launch("move", PROGRAM);
+    let (mut s, file, _dir) = launch("move", PROGRAM);
     // Line 3 is blank, line 4 is `fun sum xs =` and its body starts on 5.
     let landed = s.set_breakpoints(&file, &[3])[0];
     assert!(matches!(landed, Some(l) if l > 3), "{landed:?}");
@@ -119,7 +118,7 @@ fn a_line_with_no_code_moves_to_the_next_one_that_has_some() {
 
 #[test]
 fn stepping_in_enters_the_call_and_out_returns_from_it() {
-    let (mut s, file) = launch("step", PROGRAM);
+    let (mut s, file, _dir) = launch("step", PROGRAM);
     s.set_breakpoints(&file, &[10]);
     assert_eq!(go(&mut s, Mode::Continue), Stop::Breakpoint);
     assert_eq!(stack(&s)[0].0, "main");
@@ -136,7 +135,7 @@ fn stepping_in_enters_the_call_and_out_returns_from_it() {
 
 #[test]
 fn stepping_over_a_call_stays_in_the_function() {
-    let (mut s, file) = launch("over", PROGRAM);
+    let (mut s, file, _dir) = launch("over", PROGRAM);
     s.set_breakpoints(&file, &[10]);
     assert_eq!(go(&mut s, Mode::Continue), Stop::Breakpoint);
     for _ in 0..4 {
@@ -153,7 +152,7 @@ fn stepping_over_a_call_stays_in_the_function() {
 
 #[test]
 fn output_is_captured_rather_than_printed() {
-    let (mut s, _) = launch("out", "fun main () =\n  println \"hello\"\n");
+    let (mut s, _, _dir) = launch("out", "fun main () =\n  println \"hello\"\n");
     assert_eq!(
         go(&mut s, Mode::Continue),
         Stop::Exited(Ok("()".to_string()))
@@ -163,7 +162,7 @@ fn output_is_captured_rather_than_printed() {
 
 #[test]
 fn a_failure_stops_where_it_happened() {
-    let (mut s, _) = launch(
+    let (mut s, _, _dir) = launch(
         "fail",
         "fun f n =\n  n / 0\n\nfun main () = println (f 7)\n",
     );
@@ -180,7 +179,7 @@ fn a_failure_stops_where_it_happened() {
 #[test]
 fn values_can_be_opened_up() {
     let src = "fun f pair =\n  pair\n\nfun main () = match f (Just [1; 2], { x = 1, y = \"s\" }) with | (_, r) -> println r.y\n";
-    let (mut s, file) = launch("open", src);
+    let (mut s, file, _dir) = launch("open", src);
     s.set_breakpoints(&file, &[2]);
     assert_eq!(go(&mut s, Mode::Continue), Stop::Breakpoint);
     let pair = local(&mut s, 0, "pair");
@@ -195,7 +194,7 @@ fn values_can_be_opened_up() {
 
 #[test]
 fn the_raw_machine_is_there_too() {
-    let (mut s, file) = launch("raw", PROGRAM);
+    let (mut s, file, _dir) = launch("raw", PROGRAM);
     s.set_breakpoints(&file, &[2]);
     go(&mut s, Mode::Continue);
     let scopes: Vec<&str> = s.scopes(0).iter().map(|sc| sc.name).collect();
@@ -258,9 +257,7 @@ mod protocol {
 
     #[test]
     fn a_session_from_launch_to_exit() {
-        let dir = std::env::temp_dir().join(format!("meadow-dap-{}-protocol", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = meadow_scratch::scratch!("meadow-dap-{}-protocol", std::process::id());
         let file = dir.join("main.mw");
         std::fs::write(&file, PROGRAM).unwrap();
         let path = file.display().to_string();
@@ -335,9 +332,7 @@ mod protocol {
 
     #[test]
     fn a_program_that_does_not_compile_fails_to_launch_and_says_why() {
-        let dir = std::env::temp_dir().join(format!("meadow-dap-{}-broken", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = meadow_scratch::scratch!("meadow-dap-{}-broken", std::process::id());
         let file = dir.join("main.mw");
         std::fs::write(&file, "fun main () = nope\n").unwrap();
 
@@ -369,7 +364,7 @@ fn a_call_inside_a_call_is_still_one_frame() {
     // `main` waits for `inc` and then for `double`: two continuations, one call.
     let src =
         "fun inc n =\n  n + 1\n\nfun double n = n * 2\n\nfun main () = println (double (inc 20))\n";
-    let (mut s, file) = launch("nested", src);
+    let (mut s, file, _dir) = launch("nested", src);
     s.set_breakpoints(&file, &[2]);
     assert_eq!(go(&mut s, Mode::Continue), Stop::Breakpoint);
     let names: Vec<String> = stack(&s).into_iter().map(|(n, _)| n).collect();
@@ -379,7 +374,7 @@ fn a_call_inside_a_call_is_still_one_frame() {
 #[test]
 fn stepping_in_can_reach_the_standard_library() {
     let src = "use Std.Collections.List as L\n\nfun main () =\n  println (L.length [1; 2; 3])\n";
-    let (mut s, file) = launch("std", src);
+    let (mut s, file, _dir) = launch("std", src);
     s.set_breakpoints(&file, &[4]);
     assert_eq!(go(&mut s, Mode::Continue), Stop::Breakpoint);
     assert_eq!(go(&mut s, Mode::StepIn), Stop::Step);
@@ -394,8 +389,7 @@ fn stepping_in_can_reach_the_standard_library() {
 #[test]
 fn a_package_of_several_modules_debugs_across_them() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/MiniML");
-    let dir = std::env::temp_dir().join(format!("meadow-dap-{}-miniml", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = meadow_scratch::scratch!("meadow-dap-{}-miniml", std::process::id());
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::copy(root.join("Meadow.toml"), dir.join("Meadow.toml")).unwrap();
     for f in ["Syntax.mw", "Parser.mw", "Infer.mw", "Eval.mw", "Main.mw"] {
@@ -442,9 +436,8 @@ fn a_package_of_several_modules_debugs_across_them() {
 // --- starting at a function --------------------------------------------------------
 
 /// A package on disk: `(relative path, text)` pairs, and its root.
-fn package(who: &str, files: &[(&str, &str)]) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-dap-{}-{who}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+fn package(who: &str, files: &[(&str, &str)]) -> meadow_scratch::Scratch {
+    let dir = meadow_scratch::scratch!("meadow-dap-{}-{who}", std::process::id());
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
         dir.join("Meadow.toml"),

@@ -678,6 +678,12 @@ on a machine with cores to spare, where `check.sh` is most of an hour. It is
 what to run on a commit before pushing it, with `--version v0.2.0` for a
 release's tag.
 
+A test that needs files makes its directory with `meadow_scratch::scratch!`
+(`compiler/meadow-scratch`), which is removed when the test ends, failed or
+not, and is under the workspace's `target/tmp` rather than the system's
+temporary directory, so `cargo clean` takes whatever a killed run left. Set
+`MEADOW_KEEP_TEST_DIRS=1` to keep them, to look at what a failing test wrote.
+
 A commit is checked that way on a rented Linux machine before it is pushed, and
 whoever ran it says so on the commit, as a status called `suite/linux-x86_64`:
 

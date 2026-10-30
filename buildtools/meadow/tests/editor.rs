@@ -7,12 +7,11 @@
 //! dependencies out: every name one provided was reported undefined.
 
 use meadow::Options;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// A package written out in a directory of its own.
-fn package(what: &str, manifest: &str, files: &[(&str, &str)]) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-editor-{}-{what}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+fn package(what: &str, manifest: &str, files: &[(&str, &str)]) -> meadow_scratch::Scratch {
+    let dir = meadow_scratch::scratch!("meadow-editor-{}-{what}", std::process::id());
     std::fs::create_dir_all(dir.join("src")).expect("a scratch package");
     std::fs::write(dir.join("Meadow.toml"), manifest).expect("a manifest");
     for (name, text) in files {

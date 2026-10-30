@@ -1315,8 +1315,7 @@ mod tests {
 
     #[test]
     fn what_a_macro_answered_is_kept_for_the_next_build_under_the_same_packages() {
-        let dir = std::env::temp_dir().join(format!("meadow-macro-answers-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = meadow_scratch::scratch!("meadow-macro-answers-{}", std::process::id());
         let path = dir.join("App.macros");
         let (package, name, at) = call();
         let scope = Scope {
@@ -1345,6 +1344,5 @@ mod tests {
         // Other packages: nothing kept is theirs, and there is nothing to run.
         let other = empty().remembering(path, 8);
         assert!(other.run(package, name, &[], at, &scope).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

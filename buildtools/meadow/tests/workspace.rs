@@ -9,11 +9,9 @@ use std::path::{Path, PathBuf};
 
 /// A directory of our own, named after the test so concurrent ones do not
 /// collide.
-fn scratch(who: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-ws-{}-{who}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::canonicalize(&dir).unwrap()
+fn scratch(who: &str) -> meadow_scratch::Scratch {
+    let dir = meadow_scratch::scratch!("meadow-ws-{}-{who}", std::process::id());
+    dir.canonical()
 }
 
 fn write(path: &Path, text: &str) {
@@ -24,8 +22,8 @@ fn write(path: &Path, text: &str) {
 /// `shop/`: a virtual workspace of `app`, which uses `text` and `util`, and
 /// `text`, which uses `util` -- the libraries under `libs/*`, taking their
 /// version and dependencies from the root, which also sets a debug flag.
-fn shop(who: &str) -> PathBuf {
-    let root = scratch(who).join("shop");
+fn shop(who: &str) -> meadow_scratch::Scratch {
+    let root = scratch(who).child("shop");
     write(
         &root.join("Meadow.toml"),
         r#"[workspace]
@@ -178,14 +176,14 @@ fn a_package_inside_a_workspace_must_be_a_member() {
 fn a_workspace_is_found_from_anywhere_inside_a_member() {
     let root = shop("find");
     for inside in [
-        root.clone(),
+        root.to_path_buf(),
         root.join("app"),
         root.join("app/src"),
         root.join("app/src/Main.mw"),
         root.join("libs/util"),
     ] {
         let ws = Workspace::find(&inside).unwrap().expect("found");
-        assert_eq!(ws.root, root, "from {}", inside.display());
+        assert_eq!(ws.root, *root, "from {}", inside.display());
     }
     assert!(Workspace::find(&root.parent().unwrap()).unwrap().is_none());
 }
@@ -264,7 +262,7 @@ fn members_build_together_into_one_target() {
     assert_eq!(run(&out.each[0]), r#"(42, "b x2", "shop")"#);
     for (built, name) in out.each.iter().zip(["App", "Text"]) {
         let (dir, pkg) = built.package.clone().unwrap();
-        assert_eq!(dir, root, "{name} builds into the workspace's target");
+        assert_eq!(dir, *root, "{name} builds into the workspace's target");
         assert_eq!(&*pkg, name);
     }
     // `text` is linked with what it depends on and nothing else.
@@ -356,7 +354,7 @@ fn inheriting_what_the_workspace_lacks_is_an_error() {
         "{msg}"
     );
 
-    let lone = scratch("inherit-lone").join("lone");
+    let lone = scratch("inherit-lone").child("lone");
     write(
         &lone.join("Meadow.toml"),
         "[package]\nname = \"Lone\"\nversion.workspace = true\n",
@@ -426,7 +424,6 @@ fn init_makes_a_workspace_and_members_join_it() {
     // And what `init` made builds.
     let (ok, output) = meadow(&root, &["build", "--workspace"]);
     assert!(ok, "{output}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Two packages beside each other, both depending only on `Std`, used to be
@@ -459,5 +456,4 @@ fn packages_beside_each_other_keep_their_own_definitions() {
     let out = pipeline::build(&dir.join("app"), Options::debug().entry("result"));
     assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
     assert_eq!(run(&out), "(2, 11, 200, 300)");
-    let _ = std::fs::remove_dir_all(&dir);
 }

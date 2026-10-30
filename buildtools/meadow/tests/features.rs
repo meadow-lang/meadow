@@ -10,7 +10,7 @@
 use meadow::package::{AskedFeatures, ask_features};
 use meadow::pipeline;
 use meadow_eval as eval;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
 /// What the command line asked for is the process's, so the tests take turns.
@@ -19,11 +19,8 @@ fn turn() -> MutexGuard<'static, ()> {
     TURN.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-fn scratch(what: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-feat-{}-{what}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    dir
+fn scratch(what: &str) -> meadow_scratch::Scratch {
+    meadow_scratch::scratch!("meadow-feat-{}-{what}", std::process::id())
 }
 
 fn package(dir: &Path, manifest: &str, file: &str, source: &str) {
@@ -70,7 +67,7 @@ def result = (voice, round, fancy)
 ";
 
 /// An app at `what/app` depending on Shapes at `what/lib` as `dep` says.
-fn app(what: &str, dep: &str) -> PathBuf {
+fn app(what: &str, dep: &str) -> meadow_scratch::Scratch {
     let root = scratch(what);
     package(&root.join("lib"), SHAPES, "Lib.mw", SHAPES_SRC);
     let manifest = format!(
@@ -78,7 +75,7 @@ fn app(what: &str, dep: &str) -> PathBuf {
          [dependencies]\nShapes = {dep}\n"
     );
     package(&root.join("app"), &manifest, "Main.mw", APP_SRC);
-    root.join("app")
+    root.child("app")
 }
 
 fn built(app: &Path, asked: AskedFeatures) -> Result<String, String> {

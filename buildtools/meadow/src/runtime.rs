@@ -638,6 +638,9 @@ pub fn run_tests_native(
         .join("meadow-silo-tests")
         .join(std::process::id().to_string());
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    // Removed however this returns: a failed link answers early with `?`,
+    // past the end where it used to be removed, and left it behind.
+    let _removed = Removed(&dir);
     let modules = crate::aot::write_units(&dir, "tests", &units)?;
     let exe = dir.join(format!("tests{}", std::env::consts::EXE_SUFFIX));
     crate::aot::clang_link(&modules, &[], &runtime, &exe, opt, target, false)?;
@@ -680,10 +683,6 @@ pub fn run_tests_native(
             });
         }
     });
-    // Kept on request, to run a test again by hand: `tests <number>`.
-    if std::env::var_os("MEADOW_SILO_KEEP").is_none() {
-        let _ = std::fs::remove_dir_all(&dir);
-    }
     Ok(slots
         .into_iter()
         .map(|s| {
@@ -695,6 +694,24 @@ pub fn run_tests_native(
                 })
         })
         .collect())
+}
+
+/// A directory of this run's own, removed when this is dropped -- unless
+/// `MEADOW_SILO_KEEP` is set, which keeps it to run a test again by hand:
+/// `tests <number>`. Its parent goes too once nothing else is in it.
+struct Removed<'a>(&'a std::path::Path);
+
+impl Drop for Removed<'_> {
+    fn drop(&mut self) {
+        if std::env::var_os("MEADOW_SILO_KEEP").is_some() {
+            return;
+        }
+        let _ = std::fs::remove_dir_all(self.0);
+        if let Some(parent) = self.0.parent() {
+            // Fails, as it should, while another run's directory is there.
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
 }
 
 /// `program` with a definition per test that calls it with `()` -- the

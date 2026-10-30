@@ -20,6 +20,7 @@ meadow-axcut = { path = "../compiler/meadow-axcut" }
 meadow-codegen = { path = "../compiler/meadow-codegen" }
 meadow-llvm = { path = "../compiler/meadow-llvm" }
 meadow-bytecode = { path = "../compiler/meadow-bytecode" }
+meadow-scratch = { path = "../compiler/meadow-scratch" }
 
 # The `meadow` binary is an interpreter: its inner loop wants cross-crate
 # inlining, and the instruction dispatch wants to be one function rather than

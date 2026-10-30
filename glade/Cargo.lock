@@ -363,6 +363,7 @@ dependencies = [
  "meadow-eval",
  "meadow-intern",
  "meadow-rt",
+ "meadow-scratch",
  "meadow-seq",
  "num-bigint",
  "num-traits",
@@ -464,6 +465,10 @@ version = "0.5.0"
 dependencies = [
  "meadow-hir",
 ]
+
+[[package]]
+name = "meadow-scratch"
+version = "0.5.0"
 
 [[package]]
 name = "meadow-seq"

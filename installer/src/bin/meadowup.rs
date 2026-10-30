@@ -173,13 +173,15 @@ fn install(args: &Args, updating: bool) -> Result<(), String> {
     // `--from` is a directory that already holds the binaries -- built from
     // source, or an unpacked archive. Nothing is looked up and nothing is
     // fetched, so this is the offline install too.
-    let (unpacked, fetched, provenance) = match &args.from {
+    // A download is removed when `download` is dropped -- below, or on any
+    // early return that a failed install takes.
+    let (unpacked, download, provenance) = match &args.from {
         Some(dir) => {
             if !dir.is_dir() {
                 return Err(format!("{} is not a directory", dir.display()));
             }
             ui::info(format!("installing from {}", dir.display()));
-            (dir.clone(), false, Provenance::Local)
+            (dir.clone(), None, Provenance::Local)
         }
         None => {
             let target = meadowup::target_triple()?;
@@ -260,7 +262,7 @@ fn install(args: &Args, updating: bool) -> Result<(), String> {
             }
             ui::info(format!("downloading toolchain for {}", bold(target)));
             let (dir, _) = release::fetch(&tag, target, "meadowup-install")?;
-            (dir, true, Provenance::Release(tag))
+            (dir.to_path_buf(), Some(dir), Provenance::Release(tag))
         }
     };
 
@@ -308,9 +310,7 @@ fn install(args: &Args, updating: bool) -> Result<(), String> {
     }
     // Only what was downloaded is cleared away; a `--from` directory is the
     // caller's, and removing it would take their build with it.
-    if fetched {
-        let _ = std::fs::remove_dir_all(&unpacked);
-    }
+    drop(download);
     if let Err(e) = meadowup::record(&args.home, &provenance) {
         ui::warn(format!("could not record what was installed: {e}"));
     }

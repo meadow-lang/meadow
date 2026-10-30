@@ -331,6 +331,7 @@ dependencies = [
  "meadow-axcut",
  "meadow-intern",
  "meadow-rt",
+ "meadow-scratch",
 ]
 
 [[package]]
@@ -410,6 +411,7 @@ dependencies = [
  "meadow-hir",
  "meadow-intern",
  "meadow-rt",
+ "meadow-scratch",
  "meadow-seq",
 ]
 
@@ -447,6 +449,7 @@ version = "0.5.0"
 dependencies = [
  "libc",
  "meadow-intern",
+ "meadow-scratch",
  "meadow-span",
  "num-bigint",
  "num-traits",
@@ -463,6 +466,10 @@ version = "0.5.0"
 dependencies = [
  "meadow-hir",
 ]
+
+[[package]]
+name = "meadow-scratch"
+version = "0.5.0"
 
 [[package]]
 name = "meadow-seq"

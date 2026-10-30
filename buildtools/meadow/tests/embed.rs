@@ -4,13 +4,11 @@
 use meadow::package::ProfileConfig;
 use meadow::pipeline;
 use meadow::profile::{Profile, Resolved};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-fn scratch(who: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-embed-{}-{who}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::canonicalize(&dir).unwrap()
+fn scratch(who: &str) -> meadow_scratch::Scratch {
+    let dir = meadow_scratch::scratch!("meadow-embed-{}-{who}", std::process::id());
+    dir.canonical()
 }
 
 fn write(path: &Path, text: &str) {
@@ -19,8 +17,8 @@ fn write(path: &Path, text: &str) {
 }
 
 /// A package whose `Main.mw` is `main`, beside a `note.txt` of `note`.
-fn package(who: &str, main: &str, note: &str) -> PathBuf {
-    let root = scratch(who).join("app");
+fn package(who: &str, main: &str, note: &str) -> meadow_scratch::Scratch {
+    let root = scratch(who).child("app");
     write(
         &root.join("Meadow.toml"),
         "[package]\nname = \"App\"\nversion = \"0.1.0\"\n",

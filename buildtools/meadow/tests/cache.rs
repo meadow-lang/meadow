@@ -14,11 +14,8 @@ use std::time::{Duration, SystemTime};
 const HOUR: Duration = Duration::from_secs(60 * 60);
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
-fn scratch(who: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-cache-{}-{who}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn scratch(who: &str) -> meadow_scratch::Scratch {
+    meadow_scratch::scratch!("meadow-cache-{}-{who}", std::process::id())
 }
 
 /// Set `path`'s modification time to `age` ago.
