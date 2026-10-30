@@ -1278,18 +1278,22 @@ fn embedded(runtime: Runtime, lib: &str) -> Option<PathBuf> {
     if bytes.is_empty() {
         return None;
     }
-    let dir = crate::stdlib::home()?.join("lib").join(runtime.symbol());
+    // Before anything is written: every rebuilt `meadow` writes a directory
+    // here, and a disk they have filled wants the room back first.
+    crate::cache::auto();
+    let dir = crate::cache::lib_dir()?.join(runtime.symbol());
     let path = dir.join(lib);
-    if std::fs::metadata(&path).is_ok_and(|m| m.len() == bytes.len() as u64) {
-        return Some(path);
+    if !std::fs::metadata(&path).is_ok_and(|m| m.len() == bytes.len() as u64) {
+        std::fs::create_dir_all(&dir).ok()?;
+        // Whole or not at all: another `meadow` may be linking against it.
+        let partial = dir.join(format!("{lib}.{}", std::process::id()));
+        std::fs::write(&partial, bytes).ok()?;
+        if std::fs::rename(&partial, &path).is_err() {
+            let _ = std::fs::remove_file(&partial);
+        }
     }
-    std::fs::create_dir_all(&dir).ok()?;
-    // Whole or not at all: another `meadow` may be linking against it.
-    let partial = dir.join(format!("{lib}.{}", std::process::id()));
-    std::fs::write(&partial, bytes).ok()?;
-    if std::fs::rename(&partial, &path).is_err() {
-        let _ = std::fs::remove_file(&partial);
-    }
+    // Used, not merely written, is what keeps it from being pruned.
+    crate::cache::used(&dir);
     Some(path).filter(|p| p.is_file())
 }
 

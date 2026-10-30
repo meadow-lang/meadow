@@ -2069,6 +2069,32 @@ fn every_kind_of_cycle_is_collected_by_either_collector() {
     }
 }
 
+/// Three knots of a `Ref` and a node each, two of them pointing into the
+/// third: let go of together, all three `Ref`s are candidates in one run of
+/// trial deletion, and each of the two walks of its collect pass reaches the
+/// third knot. The first frees it; the second must not take what it finds
+/// there, a block back in its size class, for part of the garbage again.
+#[test]
+fn trial_deletion_frees_a_cycle_two_candidates_reach_once() {
+    let src = "data L = Nil | Node Int (Ref L) (Ref L)
+         use L.*
+         fun knot (n : Int) =
+           let c = newRef Nil in
+           let _ = setRef c (Node n c c) in
+           let x = newRef Nil in
+           let _ = setRef x (Node n x c) in
+           let y = newRef Nil in
+           let _ = setRef y (Node n y c) in
+           ()
+         fun many (n : Int) : Int ! Mut = if n == 0 then 0 else let _ = knot n in many (n - 1)
+         def result = many 20000";
+    for how in [Cycles::Trial, Cycles::Tracing] {
+        let (got, stderr) = run_mode("shared_knot", src, how, &[]);
+        assert_eq!(got, "0", "under {how:?}");
+        assert_eq!(live_at_exit(&stderr), 0, "under {how:?}: {stderr}");
+    }
+}
+
 #[test]
 fn a_trace_runs_while_the_program_does() {
     // Forty thousand knots of two blocks each: the heap doubles past the

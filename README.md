@@ -221,6 +221,13 @@ depends on. The next build reads back each one whose fingerprint still matches,
 so an edit recompiles only the package changed and those downstream of it.
 `MEADOW_INCREMENTAL=0` turns this off.
 
+`meadow clean` removes a package's `target/`. The toolchain keeps a cache of its
+own in `~/.meadow/lib`: the runtime library a native build links, and the
+compiled `Std`, one directory for each build of `meadow` that wrote them. Each
+`meadow` removes, once a day, those that other builds wrote and nothing has used
+for a week; `meadow clean --cache` removes all but its own at once (see
+[docs/RUNTIME.md](docs/RUNTIME.md#aot-executables)).
+
 Packages developed together can be a **workspace**, as in Cargo: a root
 `Meadow.toml` with `[workspace] members = ["app", "libs/*"]`, whose members
 share one `target/`, the root's `[profile.*]`, and a version and dependencies
