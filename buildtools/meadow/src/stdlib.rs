@@ -231,7 +231,13 @@ fn precompiled(opts: Options) -> Option<Vec<(&'static str, CompiledPackage)>> {
 
 /// The modules an earlier run of this toolchain compiled for `opts`.
 fn cached(opts: Options) -> Option<Vec<(&'static str, CompiledPackage)>> {
-    decode(&std::fs::read(cache_file(opts)?).ok()?)
+    // Each `meadow` built from other sources keeps its own compile here, so
+    // this is where they pile up -- see `cache`.
+    crate::cache::auto();
+    let path = cache_file(opts)?;
+    let modules = decode(&std::fs::read(&path).ok()?)?;
+    crate::cache::used(path.parent()?);
+    Some(modules)
 }
 
 /// Keep `modules` for every later run of this toolchain. Whole or not at all,

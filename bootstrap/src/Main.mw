@@ -321,6 +321,7 @@ cli! {
       {
         path : Maybe String "The package, or a workspace, whose `target` to remove"
         profile : Option String "Only this profile's, rather than all of them" value "NAME"
+        cache : Flag "Remove other `meadow` builds' runtime libraries and compiled `Std` from `~/.meadow/lib`, rather than a package's `target`"
         dryRun : Flag "Say what would be removed without removing it"
       }
     | update
