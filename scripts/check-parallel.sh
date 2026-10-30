@@ -124,6 +124,11 @@ if (cd buildtools && CARGO_TARGET_DIR="$WORK/cli" cargo build --quiet -p meadow)
     job "example-$(basename "$example")" "$M" test "$example"
   done
   job fmt "$M" fmt --check lib/Std examples
+  # Every Meadow source, as the language server sees it: see `check.sh`.
+  job lsp bash -c '
+    mapfile -t sources < <(git ls-files "*.mw" | grep -v -e "^bootstrap/tests/lex/" -e "^bootstrap/tests/parse/" -e "^bootstrap/tests/rename/Cfg/")
+    "$1" lsp --check "${sources[@]}"
+  ' lsp "$M"
 
   # The collector under pressure, as `check.sh` has it: once with marking on
   # its own threads, once on the program's. The examples are copies, since

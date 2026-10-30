@@ -111,19 +111,13 @@ pub fn serve(
     load_package: Option<PackageLoader>,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
     handshake(connection)?;
-    let std_decls = std_packages
-        .iter()
-        .flat_map(|p| meadow_find::collect::package(p, Default::default()))
-        .collect();
-    let mut server = Server {
-        std_decls,
-        std: Std::new(std_packages, std_modules, std_src_root, std_sources),
-        docs: HashMap::new(),
-        indexes: HashMap::new(),
+    let mut server = Server::new(
+        std_packages,
+        std_modules,
+        std_src_root,
+        std_sources,
         load_package,
-        memory: Default::default(),
-        stale: Default::default(),
-    };
+    );
     // Two threads. This one analyses, which for a package with macros to
     // expand is seconds of work for each change; the other reads what the
     // editor sends and answers what needs no analysis -- formatting -- at
@@ -134,6 +128,91 @@ pub fn serve(
         threads.spawn(move || route(connection, forward));
         server.main_loop(connection, inbox)
     })
+}
+
+/// What the server says of each of `files` -- read from disk, and opened one
+/// after another as an editor opens them, through the same analysis -- with
+/// what it was given as [`serve`] is. What `meadow lsp --check` reports: a
+/// file the editor would mark is one this finds.
+pub fn check(
+    std_packages: Vec<CompiledPackage>,
+    std_modules: Vec<(String, CompiledPackage)>,
+    std_src_root: Option<std::path::PathBuf>,
+    std_sources: &[(&str, &str)],
+    load_package: Option<PackageLoader>,
+    files: &[std::path::PathBuf],
+    each: &mut dyn FnMut(&std::path::Path, &[Diagnostic]),
+) {
+    let mut server = Server::new(
+        std_packages,
+        std_modules,
+        std_src_root,
+        std_sources,
+        load_package,
+    );
+    // A package's files, analysed together: each file's analysis compiles
+    // the whole package, and with every file as it is on disk each would
+    // come to the same, so the one compile answers for all of them.
+    let mut known: HashMap<std::path::PathBuf, Vec<Diagnostic>> = HashMap::new();
+    for file in files {
+        let path = std::fs::canonicalize(file).unwrap_or_else(|_| file.clone());
+        if let Some(ds) = known.remove(&path) {
+            each(file, &ds);
+            continue;
+        }
+        let in_std = path_to_uri(&path).is_some_and(|u| server.std.module_at(u.as_str()).is_some());
+        if !in_std
+            && let Some(load) = server.load_package
+            && let Some(Ok(sources)) = load(&path)
+        {
+            for (f, ds) in server.std.package_diagnostics(&sources) {
+                let text = sources
+                    .modules
+                    .iter()
+                    .find(|m| m.file == f)
+                    .map_or("", |m| m.text.as_str());
+                let index = LineIndex::new(text);
+                let ds = ds
+                    .iter()
+                    .map(|d| {
+                        let (start, end) = index.range(d.label.1);
+                        Diagnostic {
+                            range: Range {
+                                start: Position::new(start.0, start.1),
+                                end: Position::new(end.0, end.1),
+                            },
+                            severity: Some(DiagnosticSeverity::ERROR),
+                            source: Some("meadow".into()),
+                            message: d.msg.clone(),
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+                let f = std::fs::canonicalize(&f).unwrap_or(f);
+                known.insert(f, ds);
+            }
+            if let Some(ds) = known.remove(&path) {
+                each(file, &ds);
+                continue;
+            }
+        }
+        let (Some(uri), Ok(text)) = (path_to_uri(&path), std::fs::read_to_string(&path)) else {
+            each(
+                file,
+                &[Diagnostic {
+                    message: "this file cannot be read".into(),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    ..Default::default()
+                }],
+            );
+            continue;
+        };
+        server.set(uri.clone(), text);
+        each(file, &server.publish(&uri));
+        // Closed again, as an editor closes it: nothing of it is kept for the
+        // next.
+        server.docs.remove(&uri);
+    }
 }
 
 /// Read what the editor sends, answer a formatting request from the text of
@@ -338,6 +417,28 @@ struct Server {
 }
 
 impl Server {
+    fn new(
+        std_packages: Vec<CompiledPackage>,
+        std_modules: Vec<(String, CompiledPackage)>,
+        std_src_root: Option<std::path::PathBuf>,
+        std_sources: &[(&str, &str)],
+        load_package: Option<PackageLoader>,
+    ) -> Server {
+        let std_decls = std_packages
+            .iter()
+            .flat_map(|p| meadow_find::collect::package(p, Default::default()))
+            .collect();
+        Server {
+            std_decls,
+            std: Std::new(std_packages, std_modules, std_src_root, std_sources),
+            docs: HashMap::new(),
+            indexes: HashMap::new(),
+            load_package,
+            memory: Default::default(),
+            stale: Default::default(),
+        }
+    }
+
     fn main_loop(
         &mut self,
         c: &Connection,

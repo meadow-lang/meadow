@@ -119,7 +119,7 @@ fn mutation_inside_run_st_leaves_a_pure_type() {
 fn other_effects_pass_through() {
     // `St` is removed and nothing else is: a `Ref` touched inside keeps `Mut`.
     let src = "fun f u = runSt (\\() -> let r = stNewRef 0 in let c = newRef 5 in let _ = stSetRef r (getRef c) in stGetRef r)\n";
-    assert_eq!(scheme_of(src, "f"), "forall a n r. a -> n ! { Mut | r }");
+    assert_eq!(scheme_of(src, "f"), "forall a n e. a -> n ! { Mut | e }");
 }
 
 #[test]

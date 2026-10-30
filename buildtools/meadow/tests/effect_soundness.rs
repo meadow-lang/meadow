@@ -241,7 +241,7 @@ fn handling_one_effect_leaves_the_other() {
     let src = format!("{LOG_AND_ASK}fun quiet () = handle work () with {{ log m k -> k () }}\n");
     assert_eq!(
         scheme_of(&src, "quiet"),
-        "forall r. () -> Int ! { Ask | r }"
+        "forall e. () -> Int ! { Ask | e }"
     );
 }
 

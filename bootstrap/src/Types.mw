@@ -564,7 +564,11 @@ fun rewriteRow (ar : Arena s) (row : Type) (label : String) (want : Type)
         let saved = stGetRef ar.level in
         let u = stSetRef ar.level (slotLevel ar id) in
         let field = fresh ar in
-        let newRest = freshRow ar in
+        -- The rest is the same kind of row: an effect's tail stays an
+        -- effect's, or it prints, and quantifies, as a record's.
+        let newRest = (match slotKind ar id with
+          | Effect -> freshEffect ar
+          | _ -> freshRow ar) in
         let v = stSetRef ar.level saved in
         (match requireLacks ar newRest ls with
          | Err x -> Err x
