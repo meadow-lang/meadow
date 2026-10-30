@@ -104,7 +104,9 @@ cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- fmt --check
 # rename test reads, which is wrong on purpose everywhere but Windows. The
 # release workflow runs the same with each binary it builds.
 step "meadow lsp --check (every Meadow source an editor opens)"
-mapfile -t sources < <(git ls-files '*.mw' | grep -v -e '^bootstrap/tests/lex/' -e '^bootstrap/tests/parse/' -e '^bootstrap/tests/rename/Cfg/')
+# A loop, not `mapfile`: macOS ships bash 3.2, which has none.
+sources=()
+while IFS= read -r f; do sources+=("$f"); done < <(git ls-files '*.mw' | grep -v -e '^bootstrap/tests/lex/' -e '^bootstrap/tests/parse/' -e '^bootstrap/tests/rename/Cfg/')
 cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- lsp --check "${sources[@]}"
 
 # --- the editor extension ----------------------------------------------------

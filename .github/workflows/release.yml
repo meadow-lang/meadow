@@ -226,7 +226,9 @@ jobs:
           # gets, and `check.sh` runs a `meadow` built from the checkout,
           # which has none of it. MeadowBoot's dependencies are fetched.
           cd "$GITHUB_WORKSPACE"
-          mapfile -t sources < <(git ls-files '*.mw' | grep -v -e '^bootstrap/tests/lex/' -e '^bootstrap/tests/parse/' -e '^bootstrap/tests/rename/Cfg/')
+          # A loop, not `mapfile`: macOS ships bash 3.2, which has none.
+          sources=()
+          while IFS= read -r f; do sources+=("$f"); done < <(git ls-files '*.mw' | grep -v -e '^bootstrap/tests/lex/' -e '^bootstrap/tests/parse/' -e '^bootstrap/tests/rename/Cfg/')
           MEADOW_HOME="$RUNNER_TEMP/lsp-home" "$bin" lsp --check "${sources[@]}"
 
       # `meadowup`, the toolchain manager, and on Windows the double-clickable
