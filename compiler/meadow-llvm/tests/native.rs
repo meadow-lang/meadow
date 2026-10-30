@@ -587,6 +587,304 @@ fn a_thread_waits_inside_two_handlers() {
     );
 }
 
+// --- cancellation ------------------------------------------------------------
+//
+// A cancelled thread fails at its next thread operation, and a waiting one is
+// woken to fail: see `meadow_core::thread`. Each program is run on one worker,
+// where a spawned thread waits for `main` to stop before it starts, and on
+// every core, where it does not; the answers are arranged to be the same.
+
+// `Std.Stm`'s handlers, as `glade/tests/differential.rs` has them: these
+// programs are compiled without the standard library.
+const STM: &str = "use Maybe.*\ndata Maybe a = None | Just a
+    effect Stm { retrySignal : () -> (), conflictSignal : () -> () }
+    use Attempt.*\ndata Attempt a = Done a | Retried | Conflicted
+    fun unreachable u = unreachable u
+    fun readTVar tv = match stmRead tv with | Just x -> x | None -> let _ = conflictSignal () in unreachable ()
+    fun retry u = let _ = retrySignal () in unreachable ()
+    fun atomically (f : () -> a ! { Stm }) =
+      let _ = stmBegin () in
+      match handle Done (f ()) with { retrySignal u k -> Retried, conflictSignal u k -> Conflicted } with
+      | Done x -> if stmCommit () then x else atomically f
+      | Retried -> let _ = stmWait () in atomically f
+      | Conflicted -> atomically f\n";
+
+/// Compile `src`, run it under the leak check once per worker count, and
+/// answer each run: whether it succeeded, what it printed, and its stderr.
+#[track_caller]
+fn run_cancelling(name: &str, src: &str, env: &[(&str, &str)]) -> Vec<(bool, String, String)> {
+    let prog = program(src);
+    let lowered = meadow_seq::lower_program(&prog, meadow_core::OptLevel::O2);
+    assert!(lowered.unsupported.is_empty(), "{:?}", lowered.unsupported);
+    let units =
+        meadow_llvm::compile_split(&lowered.program, usize::MAX, meadow_llvm::CallConv::host())
+            .unwrap_or_else(|e| panic!("{}", e.msg));
+    let dir = std::env::temp_dir().join("meadow-llvm-tests").join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let paths: Vec<PathBuf> = units
+        .iter()
+        .enumerate()
+        .map(|(i, ll)| {
+            let path = dir.join(format!("prog{i}.ll"));
+            std::fs::write(&path, &ll.text).unwrap();
+            path
+        })
+        .collect();
+    let exe = dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
+    let out = Command::new("clang")
+        .args(["-O2", "-Wno-override-module", "-o"])
+        .arg(&exe)
+        .args(&paths)
+        .arg(runtime())
+        .args(system_libs())
+        .output()
+        .expect("clang runs");
+    assert!(
+        out.status.success(),
+        "clang failed on {}:\n{}",
+        paths[0].display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    ["1", "8"]
+        .iter()
+        .map(|workers| {
+            let mut cmd = Command::new(&exe);
+            cmd.env("MEADOW_SILO_LEAKS", "1")
+                .env("MEADOW_THREADS", workers);
+            for (k, v) in env {
+                cmd.env(k, v);
+            }
+            let ran = cmd.output().expect("the program runs");
+            (
+                ran.status.success(),
+                String::from_utf8_lossy(&ran.stdout).trim_end().to_string(),
+                String::from_utf8_lossy(&ran.stderr).to_string(),
+            )
+        })
+        .collect()
+}
+
+/// [`run_cancelling`], for a program that must fail with `want` every time.
+#[track_caller]
+fn fails_cancelling(name: &str, src: &str, want: &str) {
+    for (ok, _, stderr) in run_cancelling(name, src, &[]) {
+        assert!(!ok, "{name} should have failed");
+        assert_eq!(stderr.trim_end(), want, "{name}");
+    }
+}
+
+/// [`run_cancelling`], for a program that must answer `want` every time, and
+/// leave nothing behind: no block live, and on one worker -- where the threads
+/// it cancelled run, and end, before `main` runs again after it yields -- no
+/// segment either. On eight, a thread may still be on its way out when `main`
+/// ends the program, its segments with it.
+#[track_caller]
+fn answers_cancelling(name: &str, src: &str, want: &str, env: &[(&str, &str)]) -> Vec<String> {
+    run_cancelling(name, src, env)
+        .into_iter()
+        .enumerate()
+        .map(|(i, (ok, got, stderr))| {
+            assert!(ok, "{name} failed: {stderr}");
+            assert_eq!(got, want, "{name}");
+            assert_eq!(live_at_exit(&stderr), 0, "{name}: {stderr}");
+            if i == 0 {
+                assert_eq!(
+                    said(&stderr, " segments live at exit"),
+                    Some(0),
+                    "{name}: {stderr}"
+                );
+            }
+            stderr
+        })
+        .collect()
+}
+
+#[test]
+fn a_cancelled_thread_fails_and_so_does_its_await() {
+    let cancelled = meadow_core::thread::CANCELLED;
+    // On a channel: waiting, or not yet there.
+    fails_cancelling(
+        "cancel_receive",
+        "def result =
+           let ch = channelNew () in
+           let t = threadSpawn (\\() -> channelReceive ch + toInt 1) in
+           let _ = threadCancel t in
+           let _ = channelSend ch (toInt 1) in
+           threadAwait t",
+        cancelled,
+    );
+    // On a thread that never finishes: only the cancel ends the wait.
+    fails_cancelling(
+        "cancel_await",
+        "def result =
+           let gate = channelNew () in
+           let blocker = threadSpawn (\\() -> channelReceive gate) in
+           let waiter = threadSpawn (\\() -> threadAwait blocker + toInt 1) in
+           let _ = threadYield () in
+           let _ = threadCancel waiter in
+           threadAwait waiter",
+        cancelled,
+    );
+    // In a transaction's `retry`, on a `TVar` nobody writes.
+    fails_cancelling(
+        "cancel_retry",
+        &format!(
+            "{STM}def result =
+               let box = stmNewIO (toInt 0) in
+               let t = threadSpawn (\\() -> atomically (\\() -> if readTVar box == 0 then retry () else readTVar box)) in
+               let _ = threadYield () in
+               let _ = threadCancel t in
+               threadAwait t"
+        ),
+        cancelled,
+    );
+    // Under two handlers, neither of which can catch it.
+    fails_cancelling(
+        "cancel_in_handlers",
+        "effect Ask { ask : () -> Int }
+         effect Exn { throw : Int -> () }
+         def result =
+           let ch = channelNew () in
+           let t = threadSpawn (\\() ->
+             handle
+               (handle (let x = channelReceive ch in x + ask ())
+                with { ask u k -> k 1 + 100, return r -> r * 1000 })
+             with { throw e k -> 0 - 1 }) in
+           let _ = threadYield () in
+           let _ = threadCancel t in
+           threadAwait t",
+        cancelled,
+    );
+    // Asking does not use the cancel up: the next operation still fails.
+    fails_cancelling(
+        "cancel_after_asking",
+        "fun spin (n : Int) = if threadCancelled () then let _ = threadYield () in n else spin (n + 1)
+         def result =
+           let t = threadSpawn (\\() -> spin 0) in
+           let _ = threadCancel t in
+           threadAwait t",
+        cancelled,
+    );
+}
+
+/// Waiting threads of every kind cancelled at once -- on a channel, on
+/// another thread, in `retry`, inside a handler -- each holding a list of its
+/// own. Each is woken and fails, its heap let go whole; `main` takes back the
+/// message none of them may have taken, and goes on.
+const CANCEL_MANY: &str = "use L.*\ndata L = Nil | Cons Int L
+     use Ts.*\ndata Ts = End | More (Task Int) Ts
+     effect Ask { ask : () -> Int }
+     fun build (n : Int) = if n == 0 then Nil else Cons n (build (n - 1))
+     fun len xs = match xs with | Nil -> toInt 0 | Cons _ r -> 1 + len r
+     fun cancelAll ts = match ts with | End -> () | More t rest -> let _ = threadCancel t in cancelAll rest
+     fun yields (n : Int) = if n == 0 then () else let _ = threadYield () in yields (n - 1)
+     fun readers gate (n : Int) acc = if n == 0 then acc else
+       readers gate (n - 1) (More (threadSpawn (\\() -> let xs = build 50 in channelReceive gate + len xs)) acc)
+     fun waiters blocker (n : Int) acc = if n == 0 then acc else
+       waiters blocker (n - 1) (More (threadSpawn (\\() ->
+         handle (let xs = build 50 in threadAwait blocker + len xs + ask ()) with { ask u k -> k 1 })) acc)
+     fun retriers box (n : Int) acc = if n == 0 then acc else
+       retriers box (n - 1) (More (threadSpawn (\\() ->
+         let xs = build 50 in atomically (\\() -> if readTVar box == 0 then retry () else readTVar box) + len xs)) acc)
+     def result =
+       let gate = channelNew () in
+       let hold = channelNew () in
+       let box = stmNewIO (toInt 0) in
+       let blocker = threadSpawn (\\() -> channelReceive hold) in
+       let rs = readers gate 100 End in
+       let ws = waiters blocker 100 End in
+       let ts = retriers box 100 End in
+       let _ = yields 3 in
+       let _ = cancelAll rs in
+       let _ = cancelAll ws in
+       let _ = cancelAll ts in
+       let _ = channelSend gate (toInt 42) in
+       let mine = channelReceive gate in
+       let _ = channelSend hold (toInt 1) in
+       let _ = atomically (\\() -> stmWrite box 5) in
+       let _ = yields 3 in
+       (mine, threadAwait blocker, atomically (\\() -> readTVar box))";
+
+#[test]
+fn many_threads_cancelled_at_once_leave_nothing_behind() {
+    let src = format!("{STM}{CANCEL_MANY}");
+    answers_cancelling("cancel_many", &src, "(42, 1, 5)", &[]);
+    for stderr in answers_cancelling(
+        "cancel_many_poisoned",
+        &src,
+        "(42, 1, 5)",
+        &[("MEADOW_SILO_POISON", "ptr")],
+    ) {
+        poison_clean(&stderr);
+    }
+}
+
+#[test]
+fn a_cancel_a_thread_deals_with_itself_changes_nothing_else() {
+    // Finished before it was cancelled; and asking, and returning what it
+    // had -- which spares it being ended at a safe point.
+    let src = "fun spin (n : Int) = if threadCancelled () then n else spin (n + 1)
+         def result =
+           let done = threadSpawn (\\() -> toInt 7) in
+           let first = threadAwait done in
+           let _ = threadCancel done in
+           let _ = threadCancel done in
+           let asks = threadSpawn (\\() -> spin 0) in
+           let _ = threadCancel asks in
+           (first, threadAwait done, threadAwait asks >= 0, threadCancelled ())";
+    answers_cancelling("cancel_unnoticed", src, "(7, 7, True, False)", &[]);
+}
+
+#[test]
+fn a_thread_in_a_pure_loop_is_ended_at_a_safe_point() {
+    let cancelled = meadow_core::thread::CANCELLED;
+    // Alone: nothing else is ready, so only the cancel has it look.
+    fails_cancelling(
+        "cancel_pure_loop",
+        "fun spin (n : Int) : Int = spin (n + 1)
+         def result =
+           let t = threadSpawn (\\() -> spin 0) in
+           let _ = threadYield () in
+           let _ = threadCancel t in
+           threadAwait t",
+        cancelled,
+    );
+    // Inside a handler, whose segment goes with it.
+    fails_cancelling(
+        "cancel_pure_loop_in_handler",
+        "effect Ask { ask : () -> Int }
+         fun spin (n : Int) : Int = spin (n + 1)
+         def result =
+           let t = threadSpawn (\\() -> handle spin 0 with { ask u k -> k 1 }) in
+           let _ = threadYield () in
+           let _ = threadCancel t in
+           threadAwait t",
+        cancelled,
+    );
+}
+
+#[test]
+fn threads_ended_at_safe_points_leave_nothing_behind() {
+    // Twenty threads in loops that hold lists, cancelled; `main` works on a
+    // while, and its answer is all there is to see.
+    let src = "use L.*\ndata L = Nil | Cons Int L
+         use Ts.*\ndata Ts = End | More (Task Int) Ts
+         fun fib (n : Int) : Int = if n < 2 then n else fib (n - 1) + fib (n - 2)
+         fun build (n : Int) = if n == 0 then Nil else Cons n (build (n - 1))
+         fun len xs = match xs with | Nil -> toInt 0 | Cons _ r -> 1 + len r
+         fun churn (n : Int) : Int = churn (len (build 20) + n % 7)
+         fun loopers (n : Int) acc = if n == 0 then acc else loopers (n - 1) (More (threadSpawn (\\() -> churn n)) acc)
+         fun cancelAll ts = match ts with | End -> () | More t rest -> let _ = threadCancel t in cancelAll rest
+         fun wait (k : Int) (acc : Int) = if k == 0 then acc else let _ = threadYield () in wait (k - 1) (acc + fib 22)
+         def result =
+           let ts = loopers 20 End in
+           let _ = threadYield () in
+           let _ = cancelAll ts in
+           wait 40 0";
+    answers_cancelling("cancel_loopers", src, "708440", &[]);
+}
+
 // --- cycles ------------------------------------------------------------------
 //
 // Counting alone leaves a cycle behind, so the runtime collects them by trial

@@ -327,6 +327,9 @@ pub unsafe extern "C" fn meadow_native(
         )
     };
     let effect = meadow_rt::spelling(&effect).to_string();
+    // Where a cancelled thread stops, as at a thread operation: see
+    // `meadow_core::thread`.
+    crate::sched::notice_cancel();
     let arg = val(arg, d);
     let built = match effect.as_str() {
         "Test" if op == "fail" => fail(show::displayed(arg.word(), d)),

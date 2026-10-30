@@ -1941,6 +1941,284 @@ fn waiting_on_a_tvar_nobody_writes_is_a_deadlock() {
     );
 }
 
+// --- cancellation ----------------------------------------------------------------
+
+// A cancelled thread fails at its next thread operation, and only there: see
+// `meadow_core::thread`. Most of these cancel a thread that is held up by
+// something only `main` can let go of, so it has either not got there yet --
+// and fails on arriving -- or is waiting there and is woken to fail: the same
+// answer whatever the interleaving.
+
+fn cancelled() -> Result<String, String> {
+    Err(meadow_core::thread::CANCELLED.into())
+}
+
+/// [`threads_agree`], on the VM and the JIT with one worker only: where the
+/// answer depends on a spawned thread not having started before `main`'s next
+/// few steps, which is so when nothing else can run it.
+#[track_caller]
+fn one_worker_agrees(src: &str) -> Result<String, String> {
+    let prog = program(src);
+    let want = meadow_eval::run(&prog)
+        .map(|v| v.to_string())
+        .map_err(|e| e.msg);
+    for opt in LEVELS {
+        let lowered = meadow_seq::lower_program(&prog, opt);
+        assert!(lowered.unsupported.is_empty(), "{:?}", lowered.unsupported);
+        let image = meadow_codegen::compile(&lowered.program).expect("codegen");
+        let got = meadow_glade::sched::run_with(&image, image.entry.unwrap(), FUEL, 1)
+            .result
+            .map_err(|e| e.msg);
+        assert_eq!(want, got, "CEK vs VM at {}\n{src}", opt.name());
+        assert_eq!(want, jit(&image, 1), "CEK vs JIT at {}\n{src}", opt.name());
+    }
+    want
+}
+
+#[test]
+fn every_thread_operation_fails_in_a_cancelled_thread() {
+    // Cancelled before it starts, so the operation is the first it makes.
+    for op in [
+        "threadYield ()",
+        "channelNew ()",
+        "channelSend ch (toInt 1)",
+        "channelReceive ch",
+        "threadSpawn (\\() -> toInt 0)",
+        "threadAwait other",
+        "threadCancel other",
+    ] {
+        let src = format!(
+            "def result =
+               let ch = channelNew () in
+               let other = threadSpawn (\\() -> toInt 0) in
+               let t = threadSpawn (\\() -> let _ = {op} in toInt 1) in
+               let _ = threadCancel t in
+               threadAwait t"
+        );
+        assert_eq!(one_worker_agrees(&src), cancelled(), "{op}");
+    }
+}
+
+#[test]
+fn a_cancelled_receiver_is_woken_to_fail() {
+    let src = format!(
+        "{FIB_INT}def result =
+           let ch = channelNew () in
+           let t = threadSpawn (\\() -> let x = fib 15 in channelReceive ch + x) in
+           let _ = threadCancel t in
+           let _ = channelSend ch (toInt 1) in
+           threadAwait t"
+    );
+    assert_eq!(threads_agree(&src), cancelled());
+    // Nothing is ever sent: unless the cancel wakes it, this is a deadlock.
+    let src = "def result =
+                 let ch = channelNew () in
+                 let t = threadSpawn (\\() -> channelReceive ch + toInt 1) in
+                 let _ = threadYield () in
+                 let _ = threadCancel t in
+                 threadAwait t";
+    assert_eq!(threads_agree(src), cancelled());
+}
+
+#[test]
+fn a_thread_cancelled_while_it_awaits_another_is_woken_to_fail() {
+    // `blocker` never finishes: only the cancel can end `waiter`'s wait.
+    let src = "def result =
+                 let gate = channelNew () in
+                 let blocker = threadSpawn (\\() -> channelReceive gate) in
+                 let waiter = threadSpawn (\\() -> threadAwait blocker + toInt 1) in
+                 let _ = threadYield () in
+                 let _ = threadCancel waiter in
+                 threadAwait waiter";
+    assert_eq!(threads_agree(src), cancelled());
+    // And when it does finish, after the cancel, `waiter` still failed: its
+    // wait was over before there was an answer to take.
+    let src = "def result =
+                 let gate = channelNew () in
+                 let blocker = threadSpawn (\\() -> channelReceive gate) in
+                 let waiter = threadSpawn (\\() -> threadAwait blocker + toInt 1) in
+                 let _ = threadCancel waiter in
+                 let _ = channelSend gate (toInt 41) in
+                 (threadAwait blocker, threadAwait waiter)";
+    assert_eq!(threads_agree(src), cancelled());
+}
+
+#[test]
+fn a_thread_cancelled_in_retry_is_woken_to_fail() {
+    let src = format!(
+        "{STM}def result =
+           let box = stmNewIO (toInt 0) in
+           let t = threadSpawn (\\() -> atomically (\\() -> if readTVar box == 0 then retry () else readTVar box)) in
+           let _ = threadYield () in
+           let _ = threadCancel t in
+           threadAwait t"
+    );
+    assert_eq!(threads_agree(&src), cancelled());
+    // A commit after the cancel finds nobody waiting to wake -- and one the
+    // thread sees before it ever waits sends it to wait all the same, which
+    // is where it fails. A transaction that does not wait is not a place a
+    // thread is stopped.
+    let src = format!(
+        "{STM}def result =
+           let box = stmNewIO (toInt 0) in
+           let t = threadSpawn (\\() -> atomically (\\() -> if readTVar box < 10 then retry () else readTVar box)) in
+           let _ = threadCancel t in
+           let _ = atomically (\\() -> stmWrite box 5) in
+           (atomically (\\() -> readTVar box), threadAwait t)"
+    );
+    assert_eq!(threads_agree(&src), cancelled());
+}
+
+#[test]
+fn cancelling_a_finished_thread_changes_nothing() {
+    let src = "def result =
+                 let t = threadSpawn (\\() -> toInt 7) in
+                 let a = threadAwait t in
+                 let _ = threadCancel t in
+                 let _ = threadCancel t in
+                 (a, threadAwait t)";
+    assert_eq!(threads_agree(src), Ok("(7, 7)".into()));
+    // A failure stays the failure it was.
+    let src = "def result =
+                 let t = threadSpawn (\\() -> toInt 1 / toInt 0) in
+                 let gate = channelNew () in
+                 let w = threadSpawn (\\() -> let _ = threadAwait t in channelReceive gate) in
+                 let _ = threadYield () in
+                 let _ = threadCancel t in
+                 threadAwait t";
+    assert_eq!(threads_agree(src), Err("division by zero".into()));
+}
+
+#[test]
+fn cancelling_twice_is_cancelling_once() {
+    let src = "def result =
+                 let ch = channelNew () in
+                 let t = threadSpawn (\\() -> channelReceive ch) in
+                 let _ = threadCancel t in
+                 let _ = threadCancel t in
+                 let _ = channelSend ch (toInt 1) in
+                 let _ = threadCancel t in
+                 threadAwait t";
+    assert_eq!(threads_agree(src), cancelled());
+}
+
+#[test]
+fn a_thread_in_a_pure_loop_is_ended_at_a_preemption_point() {
+    // No operation in it, so nowhere to stop softly; it is preempted, and
+    // the second time after the cancel it is ended there.
+    let src = "fun spin (n : Int) : Int = spin (n + 1)
+               def result =
+                 let t = threadSpawn (\\() -> spin 0) in
+                 let _ = threadCancel t in
+                 threadAwait t";
+    assert_eq!(threads_agree(src), cancelled());
+    // Under a handler it never performs, the same.
+    let src = "effect Ask { ask : () -> Int }
+               fun spin (n : Int) : Int = spin (n + 1)
+               def result =
+                 let t = threadSpawn (\\() -> handle spin 0 with { ask u k -> k 1 }) in
+                 let _ = threadYield () in
+                 let _ = threadCancel t in
+                 threadAwait t";
+    assert_eq!(threads_agree(src), cancelled());
+}
+
+#[test]
+fn a_thread_can_ask_whether_it_was_cancelled() {
+    // It asks until it is, then returns: that is its answer, not a failure.
+    let src = "fun spin (n : Int) = if threadCancelled () then n else spin (n + 1)
+               def result =
+                 let t = threadSpawn (\\() -> spin 0) in
+                 let _ = threadCancel t in
+                 threadAwait t >= 0";
+    assert_eq!(threads_agree(src), Ok("True".into()));
+    // Nobody is, unasked -- `main` included.
+    let src =
+        "def result = (threadCancelled (), threadAwait (threadSpawn (\\() -> threadCancelled ())))";
+    assert_eq!(threads_agree(src), Ok("(False, False)".into()));
+    // Asking does not use the cancel up: the next operation still fails.
+    let src = "fun spin (n : Int) = if threadCancelled () then let _ = threadYield () in n else spin (n + 1)
+               def result =
+                 let t = threadSpawn (\\() -> spin 0) in
+                 let _ = threadCancel t in
+                 threadAwait t";
+    assert_eq!(threads_agree(src), cancelled());
+}
+
+#[test]
+fn a_thread_may_cancel_itself() {
+    let src = "def result =
+                 let ch = channelNew () in
+                 let t = threadSpawn (\\() ->
+                   let me = channelReceive ch in
+                   let _ = threadCancel me in
+                   threadCancelled ()) in
+                 let _ = channelSend ch t in
+                 threadAwait t";
+    assert_eq!(threads_agree(src), Ok("True".into()));
+}
+
+#[test]
+fn no_handler_in_the_thread_catches_the_cancel() {
+    // An exception handler around the work, and a handler whose operation the
+    // thread was cancelled under: the thread fails through both, and the
+    // `return` clause never runs.
+    let src = "effect Ask { ask : () -> Int }
+               effect Exn { throw : Int -> () }
+               def result =
+                 let ch = channelNew () in
+                 let t = threadSpawn (\\() ->
+                   handle
+                     (handle (let x = channelReceive ch in x + ask ())
+                      with { ask u k -> k 1 + 100, return r -> r * 1000 })
+                   with { throw e k -> 0 - 1 }) in
+                 let _ = threadCancel t in
+                 let _ = channelSend ch (toInt 41) in
+                 threadAwait t";
+    assert_eq!(threads_agree(src), cancelled());
+    // Cancelled while a handler's clause waits.
+    let src = "effect Ask { ask : () -> Int }
+               def result =
+                 let ch = channelNew () in
+                 let t = threadSpawn (\\() ->
+                   handle (ask () + 1) with { ask u k -> k (channelReceive ch) }) in
+                 let _ = threadCancel t in
+                 let _ = channelSend ch (toInt 41) in
+                 threadAwait t";
+    assert_eq!(threads_agree(src), cancelled());
+}
+
+#[test]
+fn many_threads_cancelled_at_once_all_let_go() {
+    // Two hundred readers, waiting or not yet started, all cancelled. If any
+    // were still among the channel's receivers, the message would go to it
+    // and `main` would wait for ever.
+    let src = "use Ts.*\ndata Ts = End | More (Task Int) Ts
+               fun readers gate (n : Int) acc = if n == 0 then acc else
+                 readers gate (n - 1) (More (threadSpawn (\\() -> channelReceive gate + n)) acc)
+               fun cancelAll ts = match ts with | End -> () | More t rest -> let _ = threadCancel t in cancelAll rest
+               def result =
+                 let gate = channelNew () in
+                 let ts = readers gate 200 End in
+                 let _ = threadYield () in
+                 let _ = cancelAll ts in
+                 let _ = channelSend gate (toInt 42) in
+                 channelReceive gate";
+    assert_eq!(threads_agree(src), Ok("42".into()));
+    // Each of them fails, and `await` says so.
+    let src = "use Ts.*\ndata Ts = End | More (Task Int) Ts
+               fun readers gate (n : Int) acc = if n == 0 then acc else
+                 readers gate (n - 1) (More (threadSpawn (\\() -> channelReceive gate + n)) acc)
+               fun cancelAll ts = match ts with | End -> () | More t rest -> let _ = threadCancel t in cancelAll rest
+               fun sumAll ts acc = match ts with | End -> acc | More t rest -> sumAll rest (acc + threadAwait t)
+               def result =
+                 let gate = channelNew () in
+                 let ts = readers gate 200 End in
+                 let _ = cancelAll ts in
+                 sumAll ts 0";
+    assert_eq!(threads_agree(src), cancelled());
+}
+
 // --- typed instructions --------------------------------------------------------
 
 // Operands the compiler knows are both `Int`, or both `Float`, run as typed
