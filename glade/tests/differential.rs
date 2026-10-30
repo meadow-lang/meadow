@@ -2548,6 +2548,25 @@ fn what_a_handler_drops_is_released_when_the_thread_ends() {
 }
 
 #[test]
+fn a_thread_that_took_the_cancel_on_itself_keeps_it_across_a_release() {
+    // It asks, is told, then ends a bracket -- its release run in place --
+    // and computes on: still on its own terms, not ended at a preemption
+    // point, and what it returns is its answer.
+    let src = format!(
+        "{RELEASE}fun waitAsked (u : ()) = if threadCancelled () then () else waitAsked u
+         fun count (n : Int) : Int = if n == 0 then 0 else count (n - 1)
+         def result =
+           let t = threadSpawn (\\() ->
+             let _ = waitAsked () in
+             let x = bracket (\\() -> 5) (\\n -> ()) (\\n -> n) in
+             x + count 200000) in
+           let _ = threadCancel t in
+           threadAwait t"
+    );
+    assert_eq!(threads_agree(&src), Ok("5".into()));
+}
+
+#[test]
 fn a_sleeping_thread_cancelled_runs_its_releases_at_once() {
     let src = format!(
         "{TIME}{RELEASE}def result =

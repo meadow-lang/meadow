@@ -988,10 +988,11 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
         let sh = self.shared;
         match stop {
             Stop::Preempted => {
+                // A release taken back to run in place: its own grace. A
+                // thread that has taken the cancel on itself keeps it so.
                 if fiber.vm.release_began {
                     fiber.vm.release_began = false;
                     fiber.strikes = 0;
-                    fiber.seen = false;
                 }
                 // A cancelled thread that makes no operation is ended at its
                 // second preemption point after the cancel, unless it asked:

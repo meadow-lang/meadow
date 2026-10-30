@@ -857,8 +857,9 @@ impl<'a> Machine<'a> {
                     Some((k, _)) if *k >= key => {
                         let (_, f) = self.exits.pop().expect("just looked");
                         self.held_off.set(self.held_off.get() + 1);
+                        // Its own grace; a thread that has taken the cancel
+                        // on itself keeps it so.
                         self.strikes = 0;
-                        self.seen = false;
                         Value::ctor("Maybe.Just".into(), vec![f])
                     }
                     _ => Value::ctor("Maybe.None".into(), vec![]),

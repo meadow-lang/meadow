@@ -1271,8 +1271,10 @@ pub(crate) fn wind_down(out: Result<Parcel, String>) -> Result<Parcel, String> {
     let c = cx();
     match (&c.ending, out) {
         (None, out) => {
-            // On its way out: a cancel is held off for good.
+            // On its way out: a cancel is held off for good, and a
+            // transaction the thread was in is over.
             c.cancel.held_off.fetch_add(1, Ordering::SeqCst);
+            c.txn = None;
             c.ending = Some(out);
         }
         (Some(Ok(_)), Err(e)) => c.ending = Some(Err(e)),
@@ -1421,7 +1423,9 @@ pub fn prim(p: Prim, args: &[Val]) -> Word {
                 Some((k, _)) if *k >= key => {
                     let (_, f) = c.exits.pop().expect("just looked");
                     c.cancel.held_off.fetch_add(1, Ordering::SeqCst);
-                    c.cancel.release_begins();
+                    // Its own grace; a thread that has taken the cancel on
+                    // itself keeps it so.
+                    c.cancel.armed.store(0, Ordering::Relaxed);
                     // What the stack held is handed on.
                     value::data(
                         crate::show::role(meadow_rt::roles::Role::Some),

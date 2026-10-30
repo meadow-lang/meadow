@@ -226,7 +226,6 @@ fun releaseFrom (key : Int) (after : Bool) : () ! { Thread | e } =
 -- --- tests -------------------------------------------------------------------
 
 use Std.Test (assertEq, assertTrue)
-use Std.Time (monotonic)
 use Std.Exn (toResult, raise)
 
 fun fib (n : Int) = if n < 2 then n else fib (n - 1) + fib (n - 2)
@@ -376,9 +375,8 @@ fun note (log : Ref Int) (n : Int) = setRef log (getRef log * 10 + n)
   assertEq (timeout 60000 (\() -> fib 10)) (Just 55) "answered in time"
 
 @test fun aSlowActionIsTimedOutAndStopped () =
-  let started = monotonic () in
-  let r = timeout 20 (\() -> let _ = sleep 3600000 in toInt 1) in
-  assertTrue ((r == None) and (monotonic () - started < 60000000000)) "given up on, and woken"
+  -- Asleep for an hour, unless the cancel wakes it.
+  assertEq (timeout 20 (\() -> let _ = sleep 3600000 in toInt 1)) None "given up on, and woken"
 
 @test fun raceAnswersWhicheverEndsFirst () =
   let gate = newChannel () in
