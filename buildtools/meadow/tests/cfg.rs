@@ -8,9 +8,8 @@ use meadow::profile::{Profile, Resolved};
 use meadow_compiler::intern::InternedString;
 
 /// A package whose `result` reports what its `@cfg`s kept.
-fn package(name: &str, manifest_profiles: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-cfg-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+fn package(name: &str, manifest_profiles: &str) -> meadow_scratch::Scratch {
+    let dir = meadow_scratch::scratch!("meadow-cfg-{name}-{}", std::process::id());
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
         dir.join("Meadow.toml"),

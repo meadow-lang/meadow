@@ -24,3 +24,4 @@ serde_json = "1"
 # subcommand.
 [dev-dependencies]
 meadow.workspace = true
+meadow-scratch.workspace = true

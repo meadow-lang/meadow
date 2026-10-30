@@ -1,0 +1,9 @@
+[package]
+name = "meadow-scratch"
+description = "Scratch directories for Meadow's tests that are removed when the test ends, passed or failed."
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "meadow_scratch"
+path = "src/lib.rs"

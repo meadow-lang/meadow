@@ -25,5 +25,6 @@ webpki-roots = "1"
 libc = "0.2"
 
 [dev-dependencies]
+meadow-scratch.workspace = true
 # A certificate to test TLS with.
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }

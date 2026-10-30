@@ -1311,7 +1311,7 @@ fn renamed_package(root: &Path) -> HashMap<PathBuf, String> {
 fn built(root: &Path) -> Option<(meadow::pipeline::CompiledGraph, Vec<(PathBuf, String)>)> {
     // The standard library is compiled for any build: the smallest will do.
     let entry = if is_std(root) {
-        let probe = std::env::temp_dir().join("meadowboot-std-probe.mw");
+        let probe = Path::new(env!("CARGO_TARGET_TMPDIR")).join("meadowboot-std-probe.mw");
         std::fs::write(&probe, "def result = 1\n").expect("a probe");
         probe
     } else {
@@ -1748,9 +1748,10 @@ fn expansions_turn() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// Where the rename test leaves what this compiler's macros expanded to, for
-/// MeadowBoot: a file a package, `Pkg.json`.
+/// MeadowBoot: a file a package, `Pkg.json`. One directory, refilled by each
+/// run and read by the run cache, so it lives beside that cache.
 fn expansions_dir() -> PathBuf {
-    std::env::temp_dir().join("meadowboot-expansions")
+    Path::new(env!("CARGO_TARGET_TMPDIR")).join("meadowboot-expansions")
 }
 
 /// Write `expanded` there, each package's in its file: a JSON array, an
@@ -2433,7 +2434,7 @@ const RUN_CASES_AGREEING: usize = 101;
 
 #[test]
 fn glade_cases_compiled_by_meadowboot_evaluate_as_the_rust_compiler_has_them() {
-    let dir = std::env::temp_dir().join(format!("meadowboot-run-{}", std::process::id()));
+    let dir = meadow_scratch::scratch!("meadowboot-run-{}", std::process::id());
     let cases = run_cases(&dir);
     let wants: std::collections::HashMap<PathBuf, String> = cases.iter().cloned().collect();
     let files: Vec<PathBuf> = cases.iter().map(|(f, _)| f.clone()).collect();
@@ -2531,7 +2532,7 @@ def result =
 /// standard library, which it uses nothing of -- is written here.
 #[test]
 fn a_program_of_two_units_lowered_by_meadowboot_answers_as_the_rust_compiler_has_it() {
-    let dir = std::env::temp_dir().join(format!("meadowboot-units-{}", std::process::id()));
+    let dir = meadow_scratch::scratch!("meadowboot-units-{}", std::process::id());
     let package = |name: &str, manifest: &str, file: &str, text: &str| {
         let pkg = dir.join(name);
         std::fs::create_dir_all(pkg.join("src")).expect("a package directory");
@@ -2591,7 +2592,7 @@ def result =
 /// here.
 #[test]
 fn a_program_with_the_standard_library_lowered_by_meadowboot_answers_as_the_rust_compiler_has_it() {
-    let dir = std::env::temp_dir().join(format!("meadowboot-std-{}", std::process::id()));
+    let dir = meadow_scratch::scratch!("meadowboot-std-{}", std::process::id());
     std::fs::create_dir_all(dir.join("src")).expect("a package directory");
     std::fs::write(
         dir.join("Meadow.toml"),
@@ -2738,7 +2739,7 @@ fn with_levels() -> String {
 /// What MeadowBoot's `lower` writes of the program `source`, told `args`: the
 /// package is made in a directory named for `name`.
 fn cut_of(name: &str, source: &str, args: &[&str]) -> String {
-    let dir = std::env::temp_dir().join(format!("meadowboot-{name}-{}", std::process::id()));
+    let dir = meadow_scratch::scratch!("meadowboot-{name}-{}", std::process::id());
     std::fs::create_dir_all(dir.join("src")).expect("a package directory");
     std::fs::write(
         dir.join("Meadow.toml"),
@@ -2891,7 +2892,7 @@ def result = (system, family, build, speed, level, debug shape)
 
 /// What MeadowBoot's `lower` answers of [`WITH_CFG`], told `args`.
 fn cfg_answer(name: &str, args: &[&str]) -> String {
-    let dir = std::env::temp_dir().join(format!("meadowboot-cfg-{name}-{}", std::process::id()));
+    let dir = meadow_scratch::scratch!("meadowboot-cfg-{name}-{}", std::process::id());
     std::fs::create_dir_all(dir.join("src")).expect("a package directory");
     std::fs::write(
         dir.join("Meadow.toml"),
@@ -3015,8 +3016,7 @@ def result = (twice!(first), twice!(1 + 2))
 /// What [`MACROS_APP`] answers, compiled by MeadowBoot with its macros run
 /// on `engine`.
 fn macros_answer(engine: &str) -> String {
-    let dir =
-        std::env::temp_dir().join(format!("meadowboot-macros-{engine}-{}", std::process::id()));
+    let dir = meadow_scratch::scratch!("meadowboot-macros-{engine}-{}", std::process::id());
     for (pkg, manifest, file, text) in [
         (
             "Mac",
@@ -3076,7 +3076,7 @@ fn a_procedural_macro_is_run_by_meadowboot_on_either_engine() {
 /// `meadow_compiler::expand` answers them.
 #[test]
 fn the_built_in_macros_answer_in_meadowboot() {
-    let dir = std::env::temp_dir().join(format!("meadowboot-builtin-{}", std::process::id()));
+    let dir = meadow_scratch::scratch!("meadowboot-builtin-{}", std::process::id());
     std::fs::create_dir_all(dir.join("src")).expect("a package directory");
     std::fs::write(
         dir.join("Meadow.toml"),
@@ -3115,7 +3115,7 @@ fn the_built_in_macros_answer_in_meadowboot() {
 /// condition that is quietly never true.
 #[test]
 fn a_cfg_that_could_never_hold_is_refused_by_meadowboot() {
-    let dir = std::env::temp_dir().join(format!("meadowboot-cfg-never-{}", std::process::id()));
+    let dir = meadow_scratch::scratch!("meadowboot-cfg-never-{}", std::process::id());
     std::fs::create_dir_all(dir.join("src")).expect("a package directory");
     std::fs::write(
         dir.join("Meadow.toml"),
@@ -3230,8 +3230,7 @@ def result = f None
 /// a filter after the package runs only the tests whose names have it.
 #[test]
 fn a_package_s_tests_are_run_by_meadowboot_as_meadow_test_runs_them() {
-    let dir = std::env::temp_dir().join(format!("meadowboot-tests-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = meadow_scratch::scratch!("meadowboot-tests-{}", std::process::id());
     std::fs::create_dir_all(dir.join("src")).expect("a package directory");
     std::fs::write(
         dir.join("Meadow.toml"),
@@ -3283,7 +3282,6 @@ fn a_package_s_tests_are_run_by_meadowboot_as_meadow_test_runs_them() {
         "{said}"
     );
     assert_eq!(code, Some(0), "{said}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A constructor written through the module a `use … as` names, as MeadowBoot
@@ -3292,8 +3290,7 @@ fn a_package_s_tests_are_run_by_meadowboot_as_meadow_test_runs_them() {
 /// the answer the Rust compiler gives.
 #[test]
 fn a_constructor_is_written_through_the_module_an_alias_names() {
-    let root = std::env::temp_dir().join(format!("meadowboot-ctor-alias-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = meadow_scratch::scratch!("meadowboot-ctor-alias-{}", std::process::id());
     std::fs::create_dir_all(root.join("src")).expect("a package directory");
     std::fs::write(
         root.join("Meadow.toml"),
@@ -3366,11 +3363,7 @@ fn a_library_glade_builds_is_called_from_glade_and_from_silo() {
 /// with `runtime`, and call it from a Meadow program run by `meadow` with
 /// each of `hosts`' arguments.
 fn exports_are_called_from_c(runtime: &str, hosts: &[&[&str]]) {
-    let root = std::env::temp_dir().join(format!(
-        "meadowboot-exports-{runtime}-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = meadow_scratch::scratch!("meadowboot-exports-{runtime}-{}", std::process::id());
     // A dependency's exports are the library's too.
     let dep = root.join("Dep");
     std::fs::create_dir_all(dep.join("src")).expect("a package directory");
@@ -3502,7 +3495,6 @@ fn exports_are_called_from_c(runtime: &str, hosts: &[&[&str]]) {
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// What a program prints when it is asked for help, on either stream.
@@ -3609,7 +3601,7 @@ fn said_of(name: &str, source: &str) -> String {
 
 /// The same, MeadowBoot told `args` besides.
 fn said_of_with(name: &str, source: &str, args: &[&str]) -> String {
-    let dir = std::env::temp_dir().join(format!("meadowboot-{name}-{}", std::process::id()));
+    let dir = meadow_scratch::scratch!("meadowboot-{name}-{}", std::process::id());
     std::fs::create_dir_all(dir.join("src")).expect("a package directory");
     std::fs::write(
         dir.join("Meadow.toml"),
@@ -3780,7 +3772,7 @@ fn axcut_answer(text: &str) -> String {
 
 #[test]
 fn glade_cases_lowered_to_cut_by_meadowboot_answer_as_the_rust_compiler_has_them() {
-    let dir = std::env::temp_dir().join(format!("meadowboot-cut-{}", std::process::id()));
+    let dir = meadow_scratch::scratch!("meadowboot-cut-{}", std::process::id());
     let cases = run_cases(&dir);
     let wants: std::collections::HashMap<PathBuf, String> = cases.iter().cloned().collect();
     let files: Vec<PathBuf> = cases.iter().map(|(f, _)| f.clone()).collect();
@@ -3833,8 +3825,7 @@ fn glade_cases_lowered_to_cut_by_meadowboot_answer_as_the_rust_compiler_has_them
 
 #[test]
 fn every_glade_case_evaluates_as_the_cek_machine_evaluates_it() {
-    let dir = std::env::temp_dir().join(format!("meadowboot-cek-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    let dir = meadow_scratch::scratch!("meadowboot-cek-{}", std::process::id());
     let mut files = Vec::new();
     let mut wants = std::collections::HashMap::new();
     for (i, src) in glade_programs().iter().enumerate() {

@@ -14,6 +14,7 @@ meadow-intern.workspace = true
 meadow-rt.workspace = true
 
 [dev-dependencies]
+meadow-scratch.workspace = true
 meadow-compiler = { path = "../meadow-compiler" }
 # The tests lower real programs, which takes Meadow's front end.
 meadow-core.workspace = true

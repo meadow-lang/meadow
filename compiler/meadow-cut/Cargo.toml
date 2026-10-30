@@ -13,3 +13,6 @@ path = "src/lib.rs"
 meadow-axcut.workspace = true
 meadow-rt.workspace = true
 meadow-intern.workspace = true
+
+[dev-dependencies]
+meadow-scratch.workspace = true

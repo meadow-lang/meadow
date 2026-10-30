@@ -6,6 +6,7 @@
 //! Needs clang, and builds the runtime library (`aot/`) the first time.
 
 use meadow_compiler::{Options, compile_str_with, core};
+use meadow_scratch::{KEEP, scratch};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -130,9 +131,7 @@ fn run_units(
     });
     let units = meadow_llvm::compile_split(&lowered.program, unit, meadow_llvm::CallConv::host())
         .unwrap_or_else(|e| panic!("{}", e.msg));
-    let dir = std::env::temp_dir().join("meadow-llvm-tests").join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch!("meadow-llvm-{name}");
     let paths: Vec<std::path::PathBuf> = units
         .iter()
         .enumerate()
@@ -154,7 +153,7 @@ fn run_units(
         .expect("clang runs");
     assert!(
         out.status.success(),
-        "clang failed on {}:\n{}",
+        "clang failed on {} (kept under {KEEP}=1):\n{}",
         ll_path.display(),
         String::from_utf8_lossy(&out.stderr)
     );
@@ -169,7 +168,7 @@ fn run_units(
     let stderr = String::from_utf8_lossy(&ran.stderr).to_string();
     assert!(
         ran.status.success(),
-        "{name} failed: {stderr}\n(see {})",
+        "{name} failed: {stderr}\n(see {}, kept under {KEEP}=1)",
         ll_path.display()
     );
     let got = if stdout.is_empty() {
@@ -632,9 +631,7 @@ fn run_cancelling(name: &str, src: &str, env: &[(&str, &str)]) -> Vec<(bool, Str
     let units =
         meadow_llvm::compile_split(&lowered.program, usize::MAX, meadow_llvm::CallConv::host())
             .unwrap_or_else(|e| panic!("{}", e.msg));
-    let dir = std::env::temp_dir().join("meadow-llvm-tests").join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch!("meadow-llvm-{name}");
     let paths: Vec<PathBuf> = units
         .iter()
         .enumerate()
@@ -655,7 +652,7 @@ fn run_cancelling(name: &str, src: &str, env: &[(&str, &str)]) -> Vec<(bool, Str
         .expect("clang runs");
     assert!(
         out.status.success(),
-        "clang failed on {}:\n{}",
+        "clang failed on {} (kept under {KEEP}=1):\n{}",
         paths[0].display(),
         String::from_utf8_lossy(&out.stderr)
     );
@@ -1922,9 +1919,7 @@ fn run_mode(name: &str, src: &str, how: Cycles, env: &[(&str, &str)]) -> (String
     })
     .unwrap_or_else(|e| panic!("{}", e.msg));
     let name = format!("{name}_{}", how.name());
-    let dir = std::env::temp_dir().join("meadow-llvm-tests").join(&name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch!("meadow-llvm-{name}");
     let paths: Vec<PathBuf> = units
         .iter()
         .enumerate()
@@ -1945,7 +1940,7 @@ fn run_mode(name: &str, src: &str, how: Cycles, env: &[(&str, &str)]) -> (String
         .expect("clang runs");
     assert!(
         out.status.success(),
-        "clang failed on {}:\n{}",
+        "clang failed on {} (kept under {KEEP}=1):\n{}",
         paths[0].display(),
         String::from_utf8_lossy(&out.stderr)
     );
@@ -1960,7 +1955,7 @@ fn run_mode(name: &str, src: &str, how: Cycles, env: &[(&str, &str)]) -> (String
     let stderr = String::from_utf8_lossy(&ran.stderr).to_string();
     assert!(
         ran.status.success(),
-        "{name} failed: {stderr}\n(see {})",
+        "{name} failed: {stderr}\n(see {}, kept under {KEEP}=1)",
         paths[0].display()
     );
     (stdout, stderr)

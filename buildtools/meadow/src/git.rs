@@ -711,10 +711,8 @@ mod live {
     use crate::package::GitRef;
 
     /// A repository made on the spot, so these need no network.
-    fn repo(which: &str) -> Option<PathBuf> {
-        let dir =
-            std::env::temp_dir().join(format!("meadow-git-src-{}-{which}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn repo(which: &str) -> Option<meadow_scratch::Scratch> {
+        let dir = meadow_scratch::scratch!("meadow-git-src-{}-{which}", std::process::id());
         std::fs::create_dir_all(dir.join("src")).ok()?;
         std::fs::write(
             dir.join("Meadow.toml"),
@@ -752,17 +750,14 @@ mod live {
         Some(dir)
     }
 
-    /// An empty cache directory. Naming one stands for a machine: two different
+    /// An empty cache directory, removed when the test is done. Naming one stands for a machine: two different
     /// names are two machines that share a lockfile and nothing else.
     ///
     /// A directory rather than `MEADOW_HOME`, so these run beside anything
     /// else: that variable also says where the runtime library and the
     /// extracted standard library live, and setting it would move those too.
-    fn cache(which: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("meadow-git-cache-{}-{which}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+    fn cache(which: &str) -> meadow_scratch::Scratch {
+        meadow_scratch::scratch!("meadow-git-cache-{}-{which}", std::process::id())
     }
 
     /// Run `git` in `dir`, asserting it worked.

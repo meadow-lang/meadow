@@ -3,7 +3,7 @@
 
 mod common;
 use meadow::{Engine, OptLevel, Options, pipeline, runtime};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The CEK machine's answer, required of the VM and its JIT at every level
 /// and of a release build.
@@ -117,11 +117,9 @@ fn an_alias_is_as_visible_as_it_says() {
     assert!(out.contains("`Point` is private to module `Geo`"), "{out}");
 }
 
-fn scratch(who: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-decl-{}-{who}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::canonicalize(&dir).unwrap()
+fn scratch(who: &str) -> meadow_scratch::Scratch {
+    let dir = meadow_scratch::scratch!("meadow-decl-{}-{who}", std::process::id());
+    dir.canonical()
 }
 
 fn write(path: &Path, text: &str) {
@@ -171,7 +169,6 @@ fn two_modules_may_each_declare_a_type_of_one_name() {
             "{engine:?}"
         );
     }
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A dependent sees a package's `@pub` alias, and not one it kept.
@@ -210,7 +207,6 @@ fn a_pub_alias_crosses_the_package() {
         msgs.iter().any(|m| m.contains("unknown type `Secret`")),
         "{msgs:?}"
     );
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 // --- standalone signatures ----------------------------------------------------

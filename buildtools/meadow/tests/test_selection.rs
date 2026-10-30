@@ -10,15 +10,14 @@
 //! `works` — by bare name, there is no telling them apart.
 
 use meadow_compiler::TestSite;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 /// A package with the awkward cases in it: a test name repeated across two
 /// modules (one passing, one failing, so running the wrong one is visible),
 /// and a name that is a prefix of another.
-fn package(who: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-test-select-{}-{who}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+fn package(who: &str) -> meadow_scratch::Scratch {
+    let dir = meadow_scratch::scratch!("meadow-test-select-{}-{who}", std::process::id());
     std::fs::create_dir_all(dir.join("src").join("Deep")).unwrap();
     std::fs::write(
         dir.join("Meadow.toml"),
@@ -92,7 +91,6 @@ fn a_test_is_named_by_its_module() {
             "root"
         ]
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `--exact` on a qualified name runs that test and no other — the one that
@@ -108,7 +106,6 @@ fn exact_picks_one_of_two_tests_with_the_same_name() {
         ran(&dir, &["B.works", "--exact"]),
         vec![("B.works".to_string(), false)]
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `--exact` is not a prefix match: `parse` is contained in `parseInt`.
@@ -124,7 +121,6 @@ fn exact_does_not_match_a_longer_name() {
         names(&ran(&dir, &["Deep.Er.nested", "--exact"])),
         vec!["Deep.Er.nested"]
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Without `--exact` the filter is still a substring, as it always was — of the
@@ -135,7 +131,6 @@ fn a_plain_filter_still_matches_by_substring() {
     assert_eq!(names(&ran(&dir, &["works"])), vec!["A.works", "B.works"]);
     assert_eq!(names(&ran(&dir, &["parse"])), vec!["A.parse", "B.parseInt"]);
     assert_eq!(names(&ran(&dir, &["B."])), vec!["B.parseInt", "B.works"]);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -148,7 +143,6 @@ fn exact_needs_something_to_match() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The spelling itself, which the runner and the editor both take from here.
@@ -172,8 +166,7 @@ fn a_root_test_has_no_qualifier_and_a_nested_one_has_every_segment() {
 /// being tested, as cargo builds a dependency without `cfg(test)`.
 #[test]
 fn a_dependency_is_built_without_its_tests() {
-    let root = std::env::temp_dir().join(format!("meadow-test-deps-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = meadow_scratch::scratch!("meadow-test-deps-{}", std::process::id());
     let dep = root.join("dep");
     let app = root.join("app");
     std::fs::create_dir_all(dep.join("src")).unwrap();

@@ -3,7 +3,7 @@
 
 mod common;
 use meadow::{Engine, OptLevel, Options, pipeline, runtime};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The CEK machine's answer, required of the VM and its JIT at every level
 /// and of a release build, where dictionaries meet the specializer.
@@ -414,11 +414,9 @@ fn a_trait_is_used_across_modules() {
     assert_eq!(out, "(9, 24, 2)");
 }
 
-fn scratch(who: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-traits-{}-{who}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::canonicalize(&dir).unwrap()
+fn scratch(who: &str) -> meadow_scratch::Scratch {
+    let dir = meadow_scratch::scratch!("meadow-traits-{}-{who}", std::process::id());
+    dir.canonical()
 }
 
 fn write(path: &Path, text: &str) {
@@ -477,7 +475,6 @@ fn a_trait_crosses_the_package() {
             want
         );
     }
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 // --- several parameters --------------------------------------------------------

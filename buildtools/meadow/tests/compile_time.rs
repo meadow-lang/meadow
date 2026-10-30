@@ -6,12 +6,11 @@
 //! set aside and run again once something has. See `docs/MACROS.md`.
 
 use meadow::{Options, pipeline};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// A scratch package, `what` naming it apart from every other test's.
-fn package(what: &str, manifest: &str, files: &[(&str, &str)]) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-ct-{}-{what}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+fn package(what: &str, manifest: &str, files: &[(&str, &str)]) -> meadow_scratch::Scratch {
+    let dir = meadow_scratch::scratch!("meadow-ct-{}-{what}", std::process::id());
     std::fs::create_dir_all(dir.join("src")).expect("a scratch package");
     std::fs::write(dir.join("Meadow.toml"), manifest).expect("a manifest");
     for (name, text) in files {
@@ -69,7 +68,7 @@ fun point (r : Result String Point) : Result String Point = r
   | _ -> [Fail "sumOf!(name)" Nowhere]
 "#;
 
-fn maker(what: &str) -> PathBuf {
+fn maker(what: &str) -> meadow_scratch::Scratch {
     package(
         &format!("{what}-maker"),
         "[package]\nname = \"Maker\"\nversion = \"0.1.0\"\n",
@@ -77,12 +76,11 @@ fn maker(what: &str) -> PathBuf {
     )
 }
 
-/// A package that depends on `Maker`, and on whatever else `more` lists.
-fn app(what: &str, files: &[(&str, &str)], more: &[(&str, &Path)]) -> PathBuf {
-    let mut deps = format!(
-        "Maker = {{ path = {:?} }}\n",
-        maker(what).display().to_string()
-    );
+/// A package that depends on `Maker`, and on whatever else `more` lists. The
+/// `Maker` made for it is removed with it.
+fn app(what: &str, files: &[(&str, &str)], more: &[(&str, &Path)]) -> meadow_scratch::Scratch {
+    let maker = maker(what);
+    let mut deps = format!("Maker = {{ path = {:?} }}\n", maker.display().to_string());
     for (name, dir) in more {
         deps.push_str(&format!(
             "{name} = {{ path = {:?} }}\n",
@@ -94,6 +92,7 @@ fn app(what: &str, files: &[(&str, &str)], more: &[(&str, &Path)]) -> PathBuf {
         &format!("[package]\nname = \"App\"\nversion = \"0.1.0\"\n\n[dependencies]\n{deps}"),
         files,
     )
+    .holding(maker)
 }
 
 const USES: &str = "use Maker (remember!, recall!, sumOf!)\n";
@@ -187,11 +186,12 @@ fn a_binding_is_private_to_its_module_without_a_pub() {
 fn a_binding_crosses_packages_with_the_package_it_is_in() {
     // Defined in one package, read by a macro run in another: what makes a
     // language defined in a library usable by the passes of its dependents.
+    let maker = maker("cross-facts");
     let facts = package(
         "cross-facts",
         &format!(
             "[package]\nname = \"Facts\"\nversion = \"0.1.0\"\n\n[dependencies]\nMaker = {{ path = {:?} }}\n",
-            maker("cross-facts").display().to_string()
+            maker.display().to_string()
         ),
         &[("Lib.mw", &format!("{USES}@pub remember!(answer 42)\n"))],
     );

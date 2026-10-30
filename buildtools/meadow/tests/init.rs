@@ -7,15 +7,12 @@
 //! compiler then rejected would be worse than no template.
 
 use meadow::{Options, init, package::Manifest, pipeline};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// A directory of our own, named after the test so concurrent ones do not
 /// collide. Removed first, so a previous failed run cannot make this one pass.
-fn scratch(who: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-init-{}-{who}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn scratch(who: &str) -> meadow_scratch::Scratch {
+    meadow_scratch::scratch!("meadow-init-{}-{who}", std::process::id())
 }
 
 fn init_at(path: &Path, name: Option<&str>) -> Result<init::Created, String> {
@@ -50,8 +47,6 @@ fn what_init_writes_is_a_package_that_builds() {
         out.diagnostics.iter().map(|d| &d.msg).collect::<Vec<_>>()
     );
     assert!(out.linked.is_some(), "and it should have an entry point");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -62,7 +57,6 @@ fn the_directory_is_created_if_it_is_missing() {
     assert_eq!(made.name, "Nested");
     assert!(target.join("Meadow.toml").is_file());
     assert!(target.join("src").join("Main.mw").is_file());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -71,7 +65,6 @@ fn a_name_can_be_given_when_the_directory_is_not_one() {
     let made = init_at(&dir.join("my-app"), Some("MyApp")).expect("init");
     assert_eq!(made.name, "MyApp");
     assert_eq!(Manifest::load(&made.root).unwrap().unwrap().name, "MyApp");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A manifest is what says "this is already a package", so overwriting one to
@@ -95,7 +88,6 @@ fn an_existing_package_is_refused_rather_than_overwritten() {
         before,
         "the manifest must be left exactly as it was"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Run in a directory that already has sources, `init` supplies the manifest
@@ -118,7 +110,6 @@ fn existing_sources_are_not_replaced() {
         target.join("Meadow.toml").is_file(),
         "but the manifest arrives"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A directory called `my-pkg` is what someone will type, and `my-pkg` is not
@@ -130,7 +121,6 @@ fn a_directory_that_is_not_a_package_name_becomes_one() {
     let made = init_at(&dir.join("my-pkg"), None).expect("a name is made from it");
     assert_eq!(made.name, "MyPkg");
     assert!(dir.join("my-pkg").join("Meadow.toml").is_file());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A name that *was* asked for, on the other hand, is taken at its word -- and
@@ -158,7 +148,6 @@ fn a_name_the_language_could_not_refer_to_is_refused() {
             "{bad} should be refused"
         );
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A generated package can be depended on *by the name `init` wrote* — which
@@ -196,7 +185,6 @@ fn a_generated_package_can_be_used_as_a_dependency() {
     );
     let linked = out.linked.expect("linked");
     assert_eq!(meadow_eval::run(&linked.program).unwrap().to_string(), "42");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Builds write into `target`, so a new package ignores it from the start.
@@ -207,7 +195,6 @@ fn a_new_package_ignores_its_target_directory() {
     let ignore = made.root.join(".gitignore");
     assert_eq!(std::fs::read_to_string(&ignore).unwrap(), "/target/\n");
     assert!(made.files.contains(&ignore), "and says it wrote it");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A `.gitignore` already there is someone's: the line is added, once, and
@@ -233,7 +220,6 @@ fn an_existing_gitignore_gains_the_line_and_keeps_the_rest() {
         "target\n",
         "a package that ignores `target` already is left alone"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `meadow run` leaves the image it ran in the package's own `target`
@@ -264,5 +250,4 @@ fn running_a_package_writes_its_image_under_target() {
         meadow_glade::run(&program, u64::MAX).map_err(|e| e.msg),
         Ok("()".into())
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }

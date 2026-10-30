@@ -202,12 +202,39 @@ pub fn valid_tag(tag: &str) -> bool {
         && !tag.contains("..")
 }
 
-/// A directory of this run's own, under the system's temporary one.
-pub fn scratch_dir(prefix: &str) -> Result<PathBuf, String> {
+/// A directory of this run's own, under the system's temporary one, removed
+/// when the [`Scratch`] is dropped.
+pub fn scratch_dir(prefix: &str) -> Result<Scratch, String> {
     let dir = std::env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| format!("could not make {}: {e}", dir.display()))?;
-    Ok(dir)
+    Ok(Scratch(dir))
+}
+
+/// A directory that is removed when this is dropped: when an install is done,
+/// and as well when a download or an install fails part way -- a `?` returns
+/// past any line that would have removed it, and a download left behind is a
+/// toolchain's worth of space on the system drive.
+#[derive(Debug)]
+pub struct Scratch(PathBuf);
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for Scratch {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Where a displaced binary is put.
@@ -567,7 +594,6 @@ mod provenance_tests {
         assert_eq!(channel(&home), Channel::Nightly);
         set_channel(&home, Channel::Stable).unwrap();
         assert_eq!(channel(&home), Channel::Stable);
-        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -579,9 +605,7 @@ mod provenance_tests {
 
     #[test]
     fn what_is_recorded_is_read_back() {
-        let home = std::env::temp_dir().join(format!("meadowup-prov-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).unwrap();
+        let home = scratch_dir("meadowup-prov").unwrap();
         assert_eq!(provenance(&home), None, "nothing recorded yet");
 
         record(&home, &Provenance::Release("v0.2.0".into())).unwrap();
@@ -598,15 +622,11 @@ mod provenance_tests {
 #[cfg(all(test, not(windows)))]
 mod unix_path_tests {
     use super::path::imp::{add_for, profiles_in, remove_for};
-    use super::{bin_dir, env_file};
-    use std::path::PathBuf;
+    use super::{Scratch, bin_dir, env_file, scratch_dir};
 
     /// A pretend home directory, with the profiles that exist in it named.
-    fn home(which: &str, existing: &[&str]) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("meadowup-path-{}-{which}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    fn home(which: &str, existing: &[&str]) -> Scratch {
+        let dir = scratch_dir(&format!("meadowup-path-{which}")).unwrap();
         for name in existing {
             std::fs::write(dir.join(name), "# something that was already here\n").unwrap();
         }

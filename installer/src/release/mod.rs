@@ -5,7 +5,7 @@
 //! only job is to install another one should not carry a TLS stack to do it.
 
 use super::ui::Progress;
-use super::{REPO, archive_ext, scratch_dir, valid_tag};
+use super::{REPO, Scratch, archive_ext, scratch_dir, valid_tag};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -64,12 +64,13 @@ pub fn release_name(tag: &str) -> Result<String, String> {
 }
 
 /// Download and unpack the release `tag` for `target`, answering the directory
-/// it was unpacked into and how many bytes were fetched.
+/// it was unpacked into -- removed when it is dropped, so a failed download
+/// takes its partial archive with it -- and how many bytes were fetched.
 ///
 /// The download is drawn as a progress bar. `curl` does the fetching and this
 /// watches the file grow -- which is all a bar needs, and keeps an HTTP library
 /// out of a program whose only job is installing another one.
-pub fn fetch(tag: &str, target: &str, into: &str) -> Result<(PathBuf, u64), String> {
+pub fn fetch(tag: &str, target: &str, into: &str) -> Result<(Scratch, u64), String> {
     if !valid_tag(tag) {
         return Err(format!("`{tag}` is not a release tag"));
     }

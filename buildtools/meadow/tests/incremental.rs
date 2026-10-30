@@ -7,11 +7,9 @@ use meadow::pipeline::{self, BuildOutput};
 use meadow::profile::{Profile, Resolved};
 use std::path::{Path, PathBuf};
 
-fn scratch(who: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-incr-{}-{who}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::canonicalize(&dir).unwrap()
+fn scratch(who: &str) -> meadow_scratch::Scratch {
+    let dir = meadow_scratch::scratch!("meadow-incr-{}-{who}", std::process::id());
+    dir.canonical()
 }
 
 fn write(path: &Path, text: &str) {
@@ -26,8 +24,8 @@ fn append(path: &Path, text: &str) {
 
 /// A workspace of `App`, which uses `Text`, which uses `Util`, and `Other`,
 /// which uses nothing.
-fn workspace(who: &str) -> PathBuf {
-    let root = scratch(who).join("ws");
+fn workspace(who: &str) -> meadow_scratch::Scratch {
+    let root = scratch(who).child("ws");
     write(
         &root.join("Meadow.toml"),
         "[workspace]\nmembers = [\"App\", \"libs/*\"]\n\n[workspace.dependencies]\n\

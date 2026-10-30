@@ -663,8 +663,7 @@ mod tests {
 
     #[test]
     fn tls_carries_a_conversation_both_ways() {
-        let dir = std::env::temp_dir().join(format!("meadow-tls-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = meadow_scratch::scratch!("meadow-tls-{}", std::process::id());
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let (cp, kp) = (dir.join("cert.pem"), dir.join("key.pem"));
         std::fs::write(&cp, cert.cert.pem()).unwrap();
@@ -714,7 +713,6 @@ mod tests {
         close(t2);
         close(t);
         close(l);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

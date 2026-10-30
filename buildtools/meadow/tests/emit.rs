@@ -90,11 +90,8 @@ fn a_branch_is_named_by_where_it_lands() {
     );
 }
 
-fn scratch(who: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-emit-{}-{who}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn scratch(who: &str) -> meadow_scratch::Scratch {
+    meadow_scratch::scratch!("meadow-emit-{}-{who}", std::process::id())
 }
 
 fn meadow(dir: &Path, args: &[&str]) -> (bool, String) {
@@ -180,7 +177,6 @@ fn build_writes_text_in_place_of_binaries() {
         !ok && err.contains("expected image, bytecode, asm, exe or expanded"),
         "{err}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// What `meadow dis` prints for the package at `root`, which is the text an
@@ -243,15 +239,13 @@ fn a_lone_file_has_nowhere_to_emit_to() {
         .unwrap();
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).starts_with("; meadow native code: x86_64"));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // --- not relinking what is already there -------------------------------------
 
 /// A package whose executable can be built twice over.
-fn buildable(what: &str, body: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-silo-{}-{what}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+fn buildable(what: &str, body: &str) -> meadow_scratch::Scratch {
+    let dir = meadow_scratch::scratch!("meadow-silo-{}-{what}", std::process::id());
     std::fs::create_dir_all(dir.join("src")).expect("a scratch package");
     std::fs::write(
         dir.join("Meadow.toml"),
@@ -284,6 +278,36 @@ fn link_once(dir: &Path) -> (PathBuf, std::time::SystemTime) {
         .modified()
         .unwrap();
     (exe, when)
+}
+
+/// A test's directory goes when the test fails as when it passes: here a
+/// native build, the largest thing these tests write, and the executable it
+/// made run -- a program that has just exited can hold its image a moment
+/// longer on Windows -- before a deliberate panic.
+#[test]
+fn a_failing_test_leaves_no_directory_behind() {
+    let seen = std::sync::Mutex::new(PathBuf::new());
+    // On a thread of its own, as the test harness runs a test.
+    let failed = std::thread::scope(|s| {
+        s.spawn(|| {
+            let dir = buildable("panics", "def result = 1 + 1\n");
+            *seen.lock().unwrap() = dir.to_path_buf();
+            let (exe, _) = link_once(&dir);
+            let ran = Command::new(&exe).output().expect("the program runs");
+            assert!(ran.status.success(), "{ran:?}");
+            panic!("a deliberate failure");
+        })
+        .join()
+        .is_err()
+    });
+    assert!(failed, "the deliberate failure passed");
+    let dir = seen.into_inner().unwrap();
+    assert!(
+        dir.starts_with(env!("CARGO_TARGET_TMPDIR")),
+        "{}",
+        dir.display()
+    );
+    assert!(!dir.exists(), "{} is still there", dir.display());
 }
 
 #[test]
@@ -324,8 +348,7 @@ fn an_executable_that_is_gone_is_linked_again() {
 /// Run `main` -- a module of a package built for Silo -- with `meadow run
 /// --release`, answering whether it succeeded and what it said on stderr.
 fn on_silo(name: &str, main: &str) -> (bool, String) {
-    let dir = std::env::temp_dir().join(format!("meadow-silo-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = meadow_scratch::scratch!("meadow-silo-{}-{name}", std::process::id());
     std::fs::create_dir_all(dir.join("src")).expect("a scratch package");
     std::fs::write(
         dir.join("Meadow.toml"),
@@ -395,8 +418,7 @@ fun main () =
 /// buffer at exit and the end of the output was lost.
 #[test]
 fn silo_keeps_what_follows_the_last_newline() {
-    let dir = std::env::temp_dir().join(format!("meadow-silo-{}-flush", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = meadow_scratch::scratch!("meadow-silo-{}-flush", std::process::id());
     std::fs::create_dir_all(dir.join("src")).expect("a scratch package");
     std::fs::write(
         dir.join("Meadow.toml"),
@@ -427,7 +449,6 @@ fun main () = writeOutput \"line\nno newline\"
         "line
 no newline"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A record's row through a copy of a function of dictionaries, run natively:
@@ -437,8 +458,7 @@ no newline"
 /// nothing in it. The machines that do not lay records out agreed all along.
 #[test]
 fn silo_reads_a_record_through_a_copy_at_the_callers_row() {
-    let dir = std::env::temp_dir().join(format!("meadow-silo-{}-row", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = meadow_scratch::scratch!("meadow-silo-{}-row", std::process::id());
     std::fs::create_dir_all(dir.join("src")).expect("a scratch package");
     std::fs::write(
         dir.join("Meadow.toml"),
@@ -461,5 +481,4 @@ fn silo_reads_a_record_through_a_copy_at_the_callers_row() {
         "{stdout}\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }

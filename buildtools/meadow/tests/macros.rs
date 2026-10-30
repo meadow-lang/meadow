@@ -8,7 +8,7 @@
 
 mod common;
 use meadow::{Engine, OptLevel, Options, pipeline, runtime};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// What `src` evaluates to, required to be the same on every engine -- a macro
 /// is gone by the time anything runs, so all of them must agree.
@@ -862,9 +862,8 @@ def result = discard!(1, 2 + 3)
 
 /// A package written out in a directory of its own. What a macro can be seen
 /// from only means something across a boundary, so these tests need real ones.
-fn package(what: &str, manifest: &str, files: &[(&str, &str)]) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-macro-{}-{what}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+fn package(what: &str, manifest: &str, files: &[(&str, &str)]) -> meadow_scratch::Scratch {
+    let dir = meadow_scratch::scratch!("meadow-macro-{}-{what}", std::process::id());
     std::fs::create_dir_all(dir.join("src")).expect("a scratch package");
     std::fs::write(dir.join("Meadow.toml"), manifest).expect("a manifest");
     for (name, text) in files {
@@ -1120,8 +1119,9 @@ def result = outer!(1)
 
 // --- procedural macros ---------------------------------------------------------
 
-/// A package holding a procedural macro, and one that calls it.
-fn with_macro(what: &str, macro_src: &str, caller: &str) -> PathBuf {
+/// A package holding a procedural macro, and one that calls it: the caller,
+/// which removes the macro's package with it.
+fn with_macro(what: &str, macro_src: &str, caller: &str) -> meadow_scratch::Scratch {
     let lib = package(
         &format!("{what}-lib"),
         "[package]\nname = \"Maker\"\nversion = \"0.1.0\"\n",
@@ -1135,6 +1135,7 @@ fn with_macro(what: &str, macro_src: &str, caller: &str) -> PathBuf {
         ),
         &[("Lib.mw", caller)],
     )
+    .holding(lib)
 }
 
 const SHOUT: &str = r#"

@@ -26,6 +26,7 @@ meadow-bytecode = { path = "meadow-bytecode" }
 meadow-codegen = { path = "meadow-codegen" }
 meadow-core = { path = "meadow-core" }
 meadow-rt = { path = "meadow-rt" }
+meadow-scratch = { path = "meadow-scratch" }
 num-bigint = "0.4"
 num-traits = "0.2"
 ariadne = "0.6.0"

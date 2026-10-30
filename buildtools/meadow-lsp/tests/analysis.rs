@@ -790,9 +790,8 @@ fn a_pure_function_is_not_decorated_with_an_empty_effect() {
 /// `files` are `(relative path under src, contents)`. No manifest is written on
 /// purpose in one of the tests below; where there is one, it names the package,
 /// which is what a `use <pkg>.<module>` path starts with.
-fn package(dir: &str, manifest: Option<&str>, files: &[(&str, &str)]) -> std::path::PathBuf {
-    let root = std::env::temp_dir().join(format!("meadow-lsp-{dir}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+fn package(dir: &str, manifest: Option<&str>, files: &[(&str, &str)]) -> meadow_scratch::Scratch {
+    let root = meadow_scratch::scratch!("meadow-lsp-{dir}-{}", std::process::id());
     std::fs::create_dir_all(root.join("src")).expect("mkdir");
     if let Some(m) = manifest {
         std::fs::write(root.join("Meadow.toml"), m).expect("manifest");
@@ -804,7 +803,7 @@ fn package(dir: &str, manifest: Option<&str>, files: &[(&str, &str)]) -> std::pa
         }
         std::fs::write(path, text).expect("write");
     }
-    std::fs::canonicalize(&root).unwrap_or(root)
+    root.canonical()
 }
 
 #[test]
@@ -912,7 +911,8 @@ fn go_to_definition_crosses_to_another_module_of_the_package() {
 
 #[test]
 fn a_file_outside_a_package_is_still_analysed_alone() {
-    let stray = std::env::temp_dir().join(format!("meadow-stray-{}.mw", std::process::id()));
+    let dir = meadow_scratch::scratch!("meadow-stray-{}", std::process::id());
+    let stray = dir.join("stray.mw");
     std::fs::write(&stray, "def demo = 1\n").expect("write");
     assert!(
         meadow::editor::load_package(&stray).is_none(),
@@ -2093,7 +2093,7 @@ fn a_keyword_has_no_definition() {
 
 /// A package of four modules, `Main` calling `Eval` calling `Syntax`, and
 /// `Report` beside them calling `Eval` too.
-fn four_modules(dir: &str) -> std::path::PathBuf {
+fn four_modules(dir: &str) -> meadow_scratch::Scratch {
     package(
         dir,
         Some("[package]\nname = \"Demo\"\n"),

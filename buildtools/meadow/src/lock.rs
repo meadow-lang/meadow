@@ -361,9 +361,7 @@ mod tests {
     /// manifest is.
     #[test]
     fn a_lock_under_its_former_name_is_read_and_renamed() {
-        let dir = std::env::temp_dir().join(format!("meadow-lock-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = meadow_scratch::scratch!("meadow-lock-{}", std::process::id());
         let mut lock = Lock::default();
         lock.packages.push(Locked {
             name: "Dep".to_string(),
@@ -384,7 +382,6 @@ mod tests {
             "and not left under the old one"
         );
         assert_eq!(Lock::load(&dir).packages, changed.packages);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

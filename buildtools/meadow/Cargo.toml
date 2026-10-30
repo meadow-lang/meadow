@@ -41,6 +41,8 @@ find-msvc-tools = "0.1"
 
 [dev-dependencies]
 insta = "1.47.2"
+# Scratch directories that are removed when a test is over, failed or not.
+meadow-scratch.workspace = true
 meadow-axcut.workspace = true
 
 [features]

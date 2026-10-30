@@ -6,14 +6,10 @@
 //! repository is made here, so no network is needed -- only a `git` on the
 //! path, without which these skip.
 
-use std::path::PathBuf;
 use std::process::Command;
 
-fn scratch(what: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-fetch-{}-{what}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    dir
+fn scratch(what: &str) -> meadow_scratch::Scratch {
+    meadow_scratch::scratch!("meadow-fetch-{}-{what}", std::process::id())
 }
 
 fn git(args: &[&str]) -> bool {
@@ -25,7 +21,7 @@ fn git(args: &[&str]) -> bool {
 }
 
 /// A one-commit package tagged `v1.0.0`, or `None` with no usable git.
-fn dependency_repo() -> Option<PathBuf> {
+fn dependency_repo() -> Option<meadow_scratch::Scratch> {
     let dir = scratch("repo");
     std::fs::create_dir_all(dir.join("src")).ok()?;
     std::fs::write(
@@ -53,7 +49,7 @@ fn dependency_repo() -> Option<PathBuf> {
     ok.then_some(dir)
 }
 
-fn app(what: &str, url: &str) -> PathBuf {
+fn app(what: &str, url: &str) -> meadow_scratch::Scratch {
     let dir = scratch(what);
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
@@ -77,7 +73,8 @@ fn the_server_fetches_what_a_package_needs_once_and_pins_it() {
     // A cache of this binary's own, so nothing already fetched stands in.
     // Safety: set before anything in this process reads the environment
     // on another thread; this binary is these tests alone.
-    unsafe { std::env::set_var("MEADOW_HOME", scratch("home")) };
+    let home = scratch("home");
+    unsafe { std::env::set_var("MEADOW_HOME", home.as_os_str()) };
     meadow::editor::allow_fetching();
 
     let fetched = app("fetched", &repo.display().to_string());
@@ -99,7 +96,8 @@ fn the_server_fetches_what_a_package_needs_once_and_pins_it() {
     assert!(meadow::editor::find_package(&file).expect("again").is_ok());
 
     // One that cannot be fetched says so, and is not tried on every edit.
-    let missing = app("missing", &scratch("nothing-here").display().to_string());
+    let nothing = scratch("nothing-here");
+    let missing = app("missing", &nothing.display().to_string());
     let file = missing.join("src").join("Main.mw");
     let first = meadow::editor::find_package(&file).expect("in a package");
     let first = first.err().expect("nothing to fetch");

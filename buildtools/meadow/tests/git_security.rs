@@ -7,13 +7,9 @@
 use meadow::git::{self, Net};
 use meadow::package::{GitRef, Resolver};
 use meadow::pipeline;
-use std::path::PathBuf;
 
-fn scratch(what: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-gitsec-{}-{what}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    dir
+fn scratch(what: &str) -> meadow_scratch::Scratch {
+    meadow_scratch::scratch!("meadow-gitsec-{}-{what}", std::process::id())
 }
 
 // --- the url allowlist -------------------------------------------------------
@@ -121,7 +117,7 @@ fn a_full_commit_id_is_not_mistaken_for_a_path() {
 // --- end to end: the injection never runs a command --------------------------
 
 /// A package whose one git dependency has the given url.
-fn app_with_dep_url(what: &str, url: &str) -> PathBuf {
+fn app_with_dep_url(what: &str, url: &str) -> meadow_scratch::Scratch {
     let dir = scratch(what);
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
@@ -140,12 +136,14 @@ fn app_with_dep_url(what: &str, url: &str) -> PathBuf {
 fn building_a_hostile_git_url_runs_no_command() {
     // The payload would write this file if git ran it. It is an absolute path
     // in a scratch dir so that even a regression cannot touch the repo.
-    let mark = scratch("mark").join("PWNED");
+    let marks = scratch("mark");
+    let mark = marks.join("PWNED");
     let url = format!("--upload-pack=touch {}", mark.display());
     let app = app_with_dep_url("inj", &url);
 
+    let cache = scratch("inj-cache");
     let mut resolver = Resolver::for_entry(&app);
-    resolver.cache = scratch("inj-cache");
+    resolver.cache = cache.to_path_buf();
     let out = pipeline::build_resolved(
         &app,
         meadow::Options::debug().entry("result"),
@@ -166,7 +164,8 @@ fn building_a_hostile_git_url_runs_no_command() {
 #[test]
 fn resolving_a_hostile_url_directly_runs_no_command() {
     // `git::ensure` is the one path every fetch goes through.
-    let mark = scratch("mark2").join("PWNED2");
+    let marks = scratch("mark2");
+    let mark = marks.join("PWNED2");
     let url = format!("--upload-pack=touch {}", mark.display());
     let cache = scratch("ens-cache");
     let e = git::ensure(&cache, &url, &GitRef::Default, None, Net::Allowed)

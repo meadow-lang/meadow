@@ -11,13 +11,8 @@ use common::{cek_main_std, eval_main_std};
 
 /// A fresh directory holding `n` empty files named `f0`, `f1`, ….
 /// `tag` keeps tests running in parallel out of each other's directories.
-fn dir_with(tag: &str, n: usize) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "meadow-native-vectors-{}-{tag}-{n}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+fn dir_with(tag: &str, n: usize) -> meadow_scratch::Scratch {
+    let dir = meadow_scratch::scratch!("meadow-native-vectors-{}-{tag}-{n}", std::process::id());
     for i in 0..n {
         std::fs::write(dir.join(format!("f{i}")), b"").unwrap();
     }
@@ -56,7 +51,6 @@ fn check(n: usize) {
     let want = format!("({n}, {total}, True, {})", n + 1);
     assert_eq!(eval_main_std(&src), want, "VM, {n} entries");
     assert_eq!(cek_main_std(&src), want, "CEK, {n} entries");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -90,7 +84,6 @@ fn read_bytes_is_an_array() {
     );
     assert_eq!(eval_main_std(&src), "(3, 255)");
     assert_eq!(cek_main_std(&src), "(3, 255)");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -153,6 +153,15 @@ beyond the last release is under _Unreleased_.
   nursery pauses no longer than they were.
 - `benchmarks/run.py` measures Meadow's startup with a `main` the compiler
   accepts.
+- Nothing is left in the system's temporary directory when a step fails part
+  way. `meadow test` on Silo removes the executable it built of a package's
+  tests when linking it fails, as it did when the tests ran, and `meadowup`
+  removes a downloaded release when the download or the install fails rather
+  than only once it succeeds. Meadow's own test suites, which had left
+  thousands of directories there -- tens of gigabytes on a developer's system
+  drive -- now remove each test's directory when it ends, passed or failed,
+  and keep it in the build's `target/tmp`; `MEADOW_KEEP_TEST_DIRS=1` keeps
+  them to look at.
 
 ## 0.4.0 - 2026-10-24
 

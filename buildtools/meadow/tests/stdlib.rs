@@ -111,8 +111,7 @@ fn std_set_dedups() {
 /// has to be the record the compiled code reads, field by field and whole.
 #[test]
 fn metadata_is_a_file_meta_on_every_machine() {
-    let dir = std::env::temp_dir().join(format!("meadow_meta_test_{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
+    let dir = meadow_scratch::scratch!("meadow_meta_test_{}", std::process::id());
     let p = dir.join("five.txt");
     std::fs::write(&p, "12345").unwrap();
     let p = p.to_string_lossy().replace('\\', "/");
@@ -144,10 +143,7 @@ fn metadata_is_a_file_meta_on_every_machine() {
 
 #[test]
 fn fs_write_read_list_remove() {
-    use std::path::PathBuf;
-    let dir: PathBuf = std::env::temp_dir().join(format!("meadow_fs_test_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = meadow_scratch::scratch!("meadow_fs_test_{}", std::process::id());
     let p = dir.join("hello.txt").to_string_lossy().replace('\\', "/");
     let d = dir.to_string_lossy().replace('\\', "/");
 

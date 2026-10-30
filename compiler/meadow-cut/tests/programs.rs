@@ -395,8 +395,10 @@ def idyll:Main/main (; k: ptr) =
 
 #[test]
 fn the_file_system_is_written_read_and_cleared_through_natives() {
-    let dir = std::env::temp_dir().join(format!("meadow-cut-fs-{}", std::process::id()));
-    let dir = dir.to_string_lossy().replace('\\', "/");
+    // The program removes the directory itself; the guard is for a failure
+    // before it gets that far.
+    let scratch = meadow_scratch::scratch!("meadow-cut-fs-{}", std::process::id());
+    let dir = scratch.to_string_lossy().replace('\\', "/");
     let out = runs(&format!(
         "cut 0
 entry idyll:Main/main

@@ -4,14 +4,11 @@
 //! that, as written, it does not fit in Silo's stack -- and leaving nothing
 //! behind, with the heap poisoned and under the tracing collector.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
-fn scratch(who: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("meadow-trmc-{}-{who}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn scratch(who: &str) -> meadow_scratch::Scratch {
+    meadow_scratch::scratch!("meadow-trmc-{}-{who}", std::process::id())
 }
 
 /// `meadow` run in `dir` with `args` and `env`: whether it succeeded, and

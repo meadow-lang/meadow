@@ -405,7 +405,7 @@ fn inlay_hints_annotate_parameters() {
 #[test]
 fn a_type_name_in_a_hint_is_a_link() {
     let root = std_sources("hint-link");
-    let mut c = Client::start_with(Some(root.clone()));
+    let mut c = Client::start_with(Some(root.to_path_buf()));
     c.set("fun pick m = match m with | Just v -> v | None -> toInt 0\n");
     let hints = c.request(
         "textDocument/inlayHint",
@@ -432,7 +432,6 @@ fn a_type_name_in_a_hint_is_a_link() {
     assert!(plain.contains(&"Int".to_string()), "plain: {plain:?}");
 
     drop(c);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A type a module declares is indexed by its canonical name,
@@ -441,7 +440,7 @@ fn a_type_name_in_a_hint_is_a_link() {
 #[test]
 fn a_modules_type_in_a_hint_is_a_link() {
     let root = std_sources("hint-link-module");
-    let mut c = Client::start_with(Some(root.clone()));
+    let mut c = Client::start_with(Some(root.to_path_buf()));
     c.set("use Std.String.Parse as P\n\nfun twice p = P.thenSkip p p\n");
     let hints = c.request(
         "textDocument/inlayHint",
@@ -462,7 +461,6 @@ fn a_modules_type_in_a_hint_is_a_link() {
     assert!(linked.contains(&"Parser".to_string()), "linked: {linked:?}");
 
     drop(c);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -676,7 +674,7 @@ fn a_request_before_initialized_is_answered_rather_than_dropped() {
 #[test]
 fn definition_crosses_into_the_standard_library() {
     let root = std_sources("definition");
-    let mut c = Client::start_with(Some(root.clone()));
+    let mut c = Client::start_with(Some(root.to_path_buf()));
     c.set("use Std.String (concatAll)\ndef demo = concatAll\n");
     // Line 1, character 12 is inside `concatAll` in `def demo = concatAll`.
     let def = c.at("textDocument/definition", 1, 12);
@@ -699,7 +697,6 @@ fn definition_crosses_into_the_standard_library() {
     );
 
     drop(c);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// The standard library's sources, written somewhere an editor could open them.
@@ -707,8 +704,8 @@ fn definition_crosses_into_the_standard_library() {
 /// Deliberately not `stdlib::extract_sources`: that writes to the user's home,
 /// and what is under test here is the server, not where the files are kept.
 /// `who` keeps concurrent tests out of each other's directory.
-fn std_sources(who: &str) -> std::path::PathBuf {
-    let root = std::env::temp_dir().join(format!("meadow-lsp-std-{}-{who}", std::process::id()));
+fn std_sources(who: &str) -> meadow_scratch::Scratch {
+    let root = meadow_scratch::scratch!("meadow-lsp-std-{}-{who}", std::process::id());
     for (dotted, src) in meadow::stdlib::MODULES {
         let path = root.join(format!("Std/{}.mw", dotted.replace('.', "/")));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1015,7 +1012,7 @@ fn a_workspace_symbol_in_the_open_document_points_into_it() {
 #[test]
 fn a_workspace_symbol_from_the_library_points_at_its_file() {
     let root = std_sources("symbols");
-    let mut c = Client::start_with(Some(root.clone()));
+    let mut c = Client::start_with(Some(root.to_path_buf()));
     c.set("def demo = 1\n");
     let found = symbols(&mut c, "Path.components");
     let s = found.first().expect("Std.Path.components");
@@ -1025,13 +1022,12 @@ fn a_workspace_symbol_from_the_library_points_at_its_file() {
     assert!(uri.ends_with("/Std/Path.mw"), "{uri}");
     assert!(s["location"]["range"]["start"]["line"].as_u64().unwrap() > 0);
     drop(c);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
 fn a_workspace_symbol_query_that_is_a_type_searches_by_type() {
     let root = std_sources("typed-symbols");
-    let mut c = Client::start_with(Some(root.clone()));
+    let mut c = Client::start_with(Some(root.to_path_buf()));
     c.set("def demo = 1\n");
     let found = symbols(&mut c, "String -> [String]");
     let names: Vec<&str> = found
@@ -1046,7 +1042,6 @@ fn a_workspace_symbol_query_that_is_a_type_searches_by_type() {
         "{names:?}"
     );
     drop(c);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1095,14 +1090,13 @@ fn a_definition_is_answered_in_an_ir_with_where_the_name_at_the_cursor_is() {
 }
 
 /// A package on disk, for a server that loads packages: `Main` calling `Eval`.
-fn evaluator(dir: &str) -> std::path::PathBuf {
-    let root = std::env::temp_dir().join(format!("meadow-protocol-{dir}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+fn evaluator(dir: &str) -> meadow_scratch::Scratch {
+    let root = meadow_scratch::scratch!("meadow-protocol-{dir}-{}", std::process::id());
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("Meadow.toml"), "[package]\nname = \"Demo\"\n").unwrap();
     std::fs::write(root.join("src").join("Eval.mw"), EVAL).unwrap();
     std::fs::write(root.join("src").join("Main.mw"), MAIN).unwrap();
-    std::fs::canonicalize(&root).unwrap()
+    root.canonical()
 }
 
 const EVAL: &str = "@pub(pkg) fun eval n = n + 1\n";
