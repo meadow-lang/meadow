@@ -340,11 +340,15 @@ anywhere.
 |                                                                                                                                                                                             | `MakeRecord`, `Select`, `Extend`, `Native`, `Halt`, `Error`                                                         |
 
 The heap instructions use a **fast path with a slow half**. For `field`, for
-example, the aarch64 code reaches the object -- a nursery address is one load
+example, the code reaches the object -- a nursery address is one load
 off the nursery base; an old one is two more, through the per-generation
 **block table** the heap publishes at `layout::TABLES` (`Heap::tables`), chosen
 by the address's generation bit -- loads the header, checks the kind and the
-bounds, and loads the word. An array element is reached the same way once,
+bounds, and loads the word. On x86-64 a field read straight after a tag test
+or a field read of the same object uses the object the one before found
+(`Emit::KEEPS_FOUND`), so `jumpunlesstag r0 is Fork; field r2 <- r0.0; field
+r3 <- r0.1` walks the tables once; entered any other way -- the slow half of
+the instruction before, a jump -- it finds the object first. An array element is reached the same way once,
 for the object, and then by an offset: every object is contiguous in memory,
 including one bigger than a block, which the old generation lays out in a
 run of blocks in one allocation (`old::Mem::Part`). Any check that fails branches to a slow label placed
@@ -723,6 +727,13 @@ what survives, which is usually very little.
 - After that, an object that has already survived one nursery collection is
   **promoted** to the old generation at the next one. The fixed nursery size
   bounds the nursery pause.
+- Keeping a survivor young for one collection is a bet that it is about to
+  die, and a program building something bigger than the nursery loses it
+  every time. So the bet is watched (`Heap::tenure`): when most of what was
+  kept young survived to be promoted anyway, the next collections promote
+  what survives at once, and when one finds little alive they go back to
+  keeping it young. A pause copies what survives either way; this decides
+  whether it is copied once or twice.
 - An object bigger than the whole nursery goes straight into the old
   generation.
 
@@ -799,8 +810,9 @@ cooperation with the collector beyond what the interpreter already does:
   frame. So the native stack is one frame deep, and a deep recursion grows only
   the heap.
 
-The inline fast paths only read nursery objects and only allocate in the
-nursery, so they never need the old generation's mutation lock or barriers.
+The inline fast paths read objects in either generation but write only the
+nursery -- allocating there, or storing into a young array -- so they never
+need the old generation's mutation lock or barriers.
 Anything that writes a mutable object goes to the interpreter, which runs the
 barrier.
 

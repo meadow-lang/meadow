@@ -112,6 +112,19 @@ beyond the last release is under _Unreleased_.
   arguments, `(id f) x`, lost the type of a function it answered: the
   AxCut machine refused the program, holding a closure in a name of no
   known representation.
+- Glade's native code on x86-64 reads promoted objects itself: a tag test or
+  a field read of an object in the old generation went to the interpreter,
+  as it has not on arm64 since the block tables. It also keeps `r0`–`r4` in
+  their registers from one function to the next and enters a method directly
+  on a call or a return, does arithmetic and comparisons in those registers,
+  and finds an object once for a tag test and the field reads after it. And a
+  nursery collection promotes at once what keeps surviving to be promoted,
+  rather than copying it within the nursery first. On an x86-64 desktop,
+  `benchmarks/binarytrees` went from 1.96s to 0.75s, `rbtree` from 8.2s to
+  3.6s, `wordfreq` from 373ms to 302ms and `fib` from 35ms to 21ms, with
+  nursery pauses no longer than they were.
+- `benchmarks/run.py` measures Meadow's startup with a `main` the compiler
+  accepts.
 
 ## 0.4.0 - 2026-10-24
 

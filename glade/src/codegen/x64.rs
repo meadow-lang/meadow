@@ -6,10 +6,12 @@
 //! iterations this call has made, and `rax`, `rcx`, `rdx`, `rsi`, `rdi`,
 //! `xmm0` and `xmm1` for the instruction being done.
 //!
-//! `r8` to `r11` and `r15` hold the bytecode registers a function pins (see
-//! [`super::Emit::configure`]): loaded after the prologue, written to memory
-//! before every call and return, and loaded again after every call. Nothing
-//! else touches them.
+//! `r8` to `r11` and `r15` hold bytecode registers `r0` to `r4`, in every
+//! function alike -- the fixed registers -- so that one function goes on to
+//! another with nothing moved, as on arm64: they are loaded from the register
+//! file where the machine enters native code (the prologue, before the warm
+//! entry), written to it before every call into the interpreter and every
+//! return, and loaded again after every call. Nothing else touches them.
 
 use super::{Emit, FloatOp, IntOp, Label, Operand, UnaryOp, layout, thin};
 use meadow_bytecode::{Cond, Pc, Reg};
@@ -157,6 +159,106 @@ impl Asm {
         }
     }
 
+    /// `dst op= src`, 64 bits, for an ALU `opcode` of the `r/m64, r64` form:
+    /// `0x01` add, `0x29` sub, `0x21` and, `0x39` cmp, `0x85` test.
+    fn alu_rr(&mut self, opcode: u8, dst: u8, src: u8) {
+        self.rex_w(src, dst);
+        self.bytes(&[opcode, 0xC0 | (src & 7) << 3 | (dst & 7)]);
+    }
+
+    /// `dst op= imm`, 64 bits, sign-extended from 32: `81 /ext` -- 0 add, 4
+    /// and, 5 sub, 7 cmp.
+    fn alu_ri(&mut self, ext: u8, dst: u8, imm: i32) {
+        self.rex_w(0, dst);
+        self.bytes(&[0x81, 0xC0 | ext << 3 | (dst & 7)]);
+        self.bytes(&imm.to_le_bytes());
+    }
+
+    /// The machine register `c` is in: its own if it is pinned, else `rcx`
+    /// with it put there.
+    fn operand_reg(&mut self, c: Operand) -> u8 {
+        match c {
+            Operand::Reg(r) => match self.pinned(r as u32) {
+                Some(m) => m,
+                None => {
+                    self.get(RCX, r as u32);
+                    RCX
+                }
+            },
+            Operand::Imm(n) => {
+                self.imm(RCX, n as u64);
+                RCX
+            }
+        }
+    }
+
+    /// `cmp reg, c`
+    fn cmp_reg(&mut self, reg: u8, c: Operand) {
+        match self.short_imm(c) {
+            Some(k) => self.alu_ri(7, reg, k),
+            None => {
+                let s = self.operand_reg(c);
+                self.alu_rr(0x39, reg, s);
+            }
+        }
+    }
+
+    /// `r[a] = r[b] op c` where `r[a]` is pinned, done in its own register --
+    /// `add r9, 1` rather than through `rax` and back -- or `false`, having
+    /// emitted nothing, where it cannot be: division, which wants `rax` and
+    /// `rdx`, and a `c` that is `r[a]` itself when `a` is not `b`.
+    fn int_in_place(&mut self, op: IntOp, a: Reg, b: Reg, c: Operand) -> bool {
+        let Some(d) = self.pinned(a as u32) else {
+            return false;
+        };
+        if matches!(op, IntOp::Div | IntOp::Rem)
+            || (a != b && matches!(c, Operand::Reg(r) if r == a))
+        {
+            return false;
+        }
+        if a != b {
+            self.get(d, b as u32);
+        }
+        match (op, self.short_imm(c)) {
+            (IntOp::Add, Some(k)) => self.alu_ri(0, d, k),
+            (IntOp::Sub, Some(k)) => self.alu_ri(5, d, k),
+            (IntOp::And, Some(k)) => self.alu_ri(4, d, k),
+            (IntOp::Mul, Some(k)) => {
+                self.rex_w(d, d);
+                self.bytes(&[0x69, 0xC0 | (d & 7) << 3 | (d & 7)]); // imul d, d, k
+                self.bytes(&k.to_le_bytes());
+            }
+            _ => {
+                let s = self.operand_reg(c);
+                match op {
+                    IntOp::Add => self.alu_rr(0x01, d, s),
+                    IntOp::Sub => self.alu_rr(0x29, d, s),
+                    IntOp::And => self.alu_rr(0x21, d, s),
+                    IntOp::Mul => {
+                        self.rex_w(d, s);
+                        self.bytes(&[0x0F, 0xAF, 0xC0 | (d & 7) << 3 | (s & 7)]); // imul d, s
+                    }
+                    // The count in `cl`; modulo 64, as `wrapping_shl` is.
+                    IntOp::Shl | IntOp::Shr | IntOp::Ushr => {
+                        self.mov_rr(RCX, s);
+                        let ext = match op {
+                            IntOp::Shl => 4,
+                            IntOp::Shr => 7,
+                            _ => 5,
+                        };
+                        self.rex_w(0, d);
+                        self.bytes(&[0xD3, 0xC0 | ext << 3 | (d & 7)]); // shl/sar/shr d, cl
+                    }
+                    IntOp::Div | IntOp::Rem => unreachable!("refused above"),
+                }
+            }
+        }
+        if !self.defer_live {
+            self.raise(a as u32 + 1);
+        }
+        true
+    }
+
     /// `rcx = c`
     fn operand(&mut self, c: Operand) {
         match c {
@@ -188,12 +290,15 @@ impl Asm {
         }
     }
 
+    /// `live = max(live, n)`, in `rcx` and `rdi`: not `rdx` or `rsi`, since
+    /// what `codegen::Book` emits between two instructions has to leave an
+    /// object one of them found where it is (`Emit::KEEPS_FOUND`).
     fn raise(&mut self, n: u32) {
         self.load(RCX, RBX, layout::LIVE);
-        self.bytes(&[0xBA]); // mov edx, n
+        self.bytes(&[0xB8 + 7]); // mov edi, n
         self.bytes(&n.to_le_bytes());
-        self.bytes(&[0x48, 0x39, 0xD1]); // cmp rcx, rdx
-        self.bytes(&[0x48, 0x0F, 0x42, 0xCA]); // cmovb rcx, rdx
+        self.bytes(&[0x48, 0x39, 0xF9]); // cmp rcx, rdi
+        self.bytes(&[0x48, 0x0F, 0x42, 0xCF]); // cmovb rcx, rdi
         self.save(RCX, RBX, layout::LIVE);
     }
 
@@ -226,6 +331,40 @@ impl Asm {
     fn enter_warm(&mut self) {
         self.bytes(&[0x48, 0x83, 0xC0, Self::WARM as u8]); // add rax, WARM
         self.bytes(&[0xFF, 0xE0]); // jmp rax
+    }
+
+    /// `rcx = ` the method entry for the pc in `esi`, or on to `none` if it
+    /// has none, or this call has made [`super::CHAINS`] jumps already. The
+    /// table is there whenever native code runs at all. After it, the entry
+    /// wants the arguments in `r[0..argc]`, in registers, and the object's
+    /// first word's address in `rdx`; it loads the captures itself.
+    fn method_entry(&mut self, none: Label) {
+        self.load(RCX, RBX, layout::NATIVE_METHODS);
+        self.bytes(&[0x48, 0x8B, 0x0C, 0xF1]); // mov rcx, [rcx + rsi*8]
+        self.bytes(&[0x48, 0x85, 0xC9]); // test rcx, rcx
+        self.jcc(CC_E, none);
+        self.budget(none);
+    }
+
+    /// The `argc` arguments at `r[base]` down to `r[0..argc]`, lowest first:
+    /// with `base` above zero every one moves below where it was, so none is
+    /// overwritten before it is read. Through `rax`, which is all it touches
+    /// besides the registers themselves.
+    fn args_down(&mut self, base: Reg, argc: u32) {
+        if base == 0 {
+            return;
+        }
+        for j in 0..argc {
+            let from = base as u32 + j;
+            match (self.pinned(j), self.pinned(from)) {
+                (Some(d), Some(s)) => self.mov_rr(d, s),
+                (Some(d), None) => self.load(d, R12, Self::slot(from)),
+                (None, _) => {
+                    self.get(RAX, from);
+                    self.save(RAX, R12, Self::slot(j));
+                }
+            }
+        }
     }
 
     /// Return `status` with the register file as it is in memory.
@@ -297,25 +436,17 @@ impl Asm {
         }
     }
 
-    /// `rax = r[x]`, and on to `slow` unless that is a nursery address; then
-    /// `rdx` the object's first slot, `rsi` its first word, `ecx` its kind.
-    fn nursery(&mut self, x: Reg, slow: Label) {
-        self.get(RAX, x as u32);
-        self.bytes(&[0x48, 0x3D]); // cmp rax, OLD_BASE
-        self.bytes(&crate::old::OLD_BASE.to_le_bytes());
-        self.jcc(CC_AE, slow);
-        self.load(2, RBX, layout::BASE); // rdx
-        self.bytes(&[0x48, 0x8D, 0x14, 0xC2]); // lea rdx, [rdx + rax*8]
-        self.bytes(&[0x48, 0x8B, 0x32]); // mov rsi, [rdx]
-        self.bytes(&[0x40, 0x0F, 0xB6, 0xCE]); // movzx ecx, sil
-    }
-
-    /// [`Asm::nursery`] for an object in either generation: `rdx` its first
+    /// `rax = r[x]`, an object in either generation, and then `rdx` its first
     /// word's address, `rsi` that word, `ecx` its kind -- one in the nursery
     /// the short way, one in the old generation through the block tables.
-    /// Only a compact region goes to `slow`. A long-lived closure is an old
-    /// one: a parser combinator defined at the top level, say, which every
-    /// call of the parser it builds goes through.
+    /// Only a compact region goes to `slow`.
+    ///
+    /// Everything that reads an object goes through here, as on arm64, and
+    /// not only the calls. A long-lived closure is an old one -- a parser
+    /// combinator defined at the top level, say -- and so is any data that
+    /// has lived long enough to be promoted: a tag test or a field read of a
+    /// tree that survived two collections used to go to the interpreter, and
+    /// that was 35 million trips through `meadow_exec` in `binarytrees`.
     fn anywhere(&mut self, x: Reg, slow: Label) {
         let old = self.label();
         let found = self.label();
@@ -331,7 +462,21 @@ impl Asm {
         self.bytes(&[0x48, 0x89, 0xC6]); // mov rsi, rax
         self.bytes(&[0x48, 0xC1, 0xEE, 31]); // shr rsi, 31
         self.jcc(CC_NE, slow);
-        self.thin_where();
+        // The old generation, then, whose table is the second: what
+        // `thin_where` finds by the generation bit, known here.
+        {
+            use super::addr::*;
+            self.load(2, RBX, layout::TABLES + 8); // rdx = tables[1]
+            self.bytes(&[0x89, 0xC6]); // mov esi, eax
+            self.bytes(&[0xC1, 0xEE, BLOCK_SHIFT as u8]); // shr esi, 13
+            self.bytes(&[0x81, 0xE6]); // and esi, BLOCK_MASK
+            self.bytes(&(BLOCK_MASK as u32).to_le_bytes());
+            self.bytes(&[0x48, 0x8B, 0x14, 0xF2]); // mov rdx, [rdx + rsi*8]
+            self.bytes(&[0x89, 0xC6]); // mov esi, eax
+            self.bytes(&[0x81, 0xE6]); // and esi, SLOT_MASK
+            self.bytes(&(SLOT_MASK as u32).to_le_bytes());
+            self.bytes(&[0x48, 0x8D, 0x14, 0xF2]); // lea rdx, [rdx + rsi*8]
+        }
         self.bind(found);
         self.bytes(&[0x48, 0x8B, 0x32]); // mov rsi, [rdx]
         self.bytes(&[0x40, 0x0F, 0xB6, 0xCE]); // movzx ecx, sil
@@ -384,6 +529,43 @@ impl Asm {
         self.bytes(&[0x48, 0x8D, 0x14, 0xF2]); // lea rdx, [rdx + rsi*8]
     }
 
+    /// The rest of [`Emit::field`], for the object `anywhere` found: `rdx`
+    /// its first word's address, `rsi` that word, `ecx` its kind. Leaves
+    /// `rdx` and `rsi` as they were.
+    fn field_of_found(&mut self, a: Reg, i: u32, slow: Label) {
+        self.bytes(&[0x83, 0xF9, crate::heap::Kind::Array as u8]); // cmp ecx, Array
+        self.jcc(CC_A, slow);
+        self.length();
+        self.bytes(&[0x48, 0x81, 0xFF]); // cmp rdi, i
+        self.bytes(&i.to_le_bytes());
+        self.jcc(CC_BE, slow);
+        // As on aarch64: a word of header more for every sixteen fields
+        // past the eight the second word describes.
+        let (two_words, wide, done) = (self.label(), self.label(), self.label());
+        self.bytes(&[0xF7, 0xC6, 0x00, 0x10, 0x00, 0x00]); // test esi, UNIFORM
+        self.jcc(CC_NE, two_words);
+        self.bytes(&[0x48, 0x83, 0xFF, 0x08]); // cmp rdi, 8
+        self.jcc(CC_A, wide);
+        self.bind(two_words);
+        self.bytes(&[0x48, 0x8B, 0x82]); // mov rax, [rdx + (2 + i) * 8]
+        self.bytes(&((2 + i) * 8).to_le_bytes());
+        self.store(a);
+        self.jump(done);
+        self.bind(wide);
+        const {
+            assert!(
+                meadow_rt::compact::INLINE_DESCS == 8 && meadow_rt::compact::DESCS_PER_WORD == 16
+            )
+        };
+        self.bytes(&[0x48, 0x89, 0xF9]); // mov rcx, rdi
+        self.bytes(&[0x48, 0x83, 0xC1, 0x07]); // add rcx, 7
+        self.bytes(&[0x48, 0xC1, 0xE9, 0x04]); // shr rcx, 4
+        self.bytes(&[0x48, 0x8B, 0x84, 0xCA]); // mov rax, [rdx + rcx * 8 + (2 + i) * 8]
+        self.bytes(&((2 + i) * 8).to_le_bytes());
+        self.store(a);
+        self.bind(done);
+    }
+
     /// `rdi = rsi >> 32`: the object's length.
     fn length(&mut self) {
         self.bytes(&[0x48, 0x89, 0xF7, 0x48, 0xC1, 0xEF, 0x20]);
@@ -419,7 +601,7 @@ impl Asm {
 
 impl Emit for Asm {
     const FIXED: usize = PIN_REGS.len();
-    const WARM: usize = 33;
+    const WARM: usize = 33 + 8 * PIN_REGS.len();
 
     fn new() -> Asm {
         Asm {
@@ -452,9 +634,7 @@ impl Emit for Asm {
         self.short = opt >= OptLevel::O1;
         self.chain = opt >= OptLevel::O1;
         // The fixed registers, in general registers only: floats are not kept
-        // apart here. They are still written back before every chain and
-        // loaded at every warm entry, which the arm64 code no longer needs
-        // to do.
+        // apart here.
         self.pins = (0..PIN_REGS.len() as Reg).zip(PIN_REGS).collect();
     }
 
@@ -471,13 +651,14 @@ impl Emit for Asm {
         self.load(R12, RBX, layout::REGS);
         self.bytes(&[0x45, 0x31, 0xED]); // xor r13d, r13d
         self.bytes(&[0x45, 0x31, 0xF6]); // xor r14d, r14d
+        self.reload();
         // A chained function arrives here, with the frame, the machine, its
-        // register file, the steps and the loop count of the one it came from.
+        // register file, the fixed registers, the steps and the loop count of
+        // the one it came from.
         assert_eq!(self.offset() - start, Self::WARM, "the warm entry moved");
         if let Some(warm) = warm {
             self.bind(warm);
         }
-        self.reload();
         self.ret_eax = None;
     }
 
@@ -490,7 +671,8 @@ impl Emit for Asm {
         if let Some(live) = live {
             self.save_imm(RBX, layout::LIVE, live);
         }
-        self.spill();
+        // The fixed registers go on in their registers: written back only on
+        // the way out to the machine.
         let out = self.label();
         self.budget(out);
         match to {
@@ -505,6 +687,7 @@ impl Emit for Asm {
             }
         }
         self.bind(out);
+        self.spill();
         self.save_imm(RBX, layout::PC, pc);
         self.ret_as_is(crate::abi::JUMPED);
     }
@@ -654,11 +837,37 @@ impl Emit for Asm {
     }
 
     fn mov(&mut self, a: Reg, b: Reg) {
-        self.get(RAX, b as u32);
-        self.store(a);
+        match (self.pinned(a as u32), self.pinned(b as u32)) {
+            (Some(d), _) => self.get(d, b as u32),
+            (None, Some(s)) => self.save(s, R12, Self::slot(a as u32)),
+            (None, None) => {
+                self.get(RAX, b as u32);
+                self.save(RAX, R12, Self::slot(a as u32));
+            }
+        }
+        if !self.defer_live {
+            self.raise(a as u32 + 1);
+        }
     }
 
     fn word(&mut self, a: Reg, w: u64) {
+        if let Some(d) = self.pinned(a as u32) {
+            match u32::try_from(w) {
+                Ok(w) if self.short => {
+                    // mov d32, w: zero-extended to the whole register.
+                    if d >= 8 {
+                        self.bytes(&[0x41]);
+                    }
+                    self.bytes(&[0xB8 + (d & 7)]);
+                    self.bytes(&w.to_le_bytes());
+                }
+                _ => self.imm(d, w),
+            }
+            if !self.defer_live {
+                self.raise(a as u32 + 1);
+            }
+            return;
+        }
         match u32::try_from(w) {
             Ok(w) if self.short => {
                 self.bytes(&[0xB8]); // mov eax, w
@@ -670,6 +879,9 @@ impl Emit for Asm {
     }
 
     fn int(&mut self, op: IntOp, a: Reg, b: Reg, c: Operand, zero: Label) {
+        if self.int_in_place(op, a, b, c) {
+            return;
+        }
         self.get(RAX, b as u32);
         match (op, self.short_imm(c)) {
             (IntOp::Add, Some(k)) => {
@@ -740,22 +952,24 @@ impl Emit for Asm {
         self.bytes(&[0x3B, 0x8B]); // cmp ecx, [rbx + FLIM]
         self.bytes(&layout::FLIM.to_le_bytes());
         self.jcc(CC_A, slow);
-        // The frame's slot in memory: rdx = fbase + (fsp - fcur) * 8.
-        self.bytes(&[0x8B, 0x93]); // mov edx, [rbx + FCUR]
-        self.bytes(&layout::FCUR.to_le_bytes());
-        self.bytes(&[0x48, 0x89, 0xC6]); // mov rsi, rax
-        self.bytes(&[0x48, 0x29, 0xD6]); // sub rsi, rdx
-        self.load(2, RBX, layout::FBASE); // rdx
-        self.bytes(&[0x48, 0x8D, 0x14, 0xF2]); // lea rdx, [rdx + rsi*8]
+        // The frame's slot in memory: rdx = fbias + fsp * 8.
+        self.load(2, RBX, layout::FBIAS); // rdx
+        self.bytes(&[0x48, 0x8D, 0x14, 0xC2]); // lea rdx, [rdx + rax*8]
         for (k, &w) in header.iter().enumerate() {
             self.imm(RSI, w);
             self.bytes(&[0x48, 0x89, 0xB2]); // mov [rdx + k * 8], rsi
             self.bytes(&(k as u32 * 8).to_le_bytes());
         }
         for (j, &r) in (0..).zip(fields) {
-            self.get(RSI, r as u32);
-            self.bytes(&[0x48, 0x89, 0xB2]); // mov [rdx + (hdr + j) * 8], rsi
-            self.bytes(&((hdr + j) * 8).to_le_bytes());
+            // A pinned register is stored from where it lives.
+            let m = match self.pinned(r as u32) {
+                Some(m) => m,
+                None => {
+                    self.get(RSI, r as u32);
+                    RSI
+                }
+            };
+            self.save(m, 2, (hdr + j) * 8); // mov [rdx + (hdr + j) * 8], m
         }
         self.bytes(&[0x89, 0x8B]); // mov [rbx + FSP], ecx
         self.bytes(&layout::FSP.to_le_bytes());
@@ -795,8 +1009,13 @@ impl Emit for Asm {
     }
 
     fn cmp_int(&mut self, cond: Cond, a: Reg, b: Reg, c: Operand) {
-        self.get(RAX, b as u32);
-        self.cmp_rax(c);
+        match self.pinned(b as u32) {
+            Some(m) => self.cmp_reg(m, c),
+            None => {
+                self.get(RAX, b as u32);
+                self.cmp_rax(c);
+            }
+        }
         self.bytes(&[0x0F, 0x90 | Self::int_cc(cond), 0xC0]); // setcc al
         self.bytes(&[0x0F, 0xB6, 0xC0]); // movzx eax, al
         self.store(a);
@@ -811,8 +1030,13 @@ impl Emit for Asm {
     }
 
     fn branch_int(&mut self, cond: Cond, x: Reg, y: Operand, to: Label) {
-        self.get(RAX, x as u32);
-        self.cmp_rax(y);
+        match self.pinned(x as u32) {
+            Some(m) => self.cmp_reg(m, y),
+            None => {
+                self.get(RAX, x as u32);
+                self.cmp_rax(y);
+            }
+        }
         self.jcc(Self::int_cc(cond) ^ 1, to);
     }
 
@@ -825,8 +1049,14 @@ impl Emit for Asm {
     }
 
     fn branch_zero(&mut self, x: Reg, to: Label) {
-        self.get(RAX, x as u32);
-        self.bytes(&[0x48, 0x85, 0xC0]); // test rax, rax
+        let m = match self.pinned(x as u32) {
+            Some(m) => m,
+            None => {
+                self.get(RAX, x as u32);
+                RAX
+            }
+        };
+        self.alu_rr(0x85, m, m); // test m, m
         self.jcc(CC_E, to);
     }
 
@@ -848,7 +1078,7 @@ impl Emit for Asm {
     }
 
     fn tag_test(&mut self, x: Reg, tag: u32, miss: Label, slow: Label) {
-        self.nursery(x, slow);
+        self.anywhere(x, slow);
         self.bytes(&[0x85, 0xC9]); // test ecx, ecx: Data
         self.jcc(CC_NE, miss);
         self.bytes(&[0x8B, 0x4A, 0x08]); // mov ecx, [rdx + 8]: meta
@@ -858,47 +1088,43 @@ impl Emit for Asm {
     }
 
     fn field(&mut self, a: Reg, b: Reg, i: u32, slow: Label) {
-        self.nursery(b, slow);
-        self.bytes(&[0x83, 0xF9, crate::heap::Kind::Array as u8]); // cmp ecx, Array
-        self.jcc(CC_A, slow);
-        self.length();
-        self.bytes(&[0x48, 0x81, 0xFF]); // cmp rdi, i
-        self.bytes(&i.to_le_bytes());
-        self.jcc(CC_BE, slow);
-        // As on aarch64: a word of header more for every sixteen fields
-        // past the eight the second word describes.
-        let (two_words, wide, done) = (self.label(), self.label(), self.label());
-        self.bytes(&[0xF7, 0xC6, 0x00, 0x10, 0x00, 0x00]); // test esi, UNIFORM
-        self.jcc(CC_NE, two_words);
-        self.bytes(&[0x48, 0x83, 0xFF, 0x08]); // cmp rdi, 8
-        self.jcc(CC_A, wide);
-        self.bind(two_words);
-        self.bytes(&[0x48, 0x8B, 0x82]); // mov rax, [rdx + (2 + i) * 8]
-        self.bytes(&((2 + i) * 8).to_le_bytes());
-        self.store(a);
-        self.jump(done);
-        self.bind(wide);
-        const {
-            assert!(
-                meadow_rt::compact::INLINE_DESCS == 8 && meadow_rt::compact::DESCS_PER_WORD == 16
-            )
-        };
-        self.bytes(&[0x48, 0x89, 0xF9]); // mov rcx, rdi
-        self.bytes(&[0x48, 0x83, 0xC1, 0x07]); // add rcx, 7
-        self.bytes(&[0x48, 0xC1, 0xE9, 0x04]); // shr rcx, 4
-        self.bytes(&[0x48, 0x8B, 0x84, 0xCA]); // mov rax, [rdx + rcx * 8 + (2 + i) * 8]
-        self.bytes(&((2 + i) * 8).to_le_bytes());
-        self.store(a);
-        self.bind(done);
+        self.anywhere(b, slow);
+        self.field_of_found(a, i, slow);
+    }
+
+    const KEEPS_FOUND: bool = true;
+
+    fn find(&mut self, x: Reg, slow: Label) {
+        self.anywhere(x, slow);
+    }
+
+    fn field_found(&mut self, a: Reg, i: u32, slow: Label) {
+        // `rdx` and `rsi` are as `anywhere` left them, and `tag_test` and
+        // `field` after it leave them; the kind is wanted again.
+        self.bytes(&[0x40, 0x0F, 0xB6, 0xCE]); // movzx ecx, sil
+        self.field_of_found(a, i, slow);
     }
 
     fn vector_loop(&mut self, _plan: &super::vector::Plan, _scalar: Label) {
         // Everything falls into the scalar loop.
     }
 
-    fn stub(&mut self, _captures: u32, _params: u32, _warm: Label) -> bool {
-        // No method entries here: every call rebuilds the register file.
-        false
+    fn stub(&mut self, captures: u32, params: u32, warm: Label) -> bool {
+        let argc = params - captures;
+        // The arguments up past the captures, highest first, so that none is
+        // overwritten before it has moved.
+        for j in (0..argc).rev() {
+            self.mov_rr(PIN_REGS[(captures + j) as usize], PIN_REGS[j as usize]);
+        }
+        // The captures follow the header, which is longer than two words past
+        // `compact::INLINE_DESCS` of them: see `object::write_header`.
+        let hdr = meadow_rt::compact::header_slots(false, captures as usize) as u32;
+        for i in 0..captures {
+            self.load(PIN_REGS[i as usize], 2, (hdr + i) * 8); // [rdx + field i]
+        }
+        self.save_imm(RBX, layout::LIVE, params);
+        self.jump(warm);
+        true
     }
 
     fn invoke_known(
@@ -925,10 +1151,8 @@ impl Emit for Asm {
             self.bytes(&layout::FLIM.to_le_bytes());
             self.bytes(&[0x48, 0x39, 0xD0]); // cmp rax, rdx
             self.jcc(CC_AE, generic);
-            self.bytes(&[0x48, 0x89, 0xC2]); // mov rdx, rax
-            self.bytes(&[0x48, 0x29, 0xCA]); // sub rdx, rcx
-            self.load(RSI, RBX, layout::FBASE);
-            self.bytes(&[0x48, 0x8D, 0x14, 0xD6]); // lea rdx, [rsi + rdx*8]
+            self.load(2, RBX, layout::FBIAS); // rdx
+            self.bytes(&[0x48, 0x8D, 0x14, 0xC2]); // lea rdx, [rdx + rax*8]
             self.bytes(&[0x81, 0x7A, 0x08]); // cmp dword [rdx + 8], target
             self.bytes(&g.target.to_le_bytes());
             self.jcc(CC_NE, generic);
@@ -973,16 +1197,16 @@ impl Emit for Asm {
             self.jump(slow);
             return;
         }
-        // The register file is rebuilt in memory below.
-        self.spill();
         let object = self.label();
         let rebuild = self.label();
+        let generic = self.label();
+        let generic_frame = self.label();
         // A return: the object is in the current chunk of the frame stack.
         // Everything in a stack chunk is a frame, so its kind needs no test;
         // its slot is one load from the chunk's base; its return pc is its
         // `meta`, and its one method is #0, so there is no table to look up.
         // A frame in a chunk below has chunks to release on the way down,
-        // which the interpreter does: it is not a nursery address below.
+        // which the interpreter does: it fails the kind test below.
         self.get(RAX, obj as u32);
         self.bytes(&[0x8B, 0x8B]); // mov ecx, [rbx + FCUR]
         self.bytes(&layout::FCUR.to_le_bytes());
@@ -992,20 +1216,30 @@ impl Emit for Asm {
         self.bytes(&layout::FLIM.to_le_bytes());
         self.bytes(&[0x48, 0x39, 0xD0]); // cmp rax, rdx
         self.jcc(CC_AE, object);
-        self.bytes(&[0x48, 0x89, 0xC2]); // mov rdx, rax
-        self.bytes(&[0x48, 0x29, 0xCA]); // sub rdx, rcx
-        self.load(RSI, RBX, layout::FBASE);
-        self.bytes(&[0x48, 0x8D, 0x14, 0xD6]); // lea rdx, [rsi + rdx*8]
-        self.bytes(&[0x48, 0x8B, 0x32]); // mov rsi, [rdx]
-        self.length();
+        self.load(2, RBX, layout::FBIAS); // rdx
+        self.bytes(&[0x48, 0x8D, 0x14, 0xC2]); // lea rdx, [rdx + rax*8]
+        self.bytes(&[0x8B, 0x72, 0x08]); // mov esi, [rdx + 8]
+        if self.chain {
+            // Returning pops the frame: the stack's top goes back to its
+            // slot. Then on to the method entry, as for a call below, which
+            // loads the captures from where the frame still is.
+            self.method_entry(generic_frame);
+            self.bytes(&[0x89, 0x83]); // mov [rbx + FSP], eax
+            self.bytes(&layout::FSP.to_le_bytes());
+            self.args_down(base, argc);
+            self.bytes(&[0xFF, 0xE1]); // jmp rcx
+        }
+        // The general path wants the header and the length, which a return
+        // to a method entry did not need.
+        self.bind(generic_frame);
+        self.bytes(&[0x48, 0x8B, 0x3A]); // mov rdi, [rdx]
+        self.bytes(&[0x48, 0xC1, 0xEF, 0x20]); // shr rdi, 32: the length
         self.bytes(&[0x48, 0x83, 0xFF, 0x18]); // cmp rdi, 24
         self.jcc(CC_A, slow);
-        self.bytes(&[0x8B, 0x72, 0x08]); // mov esi, [rdx + 8]
-        // Returning pops the frame: the stack's top goes back to its slot.
         self.bytes(&[0x89, 0x83]); // mov [rbx + FSP], eax
         self.bytes(&layout::FSP.to_le_bytes());
         self.jump(rebuild);
-        // A call: a closure in the nursery.
+        // A call: a closure, wherever it is.
         self.bind(object);
         self.anywhere(obj, slow);
         self.bytes(&[0x83, 0xF9, crate::heap::Kind::Closure as u8]); // cmp ecx, Closure
@@ -1026,7 +1260,17 @@ impl Emit for Asm {
         self.bytes(&(method as u32).to_le_bytes());
         self.load(RSI, RBX, layout::METHOD_PCS);
         self.bytes(&[0x8B, 0x34, 0x86]); // mov esi, [rsi + rax*4]
+        if self.chain {
+            self.method_entry(generic);
+            self.args_down(base, argc);
+            self.bytes(&[0xFF, 0xE1]); // jmp rcx
+        }
+        self.bind(generic);
+        // The general path: the register file rebuilt in memory, as the
+        // interpreter does it, from `rdx` the object, `rdi` its length and
+        // `esi` the method's pc.
         self.bind(rebuild);
+        self.spill();
         // The captures follow a header of two words, and one more for every
         // sixteen fields past the eighth, whose descriptors no longer fit the
         // second (see `object::write_header`; a closure and a frame are never
@@ -1068,6 +1312,9 @@ impl Emit for Asm {
             self.bytes(&[0x48, 0x8B, 0x04, 0xF0]); // mov rax, [rax + rsi*8]
             self.bytes(&[0x48, 0x85, 0xC0]); // test rax, rax
             self.jcc(CC_E, out);
+            // The register file was rebuilt in memory: the next function
+            // expects the fixed registers in their registers.
+            self.reload();
             self.enter_warm();
             self.bind(out);
         }
@@ -1098,9 +1345,15 @@ impl Emit for Asm {
             self.bytes(&(k as u32 * 8).to_le_bytes());
         }
         for (j, &r) in (0..).zip(fields) {
-            self.get(RSI, r as u32);
-            self.bytes(&[0x48, 0x89, 0xB2]); // mov [rdx + (hdr + j) * 8], rsi
-            self.bytes(&((hdr + j) * 8).to_le_bytes());
+            // A pinned register is stored from where it lives.
+            let m = match self.pinned(r as u32) {
+                Some(m) => m,
+                None => {
+                    self.get(RSI, r as u32);
+                    RSI
+                }
+            };
+            self.save(m, 2, (hdr + j) * 8); // mov [rdx + (hdr + j) * 8], m
         }
         self.save(RCX, RBX, layout::TOP);
         self.bytes(&[0x48, 0x81, 0x83]); // add qword [rbx + ALLOCATED], size

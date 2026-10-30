@@ -16,7 +16,9 @@
 //! does. What has survived one nursery collection already is **promoted** into
 //! the old generation at the next, so nothing is copied back and forth for long,
 //! and the nursery has a fixed largest size -- [`GcConfig::nursery`] -- so a
-//! nursery collection has a fixed longest pause.
+//! nursery collection has a fixed longest pause. While what is kept young keeps
+//! surviving to be promoted anyway, survivors are promoted at once instead:
+//! see `Heap::tenure`.
 //!
 //! Until a heap fills its largest nursery, nothing is promoted and the nursery
 //! just grows: most green threads never keep enough alive to need an old
@@ -229,6 +231,10 @@ const EVACUATE: (Duration, usize) = (Duration::from_micros(25), 1 << 11);
 
 /// Blocks looked at, per nursery collection, for ones to give back.
 const RELEASE_BUDGET: usize = 64;
+
+/// A collection that keeps alive less than one part in this of the nursery has
+/// so little to copy that how it copies hardly matters: see [`Heap::tenure`].
+const TENURE_LITTLE: usize = 16;
 
 /// How many slots a fresh heap starts with. It doubles whenever a collection
 /// leaves it more than half full.
@@ -464,6 +470,9 @@ pub struct Heap {
     /// `fbase + (a - fcur) * 8`, one load rather than the block table's three.
     pub(crate) fcur: Addr,
     pub(crate) fbase: *mut Word,
+    /// `fbase - fcur` slots, so that a frame at `a` in the current chunk is at
+    /// `fbias + a * 8`: one load and an add, for every push and return.
+    pub(crate) fbias: *mut Word,
     /// Chunks entered so far: the serial the next one gets.
     chunk_serial: u32,
     /// The nursery's half of `tables`, which this owns.
@@ -489,6 +498,9 @@ pub struct Heap {
     other: Vec<Word>,
     /// Nursery objects below this have survived a collection already.
     aged: usize,
+    /// Whether what survives a nursery collection is promoted at once rather
+    /// than kept young for one more: see [`Heap::tenure`].
+    tenure: bool,
     /// Whether survivors are promoted: once the nursery is as big as it gets.
     promoting: bool,
     old: Old,
@@ -618,6 +630,7 @@ impl Heap {
             other: Vec::new(),
             top: 0,
             aged: 0,
+            tenure: false,
             promoting: false,
             old: Old::default(),
             remembered: Vec::new(),
@@ -647,6 +660,7 @@ impl Heap {
             flim: 0,
             fcur: 0,
             fbase: std::ptr::null_mut(),
+            fbias: std::ptr::null_mut(),
             chunk_serial: 0,
             nursery_blocks: Vec::new(),
             free_chunks: Vec::new(),
@@ -710,6 +724,9 @@ impl Heap {
         } else {
             self.old.base_ptr(self.fcur)
         };
+        // Only ever added to an address in the current chunk, which brings it
+        // back inside the chunk; with no chunk, nothing is.
+        self.fbias = self.fbase.wrapping_sub(self.fcur as usize);
     }
 
     /// Has enough gone into regions since the last collection that dead ones
@@ -1649,7 +1666,7 @@ impl Heap {
             top: 0,
             aged: self.aged,
             promote: self.promoting || promote_all,
-            promote_all,
+            promote_all: promote_all || (self.promoting && self.tenure),
             black: self.marking.is_some(),
             old: &mut self.old,
             promoted: Vec::new(),
@@ -1660,6 +1677,7 @@ impl Heap {
             whole,
             copied: 0,
             promoted_slots: 0,
+            promoted_aged: 0,
         };
 
         for r in roots.iter_mut() {
@@ -1749,17 +1767,32 @@ impl Heap {
                 }
                 scan += h.size();
             } else if let Some(p) = gc.promoted.pop() {
-                let h = Head::read(gc.old.get(p), gc.old.get(p + 1));
-                let base = p + h.header() as Addr;
+                // Read and written in place: an old object is contiguous in
+                // memory, one bigger than a block too (it has a run of blocks
+                // to itself), and forwarding never moves a block -- adding
+                // one only grows the table that points at them. Its fields'
+                // pointer bits were written as it was promoted, so a field
+                // rewritten here keeps the bit it has.
+                let at = gc.old.base_ptr(p).wrapping_add(old::offset_of(p));
+                // Safety: `p` is an object `alloc` answered and `put_object`
+                // wrote, so every slot of it is there to be read.
+                let word = |k: usize| unsafe { *at.add(k) };
+                let h = Head::read(word(0), word(1));
+                if !h.may_point() {
+                    continue;
+                }
+                let header = h.header();
+                let base = p + header as Addr;
                 for i in 0..h.len as usize {
-                    if h.desc(i, |k| gc.old.get(p + k as Addr)) != desc::REF {
+                    if h.desc(i, word) != desc::REF {
                         continue;
                     }
                     let s = base + i as Addr;
-                    let a = gc.old.get(s) as Addr;
+                    let a = word(header + i) as Addr;
                     let n = gc.forward(a);
                     if a < OLD_BASE {
-                        gc.old.put_field(s, n as Word, true);
+                        // Safety: as for `word`.
+                        unsafe { *at.add(header + i) = n as Word };
                     }
                     if n < OLD_BASE {
                         if gc.old.remember(s) {
@@ -1776,11 +1809,13 @@ impl Heap {
 
         let top = gc.top;
         let (copied, promoted) = (gc.copied, gc.promoted_slots);
+        let (aged, promoted_aged) = (self.aged, gc.promoted_aged);
         self.remembered = gc.remembered;
         self.other = std::mem::replace(&mut self.space, to);
         self.sync();
         self.top = top;
         self.aged = top;
+        self.tenure(aged, promoted_aged, promoted);
         // A segment whose naming object was young and did not survive is dead
         // now, not at the end of some later marking cycle: a transaction that
         // retries cuts one off every attempt, and waiting for the marker to
@@ -1840,6 +1875,40 @@ impl Heap {
                 Collector::Generational => self.promoting = true,
             }
         }
+    }
+
+    /// Decide, after a nursery collection, whether the next one promotes what
+    /// survives it at once -- **tenures** it -- or keeps it young for one more
+    /// collection, as it does by default. `aged` slots had survived once before
+    /// this collection, `promoted_aged` of them survived it too, and
+    /// `promoted` slots were promoted in all.
+    ///
+    /// Keeping a survivor young for a collection is a bet that it is about to
+    /// die: it is copied within the nursery once, and promoted only if it is
+    /// still there at the next. Most of the time the bet is good. But a
+    /// program building something larger than the nursery -- a tree that is
+    /// walked once it is finished, a list that is reversed at the end -- loses
+    /// it every time: everything the nursery holds survives the collection and
+    /// the one after, and is copied twice. `benchmarks/binarytrees` lost it
+    /// for a quarter of everything it allocated.
+    ///
+    /// So the bet is watched. When most of what was kept young survived to be
+    /// promoted anyway, the next collections promote at once; when one of
+    /// those finds little alive, so that keeping it young would have cost next
+    /// to nothing, they go back to keeping it. A pause does the same work
+    /// either way, give or take the cheaper copy -- what survives, copied
+    /// once more -- so this moves throughput and not the longest pause.
+    fn tenure(&mut self, aged: usize, promoted_aged: usize, promoted: usize) {
+        if !self.promoting || self.config.collector != Collector::Generational {
+            self.tenure = false;
+            return;
+        }
+        let nursery = self.space.len();
+        self.tenure = if self.tenure {
+            promoted * TENURE_LITTLE >= nursery
+        } else {
+            aged * TENURE_LITTLE >= nursery && promoted_aged * 2 > aged
+        };
     }
 
     /// Check that every address reachable from `roots` is an object where it
@@ -2545,6 +2614,8 @@ struct Minor<'h> {
     whole: bool,
     copied: usize,
     promoted_slots: usize,
+    /// Of those, the slots of objects that had survived a collection before.
+    promoted_aged: usize,
 }
 
 impl Minor<'_> {
@@ -2577,20 +2648,15 @@ impl Minor<'_> {
             self.promote && (self.promote_all || a < self.aged || self.top + size > self.to.len());
         let at = if promote {
             let at = self.old.alloc(size, self.black);
-            let header = h.header();
-            for k in 0..header {
-                self.old.put(at + k as Addr, self.from[a + k]);
-            }
-            for i in 0..h.len as usize {
-                let pointer = h.desc(i, |k| self.from[a + k]) == desc::REF;
-                self.old.put_field(
-                    at + (header + i) as Addr,
-                    self.from[a + header + i],
-                    pointer,
-                );
-            }
+            let words = &self.from[a..a + size];
+            self.old.put_object(at, words, h.header(), |i| {
+                h.desc(i, |k| words[k]) == desc::REF
+            });
             self.promoted.push(at);
             self.promoted_slots += size;
+            if a < self.aged {
+                self.promoted_aged += size;
+            }
             at
         } else {
             let at = self.top;

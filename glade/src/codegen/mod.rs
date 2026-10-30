@@ -116,6 +116,9 @@ pub mod layout {
     /// machine address: a frame in the current chunk is one load away.
     pub const FCUR: u32 = 144;
     pub const FBASE: u32 = 152;
+    /// `fbase - fcur * 8`, a machine address: a frame `a` in the current
+    /// chunk is at `fbias + a * 8`.
+    pub const FBIAS: u32 = 160;
 }
 
 /// Where a heap address keeps each part, for the two-level lookup native code
@@ -305,6 +308,22 @@ pub trait Emit {
     fn steps(&mut self, run: &[thin::Step], slow: Label);
     /// `r[a] = ` field `i` of the data or array in `r[b]`.
     fn field(&mut self, a: Reg, b: Reg, i: u32, slow: Label);
+    /// Whether [`Emit::tag_test`] and [`Emit::field`] leave the object they
+    /// found where the next [`Emit::field`] of it can use it without finding
+    /// it again -- see [`Emit::field_found`] -- across nothing but what
+    /// [`Book`] emits between two instructions. An architecture that answers
+    /// `false` has every field found afresh.
+    const KEEPS_FOUND: bool = false;
+    /// Find the object in `r[x]` as [`Emit::tag_test`] and [`Emit::field`]
+    /// do, or on to `slow` if native code cannot read it.
+    fn find(&mut self, _x: Reg, _slow: Label) {
+        unreachable!("only where `KEEPS_FOUND`")
+    }
+    /// [`Emit::field`] of the object the instruction before found -- or
+    /// [`Emit::find`] did.
+    fn field_found(&mut self, _a: Reg, _i: u32, _slow: Label) {
+        unreachable!("only where `KEEPS_FOUND`")
+    }
     /// Enter method `method` of the closure in `r[obj]`, with the `argc`
     /// arguments at `r[base]`, as `Op::Invoke` does -- and go on to it, as
     /// [`Emit::chain`] does from [`OptLevel::O1`], or return, leaving for it.
@@ -1181,8 +1200,32 @@ fn block<E: Emit>(
         asm.raise_live_to(ll);
         book.set(ll);
     }
+    // The register whose object the instruction just emitted found and left
+    // where the next can use it (`Emit::KEEPS_FOUND`): a tag test and the
+    // field reads after it, `jumpunlesstag r0 is Fork; field r2 <- r0.0;
+    // field r3 <- r0.1`, find `r0` once rather than three times -- which for
+    // an old object is three dependent loads through the block tables each.
+    let mut found: Option<Reg> = None;
+    // Where a field that used the object found before it is entered from
+    // anywhere but the instruction before -- its own label, which the slow
+    // half of that instruction and every jump come to -- with what it takes
+    // to find the object there: `(label, where the field's code is, register,
+    // the field's slow half)`.
+    let mut refinds: Vec<(Label, Label, Reg, Label)> = Vec::new();
     for k in 0..f.order.len() {
         let pc = f.order[k];
+        let i = code[pc];
+        // Only straight on from the instruction that found it, with nothing
+        // but bookkeeping between; that instruction's slow half comes back
+        // here, so this is a join, and the join is what `refinds` is for.
+        let reuse = found.take().filter(|&x| {
+            i.op == Op::Field
+                && i.b == x
+                && k > 0
+                && f.order[k - 1] + 1 == pc
+                && joins[k]
+                && !plans.contains_key(&k)
+        });
         // The preheader and vector version of a loop headed here: everything
         // from outside comes through it, and falls into the header after.
         if let Some((plan, _)) = plans.get(&k) {
@@ -1194,8 +1237,9 @@ fn block<E: Emit>(
         if joins[k] {
             book.join(asm, loops.get(&pc).copied().unwrap_or(0));
         }
-        asm.bind(f.labels[k]);
-        let i = code[pc];
+        if reuse.is_none() {
+            asm.bind(f.labels[k]);
+        }
         let pc32 = pc as Pc;
         match i.op {
             Op::Nop => book.step(asm),
@@ -1342,14 +1386,31 @@ fn block<E: Emit>(
                 let miss = f.target(asm, k, i.imm as usize);
                 asm.tag_test(i.a, i.bc() as u32, miss, slow);
                 slows.push((slow, k));
+                if E::KEEPS_FOUND && book.on {
+                    found = Some(i.a);
+                }
             }
             Op::Field => {
                 let slow = asm.label();
+                // A step owed here and nothing else, the join having settled
+                // the rest: what `refinds` does on the way in, before finding.
+                debug_assert!(reuse.is_none() || book.steps == 0);
                 book.step(asm);
                 book.sync(asm);
-                asm.field(i.a, i.b, i.imm, slow);
+                match reuse {
+                    Some(x) => {
+                        let here = asm.label();
+                        asm.bind(here);
+                        refinds.push((f.labels[k], here, x, slow));
+                        asm.field_found(i.a, i.imm, slow);
+                    }
+                    None => asm.field(i.a, i.b, i.imm, slow),
+                }
                 book.wrote(i.a);
                 slows.push((slow, k));
+                if E::KEEPS_FOUND && book.on && i.a != i.b {
+                    found = Some(i.b);
+                }
             }
             Op::Invoke => {
                 let slow = asm.label();
@@ -1429,6 +1490,12 @@ fn block<E: Emit>(
             },
         }
         fall_through(asm, &mut book, &mut f, code, k);
+    }
+    for (entry, here, x, slow) in refinds {
+        asm.bind(entry);
+        asm.add_steps(1);
+        asm.find(x, slow);
+        asm.jump(here);
     }
     for (l, k) in slows {
         let pc = f.order[k];
@@ -1598,6 +1665,7 @@ mod tests {
         assert_eq!(heap + offset_of!(Heap, flim) as u32, FLIM);
         assert_eq!(heap + offset_of!(Heap, fcur) as u32, FCUR);
         assert_eq!(heap + offset_of!(Heap, fbase) as u32, FBASE);
+        assert_eq!(heap + offset_of!(Heap, fbias) as u32, FBIAS);
     }
 
     /// The shifts native code takes a heap address apart with have to be the
