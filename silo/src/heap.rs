@@ -1161,6 +1161,14 @@ impl Heap {
             self.trace.limbo.push((p, words));
             return;
         }
+        // Under the leak check, which knows every block in use: one that is
+        // not is being freed a second time, and is said here rather than as
+        // the corruption it becomes once the size class hands it out twice.
+        if let Some(b) = &mut self.blocks
+            && !b.remove(&(p as usize))
+        {
+            crate::fail(&format!("the block at {p:p} was freed twice"));
+        }
         self.live -= 1;
         // Safety: the block's header, which nothing has written over yet.
         if crate::cycles::tracing() && unsafe { *p.add(1) } & MUTABLE != 0 {
@@ -1170,11 +1178,6 @@ impl Heap {
             && (!poison_collector_only() || crate::cycles::running() || crate::trace::sweeping())
         {
             quarantine(p, words);
-            // Gone, as far as the leak check is concerned, as a block handed
-            // back is.
-            if let Some(b) = &mut self.blocks {
-                b.remove(&(p as usize));
-            }
             // Junk where its first word says it is clean: a trace must not
             // take it for a block in use. It is never handed out again.
             if crate::cycles::tracing() {
@@ -1186,9 +1189,6 @@ impl Heap {
         if crate::memory::on() {
             self.held = self.held.saturating_sub(words);
             crate::memory::LIVE.fetch_sub(words, std::sync::atomic::Ordering::Relaxed);
-        }
-        if let Some(b) = &mut self.blocks {
-            b.remove(&(p as usize));
         }
         if words >= CLASSES {
             let layout = std::alloc::Layout::array::<Word>(words).expect("a block fits memory");

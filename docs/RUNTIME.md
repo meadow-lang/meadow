@@ -630,6 +630,23 @@ runtime library could be. A release `meadow` embeds its own runtime library and
 writes it to `~/.meadow/lib/meadow_glade_<hash>/` the first time it links, so
 nothing else needs to be installed.
 
+Since the hash covers the sources, every `meadow` built from different ones --
+each nightly, each development build -- writes a directory of its own, and a
+`meadow` built without a precompiled `Std` keeps its compile of it beside them,
+in `~/.meadow/lib/std/<fingerprint>/`. None is any use to another `meadow`, and
+at tens of megabytes each they would fill a disk, so `meadow` prunes them
+(`buildtools/meadow/src/cache.rs`). At most once a day, the first time a run
+reaches for the cache, it removes every such directory that is not its own and
+has not been used for a week -- "used" meaning a link or a build read it, which
+each `meadow` stamps as it does. A week leaves another `meadow` on the machine,
+the installed toolchain or a development build, what it still uses; one removed
+too soon costs only being written again. Nothing used within the last hour is
+removed, since a link may be reading it, and nothing in `~/.meadow/lib` with a
+name of another shape is touched. A prune that cannot remove something leaves
+it for the next, and never fails a build. `meadow clean --cache` removes all but
+the running `meadow`'s own now, and says how much that freed. `MEADOW_HOME`
+moves all of it, as it does the rest of `~/.meadow`.
+
 ## 4. The memory model
 
 `glade/src/heap.rs`, `object.rs`, `old.rs`, `mark.rs`, `evacuate.rs`,
