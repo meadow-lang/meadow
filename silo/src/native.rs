@@ -339,7 +339,8 @@ pub unsafe extern "C" fn meadow_native(
         "Random" => random(&op, arg),
         "Time" => time(&op, arg),
         "Log" => log(&op, arg),
-        "Net" => net(&op, arg),
+        // What it opens is this thread's: see `meadow_rt::net`.
+        "Net" => meadow_rt::net::owning(crate::sched::owner(), || net(&op, arg)),
         _ => None,
     };
     match built {

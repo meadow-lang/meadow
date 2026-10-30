@@ -1210,6 +1210,12 @@ with a runtime error. Immutable data copies invisibly. **Compact regions and
 are the same in every heap, and holds a reference count on the region. This is
 how `examples/Parallel` lets eight threads read one prime table.
 
+The export also notes the sockets the value holds, which are `Std.Net`'s
+constructors for the roles `listener` and `stream` (`Heap::socket_tags`). It
+hands each to nobody, and the import gives each to the receiving thread. A
+copy into a region hands its sockets to nobody too. A thread that ends closes
+what it still owns (`meadow_rt::net::close_owned`). See `docs/CANCELLATION.md`.
+
 The rule has three consequences:
 
 - **No locks in the machine.** Allocation, field reads and writes, and `Ref`

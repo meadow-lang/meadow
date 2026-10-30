@@ -75,10 +75,14 @@
 -- it is woken by a cancel like any waiting thread, and a program may have
 -- thousands of them asleep at once.
 --
+-- The sockets a thread opened (`Std.Net`, `Std.Tls`) are closed when it ends,
+-- however it ends, after its releases -- except those it handed to another
+-- thread, in what it spawned, sent or answered, which are that thread's now.
+--
 -- Two limits. An operation made in place -- a file read, a child process run
 -- to its end -- runs to its end first; the thread fails at the operation
 -- after. And a socket wait the thread is woken from carries on, on its own
--- I/O thread, until it ends; what it answers is dropped.
+-- I/O thread, until the socket is closed; what it answers is dropped.
 
 use Std.Collections.Vector as V
 use Std.Collections.Vector (vecFromArray)

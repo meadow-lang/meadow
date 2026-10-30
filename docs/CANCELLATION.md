@@ -288,4 +288,4 @@ inside `act`, as a spawned function does.
 | ---- | ---- | ----- |
 | 3 | `Time.sleep` parks on the scheduler, and a cancel wakes it | built (#51) |
 | 1 | release stack, `bracket`, `finally`, `defer`; `race`, `timeout` | built |
-| 2 | sockets owned by threads, handed on, closed at the end | third step |
+| 2 | sockets owned by threads, handed on, closed at the end | built |

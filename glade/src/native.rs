@@ -394,11 +394,13 @@ impl Vm<'_> {
             }
             _ => return Ok(None),
         };
+        // What the call opens is this thread's, wherever it is made.
+        let owner = self.owner;
         if self.scheduled {
-            self.blocking = Some(job);
+            self.blocking = Some(Box::new(move || meadow_rt::net::owning(owner, job)));
             Ok(Some(Build::unit()))
         } else {
-            Ok(Some(job()))
+            Ok(Some(meadow_rt::net::owning(owner, job)))
         }
     }
 

@@ -717,6 +717,8 @@ pub const MEADOW_ROLES: &[(Role, &str)] = &[
     (Role::VNodeBranch, "VNode.Branch"),
     (Role::False, "Bool.False"),
     (Role::FileMeta, "FileMeta.FileMeta"),
+    (Role::Listener, core::net::LISTENER),
+    (Role::Stream, core::net::STREAM),
 ];
 
 /// The same for a tail-resumptive clause -- `op x k -> k e` -- whose object

@@ -145,6 +145,9 @@ pub struct Ctx {
     /// How the thread's own code ended, once it has, while its releases run:
     /// see `crate::sched::wind_down`.
     pub ending: Option<Result<crate::parcel::Parcel, String>>,
+    /// Whose the sockets this thread opens are (`meadow_rt::net::owning`):
+    /// closed when it ends.
+    pub owner: u64,
 }
 
 // Safety: a context is used by one OS thread at a time -- the one running its
@@ -180,6 +183,7 @@ impl Ctx {
             exits: Vec::new(),
             next_exit: 0,
             ending: None,
+            owner: meadow_rt::net::new_owner(),
         });
         c.spill_at = c.spill.as_mut_ptr();
         c

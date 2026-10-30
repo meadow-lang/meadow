@@ -148,6 +148,21 @@ beyond the last release is under _Unreleased_.
   executables) and Silo. `docs/CANCELLATION.md` is the design, and says why
   this is a library over a stack the runtime keeps per thread rather than a
   clause on `handle`.
+- A thread that ends closes the sockets it holds. A listener, stream or TLS
+  stream belongs to the thread that opened it, and is closed when that
+  thread ends, whichever way it ends and after its releases have run. A
+  cancelled server's port is free again at once, and its peers see the end
+  of their streams. A socket handed to another thread, in a function it
+  spawns, a message or its answer, belongs to that thread from then on. So
+  an accepting thread can give each connection to a worker, and a worker
+  that is cancelled takes its connection with it. A socket kept in a `TVar`
+  or a `Compact` belongs to nobody and stays open until it is closed. A
+  connection accepted for a thread that was cancelled while it waited is
+  closed as it arrives. This works on the CEK machine, on Glade (the VM, the
+  JIT and executables) and on Silo. The runtimes find sockets in what crosses
+  between threads by two new roles, `listener` and `stream`, which a program
+  declares for `Std.Net`'s constructors. A program that declares neither,
+  such as Cut from another front end, keeps its sockets open as before.
 
 ### Fixed
 

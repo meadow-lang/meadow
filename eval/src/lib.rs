@@ -438,6 +438,8 @@ struct Machine<'a> {
     /// How the thread's own code ended, once it has: what it answers when the
     /// releases left on its stack have run.
     ending: Option<Result<Value, String>>,
+    /// Whose sockets it opens: closed when it ends. See `meadow_core::net`.
+    owner: u64,
     /// Is the scheduler running it? Then a `Time.sleep` waits on the
     /// scheduler, which runs the other threads meanwhile; without one -- a
     /// procedural macro's machine -- there is nothing else to run.
@@ -490,6 +492,7 @@ impl<'a> Machine<'a> {
             exits: Vec::new(),
             next_exit: 0,
             ending: None,
+            owner: core::net::new_owner(),
             scheduled: false,
         }
     }
@@ -867,6 +870,7 @@ impl<'a> Machine<'a> {
             }
             StmNew => {
                 storable(&args[0])?;
+                hand_on(&args[0], 0);
                 return Ok(Value::TVar(Rc::new(TVarCell {
                     version: std::cell::Cell::new(0),
                     value: RefCell::new(args[0].clone()),
@@ -894,6 +898,7 @@ impl<'a> Machine<'a> {
             StmWrite => {
                 let tv = as_tvar(&args[0])?;
                 storable(&args[1])?;
+                hand_on(&args[1], 0);
                 let txn = self.txn.as_mut().ok_or_else(|| RuntimeError {
                     msg: core::stm::outside("writeTVar"),
                 })?;
@@ -1523,12 +1528,16 @@ impl<'a> Machine<'a> {
                 return Ok(());
             }
             if &*effect == "Net" || &*effect == "Std.Net.Net" {
-                match native_net(&op, arg)? {
+                // What it opens is this thread's, wherever the call is made.
+                let owner = self.owner;
+                match core::net::owning(owner, || native_net(&op, arg))? {
                     NetCall::Now(v) => self.ctrl = Control::Ret(v),
                     NetCall::Later(call) => {
                         // Answered by the scheduler once the call is made.
                         self.ctrl = Control::Ret(Value::Unit);
-                        self.request = Some(Request::Block(call));
+                        self.request = Some(Request::Block(Box::new(move || {
+                            core::net::owning(owner, call)
+                        })));
                     }
                 }
                 return Ok(());
@@ -1922,12 +1931,14 @@ fn run_prim(op: core::Prim, args: Vec<Value>) -> Result<Value, RuntimeError> {
         Compact => {
             let region = Rc::new(RefCell::new(Region::default()));
             compact_into(&region, &args[0], meadow_core::compact::uncompactable)?;
+            hand_on(&args[0], 0);
             Ok(Value::Compact(Rc::new((args[0].clone(), region))))
         }
         GetCompact => Ok(as_compact(&args[0])?.0.clone()),
         CompactAdd => {
             let region = as_compact(&args[0])?.1.clone();
             compact_into(&region, &args[1], meadow_core::compact::uncompactable)?;
+            hand_on(&args[1], 0);
             Ok(Value::Compact(Rc::new((args[1].clone(), region))))
         }
         CompactSize => Ok(Value::Int(
@@ -3681,6 +3692,12 @@ fn schedule(mut main: Machine<'_>) -> Result<Value, RuntimeError> {
                 continue;
             }
             let out = $m.ending.take().expect("it has ended");
+            // What it answers is handed on; the sockets it still holds are
+            // closed.
+            if let Ok(v) = &out {
+                hand_on(v, 0);
+            }
+            core::net::close_owned($m.owner);
             if $task == 0 {
                 return out.map_err(|msg| RuntimeError { msg });
             }
@@ -3811,6 +3828,9 @@ fn schedule(mut main: Machine<'_>) -> Result<Value, RuntimeError> {
                             m.fields,
                         );
                         child.scheduled = true;
+                        if let Control::Ret(f) = &child.ctrl {
+                            hand_on(f, child.owner);
+                        }
                         tasks.push(TaskSlot {
                             cancelled: child.cancel.clone(),
                             held_off: child.held_off.clone(),
@@ -3822,7 +3842,10 @@ fn schedule(mut main: Machine<'_>) -> Result<Value, RuntimeError> {
                     Request::Await(t) => match tasks.get_mut(t as usize) {
                         None => m.failed = Some(format!("await: there is no thread {t}")),
                         Some(slot) => match &slot.outcome {
-                            Some(Ok(v)) => m.ctrl = Control::Ret(v.clone()),
+                            Some(Ok(v)) => {
+                                hand_on(v, m.owner);
+                                m.ctrl = Control::Ret(v.clone())
+                            }
                             Some(Err(msg)) => m.failed = Some(msg.clone()),
                             None => {
                                 slot.waiters.push((m, task));
@@ -3862,10 +3885,14 @@ fn schedule(mut main: Machine<'_>) -> Result<Value, RuntimeError> {
                         Some(ch) => {
                             match ch.receivers.pop_front() {
                                 Some((mut r, rt)) => {
+                                    hand_on(&v, r.owner);
                                     r.ctrl = Control::Ret(v);
                                     ready.push_back((r, rt));
                                 }
-                                None => ch.messages.push_back(v),
+                                None => {
+                                    hand_on(&v, 0);
+                                    ch.messages.push_back(v)
+                                }
                             }
                             m.ctrl = Control::Ret(Value::Unit);
                         }
@@ -3925,7 +3952,10 @@ fn schedule(mut main: Machine<'_>) -> Result<Value, RuntimeError> {
                     Request::Receive(c) => match channels.get_mut(c as usize) {
                         None => m.failed = Some(format!("receive: there is no channel {c}")),
                         Some(ch) => match ch.messages.pop_front() {
-                            Some(v) => m.ctrl = Control::Ret(v),
+                            Some(v) => {
+                                hand_on(&v, m.owner);
+                                m.ctrl = Control::Ret(v)
+                            }
                             None => {
                                 ch.receivers.push_back((m, task));
                                 break;
@@ -4005,12 +4035,58 @@ fn finish<'a>(
     let slot = &mut tasks[task as usize];
     for (mut w, wt) in slot.waiters.drain(..) {
         match &outcome {
-            Ok(v) => w.ctrl = Control::Ret(v.clone()),
+            Ok(v) => {
+                hand_on(v, w.owner);
+                w.ctrl = Control::Ret(v.clone())
+            }
             Err(msg) => w.failed = Some(msg.clone()),
         }
         ready.push_back((w, wt));
     }
     slot.outcome = Some(outcome);
+}
+
+/// The sockets in `v` -- `Std.Net`'s listeners and streams, by the
+/// constructors they are -- belong to `owner` now: the thread `v` goes to, or
+/// nobody. See `meadow_core::net`.
+fn hand_on(v: &Value, owner: u64) {
+    let mut seen: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    let mut stack = vec![v.clone()];
+    while let Some(v) = stack.pop() {
+        match &v {
+            Value::Ctor(name, fields) => {
+                if (&**name == core::net::LISTENER || &**name == core::net::STREAM)
+                    && let [Value::Int(id)] = &fields[..]
+                {
+                    core::net::hand_on(*id, owner);
+                }
+                if seen.insert((Rc::as_ptr(fields) as *const () as usize, 0)) {
+                    stack.extend(fields.iter().cloned());
+                }
+            }
+            Value::Closure { param, body, env } => {
+                let key = (Arc::as_ptr(body) as usize, Rc::as_ptr(env) as usize);
+                if seen.insert(key) {
+                    for &var in free_vars(body).iter() {
+                        if var != *param
+                            && let Some(x) = lookup(env, var)
+                        {
+                            stack.push(x);
+                        }
+                    }
+                }
+            }
+            Value::Builtin { args, .. } => stack.extend(args.iter().cloned()),
+            Value::Array(xs) => {
+                if seen.insert((Rc::as_ptr(xs) as *const () as usize, 0)) {
+                    stack.extend(xs.iter().cloned());
+                }
+            }
+            Value::Tuple(xs) => stack.extend(xs.iter().cloned()),
+            Value::Record(fields) => stack.extend(fields.values().cloned()),
+            _ => {}
+        }
+    }
 }
 
 /// Refuse a value another thread must not see: see `meadow_core::thread`.

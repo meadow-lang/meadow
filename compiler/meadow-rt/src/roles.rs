@@ -52,13 +52,19 @@ pub enum Role {
     /// A file's metadata, as `Fs.metadata` answers it: a record of `isFile`,
     /// `isDir`, `len`, `readonly` and `modified`, in that order.
     FileMeta,
+    /// A socket that takes connections: one field, its handle in
+    /// [`crate::net`]'s table. The runtimes look for it in what crosses
+    /// between threads, which is how a socket is handed on with its owner.
+    Listener,
+    /// A connection, plain or TLS: one field, its handle. As [`Role::Listener`].
+    Stream,
 }
 
 impl Role {
     /// Every role, in the order a runtime's tables keep them: a role's place
     /// here is its [`Role::index`], which an emitted program's table and the
     /// runtime reading it agree on.
-    pub const ALL: [Role; 13] = [
+    pub const ALL: [Role; 15] = [
         Role::None,
         Role::Some,
         Role::Ok,
@@ -72,6 +78,8 @@ impl Role {
         Role::VNodeBranch,
         Role::False,
         Role::FileMeta,
+        Role::Listener,
+        Role::Stream,
     ];
 
     /// This role's place in [`Role::ALL`].
@@ -98,6 +106,8 @@ impl Role {
             Role::VNodeBranch => "vnode-branch",
             Role::False => "false",
             Role::FileMeta => "file-meta",
+            Role::Listener => "listener",
+            Role::Stream => "stream",
         }
     }
 
@@ -110,7 +120,13 @@ impl Role {
     pub const fn arity(self) -> usize {
         match self {
             Role::None | Role::Nil | Role::VectorEmpty | Role::False => 0,
-            Role::Some | Role::Ok | Role::Err | Role::VectorSingle | Role::VNodeLeaf => 1,
+            Role::Some
+            | Role::Ok
+            | Role::Err
+            | Role::VectorSingle
+            | Role::VNodeLeaf
+            | Role::Listener
+            | Role::Stream => 1,
             Role::Cons | Role::VNodeBranch => 2,
             Role::FileMeta => 5,
             Role::VectorFull => 7,

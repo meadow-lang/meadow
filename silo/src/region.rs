@@ -568,6 +568,10 @@ fn copy(inside: &mut Inside, r: *const Region, v: Word, d: i64) -> Result<Word, 
         if heap::kind(new) == heap::TVAR {
             crate::sched::held_var(heap::field(new, 0) as usize);
         }
+        // A socket where every thread may read it belongs to nobody.
+        if let Some(id) = crate::parcel::socket(b) {
+            meadow_rt::net::hand_on(id, 0);
+        }
         made.insert(b, new);
         at += size + 1;
     }

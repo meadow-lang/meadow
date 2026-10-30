@@ -646,6 +646,12 @@ there, so the thread ends with its first failure. `main`, and a program that
 never spawns and so has no scheduler, run theirs the same way before the
 process exits (`sched::last_rites`).
 
+**Sockets** belong to the thread that opened them. Each context has an owner
+token, and `sched::blocking` makes a call under it (`meadow_rt::net::owning`).
+A parcel notes the sockets in what it lifts and hands them to the thread that
+opens it, and a region hands what it takes in to nobody. A thread that ends
+closes what it still owns, after its releases.
+
 **A heap per thread** (`silo/src/ctx.rs`), so counting needs no atomics and no
 two workers ever touch the same block. What crosses between threads is copied
 (`silo/src/parcel.rs`): the function a thread is spawned with and everything it
