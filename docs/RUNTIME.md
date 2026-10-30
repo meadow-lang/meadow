@@ -188,6 +188,14 @@ On a `map` of a million-element list: 3.0s â†’ 1.07s on the interpreter, 856ms â
 655ms on the debug JIT, and even in a release executable. `MEADOW_NO_TRMC=1`
 turns the pass off.
 
+That pass is the Rust front end's. A program of Cut -- MeadowBoot's, Idyll's
+-- is rewritten by the back end, on Cut, after inlining: see `docs/CUT.md`,
+[Tail recursion modulo context](CUT.md#tail-recursion-modulo-context). It is
+the same idea in more places -- constructors nested in one another, tuples on
+the way to the hole, and definitions that call each other -- with a nullary
+constructor as the placeholder, made once and handed down, rather than the
+destination.
+
 ### A register is a word, and types become descriptors
 
 Registers and object fields hold 64-bit words with no tags. An `Int`, a `Float`

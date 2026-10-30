@@ -19,10 +19,11 @@ end. What does reach it is described here, and nothing else is.
 6. [Cut: the upper IR](#cut-the-upper-ir)
 7. [Primitives](#primitives)
 8. [Effects](#effects)
-9. [AxCut: the lower IR](#axcut-the-lower-ir)
-10. [Evidence](#evidence)
-11. [Versions](#versions)
-12. [Open questions](#open-questions)
+9. [Tail recursion modulo context](#tail-recursion-modulo-context)
+10. [AxCut: the lower IR](#axcut-the-lower-ir)
+11. [Evidence](#evidence)
+12. [Versions](#versions)
+13. [Open questions](#open-questions)
 
 ## Two IRs
 
@@ -529,6 +530,14 @@ for its type, as it is in source: `toUInt8`, `toInt32`. The full list of primiti
 with what each takes and answers, is `meadow_rt::Prim`. The spec will quote it
 as a table before v0 is frozen.
 
+One primitive is the back end's own: `prim setField(dst, i, v; k)` writes `v`
+into field `i` of the constructor `dst` and answers `unit`. Data is immutable
+everywhere else, and this is not an exception a program can see: only
+[tail recursion modulo context](#tail-recursion-modulo-context) writes it, into
+a constructor it built a moment before and nothing else has seen. A front end
+never writes it, and the reference interpreter, which runs Cut as a front end
+writes it, does not have it.
+
 ## Effects
 
 ### Declaring an effect
@@ -605,6 +614,228 @@ effects gets the strategy its caller's effects need:
 A whole-program analysis may move a `@many` operation that every handler
 resumes at most once onto the `Effect` path. Nothing may depend on that, since
 a program loaded later, or patched while it runs, may change it.
+
+## Tail recursion modulo context
+
+`compiler/meadow-cut/src/trmc.rs`, from Leijen and Lorenzen, _Tail Recursion
+Modulo Context_ (POPL 2023), the design Koka uses.
+
+### Why
+
+A tail call costs nothing here: a definition is handed its continuation, so
+calling another with the same one is a jump. But the commonest recursion in a
+functional program is not a tail call:
+
+```text
+def map (f: ptr, xs: ptr; k: ptr) =
+  <xs | case { Nil => <Nil | k>;
+               Cons(x: i64, r: ptr) =>
+                 <f | apply(x; μ̃ y: i64. map(f, r; μ̃ ys: ptr. <Cons(y, ys) | k>))> }>
+```
+
+The recursive call's continuation builds a cell before anything reaches `k`,
+so each element is a frame on the way down, live until the last element is
+reached, and a return on the way back up. On Glade a frame is a slot on a
+frame stack of heap chunks, so depth is memory and a collector's scanning. On
+Silo a frame is a native stack frame, and depth is bounded: `main` runs on a
+stack of a GiB and every other thread on 256 MiB. A map over four million
+records on a thread does not fit (see [Measurements](#measurements)).
+
+The Rust front end does this on its core (`meadow_core::trmc`, see
+`docs/RUNTIME.md`), for one constructor around a call of the definition
+itself, so `meadow run` had it; a program of Cut from MeadowBoot or from
+Idyll had none. Doing it on Cut, in the back
+end, gives it to every front end and both runtimes with one implementation,
+and leaves no pass for a front end to port: MeadowBoot needs nothing of its
+own, and when the Rust front end is retired nothing is lost. Cut is also
+where the rewrite is easiest to state, because the context is already
+there to read: `μ̃ ys. <Cons(y, ys) | k>` is a constructor with a hole where
+the call's answer goes.
+
+### The rewrite
+
+For each definition with such a call, a **twin** in destination-passing style:
+
+```text
+def map#dps (dst: ptr, at: i64, hole: ptr, f: ptr, xs: ptr; k: ptr)
+```
+
+writes what `map(f, xs)` would have answered into field `at` of `dst`, and
+answers `unit`. Its body is `map`'s with every tail position changed:
+
+- a call under a context, `g(args; μ̃ r. <K(.., r, ..) | k>)`, builds
+  `K(.., hole, ..)` with the placeholder where `r` was, writes it into `dst`,
+  and goes on as `g#dps(cell, i, hole, args; k)` -- a tail call;
+- a tail call, `g(args; k)`, goes on as `g#dps(dst, at, hole, args; k)`;
+- anything else given to `k` -- `<Nil | k>`, `<ys | k>`, a primitive's
+  answer, a closure called with `k` -- is written into `dst` instead.
+
+`map` itself changes only at its calls under a context: it makes the
+placeholder, builds the first cell around it, calls the twin to fill it in,
+and answers the cell. That call is not a tail call, and is the one frame the
+whole recursion takes.
+
+```text
+Cons(x, r) => <f | apply(x; μ̃ y.
+                let hole = Nil in let cell = Cons(y, hole) in
+                map#dps(cell, 1, hole, f, r; μ̃ u: unit. <cell | k>))>
+```
+
+`g` is the definition itself or any other in its **group**: the definitions
+whose tail positions call each other in a cycle that goes through a context
+at least once. `odds` building every other element of a list and `skip`
+passing over the rest are one group, and both get twins; a definition that
+only calls itself in tail position needs none and gets none.
+
+### Which contexts
+
+A context is a continuation that only builds around what it is given: `let`s
+of constructors and tuples of names and literals, then one of them given to
+`k`, with the answer in exactly one field of one constructor on the way down
+from it. So:
+
+- `Cons(y, r)`: one cell, the hole its second field;
+- `Cons(a, Cons(b, r))`, or the same written with `let`s: two cells, built
+  together, the inner one the next destination;
+- `Step(#tuple(n, r))`, `Node(l, v, r)`: a tuple on the way is a cell like
+  any constructor, and a tree fills its last subtree in place, its first being
+  a call that returns -- to the definition, which builds that subtree in
+  place too;
+- several fields, any of them the hole: what matters is that the answer is
+  in one.
+
+Not a context, and left as written: a continuation that computes after the
+call answers (`prim add(x, 1; ...)` before the cell is built -- Koka's
+contexts of arithmetic are not taken), uses the answer twice, puts it in a
+record, an array or an object, or gives it to anything but the definition's
+own `k`. A hole whose representation is not `ptr` is not one either.
+
+### Order of evaluation
+
+Nothing a program can observe moves. Cut fixes the order already: the call's
+arguments and every other field of the cell were computed before the call
+was made, in the order the front end wrote them, and a context does nothing
+but allocate. The rewrite moves the allocation from after the call to
+before it, which no program can tell. Meadow evaluates operands and
+arguments left to right, so in `Cons (f x) (map f rest)` the call to `f`
+comes first, and it still does: it is outside the context, before the call
+in the Cut as written, and before it after.
+
+### Effects
+
+The writes are safe if nothing runs the rest of a recursion twice. A twin
+writes into cells that are reachable only from the chain of calls filling
+them, and from the outermost call's frame, which holds the first. A handler
+that never resumes drops the chain, and it is freed. One that resumes does
+so once -- every resumption is one-shot unless its operation is `@many` --
+and the chain is finished as if nothing had happened. A resumption run
+twice would run the rest of the recursion twice, writing into cells the first
+run's answer already holds, so in a program that declares a `@many`
+operation only the definitions no handler can capture are rewritten
+(`crate::pure`, the set Silo's borrowing already relies on). A call under a
+`handle` gives its answer to the handle's body, not the definition's `k`, so
+it is never a context, and a definition whose `k` is captured by an object or
+a handler is left alone.
+
+### The placeholder, and each runtime's memory
+
+Until it is filled, the hole holds a nullary constructor -- the first the
+program declares, or the empty tuple -- made once by the outermost call and
+handed down the twin as `hole`. It is a `ptr`, so every cell is built with
+the descriptor its field will have when filled. The Rust front end's pass
+puts the destination itself there instead, which costs Glade nothing, but on
+Silo counts the destination once more for every cell and makes each cell and
+its parent point at each other until the next step overwrites the hole. A
+nullary constructor is neither:
+
+- **Silo.** A nullary constructor is an odd word, which counting skips. The
+  write is inline (`emit.rs`, `SetField`): load the old field, share the
+  value, store it, erase the old by the new value's descriptor -- a no-op on
+  the odd word. The field's descriptor is not rewritten, which is why the
+  placeholder has to be a `ptr`. A cell is held by its parent's field and by
+  the twin's argument and by nothing else, so nothing can see it change.
+  Filling a hole ties no knot: what is written is always newer than what it
+  is written into, so `emit::ties_knots` does not count `setField`, and a
+  program that only builds lists this way carries no cycle collector. Under
+  the tracing collector the write takes the SATB barrier of a reference
+  store, which logs the overwritten value -- the placeholder, an odd word it
+  skips -- and needs nothing for the new one: a cell made while marking is
+  black, as every new block is (a reused one is logged and blackened), and
+  one made before is reachable from the chain the roots hold, the first cell
+  from the outermost frame on the native stack, which the pause scans. **Reuse** composes: the twin takes the input apart before
+  it builds the cell, so where the input list is held only by the call, the
+  new cell is built in the old one's block, and `map` over a list nobody else
+  holds is an in-place loop. Over ten million elements the program acquires
+  10,000,004 blocks, the same as without the rewrite, where the old block was
+  kept for the cell built after the call returned, and 20,000,004 with
+  `MEADOW_NO_REUSE`; what the rewrite takes away is the stack the blocks were
+  kept on.
+- **Glade.** The write is `Heap::set_field`: in place for a young cell, with
+  the field's descriptor rewritten if it changed; for one promoted while the
+  recursion ran, the SATB log of the old value while marking and the
+  remembered set's barrier for an old object that comes to point at a young
+  one -- the barriers any mutation of an old object takes. Native code fills
+  a young cell inline (`codegen/thin.rs`, `field_set_young`) and leaves the
+  rest to the interpreter. The placeholder is one small object per outermost
+  call, not one per cell.
+- **The AxCut machine** keeps a constructor's fields in a cell it may write
+  for this one primitive (`meadow_axcut::machine::Fields`).
+- **The CEK machines** -- `meadow-eval`'s and MeadowBoot's `Cek.mw` -- run core
+  as lowering wrote it and never see the rewrite, and neither does the
+  reference interpreter.
+
+### MeadowBoot
+
+MeadowBoot hands the back end Cut, and `meadow cut` -- what MeadowBoot's
+`build` and `run` call -- lowers it through `lower::optimized`, which runs
+`specialize`, `inline` and then this. So a program MeadowBoot compiles,
+MeadowBoot itself among them, is rewritten with nothing written in Meadow.
+Its differential tests compare answers, of the Cut it writes as written, on
+the reference interpreter and on the AxCut machine lowered by `lower`, which
+does not optimise; they are unchanged, and `meadow-cut`'s own tests check
+that the rewritten program answers what the written one does
+(`tests/trmc.rs`, every program of `tests/programs.rs`, and Idyll's corpus
+where `CUT_CORPUS` names it: 248 of its programs, 15 of them rewritten).
+
+### Measurements
+
+On the Windows desktop (x86-64), shared with other work, so a few percent
+either way is noise: wall time, the shortest of five runs (or of seven, taken
+alternately, for the trees), and the process's peak working set. Programs
+compiled by MeadowBoot, then by `meadow cut` with the rewrite and with
+`MEADOW_CUT_TRMC=0`; Glade's are ahead-of-time executables.
+
+| program                                       | Glade, with      | Glade, without    | Silo, with      | Silo, without         |
+| --------------------------------------------- | ---------------- | ----------------- | --------------- | --------------------- |
+| a map over 10M elements, and their sum        | 2.30 s, 659 MiB  | 5.50 s, 1071 MiB  | 0.29 s, 388 MiB | 0.63 s, 846 MiB       |
+| map, filter, append, every other, take: 10M   | 8.93 s, 790 MiB  | 20.70 s, 1184 MiB | 0.82 s, 579 MiB | 1.43 s, 846 MiB       |
+| 4M records rotated, on a thread               |                  |                   | runs            | overflows its stack   |
+| `binarytrees`                                 | 2.23 s, 85 MiB   | 1.97 s, 85 MiB    | 0.74 s, 42 MiB  | 0.75 s, 42 MiB        |
+| `rbtree`                                      | 10.69 s, 391 MiB | 9.60 s, 391 MiB   | 2.27 s, 263 MiB | 2.19 s, 263 MiB       |
+| `wordfreq`                                    | 0.37 s, 29 MiB   | 0.38 s, 30 MiB    | 0.11 s, 15 MiB  | 0.11 s, 15 MiB        |
+| `matmul`, `fib`                               | the same         |                   | the same        |                       |
+
+(The second row is Cut written by hand, run by `meadow cut`; the third is
+`tests/trmc.rs` in `buildtools/meadow`.) A list is where it pays: no frame
+per element, so less than half the time and a third to a half less memory,
+and on Silo a depth no thread's stack has room for. A tree is where it does not: its
+recursion is only as deep as the tree, and on Glade the write and the
+twin's longer calls cost more than the frame and the return they replace --
+`binarytrees` and `rbtree` are 11 to 13% slower there, whether the nursery is
+2 MiB or 128, and nothing more is handed back to the interpreter
+(`MEADOW_TRAPS`), so it is the work per node, not promotion. On Silo the same
+trees are within 3%. The Rust front end's pass makes the same trade on the
+same programs (`rbtree` 6% slower on Glade with it).
+
+MeadowBoot built by itself with the rewrite is 72.4 MiB of code, against
+72.2 without, and the back end takes as long to build it (75 s and 82 s).
+That compiler compiles `Std` and a program as fast either way (MiniML 6.3 s
+and 6.1 s, `Mapdeep` 5.7 s and 6.2 s, to linked Cut). It cannot yet compile
+itself on Windows, with the rewrite or without: it overflows its stack in
+renaming its own unit, as it did before.
+
+`MEADOW_CUT_TRMC=0` leaves the rewrite out, to measure it by;
+`meadow cut --emit inlined` prints the twins.
 
 ## AxCut: the lower IR
 

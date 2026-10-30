@@ -35,6 +35,23 @@ fn inlined_agrees(p: &meadow_cut::Program, out: &Outcome) {
         Err((e, _)) => panic!("inlined, it fails: {e}\n{shown}"),
     }
     lowered_agrees(&again, out);
+    trmc_agrees(&again, out);
+}
+
+/// `p` with its calls under a constructor made tail calls that fill it in
+/// (`meadow_cut::trmc`), as the back end runs it after inlining, reads back
+/// as printed and does what `p` does on the AxCut machine. The reference
+/// interpreter runs Cut as a front end writes it, which has no `setField`.
+#[track_caller]
+fn trmc_agrees(p: &meadow_cut::Program, out: &Outcome) {
+    let rewritten = meadow_cut::trmc::program(p);
+    let shown = print::program(&rewritten);
+    let again = parse(&shown).unwrap_or_else(|e| panic!("rewritten, read back: {e}\n{shown}"));
+    assert_eq!(
+        rewritten, again,
+        "rewritten, printed and read back:\n{shown}"
+    );
+    lowered_agrees(&again, out);
 }
 
 /// A small definition is inlined where it is called, and what that leaves

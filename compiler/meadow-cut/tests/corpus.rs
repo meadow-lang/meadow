@@ -113,3 +113,57 @@ fn idylls_corpus_runs_as_idyll_says_it_does() {
         bad.join("\n")
     );
 }
+
+/// What the AxCut machine makes of `p` lowered, as text: its answer, or why
+/// it has none.
+fn on_the_machine(p: &meadow_cut::Program) -> Option<String> {
+    use meadow_axcut::machine::Machine;
+    let lowered = meadow_cut::lower::lower(p).ok()?;
+    std::thread::Builder::new()
+        .stack_size(256 << 20)
+        .spawn(move || match Machine::run(&lowered, 500_000_000) {
+            Ok(v) => format!("answered {v}"),
+            Err(e) => format!("fails: {}", e.msg),
+        })
+        .ok()?
+        .join()
+        .ok()
+}
+
+/// The corpus as the back end runs it -- specialized, inlined, and its calls
+/// under a constructor made tail calls that fill it in
+/// (`meadow_cut::trmc`) -- does on the AxCut machine what it does as Idyll
+/// wrote it, wherever the machine runs it at all.
+#[test]
+fn idylls_corpus_optimized_answers_as_written() {
+    let Some(root) = std::env::var_os("CUT_CORPUS") else {
+        eprintln!("CUT_CORPUS is not set: Idyll's corpus not run");
+        return;
+    };
+    let mut files = Vec::new();
+    programs(Path::new(&root), &mut files);
+    files.sort();
+    let (mut compared, mut rewritten) = (0, 0);
+    let mut bad = Vec::new();
+    for cut in &files {
+        let name = cut.strip_prefix(&root).unwrap_or(cut).display().to_string();
+        let Ok(program) = parse(&std::fs::read_to_string(cut).expect("a .cut file reads")) else {
+            continue;
+        };
+        let optimized = meadow_cut::lower::optimized(&program);
+        if optimized.defs.iter().any(|d| d.symbol.last() == "#dps") {
+            rewritten += 1;
+        }
+        // What the machine cannot run as written says nothing of the rewrite.
+        let Some(want) = on_the_machine(&program).filter(|w| w.starts_with("answered")) else {
+            continue;
+        };
+        compared += 1;
+        match on_the_machine(&optimized) {
+            Some(got) if got == want => {}
+            got => bad.push(format!("{name}: {want} as written, {got:?} optimized")),
+        }
+    }
+    eprintln!("{compared} programs compared, {rewritten} with twins");
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
