@@ -383,6 +383,9 @@ fn run(heap: &mut heap::Heap, batch: usize, budget: usize) {
     let was = heap.freed();
     let mut kids = Vec::new();
     let mut work: Vec<Word> = Vec::new();
+    // The garbage this run finds, freed once it has walked everything: see
+    // `collect_white`.
+    let mut doomed: Vec<Word> = Vec::new();
 
     // 1. Mark. A candidate that is no longer purple has been handled since it
     //    was buffered; one that died while buffered is freed here, which is
@@ -406,7 +409,7 @@ fn run(heap: &mut heap::Heap, batch: usize, budget: usize) {
         // it, which is what white means -- so it and what it reaches go now.
         if heap::colour(s) == heap::WHITE {
             heap::set_buffered(s, false);
-            collect_white(s, heap, &mut work, &mut kids);
+            collect_white(s, &mut work, &mut kids, &mut doomed);
             continue;
         }
         if heap::colour(s) == heap::PURPLE && refs(s) > 0 {
@@ -445,14 +448,16 @@ fn run(heap: &mut heap::Heap, batch: usize, budget: usize) {
         scan(s, &mut work, &mut kids);
     }
 
-    // 3. Collect. Unbuffer first: `collect_white` leaves a block that is still
-    //    buffered alone, since another candidate may yet reach it.
+    // 3. Collect. Unbuffer first: `free_white` holds back the memory of a
+    //    block that is still buffered, since another candidate may yet reach
+    //    it.
     for &s in &marked {
         heap::set_buffered(s, false);
     }
     for &s in &marked {
-        collect_white(s, heap, &mut work, &mut kids);
+        collect_white(s, &mut work, &mut kids, &mut doomed);
     }
+    free_white(doomed, heap);
     if heap::tracking() {
         heap.check_none_white();
     }
@@ -566,7 +571,21 @@ fn scan_black(s: Word, kids: &mut Vec<Word>) {
     }
 }
 
-/// The white blocks are reachable only from each other. Free them.
+/// The white blocks are reachable only from each other: colour them black,
+/// and put them in `doomed`, for [`free_white`] once the run has walked
+/// everything.
+///
+/// Not freed here, because the walks of one run meet. Two candidates of a
+/// run can both reach one garbage block -- two knots that each point into a
+/// third -- and the walk from the second came to it after the walk from the
+/// first had freed it. A freed block is back in its size class, and its word
+/// 1, where a block's colour is, holds the address of the next block of that
+/// class (`heap::Heap::clean_block`). Read as a colour, an address with the
+/// two bits that make white took the block for garbage again: its old fields
+/// walked, the free list's link written over, and the block freed twice --
+/// handed out to two owners, and a program that ended in a segmentation
+/// fault. What `doomed` holds is still a block until the run is through, and
+/// black, so a walk that comes to it again goes no further.
 ///
 /// All of them, through a block still waiting in the candidate buffer as
 /// through any other. A run takes a batch of the candidates, not all of
@@ -578,11 +597,9 @@ fn scan_black(s: Word, kids: &mut Vec<Word>) {
 /// collected with the rest, and only its memory is held back, as for one
 /// that died while waiting, until its turn takes it ([`heap::Heap::
 /// hold_collected`]).
-fn collect_white(s: Word, heap: &mut heap::Heap, work: &mut Vec<Word>, kids: &mut Vec<Word>) {
+fn collect_white(s: Word, work: &mut Vec<Word>, kids: &mut Vec<Word>, doomed: &mut Vec<Word>) {
     work.clear();
     work.push(s);
-    // Freed after the walk, not during it: the walk reads their fields.
-    let mut doomed = Vec::new();
     while let Some(v) = work.pop() {
         if heap::colour(v) != heap::WHITE {
             continue;
@@ -594,6 +611,13 @@ fn collect_white(s: Word, heap: &mut heap::Heap, work: &mut Vec<Word>, kids: &mu
         }
         doomed.push(v);
     }
+}
+
+/// Free what a run's [`collect_white`] walks found, now that nothing more of
+/// the run reads them: first the leaves they hold, since that reads their
+/// fields, then the blocks -- but for one still waiting in the candidate
+/// buffer, whose memory is held back until its turn.
+fn free_white(doomed: Vec<Word>, heap: &mut heap::Heap) {
     for &v in &doomed {
         release_leaves(v, heap);
     }
