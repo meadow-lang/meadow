@@ -164,6 +164,14 @@ beyond the last release is under _Unreleased_.
   nursery pauses no longer than they were.
 - `benchmarks/run.py` measures Meadow's startup with a `main` the compiler
   accepts.
+- A Silo program built with trial deletion (`MEADOW_CYCLES=trial`) could die
+  of a segmentation fault, with nothing said, when two candidates of one run
+  of the collector both reached the same garbage: the second walk read the
+  block the first had freed, whose colour is now where its size class links
+  to the next free block, and could take it for garbage again and free it
+  twice. A run frees what it found once it has walked everything. Under the
+  leak check (`MEADOW_SILO_LEAKS`), a block freed twice is now said where it
+  happens.
 
 ## 0.4.0 - 2026-10-24
 
