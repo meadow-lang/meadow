@@ -76,6 +76,17 @@ beyond the last release is under _Unreleased_.
   optimization level -- Glade's VM, JIT and native code, Silo, the CEK and
   AxCut machines, and MeadowBoot's CEK machine -- and another through
   `meadow run` with each backend, in debug and release.
+- `meadow` prunes its cache in `~/.meadow/lib`. Each build of `meadow` writes
+  its runtime libraries there, and a build without a precompiled `Std` its
+  compile of that, in directories named for the sources that made them -- so
+  every nightly and every development build added tens of megabytes that
+  nothing removed, until the disk was full and no link worked. Now, at most
+  once a day, `meadow` removes the directories other builds wrote that have
+  not been used for a week, never one used within the last hour, and nothing
+  in `~/.meadow/lib` whose name it does not know; a prune that fails is left
+  for the next and never fails a build. `meadow clean --cache` removes all but
+  the running `meadow`'s own at once and says how much that freed.
+  `docs/RUNTIME.md`, "AOT executables".
 
 ### Fixed
 

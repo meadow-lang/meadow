@@ -12,6 +12,7 @@
 pub mod add;
 pub mod aot;
 pub mod artifacts;
+pub mod cache;
 pub mod channel;
 pub mod clean;
 pub mod complete;
