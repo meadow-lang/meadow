@@ -126,7 +126,9 @@ if (cd buildtools && CARGO_TARGET_DIR="$WORK/cli" cargo build --quiet -p meadow)
   job fmt "$M" fmt --check lib/Std examples
   # Every Meadow source, as the language server sees it: see `check.sh`.
   job lsp bash -c '
-    mapfile -t sources < <(git ls-files "*.mw" | grep -v -e "^bootstrap/tests/lex/" -e "^bootstrap/tests/parse/" -e "^bootstrap/tests/rename/Cfg/")
+    # A loop, not `mapfile`: macOS ships bash 3.2, which has none.
+    sources=()
+    while IFS= read -r f; do sources+=("$f"); done < <(git ls-files "*.mw" | grep -v -e "^bootstrap/tests/lex/" -e "^bootstrap/tests/parse/" -e "^bootstrap/tests/rename/Cfg/")
     "$1" lsp --check "${sources[@]}"
   ' lsp "$M"
 
