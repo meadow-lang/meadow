@@ -334,13 +334,24 @@ enum Cmd {
     ///
     /// Sources, `Meadow.toml` and `Meadow.lock` are not touched, and neither is
     /// anything fetched into the dependency cache, which other packages share.
+    ///
+    /// With `--cache`, the toolchain's cache instead: the runtime libraries
+    /// and compiled standard libraries under `~/.meadow/lib` (or
+    /// `$MEADOW_HOME/lib`) that other builds of `meadow` wrote. Each `meadow`
+    /// prunes those once a day by itself, removing any unused for a week;
+    /// `--cache` removes all but this `meadow`'s own now. One used within the
+    /// last hour is left either way, since a link may be reading it.
     Clean {
         /// The package, or a workspace, whose `target` to remove.
         #[arg(default_value = ".", value_name = "PATH")]
         path: PathBuf,
         /// Only this profile's, rather than all of them.
-        #[arg(long, value_name = "NAME")]
+        #[arg(long, value_name = "NAME", conflicts_with = "cache")]
         profile: Option<String>,
+        /// Remove other `meadow` builds' runtime libraries and compiled `Std`
+        /// from `~/.meadow/lib`, rather than a package's `target`.
+        #[arg(long)]
+        cache: bool,
         /// Say what would be removed without removing it.
         #[arg(long)]
         dry_run: bool,
@@ -1146,9 +1157,54 @@ fn command() {
             }
         }
         Some(Cmd::Clean {
+            cache: true,
+            dry_run,
+            ..
+        }) => match meadow::cache::clean(dry_run) {
+            Ok(out) => {
+                let lib = meadow::cache::lib_dir().unwrap_or_default();
+                let what = if dry_run { "Would remove" } else { "Removed" };
+                let dirs = |n: usize| if n == 1 { "directory" } else { "directories" };
+                if out.removed.is_empty() {
+                    status::status("Clean", format!("nothing to remove in {}", lib.display()));
+                } else {
+                    status::status(
+                        what,
+                        format!(
+                            "{} cache {} from {}, {} freed",
+                            out.removed.len(),
+                            dirs(out.removed.len()),
+                            lib.display(),
+                            meadow::clean::bytes(out.bytes)
+                        ),
+                    );
+                }
+                for dir in &out.failed {
+                    status::warning(format!(
+                        "could not remove all of {}: something has it open",
+                        dir.display()
+                    ));
+                }
+                if !out.recent.is_empty() {
+                    status::note(
+                        "Kept",
+                        format!(
+                            "{} used within the last hour, which a link may be reading",
+                            out.recent.len()
+                        ),
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        },
+        Some(Cmd::Clean {
             path,
             profile,
             dry_run,
+            ..
         }) => match meadow::clean::run(&path, profile.as_deref(), dry_run) {
             Ok(out) if out.removed.is_empty() => {
                 status::status("Clean", "nothing to remove".to_string());

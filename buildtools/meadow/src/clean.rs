@@ -58,7 +58,7 @@ pub fn run(path: &Path, profile: Option<&str>, dry_run: bool) -> Result<Cleaned,
 
 /// Every byte under `dir`. Best effort: a file that cannot be read is a file
 /// whose size is not counted, which is better than refusing to clean.
-fn size_of(dir: &Path) -> u64 {
+pub(crate) fn size_of(dir: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
