@@ -315,16 +315,28 @@ def t:Main/main (; k: ptr) =
 "
     );
     std::fs::write(dir.join("traced.cut"), text).unwrap();
-    let (ok, out, err) = meadow(
+    // Built, then run here rather than by `meadow cut`, so that a run that
+    // dies says how: `meadow cut` answers a signal as a plain failure.
+    let (ok, _, err) = meadow(
         &dir,
-        &["cut", "traced.cut", "--runtime", "silo"],
-        &[
+        &["cut", "traced.cut", "--runtime", "silo", "--no-run"],
+        &[],
+    );
+    assert!(ok, "{err}");
+    let exe = dir
+        .join("target/release/native/silo")
+        .join(format!("traced{}", std::env::consts::EXE_SUFFIX));
+    let ran = Command::new(&exe)
+        .envs([
             ("MEADOW_SILO_LEAKS", "1"),
             ("MEADOW_SILO_CYCLES", "1"),
             ("MEADOW_SILO_POISON", "ptr"),
-        ],
-    );
-    assert!(ok, "{err}");
+        ])
+        .output()
+        .expect("the program runs");
+    let out = String::from_utf8_lossy(&ran.stdout).into_owned();
+    let err = String::from_utf8_lossy(&ran.stderr).into_owned();
+    assert!(ran.status.success(), "{:?}\n{out}\n{err}", ran.status);
     // Each of 1..=200000, thirty more.
     assert_eq!(out, (200_000i64 * 200_001 / 2 + 30 * 200_000).to_string());
     let traces: u64 = err
