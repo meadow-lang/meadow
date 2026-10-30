@@ -1099,6 +1099,48 @@ impl Vm<'_> {
                 Value::Unit
             }
 
+            // --- the release stack ------------------------------------------------
+            //
+            // The thread's own, so no scheduler is asked: see
+            // `docs/CANCELLATION.md`. What is left on it when the thread ends,
+            // the scheduler runs.
+            ThreadDefer => {
+                let key = self.next_exit;
+                self.next_exit += 1;
+                self.exits.push((key, arg(self, 0)));
+                Value::Int(key)
+            }
+            ThreadTake => {
+                let key = match arg(self, 0) {
+                    Value::Int(k) => k,
+                    other => {
+                        return err(format!(
+                            "threadTake: expected an Int, got {}",
+                            self.show(other)
+                        ));
+                    }
+                };
+                if matches!(arg(self, 1), Value::Bool(true)) {
+                    let _ = self.held_off.fetch_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |n| n.checked_sub(1),
+                    );
+                }
+                // Room first: the release is a root while it is on the stack.
+                self.ensure(Heap::size_of(Kind::Data, 1));
+                match self.exits.last() {
+                    Some((k, _)) if *k >= key => {
+                        let (_, f) = self.exits.pop().expect("just looked");
+                        self.held_off
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        self.release_began = true;
+                        self.data(Role::Some, &[f])
+                    }
+                    _ => self.data(Role::None, &[]),
+                }
+            }
+
             // --- green threads ------------------------------------------------
             //
             // None of these acts here. Each leaves a request for the scheduler,

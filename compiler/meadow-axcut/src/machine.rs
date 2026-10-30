@@ -1457,7 +1457,7 @@ fn prim<'p>(
         // scheduler. Green threads run on the bytecode VM and the CEK machine,
         // which are checked against each other.
         ThreadSpawn | ThreadAwait | ThreadYield | ChannelNew | ChannelSend | ChannelReceive
-        | ThreadCancel | ThreadCancelled => {
+        | ThreadCancel | ThreadCancelled | ThreadDefer | ThreadTake => {
             err("green threads are not supported by the sequent machine")
         }
         StmNew | StmRead | StmWrite | StmBegin | StmCommit | StmWait | StmNest | StmMerge

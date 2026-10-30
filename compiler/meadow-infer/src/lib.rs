@@ -4909,6 +4909,44 @@ fn prim_scheme(name: &str) -> Option<Scheme> {
             quant: vec![VarKind::Effect],
             ty: Type::func_eff(vec![Type::unit()], Type::bool(), thread_row(0)),
         },
+        // A release performs only what the runtime answers, as a spawned
+        // function does: on the way out of a failure there are no handlers
+        // left to answer anything else. See `docs/CANCELLATION.md`.
+        "threadDefer" => Scheme {
+            lacks: Vec::new(),
+            preds: Vec::new(),
+            quant: vec![VarKind::Effect],
+            ty: Type::func_eff(
+                vec![Type::Fun(
+                    vec![Type::unit()],
+                    Box::new(Type::unit()),
+                    Box::new(thread_body_row()),
+                )],
+                Type::int(),
+                thread_row(0),
+            ),
+        },
+        // What it takes back is typed at the caller's row, so that running it
+        // in place does not add `Eff` to the caller's type: `threadDefer` has
+        // held it to the runtime's effects already, and anything that performs
+        // `Thread` runs under the runtime.
+        "threadTake" => Scheme {
+            lacks: Vec::new(),
+            preds: Vec::new(),
+            quant: vec![VarKind::Effect, VarKind::Effect],
+            ty: Type::func_eff(
+                vec![Type::int(), Type::bool()],
+                Type::Con(
+                    InternedString::from("Maybe"),
+                    vec![Type::Fun(
+                        vec![Type::unit()],
+                        Box::new(Type::unit()),
+                        Box::new(Bound(0)),
+                    )],
+                ),
+                thread_row(1),
+            ),
+        },
         "stmNew" => Scheme {
             lacks: Vec::new(),
             preds: Vec::new(),

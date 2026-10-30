@@ -286,6 +286,6 @@ inside `act`, as a spawned function does.
 
 | Part | What | Where |
 | ---- | ---- | ----- |
-| 3 | `Time.sleep` parks on the scheduler, and a cancel wakes it | first step |
-| 1 | release stack, `bracket`, `finally`, `defer`; `race`, `timeout` | second step |
+| 3 | `Time.sleep` parks on the scheduler, and a cancel wakes it | built (#51) |
+| 1 | release stack, `bracket`, `finally`, `defer`; `race`, `timeout` | built |
 | 2 | sockets owned by threads, handed on, closed at the end | third step |

@@ -4070,12 +4070,55 @@ fun main () =
 the worker stops at its next receive
 ```
 
-Nothing of a cancelled thread runs after it stops, and no handler inside it
-can catch the failure, so code never has to guard its cleanup against a
-cancel arriving half way through: there is no exception to mask, because a
-thread is only ever stopped at an operation it performs, or in pure code that
-has nothing to clean up. Threads share nothing mutable, so a thread stopped
+No handler inside a cancelled thread can catch the failure, so code never has
+to guard its cleanup against a cancel arriving half way through: there is no
+exception to mask, because a thread is only ever stopped at an operation it
+performs, or in pure code. Threads share nothing mutable, so a thread stopped
 part way through leaves nobody else's state half made.
+
+What a thread does need to undo, it says with `Thread.bracket`: acquire,
+release, use. The release runs when the use returns, or, if the thread fails
+or is cancelled first, on its way out, before `await` sees the end. Releases
+run newest first, and a cancel waits while one runs, so cleanup is not cut
+short. A release may perform only what the runtime answers, as a spawned
+function may: on the way out of a failure there are no handlers left.
+`Thread.finally` is a bracket with nothing to acquire.
+
+```meadow
+use Std.Thread as Thread
+
+fun main () =
+  let told = Thread.newChannel () in
+  let never = Thread.newChannel () in
+  let worker = Thread.spawn (\() ->
+    Thread.finally (\() -> Thread.send told "cleaned up") (\() ->
+      Thread.receive never)) in
+  let _ = Thread.cancel worker in
+  println (Thread.receive told)
+```
+
+```
+cleaned up
+```
+
+`Thread.timeout ms act` runs `act` on a thread of its own and cancels it if
+it has not answered in `ms` milliseconds: `Just` the answer, or `None`.
+`Thread.race f g` is the general form: whichever of two threads ends first
+decides, and the other is cancelled.
+
+```meadow
+use Std.Thread as Thread
+use Std.Time (sleep)
+
+fun main () =
+  let quick = Thread.timeout 1000 (\() -> 6 * 7) in
+  let slow = Thread.timeout 10 (\() -> let _ = sleep 60000 in 0) in
+  println "${quick:?} ${slow:?}"
+```
+
+```
+Just(42) None
+```
 
 `Thread` is an effect in the types, but unlike the others here it cannot be
 handled: the operations are the runtime's. On the VM, threads run in parallel

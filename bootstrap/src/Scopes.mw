@@ -367,9 +367,10 @@ def primNames : [String] =
     "setRef", "runSt", "stNewRef", "stGetRef", "stSetRef", "stNewArray", "stGetArray", "stSetArray",
     "stArrayLen", "stFreeze", "stThaw", "compact", "getCompact", "compactAdd", "compactSize",
     "threadSpawn", "threadAwait", "threadYield", "channelNew", "channelSend", "channelReceive",
-    "threadCancel", "threadCancelled", "stmNew", "stmNewIO", "stmRead", "stmWrite", "stmBegin",
-    "stmCommit", "stmWait", "stmNest", "stmMerge", "stmRollback", "concatStrings",
-    "stringByteLength", "stringByteAt", "stringSlice", "stringIndexOf", "stringCompare"
+    "threadCancel", "threadCancelled", "threadDefer", "threadTake", "stmNew", "stmNewIO", "stmRead",
+    "stmWrite", "stmBegin", "stmCommit", "stmWait", "stmNest", "stmMerge", "stmRollback",
+    "concatStrings", "stringByteLength", "stringByteAt", "stringSlice", "stringIndexOf",
+    "stringCompare"
   ]
 
 -- The standard library's modules in the order `meadow` compiles them, each

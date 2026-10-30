@@ -57,14 +57,22 @@
 //! taken the cancel on itself: it is not ended at a preemption point, and it
 //! stops where it chooses, or at its next operation.
 //!
-//! Either way the thread is over and runs nothing more of its own, and
-//! `await` of it fails with the same message. Ending a thread in pure code is
-//! safe because threads share nothing mutable: a thread stopped half way
-//! through a computation can leave nobody else's state half made, and it never
-//! sees anything itself. Meadow's handlers have no clause that runs on the way
-//! out, so in neither tier does any of the thread's code run after the cancel
-//! takes hold; what it held outside its heap -- on Silo, the stacks of the
-//! handlers it was inside -- the runtime gives back.
+//! Either way the thread's own code is over, and `await` of it fails with the
+//! same message. Ending a thread in pure code is safe because threads share
+//! nothing mutable: a thread stopped half way through a computation can leave
+//! nobody else's state half made, and it never sees anything itself. What the
+//! thread said to do on the way out still runs: the releases on its release
+//! stack (`threadDefer`, and `Std.Thread`'s `bracket` over it), newest first,
+//! under no handlers, before `await` sees the end -- on every way a thread
+//! ends, a cancel or a failure or returning. A cancel is held off while a
+//! release runs, whether in place at the end of its bracket or on the way out:
+//! its operations answer and its waits are not broken into, so cleanup is not
+//! cut short. In a cancelled thread each release is still ended at a
+//! preemption point, after a longer grace than other code (sixteen points, or
+//! sixteen ticks on Silo), and the next one runs: no release keeps a cancelled
+//! thread for ever by computing. What the thread held outside its heap -- on
+//! Silo, the stacks of the handlers it was inside -- the runtime gives back.
+//! `docs/CANCELLATION.md` is the design.
 //!
 //! None of this is an exception a thread did not ask for. The failure is the
 //! runtime's, not an effect: no handler in the thread, an `Exn` handler

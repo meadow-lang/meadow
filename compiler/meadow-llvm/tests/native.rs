@@ -985,6 +985,128 @@ fn a_sleeping_thread_is_woken_by_a_cancel() {
     assert!(took < std::time::Duration::from_secs(120), "took {took:?}");
 }
 
+// --- releases ----------------------------------------------------------------
+//
+// A thread's release stack (`docs/CANCELLATION.md`), with `Std.Thread`'s
+// `bracket` and `finally` written over the primitives as it writes them.
+
+const RELEASE: &str = "use Maybe.*\ndata Maybe a = None | Just a
+    fun releaseFrom (key : Int) (after : Bool) =
+      match threadTake key after with | Just f -> let _ = f () in releaseFrom key True | None -> ()
+    fun bracket acquire release act =
+      let it = acquire () in
+      let key = threadDefer (\\() -> release it) in
+      let out = act it in
+      let _ = releaseFrom key False in
+      out
+    fun finally release act = bracket (\\() -> ()) (\\u -> release ()) (\\u -> act ())
+    fun note log (n : Int) = setRef log (getRef log * 10 + n)\n";
+
+#[test]
+fn releases_run_newest_first_on_every_way_out() {
+    // As brackets end, in place; and with a failing thread, a cancelled one
+    // waiting, one cancelled in a loop, and one whose bracket a handler
+    // dropped -- each told by its releases, newest first. Nothing is left.
+    let src = format!(
+        "{RELEASE}use L.*\ndata L = Nil | Cons Int L
+         effect Ask {{ ask : () -> Int }}
+         fun build (n : Int) = if n == 0 then Nil else Cons n (build (n - 1))
+         fun len xs = match xs with | Nil -> toInt 0 | Cons _ r -> 1 + len r
+         fun spin (n : Int) : Int = spin (n + 1)
+         fun told2 ch = let a = channelReceive ch in a * 10 + channelReceive ch
+         def result =
+           let log = newRef (toInt 0) in
+           let s = bracket (\\() -> build 30) (\\xs -> note log 1) (\\a ->
+             bracket (\\() -> 2) (\\n -> note log n) (\\b ->
+               let _ = threadDefer (\\() -> note log 3) in len a + b)) in
+           let ch = channelNew () in
+           let never = channelNew () in
+           let failing = threadSpawn (\\() ->
+             finally (\\() -> channelSend ch (toInt 1)) (\\() ->
+               finally (\\() -> channelSend ch (toInt 2)) (\\() -> len (build 20) / toInt 0))) in
+           let f = told2 ch in
+           let waiting = threadSpawn (\\() ->
+             finally (\\() -> channelSend ch (toInt 3)) (\\() ->
+               finally (\\() -> channelSend ch (toInt 4)) (\\() -> channelReceive never + len (build 9)))) in
+           let _ = threadYield () in
+           let _ = threadCancel waiting in
+           let w = told2 ch in
+           let looping = threadSpawn (\\() ->
+             finally (\\() -> channelSend ch (toInt 5)) (\\() ->
+               finally (\\() -> channelSend ch (toInt 6)) (\\() -> spin (len (build 5))))) in
+           let _ = threadYield () in
+           let _ = threadCancel looping in
+           let l = told2 ch in
+           let dropped = threadSpawn (\\() ->
+             handle (bracket (\\() -> build 4) (\\xs -> channelSend ch (len xs)) (\\xs -> ask () + 1))
+             with {{ ask u k -> toInt 7 }}) in
+           let d = threadAwait dropped in
+           (s, getRef log, f, w, l, (d, channelReceive ch))"
+    );
+    let want = "(32, 321, 21, 43, 65, (7, 4))";
+    answers_cancelling("releases", &src, want, &[]);
+    for stderr in answers_cancelling(
+        "releases_poisoned",
+        &src,
+        want,
+        &[("MEADOW_SILO_POISON", "ptr")],
+    ) {
+        poison_clean(&stderr);
+    }
+}
+
+#[test]
+fn a_cancel_is_held_off_while_a_release_runs_and_one_that_runs_on_is_ended() {
+    // The release waits after the cancel, and is answered; one that never
+    // ends by itself is ended a while later, and the next one runs.
+    let src = format!(
+        "{RELEASE}fun spin (n : Int) : Int = spin (n + 1)
+         def result =
+           let told = channelNew () in
+           let back = channelNew () in
+           let never = channelNew () in
+           let t = threadSpawn (\\() ->
+             finally (\\() -> channelSend told (channelReceive back + toInt 1)) (\\() -> channelReceive never)) in
+           let _ = threadYield () in
+           let _ = threadCancel t in
+           let _ = channelSend back (toInt 41) in
+           let a = channelReceive told in
+           let u = threadSpawn (\\() ->
+             finally (\\() -> channelSend told (toInt 3)) (\\() ->
+               finally (\\() -> let _ = spin 0 in ()) (\\() -> channelReceive never))) in
+           let _ = threadYield () in
+           let _ = threadCancel u in
+           (a, channelReceive told)"
+    );
+    answers_cancelling("releases_held_off", &src, "(42, 3)", &[]);
+}
+
+#[test]
+fn a_failing_main_runs_its_releases_before_the_program_stops() {
+    // On every engine's way out: a program with threads, and one without --
+    // which has no scheduler, and runs them where it failed.
+    for (name, spawn) in [
+        (
+            "main_releases_threaded",
+            "let _ = threadAwait (threadSpawn (\\() -> toInt 1)) in",
+        ),
+        ("main_releases_alone", ""),
+    ] {
+        let src = format!(
+            "effect Console {{ writeOutput : String -> () }}
+             {RELEASE}def result =
+               {spawn}
+               finally (\\() -> writeOutput \"first\\n\") (\\() ->
+                 finally (\\() -> writeOutput \"second\\n\") (\\() -> toInt 1 / toInt 0))"
+        );
+        for (ok, out, stderr) in run_cancelling(name, &src, &[]) {
+            assert!(!ok, "{name}");
+            assert_eq!(out, "second\nfirst", "{name}");
+            assert!(stderr.contains("division by zero"), "{name}: {stderr}");
+        }
+    }
+}
+
 // --- cycles ------------------------------------------------------------------
 //
 // Counting alone leaves a cycle behind, so the runtime collects them by trial

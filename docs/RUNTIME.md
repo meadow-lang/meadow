@@ -1216,6 +1216,24 @@ The rule has three consequences:
 - A panic inside the runtime stops every worker instead of hanging the run
   (`StopOnPanic`).
 
+### Releases on the way out
+
+Each `Vm` keeps a **release stack** (`Vm::exits`): the functions
+`threadDefer` pushed, newest last, which are collector roots like the
+globals. `threadTake` pops one back for `Std.Thread.bracket` to run in place.
+Both are primitives the machine carries out itself, since the stack is the
+thread's own, so they work with or without a scheduler. When a thread's code
+halts or fails, `Worker::settle` keeps how it ended (`Fiber::ending`: `main`'s
+rendered answer, another thread's exported parcel, or the failure) and, while
+anything is left on the stack, starts the newest release with
+`Vm::start_release`. That is the same entry a spawned thread gets, under no
+handlers and with a halt of its own, and whatever the thread's code left in
+the registers and on the frame stack is abandoned. Each release that halts or
+fails brings the scheduler back to the next one, and the thread is completed
+only when the stack is empty. While a release runs, the thread's `Ctl` counts
+it as held off: the cancel checks pass it by, and a canceller does not wake
+it from a wait. See `docs/CANCELLATION.md`.
+
 ### Parallelism, summarized
 
 | layer                             | how it uses cores                                                         |

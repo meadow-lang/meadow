@@ -79,6 +79,20 @@
 //! whoever takes it out (the timer, or a canceller, who finds it by its
 //! `Ctl` as any waiting thread) has made it active again.
 //!
+//! # Releases on the way out
+//!
+//! A thread's code that halts or fails is not the end of the thread while
+//! its release stack (`Vm::exits`) holds anything: [`Worker::settle`] keeps
+//! how it ended in [`Fiber::ending`] and starts the newest release in the
+//! same machine, under no handlers ([`Vm::start_release`]), and each release
+//! that halts or fails brings it back for the next, until the stack is empty
+//! and the thread completes with what its code answered -- or with the first
+//! failure, if a release failed where the code had not. From the first of
+//! them, its `Ctl` counts it as held off for good: no cancel check stops it
+//! and no canceller wakes it, and a release still running at its
+//! [`RELEASE_GRACE`]th preemption point in a cancelled thread is ended there,
+//! as one more failure. See `docs/CANCELLATION.md`.
+//!
 //! # Fairness, deadlock and the end
 //!
 //! A thread runs for [`SLICE`] instructions and then goes to the back of its
@@ -409,9 +423,34 @@ struct Fiber<'p> {
     /// It asked whether it had been cancelled, and was told so: it stops of
     /// its own accord, and is not ended at a preemption point.
     seen: bool,
-    /// It has been preempted once since it was cancelled: the next ends it.
-    armed: bool,
+    /// Times it has been preempted since it was cancelled, or since the
+    /// release it runs began: at [`GRACE`] -- [`RELEASE_GRACE`] for a
+    /// release -- it is ended there.
+    strikes: u32,
+    /// How its own code ended, once it has, while the releases left on its
+    /// stack run: what it then answers -- unless a release fails where it
+    /// had succeeded. See `docs/CANCELLATION.md`.
+    ending: Option<Result<Answer, Error>>,
 }
+
+/// What a thread's code answered, kept while its releases run.
+enum Answer {
+    /// `main`'s, rendered, and itself where it is not an object.
+    Main {
+        shown: String,
+        answer: Option<crate::value::Value>,
+    },
+    /// Another thread's, exported for whoever awaits it.
+    Parcel(Parcel),
+}
+
+/// Preemption points a cancelled thread gets, to stop of its own accord,
+/// before it is ended at one.
+const GRACE: u32 = 2;
+
+/// The same for each release a cancelled thread runs: it has work it must
+/// finish, but must not keep the thread for ever. See `docs/CANCELLATION.md`.
+const RELEASE_GRACE: u32 = 16;
 
 impl<'p> Fiber<'p> {
     fn new(vm: Vm<'p>, task: u32, wake: Wake) -> Box<Fiber<'p>> {
@@ -422,9 +461,11 @@ impl<'p> Fiber<'p> {
             wake,
             ctl,
             seen: false,
-            armed: false,
+            strikes: 0,
+            ending: None,
         });
         f.vm.cancel = Some(f.ctl.cancelled.clone());
+        f.vm.held_off = f.ctl.held_off.clone();
         f
     }
 }
@@ -434,6 +475,9 @@ impl<'p> Fiber<'p> {
 struct Ctl<'p> {
     /// Its machine reads it too, at every operation the runtime answers.
     cancelled: Arc<AtomicBool>,
+    /// Releases it runs, and its way out: a cancel is held off while there
+    /// are any. Its machine counts them.
+    held_off: Arc<std::sync::atomic::AtomicU32>,
     parked: Mutex<Parked<'p>>,
 }
 
@@ -462,11 +506,21 @@ impl<'p> Ctl<'p> {
     /// waits on locked.
     fn park(&self, at: Parked<'p>) -> bool {
         *lock(&self.parked) = at;
-        self.cancelled.load(Ordering::SeqCst)
+        self.stops()
     }
 
     fn cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn held_off(&self) -> bool {
+        self.held_off.load(Ordering::SeqCst) > 0
+    }
+
+    /// Does a cancel stop it at an operation, or wake it from a wait? Not
+    /// while it is held off.
+    fn stops(&self) -> bool {
+        self.cancelled() && !self.held_off()
     }
 }
 
@@ -934,15 +988,26 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
         let sh = self.shared;
         match stop {
             Stop::Preempted => {
+                if fiber.vm.release_began {
+                    fiber.vm.release_began = false;
+                    fiber.strikes = 0;
+                    fiber.seen = false;
+                }
                 // A cancelled thread that makes no operation is ended at its
                 // second preemption point after the cancel, unless it asked:
-                // at least a slice's grace to stop of its own accord.
+                // at least a slice's grace to stop of its own accord. A
+                // release it runs is given longer, and only it is ended.
                 if fiber.ctl.cancelled() && !fiber.seen && fiber.task != 0 {
-                    if fiber.armed {
+                    fiber.strikes += 1;
+                    let grace = if fiber.ctl.held_off() {
+                        RELEASE_GRACE
+                    } else {
+                        GRACE
+                    };
+                    if fiber.strikes >= grace {
                         let msg = meadow_rt::thread::CANCELLED.into();
                         return self.settle(scope, fiber, Stop::Failed(Error { msg }));
                     }
-                    fiber.armed = true;
                 }
                 self.requeue(fiber);
                 None
@@ -953,47 +1018,36 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
                 }));
                 None
             }
+            // The thread's own code is over -- or a release it runs on the
+            // way out is: run the next, or end it.
             Stop::Halted(v) => {
-                Self::collect(sh, &mut fiber);
-                if fiber.task == 0 {
-                    if !matches!(v, crate::value::Value::Obj(_)) {
-                        *lock(&sh.answer) = Some(v);
-                    }
-                    let shown = fiber.vm.show(v);
-                    {
-                        let mut stats = lock(&sh.stats);
-                        stats.add(&fiber.vm.heap);
-                        stats.heap_slots = fiber.vm.heap.capacity();
-                        stats.region_slots = fiber.vm.heap.region_slots();
-                        stats.old_slots = fiber.vm.heap.old_slots();
-                        stats.old_live = fiber.vm.heap.old_live();
-                    }
-                    sh.finish(Ok(shown));
-                } else {
-                    // Exported with the thread's own heap, which goes away with it.
-                    let outcome = fiber
-                        .vm
-                        .heap
-                        .export(v)
-                        .map_err(|why| meadow_rt::thread::unsendable(why.describe()));
-                    lock(&sh.stats).add(&fiber.vm.heap);
-                    self.complete(fiber.task, outcome);
-                    sh.release();
+                if fiber.ending.is_none() {
+                    let out = if fiber.task == 0 {
+                        let answer = (!matches!(v, crate::value::Value::Obj(_))).then_some(v);
+                        Ok(Answer::Main {
+                            shown: fiber.vm.show(v),
+                            answer,
+                        })
+                    } else {
+                        // Exported with the thread's own heap, which goes away with it.
+                        fiber
+                            .vm
+                            .heap
+                            .export(v)
+                            .map(Answer::Parcel)
+                            .map_err(|why| Error {
+                                msg: meadow_rt::thread::unsendable(why.describe()),
+                            })
+                    };
+                    Self::ended(&mut fiber, out);
                 }
-                None
+                self.wind_down(fiber)
             }
             Stop::Failed(e) => {
-                Self::collect(sh, &mut fiber);
-                lock(&sh.stats).add(&fiber.vm.heap);
-                if fiber.task == 0 {
-                    sh.finish(Err(e));
-                } else {
-                    self.complete(fiber.task, Err(e.msg));
-                    sh.release();
-                }
-                None
+                Self::ended(&mut fiber, Err(e));
+                self.wind_down(fiber)
             }
-            Stop::Requested(request) if request.notices_cancel() && fiber.ctl.cancelled() => {
+            Stop::Requested(request) if request.notices_cancel() && fiber.ctl.stops() => {
                 fiber.wake = Wake::Fail(meadow_rt::thread::CANCELLED.into());
                 Some(fiber)
             }
@@ -1008,7 +1062,12 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
                         t.outcome.is_none().then(|| t.ctl.clone())
                     };
                     // Finished, or asked already: nothing to do.
-                    if let Some(ctl) = ctl.filter(|c| !c.cancelled.swap(true, Ordering::SeqCst)) {
+                    // Held off -- running a release -- it is not woken: it
+                    // stops at its first operation once it is not.
+                    if let Some(ctl) = ctl
+                        .filter(|c| !c.cancelled.swap(true, Ordering::SeqCst))
+                        .filter(|c| !c.held_off())
+                    {
                         let at = std::mem::take(&mut *lock(&ctl.parked));
                         let sleeping = matches!(at, Parked::Sleep(_));
                         if let Some(mut w) = self.unpark(task, at) {
@@ -1303,6 +1362,69 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
                 Some(f)
             }
         }
+    }
+
+    /// The thread's own code ended with `out` -- or a release it ran on the
+    /// way out did. It answers how its own code ended, unless a release
+    /// failed where it had succeeded: the first failure, then.
+    fn ended(fiber: &mut Fiber<'p>, out: Result<Answer, Error>) {
+        match (&fiber.ending, out) {
+            (None, out) => {
+                // On its way out: a cancel is held off for good.
+                fiber.ctl.held_off.fetch_add(1, Ordering::SeqCst);
+                fiber.ending = Some(out);
+            }
+            (Some(Ok(_)), Err(e)) => fiber.ending = Some(Err(e)),
+            _ => {}
+        }
+    }
+
+    /// Run the newest release left on the thread's stack, handing the thread
+    /// back to run it; or, with none left, end the thread with what it
+    /// answers. See `docs/CANCELLATION.md`.
+    fn wind_down(&mut self, mut fiber: Box<Fiber<'p>>) -> Option<Box<Fiber<'p>>> {
+        let sh = self.shared;
+        while let Some((_, f)) = fiber.vm.exits.pop() {
+            fiber.strikes = 0;
+            fiber.seen = false;
+            fiber.wake = Wake::Go;
+            match fiber.vm.start_release(f) {
+                Ok(()) => return Some(fiber),
+                Err(e) => Self::ended(&mut fiber, Err(e)),
+            }
+        }
+        Self::collect(sh, &mut fiber);
+        let out = fiber.ending.take().expect("the thread has ended");
+        if fiber.task == 0 {
+            let mut stats = lock(&sh.stats);
+            stats.add(&fiber.vm.heap);
+            let result = match out {
+                Ok(Answer::Main { shown, answer }) => {
+                    if let Some(v) = answer {
+                        *lock(&sh.answer) = Some(v);
+                    }
+                    stats.heap_slots = fiber.vm.heap.capacity();
+                    stats.region_slots = fiber.vm.heap.region_slots();
+                    stats.old_slots = fiber.vm.heap.old_slots();
+                    stats.old_live = fiber.vm.heap.old_live();
+                    Ok(shown)
+                }
+                Ok(Answer::Parcel(_)) => unreachable!("main answers as main"),
+                Err(e) => Err(e),
+            };
+            drop(stats);
+            sh.finish(result);
+        } else {
+            lock(&sh.stats).add(&fiber.vm.heap);
+            let outcome = match out {
+                Ok(Answer::Parcel(p)) => Ok(p),
+                Ok(Answer::Main { .. }) => unreachable!("a thread answers as a thread"),
+                Err(e) => Err(e.msg),
+            };
+            self.complete(fiber.task, outcome);
+            sh.release();
+        }
+        None
     }
 
     /// Record a spawned thread's result, and put whoever awaits it on this

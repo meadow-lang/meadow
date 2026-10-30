@@ -136,6 +136,15 @@ pub struct Ctx {
     /// Whether the thread has been asked to stop, and where it waits: shared
     /// with its task, where a canceller finds it. See `crate::sched::Ctl`.
     pub cancel: std::sync::Arc<crate::sched::Ctl>,
+    /// The release stack (`Prim::ThreadDefer`): each release's key and the
+    /// function, a reference this holds, newest last. See
+    /// `docs/CANCELLATION.md`.
+    pub exits: Vec<(i64, Word)>,
+    /// The key the next release is given.
+    pub next_exit: i64,
+    /// How the thread's own code ended, once it has, while its releases run:
+    /// see `crate::sched::wind_down`.
+    pub ending: Option<Result<crate::parcel::Parcel, String>>,
 }
 
 // Safety: a context is used by one OS thread at a time -- the one running its
@@ -168,6 +177,9 @@ impl Ctx {
             tid,
             guarded: false,
             cancel: Default::default(),
+            exits: Vec::new(),
+            next_exit: 0,
+            ending: None,
         });
         c.spill_at = c.spill.as_mut_ptr();
         c

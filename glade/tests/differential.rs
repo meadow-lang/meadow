@@ -2338,6 +2338,228 @@ fn a_sleeping_thread_is_woken_by_a_cancel() {
     assert!(took < std::time::Duration::from_secs(120), "took {took:?}");
 }
 
+// --- releases --------------------------------------------------------------------
+
+// A thread's release stack: see `docs/CANCELLATION.md`. `Std.Thread`'s
+// `bracket` and `finally`, written over the two primitives as it writes them:
+// these programs are compiled without the standard library.
+const RELEASE: &str = "use Maybe.*\ndata Maybe a = None | Just a
+    fun releaseFrom (key : Int) (after : Bool) =
+      match threadTake key after with | Just f -> let _ = f () in releaseFrom key True | None -> ()
+    fun bracket acquire release act =
+      let it = acquire () in
+      let key = threadDefer (\\() -> release it) in
+      let out = act it in
+      let _ = releaseFrom key False in
+      out
+    fun finally release act = bracket (\\() -> ()) (\\u -> release ()) (\\u -> act ())
+    fun note log (n : Int) = setRef log (getRef log * 10 + n)\n";
+
+#[test]
+fn releases_run_newest_first_when_their_brackets_end() {
+    // Nested, and one deferred inside: each as its bracket ends, the
+    // deferred one with the bracket around it, before that bracket's own.
+    let src = format!(
+        "{RELEASE}def result =
+           let log = newRef (toInt 0) in
+           let s = bracket (\\() -> 1) (\\n -> note log n) (\\a ->
+             bracket (\\() -> 2) (\\n -> note log n) (\\b ->
+               let _ = threadDefer (\\() -> note log 3) in a + b)) in
+           (s, getRef log)"
+    );
+    assert_eq!(threads_agree(&src), Ok("(3, 321)".into()));
+    // Taking back from a key with nothing left above it gives nothing.
+    let src = format!(
+        "{RELEASE}def result =
+           let k = threadDefer (\\() -> ()) in
+           let a = match threadTake (k + 1) False with | Just f -> 1 | None -> 0 in
+           let b = match threadTake k False with | Just f -> 1 | None -> 0 in
+           let c = match threadTake k True with | Just f -> 1 | None -> 0 in
+           (a, b, c)"
+    );
+    assert_eq!(threads_agree(&src), Ok("(0, 1, 0)".into()));
+}
+
+#[test]
+fn a_failing_thread_runs_its_releases_newest_first() {
+    let src = format!(
+        "{RELEASE}def result =
+           let told = channelNew () in
+           let t = threadSpawn (\\() ->
+             finally (\\() -> channelSend told (toInt 1)) (\\() ->
+               finally (\\() -> channelSend told (toInt 2)) (\\() -> toInt 1 / toInt 0))) in
+           let a = channelReceive told in
+           let b = channelReceive told in
+           (a, b)"
+    );
+    assert_eq!(threads_agree(&src), Ok("(2, 1)".into()));
+    // And it still fails as it did.
+    let src = format!(
+        "{RELEASE}def result =
+           let t = threadSpawn (\\() -> finally (\\() -> ()) (\\() -> toInt 1 / toInt 0)) in
+           threadAwait t"
+    );
+    assert_eq!(threads_agree(&src), Err("division by zero".into()));
+    // A release that fails ends itself only: the next runs, and a thread that
+    // had succeeded fails with what its release failed with.
+    let src = format!(
+        "{RELEASE}def result =
+           let told = channelNew () in
+           let t = threadSpawn (\\() ->
+             finally (\\() -> channelSend told (toInt 1)) (\\() ->
+               finally (\\() -> let _ = toInt 1 / toInt 0 in ()) (\\() -> toInt 42))) in
+           let a = channelReceive told in
+           (a, threadAwait t)"
+    );
+    assert_eq!(threads_agree(&src), Err("division by zero".into()));
+}
+
+#[test]
+fn a_cancelled_thread_runs_its_releases() {
+    // Softly, waiting on a channel nobody sends to.
+    let src = format!(
+        "{RELEASE}def result =
+           let told = channelNew () in
+           let never = channelNew () in
+           let t = threadSpawn (\\() ->
+             finally (\\() -> channelSend told (toInt 7)) (\\() -> channelReceive never + toInt 1)) in
+           let _ = threadYield () in
+           let _ = threadCancel t in
+           channelReceive told"
+    );
+    assert_eq!(threads_agree(&src), Ok("7".into()));
+    // Hard, in a loop that performs nothing.
+    let src = format!(
+        "{RELEASE}fun spin (n : Int) : Int = spin (n + 1)
+         def result =
+           let told = channelNew () in
+           let t = threadSpawn (\\() -> finally (\\() -> channelSend told (toInt 8)) (\\() -> spin 0)) in
+           let _ = threadYield () in
+           let _ = threadCancel t in
+           channelReceive told"
+    );
+    assert_eq!(threads_agree(&src), Ok("8".into()));
+    // Its `await` fails as a cancelled thread's does.
+    let src = format!(
+        "{RELEASE}def result =
+           let never = channelNew () in
+           let t = threadSpawn (\\() -> finally (\\() -> ()) (\\() -> channelReceive never)) in
+           let _ = threadCancel t in
+           threadAwait t"
+    );
+    assert_eq!(threads_agree(&src), cancelled());
+}
+
+#[test]
+fn a_cancel_is_held_off_while_a_release_runs() {
+    // Cancelled, the release still waits, and is not woken from its wait:
+    // it gets what `main` sends it, and passes it on.
+    let src = format!(
+        "{RELEASE}def result =
+           let told = channelNew () in
+           let back = channelNew () in
+           let never = channelNew () in
+           let t = threadSpawn (\\() ->
+             finally (\\() -> let _ = threadYield () in channelSend told (channelReceive back + toInt 1))
+               (\\() -> channelReceive never)) in
+           let _ = threadYield () in
+           let _ = threadCancel t in
+           let _ = channelSend back (toInt 41) in
+           channelReceive told"
+    );
+    assert_eq!(threads_agree(&src), Ok("42".into()));
+    // In place, at the end of a bracket, the same: cancelled while the
+    // release waits, it carries on; the thread stops at its next operation.
+    let src = format!(
+        "{RELEASE}def result =
+           let told = channelNew () in
+           let back = channelNew () in
+           let t = threadSpawn (\\() ->
+             let x = bracket (\\() -> ()) (\\u -> channelSend told (channelReceive back)) (\\u -> toInt 1) in
+             let _ = threadYield () in
+             x) in
+           let _ = threadYield () in
+           let _ = threadCancel t in
+           let _ = channelSend back (toInt 5) in
+           channelReceive told"
+    );
+    assert_eq!(threads_agree(&src), Ok("5".into()));
+}
+
+#[test]
+fn a_release_that_runs_on_and_on_is_ended_in_a_cancelled_thread() {
+    // The inner release never ends by itself: it is ended, as a release, a
+    // while later, and the outer one runs.
+    let src = format!(
+        "{RELEASE}fun spin (n : Int) : Int = spin (n + 1)
+         def result =
+           let told = channelNew () in
+           let never = channelNew () in
+           let t = threadSpawn (\\() ->
+             finally (\\() -> channelSend told (toInt 3)) (\\() ->
+               finally (\\() -> let _ = spin 0 in ()) (\\() -> channelReceive never))) in
+           let _ = threadYield () in
+           let _ = threadCancel t in
+           (channelReceive told, threadAwait t)"
+    );
+    assert_eq!(threads_agree(&src), cancelled());
+    let src = format!(
+        "{RELEASE}fun spin (n : Int) : Int = spin (n + 1)
+         def result =
+           let told = channelNew () in
+           let never = channelNew () in
+           let t = threadSpawn (\\() ->
+             finally (\\() -> channelSend told (toInt 3)) (\\() ->
+               finally (\\() -> let _ = spin 0 in ()) (\\() -> channelReceive never))) in
+           let _ = threadYield () in
+           let _ = threadCancel t in
+           channelReceive told"
+    );
+    assert_eq!(threads_agree(&src), Ok("3".into()));
+}
+
+#[test]
+fn what_a_handler_drops_is_released_when_the_thread_ends() {
+    // `ask`'s clause never resumes: the bracket inside never ends, and its
+    // release runs when the thread does -- after the thread's answer is in.
+    let src = format!(
+        "{RELEASE}effect Ask {{ ask : () -> Int }}
+         def result =
+           let told = channelNew () in
+           let t = threadSpawn (\\() ->
+             handle (bracket (\\() -> ()) (\\u -> channelSend told (toInt 9)) (\\u -> ask () + 1))
+             with {{ ask u k -> toInt 7 }}) in
+           let a = threadAwait t in
+           (a, channelReceive told)"
+    );
+    assert_eq!(threads_agree(&src), Ok("(7, 9)".into()));
+    // Or when the bracket around it ends, before that one's own.
+    let src = format!(
+        "{RELEASE}effect Ask {{ ask : () -> Int }}
+         def result =
+           let log = newRef (toInt 0) in
+           let _ = finally (\\() -> note log 1) (\\() ->
+             let r = handle (bracket (\\() -> ()) (\\u -> note log 2) (\\u -> ask () + 1))
+                     with {{ ask u k -> toInt 7 }} in
+             note log 3) in
+           getRef log"
+    );
+    assert_eq!(threads_agree(&src), Ok("321".into()));
+}
+
+#[test]
+fn a_sleeping_thread_cancelled_runs_its_releases_at_once() {
+    let src = format!(
+        "{TIME}{RELEASE}def result =
+           let told = channelNew () in
+           let t = threadSpawn (\\() -> finally (\\() -> channelSend told (toInt 4)) (\\() -> sleep 3600000)) in
+           let _ = sleep 20 in
+           let _ = threadCancel t in
+           channelReceive told"
+    );
+    assert_eq!(threads_agree(&src), Ok("4".into()));
+}
+
 // --- typed instructions --------------------------------------------------------
 
 // Operands the compiler knows are both `Int`, or both `Float`, run as typed

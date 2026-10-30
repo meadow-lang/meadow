@@ -115,6 +115,28 @@ beyond the last release is under _Unreleased_.
   program that never spawns. `docs/CANCELLATION.md` is the design, for this
   and for what follows from it: cleanup that runs as a thread ends, sockets
   closed with the thread that held them, and timeouts.
+- A thread can say what to undo on its way out: `Std.Thread.bracket acquire
+  release use` releases what `acquire` gave when `use` returns, or, if the
+  thread fails or is cancelled first, before `await` sees it end.
+  `Std.Thread.finally` is a bracket with nothing to acquire, and
+  `Std.Thread.defer` registers a release for the end of the bracket around it
+  or of the thread. Releases run newest first. One that fails ends only
+  itself, and a thread that had succeeded then fails with what it failed
+  with. A cancel waits while a release runs: its operations answer and its
+  waits are not broken into. In a cancelled thread a release that runs on and
+  on is still ended, after longer than other code is given, and the next one
+  runs. A release performs only what the runtime answers, as a spawned
+  function does, which its type checks: on the way out of a failure no
+  handler is left to answer anything else. What a handler drops, such as a
+  bracket inside a `toResult` that raised, is released when the bracket
+  around it ends, or the thread does. `Std.Thread.race f g` runs both on
+  threads of their own and answers whichever ends first, cancelling the other
+  and waiting for its releases; `Std.Thread.timeout ms act` is `Just` the
+  answer, or `None` once `ms` milliseconds have passed and `act` has been
+  cancelled. Works on the CEK machine, Glade (the VM, the JIT and
+  executables) and Silo. `docs/CANCELLATION.md` is the design, and says why
+  this is a library over a stack the runtime keeps per thread rather than a
+  clause on `handle`.
 
 ### Fixed
 

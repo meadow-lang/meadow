@@ -274,7 +274,9 @@ pub const PRIMS: &[&str] = &[
     "channelSend",
     "channelReceive",
     "threadCancel",
-    "threadCancelled", //
+    "threadCancelled",
+    "threadDefer",
+    "threadTake", //
     // software transactional memory: the parts `Std.Stm` cannot write itself
     "stmNew",
     "stmNewIO",
