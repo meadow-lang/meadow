@@ -238,6 +238,13 @@ beyond the last release is under _Unreleased_.
   longer sees its own name: the name means what it meant before, an import or
   an earlier entry, as in a `let`, and is undefined if that is nothing. Inside
   a function it is the definition still, so `def f = \n -> f (n - 1)` recurses.
+- A type with five or more type variables printed `e`, `f`, `n` and `r` for
+  plain variables too, the letters of an effect row, a fraction, a number and
+  a record row, so a scheme could name two different variables `e`. Plain
+  type variables now skip those four letters everywhere a type is printed --
+  hovers, errors, `meadow build --types`, MeadowBoot -- going `a`, `b`, `c`,
+  `d`, `g`, `h`, so a letter always says what kind of variable it is. A type
+  with four or fewer prints as before.
 
 ## 0.4.0 - 2026-10-24
 

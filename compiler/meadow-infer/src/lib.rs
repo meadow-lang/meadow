@@ -5096,7 +5096,8 @@ impl Namer {
     }
 
     /// Name a bound variable of a scheme by its kind: type vars get `a`, `b`, `c`
-    /// …; record-row vars `r`, `r1`, `r2` …; effect-row vars `e`, `e1`, `e2` ….
+    /// … (see [`TYPE_LETTERS`]); record-row vars `r`, `r1`, `r2` …; effect-row
+    /// vars `e`, `e1`, `e2` ….
     fn bound_name(&self, i: u32) -> String {
         let kind = self
             .bound_kinds
@@ -5127,14 +5128,25 @@ fn meadow_num_width(name: &str) -> bool {
     )
 }
 
+/// The letters a plain type variable is named with: the alphabet, less the
+/// four [`kinded_var_name`] gives the other kinds. A letter always says what
+/// kind of variable it is, whatever else the type has in it, so `e` is an
+/// effect row in every type printed and two different variables never share
+/// a name: the fifth type variable is `g`, with or without an effect row
+/// beside it. Skipping only the letters a type turns out to use would rename
+/// a variable when the type gains another of a different kind, and a free
+/// variable is named as it is met, before the rest of the type is seen.
+const TYPE_LETTERS: &[u8; 22] = b"abcdghijklmopqstuvwxyz";
+
 fn var_name(mut n: u32) -> String {
+    let base = TYPE_LETTERS.len() as u32;
     let mut s = String::new();
     loop {
-        s.insert(0, char::from(b'a' + (n % 26) as u8));
-        if n < 26 {
+        s.insert(0, char::from(TYPE_LETTERS[(n % base) as usize]));
+        if n < base {
             break;
         }
-        n = n / 26 - 1;
+        n = n / base - 1;
     }
     s
 }
@@ -5452,6 +5464,76 @@ mod tests {
         assert_eq!(
             Type::func(vec![Type::Var(1)], Type::Var(9)).to_string(),
             "a -> b"
+        );
+    }
+
+    #[test]
+    fn the_letters_of_one_kind_are_not_those_of_another() {
+        // Five type variables and an effect row: the fifth is not the row's `e`.
+        let scheme = Scheme {
+            preds: Vec::new(),
+            lacks: Vec::new(),
+            quant: vec![
+                VarKind::Type,
+                VarKind::Type,
+                VarKind::Type,
+                VarKind::Type,
+                VarKind::Type,
+                VarKind::Effect,
+            ],
+            ty: Type::func_eff(
+                (0..5).map(Type::Bound).collect(),
+                Type::Tuple((0..5).map(Type::Bound).collect()),
+                Type::RowExtend(
+                    "Console".into(),
+                    Box::new(Type::Tuple(Vec::new())),
+                    Box::new(Type::Bound(5)),
+                ),
+            ),
+        };
+        assert_eq!(
+            scheme.to_string(),
+            "forall a b c d g e. a -> b -> c -> d -> g -> (a, b, c, d, g) ! { Console | e }"
+        );
+
+        // The same letters with no effect row: `g` means the same in both.
+        let plain = Scheme {
+            preds: Vec::new(),
+            lacks: Vec::new(),
+            quant: vec![VarKind::Type; 5],
+            ty: Type::Tuple((0..5).map(Type::Bound).collect()),
+        };
+        assert_eq!(plain.to_string(), "forall a b c d g. (a, b, c, d, g)");
+
+        // A free variable takes the same letters, and past them, two.
+        let free = Type::Tuple((0..6).map(Type::Var).collect());
+        assert_eq!(free.to_string(), "(a, b, c, d, g, h)");
+        let names: Vec<String> = [3, 4, 7, 8, 10, 11, 21, 22, 23, 26, 44]
+            .map(var_name)
+            .into();
+        assert_eq!(
+            names,
+            ["d", "g", "j", "k", "m", "o", "z", "aa", "ab", "ag", "ba"]
+        );
+    }
+
+    #[test]
+    fn a_free_variable_of_another_kind_keeps_its_own_letter() {
+        // `e`, the effect row, beside a fifth type variable, as a hover shows it.
+        let mut renderer = Renderer::new();
+        renderer.namer.classes.insert(9, VarKind::Effect);
+        let ty = Type::func_eff(
+            (0..5).map(Type::Var).collect(),
+            Type::Var(4),
+            Type::RowExtend(
+                "Console".into(),
+                Box::new(Type::Tuple(Vec::new())),
+                Box::new(Type::Var(9)),
+            ),
+        );
+        assert_eq!(
+            renderer.render(&ty),
+            "a -> b -> c -> d -> g -> g ! { Console | e }"
         );
     }
 
