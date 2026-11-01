@@ -229,6 +229,13 @@ beyond the last release is under _Unreleased_.
   drive -- now remove each test's directory when it ends, passed or failed,
   and keep it in the build's `target/tmp`; `MEADOW_KEEP_TEST_DIRS=1` keeps
   them to look at.
+- A type with five or more type variables printed `e`, `f`, `n` and `r` for
+  plain variables too, the letters of an effect row, a fraction, a number and
+  a record row, so a scheme could name two different variables `e`. Plain
+  type variables now skip those four letters everywhere a type is printed --
+  hovers, errors, `meadow build --types`, MeadowBoot -- going `a`, `b`, `c`,
+  `d`, `g`, `h`, so a letter always says what kind of variable it is. A type
+  with four or fewer prints as before.
 - A Silo program that cannot spawn a thread could have its tracing collector
   free what its outermost frames held. A trace scans the stack up to where the
   program began, and that place was taken a little too low, so those frames

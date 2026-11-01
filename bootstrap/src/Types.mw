@@ -738,10 +738,16 @@ fun boundName (nm : Namer) (i : Int) : String =
 
 fun sameKind (kind : VarKind) (k : VarKind) : Bool = kindKey kind == kindKey k
 
-@pub fun varName (n : Int) : String =
-  if n < 26 then letter n else varName (n / 26 - 1) ++ letter (n % 26)
+-- The letters a plain variable is named with: the alphabet, less the ones
+-- `kindedVarName` gives the other kinds, so that a letter always says what
+-- kind of variable it is, as `TYPE_LETTERS` in `meadow-infer` has it.
+def typeLetters : String = "abcdghijklmopqstuvwxyz"
 
-fun letter (i : Int) : String = stringSlice "abcdefghijklmnopqrstuvwxyz" i (i + 1)
+@pub fun varName (n : Int) : String =
+  let base = stringByteLength typeLetters in
+  if n < base then letter n else varName (n / base - 1) ++ letter (n % base)
+
+fun letter (i : Int) : String = stringSlice typeLetters i (i + 1)
 
 fun kindedVarName (kind : VarKind) (rank : Int) : String =
   match kind with
@@ -1011,6 +1017,40 @@ use Std.Test (assertEq)
       "two"
   in assertEq (showScheme (mono (intT ()))) "Int" "none"
 
+@test fun theLettersOfOneKindAreNotThoseOfAnother () =
+  let bounds = V.map Bound (V.range 0 5) in
+  let a =
+    assertEq
+      (showScheme
+         (Scheme {
+           quant = [Plain, Plain, Plain, Plain, Plain, Effect],
+           preds = [],
+           ty = funcEff bounds (Tuple bounds) (RowExtend "Console" (Tuple []) (Bound 5)),
+           lacks = []
+         }))
+      "forall a b c d g e. a -> b -> c -> d -> g -> (a, b, c, d, g) ! { Console | e }"
+      "the fifth type variable is not the row's `e`"
+  in
+  let b =
+    assertEq
+      (showScheme
+         (Scheme {
+           quant = [Plain, Plain, Plain, Plain, Plain],
+           preds = [],
+           ty = Tuple bounds,
+           lacks = []
+         }))
+      "forall a b c d g. (a, b, c, d, g)"
+      "and it is the same with no row there"
+  in
+  let c =
+    assertEq (showType (Tuple (V.map Var (V.range 0 6)))) "(a, b, c, d, g, h)" "free ones too"
+  in
+  assertEq
+    (S.join " " (V.map varName [3, 4, 7, 8, 10, 11, 21, 22, 23, 26, 44]))
+    "d g j k m o z aa ab ag ba"
+    "and past the letters, two of them"
+
 @test fun aLoneEffectVariableIsLeftOut () =
   let s =
     Scheme {
@@ -1024,7 +1064,7 @@ use Std.Test (assertEq)
   let t =
     Scheme {
       quant = [Num, Effect],
-      preds = [Pred { tr = "Std::Ops::Add", tys = [Bound 0], assocs = [] }],
+      preds = [Pred { tr = "Std.Ops.Add", tys = [Bound 0], assocs = [] }],
       ty = funcEff [Bound 0] (Bound 0) (RowExtend "Console" (Tuple []) (Bound 1)),
       lacks = []
     }
