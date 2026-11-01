@@ -229,6 +229,15 @@ beyond the last release is under _Unreleased_.
   drive -- now remove each test's directory when it ends, passed or failed,
   and keep it in the build's `target/tmp`; `MEADOW_KEEP_TEST_DIRS=1` keeps
   them to look at.
+- A Silo program that cannot spawn a thread could have its tracing collector
+  free what its outermost frames held. A trace scans the stack up to where the
+  program began, and that place was taken a little too low, so those frames
+  were read only if a copy of what they held happened to be left lower down.
+  Compiled from Cut on Linux, whose calling convention keeps those frames
+  small, a program lost its `main`'s continuation in about one run in seven:
+  it died with a segmentation fault as `main` answered, or ran on through
+  memory given to something else until it ran out. A trace now scans every
+  frame the program has.
 
 ## 0.4.0 - 2026-10-24
 
