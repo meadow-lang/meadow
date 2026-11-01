@@ -180,11 +180,16 @@ fn run_main(entry: extern "C" fn() -> Word) -> (Box<Ctx>, Word) {
     let mut c = Ctx::new(0);
     ctx::set(&mut *c);
     // The program runs on this stack until a `handle` starts a segment, and
-    // a trace scans it from here down: see `trace::Level`.
-    let base = trace::stopped(|sp| sp);
-    c.os_level = Some(trace::Level { base, stopped: 0 });
-    let v = entry();
-    mains_releases(v);
+    // a trace scans it from here down: see `trace::Level`. From inside
+    // `stopped`, and not with what it answered: what it wrote is below this
+    // frame, where `entry`'s own frames go once it has returned, and those
+    // would be above where a trace stops -- `main`'s continuation with them.
+    let v = trace::stopped(|base| {
+        c.os_level = Some(trace::Level { base, stopped: 0 });
+        let v = entry();
+        mains_releases(v);
+        v
+    });
     c.os_level = None;
     (c, v)
 }
