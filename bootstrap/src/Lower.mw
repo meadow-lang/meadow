@@ -1857,7 +1857,7 @@ fun applied b parts (over : Maybe Meta) =
 -- called with the rest, which are evaluated first. That is the plain call if
 -- either side is inert, and `(\$pipe -> f $pipe) rest` if not, as `pipe` in
 -- `meadow-parser` has it.
-fun pipedb parts (over : Maybe Meta) =
+fun piped b parts (over : Maybe Meta) =
   let n = V.len parts in
   match V.get parts (n - 1) with
   | None -> newAstExprUnit b (spanMeta 0 0)
