@@ -236,6 +236,15 @@ beyond the last release is under _Unreleased_.
   hovers, errors, `meadow build --types`, MeadowBoot -- going `a`, `b`, `c`,
   `d`, `g`, `h`, so a letter always says what kind of variable it is. A type
   with four or fewer prints as before.
+- A Silo program that cannot spawn a thread could have its tracing collector
+  free what its outermost frames held. A trace scans the stack up to where the
+  program began, and that place was taken a little too low, so those frames
+  were read only if a copy of what they held happened to be left lower down.
+  Compiled from Cut on Linux, whose calling convention keeps those frames
+  small, a program lost its `main`'s continuation in about one run in seven:
+  it died with a segmentation fault as `main` answered, or ran on through
+  memory given to something else until it ran out. A trace now scans every
+  frame the program has.
 
 ## 0.4.0 - 2026-10-24
 
