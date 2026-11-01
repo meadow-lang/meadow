@@ -7,9 +7,10 @@ not. The promise covers the language, `Std`'s public API and `Meadow.toml`; the
 bytecode image, the Cut IR and the runtimes' layouts may change in any release
 until 1.0.
 
-Each release has three lists: what **breaks** code that built before, what is
-**added**, and what is **fixed**. A nightly build is `master`, and what it has
-beyond the last release is under _Unreleased_.
+Each release has up to four lists: what **breaks** code that built before,
+what is **changed** in what code that still builds does, what is **added**,
+and what is **fixed**. A nightly build is `master`, and what it has beyond the
+last release is under _Unreleased_.
 
 ## Unreleased
 
@@ -22,6 +23,19 @@ beyond the last release is under _Unreleased_.
   `+` for `+.`, `<` for `<.`, and so on. A program built without `Std` names
   the float primitives (`_primAddF x y`), since there `+` is the integers'
   primitive.
+
+### Changed
+
+- `x |> f` evaluates `x` first, and then `f`, as it is written, on every
+  engine. It used to be exactly `f x`, which evaluates `f` first. Only a
+  program in which working out what is piped into performs something can
+  tell: in `read () |> check (log ())`, `read` now runs before `log`, and a
+  stage whose `f a` itself performs something runs after the value before it.
+  A name, a constructor or a function on either side of the `|>` costs and
+  means what it did, and a pipe types as it did. The `_`s of a section are
+  numbered as they are written across a pipe, as they are everywhere else:
+  `(_ |> f _)` takes the piped value first, where it used to take `f`'s
+  argument first. `<|` is unchanged: `f <| x` is `f`, then `x`.
 
 ### Added
 

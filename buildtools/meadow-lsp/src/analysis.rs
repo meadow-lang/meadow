@@ -1808,7 +1808,10 @@ impl Walk<'_> {
         if let Some(ty) = self.types.and_then(|t| t.get(id)) {
             self.a.typed.push((ident.span, ty.to_string()));
         }
-        if let Some(rendered) = hint.then(|| self.hint_type(id)).flatten() {
+        // A name with no span is one the source does not write: the value of
+        // a pipe, say, which has nowhere for a hint to go.
+        let written = ident.span.start < ident.span.end;
+        if let Some(rendered) = (hint && written).then(|| self.hint_type(id)).flatten() {
             self.a.annotate(ident.span, &rendered);
         }
     }

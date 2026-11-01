@@ -15,6 +15,14 @@ def vectors = ([], [1], [1, 2, 3], [;], [1; 2], [x, ])
 
 def pipes = x |> f |> g <| h <| y
 
+def pipesInOrder = (g y |> f, g y |> f a |> h b, x |> f a, -1 |> f a, () |> f a, g y |> M.f)
+
+def pipesIntoValues = (g y |> Just, g y |> (\n -> n), g y |> (_ + 1), g y |> (f))
+
+def pipesOfParts = (x.y |> f a, (g y) |> f a, (x) |> f a, (g y |> f) |> h b, g y |> (f a))
+
+def pipeHoles = ((_ |> f _), (_ |> _), (g _ |> f _ |> h _), (_ |> f), (x |> _))
+
 def logic = a and b or c and not d or e
 
 def infixes = 1 + 2 * 3 :: xs == ys

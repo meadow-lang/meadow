@@ -239,6 +239,19 @@ fn inlay_hints_read_as_a_writable_annotation() {
 }
 
 #[test]
+fn the_value_of_a_pipe_is_not_a_binding_a_person_wrote() {
+    let src = "fun g (y : Int) = y
+               fun f (a : Int) (b : Int) = a + b
+               def v = g 1 |> f 2";
+    assert!(hinted(src).ends_with("def v = g 1 |> f 2"), "{}", hinted(src));
+    let (a, off) = at(src, "1 |>");
+    assert!(!a.hover_at(off).expect("hover").contains("$pipe"));
+    // On the space after the value there is nothing to find, as ever.
+    let (a, off) = at(src, " |> f");
+    assert!(a.var_at(off).is_none());
+}
+
+#[test]
 fn a_parameter_that_is_already_annotated_is_not_hinted_again() {
     assert_eq!(
         hinted("fun add (a : Int) b = a + b\n"),

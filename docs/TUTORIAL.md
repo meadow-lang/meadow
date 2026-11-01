@@ -532,7 +532,8 @@ fun main () =
 ```
 
 `|>` binds looser than every arithmetic operator, so `x |> f |> g` is `g (f x)` and
-`1 + 2 |> double` is `double (1 + 2)`.
+`1 + 2 |> double` is `double (1 + 2)`, with the value worked out first, as it
+is written (see [Evaluation order](#evaluation-order)).
 
 ### Composing
 
@@ -4491,10 +4492,10 @@ everything an expression is made of before the expression itself.
   since a call that is not complete yet does nothing: where `f a` would
   perform something, the type checker asks for `(f a) b`, two calls, the
   first done before `b` is evaluated.
-- **Pipes** are the calls they stand for: `x |> f` and `f <| x` are both
-  `f x`, the function first. A pipeline's stages are almost always
-  partial applications, which do nothing, so this only shows when working
-  out a stage performs something itself.
+- **Pipes** are evaluated as they read. `x |> f` is `x`, then `f`, then the
+  call, and `x |> f a` is `x`, `f`, `a`, then the body, so a pipeline runs
+  its stages in the order they are written down the page. `f <| x` is `f`,
+  then `x`, then the call.
 - **Constructors, tuples, arrays, vectors, lists and ranges**: their parts
   from left to right.
 - **Records**: the fields in the order written, whatever order the type
@@ -4642,5 +4643,3 @@ a worked example.
 - `Std.Test` is not in the prelude — `use Std.Test (assertEq)`.
 - A qualifier comes only from `as`: after `use Std.Collections.List`, it is
   `length`, not `List.length`.
-- `x |> f` is `f x`, so `f` is evaluated first: where working out `f`
-  performs something, that happens before `x` is evaluated.
