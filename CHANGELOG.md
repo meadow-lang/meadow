@@ -166,6 +166,12 @@ beyond the last release is under _Unreleased_.
 
 ### Fixed
 
+- `Std.Json` read an integer too long for an `Int` as whatever it wrapped round
+  to. It now reads as the nearest `Float`, the one number that is close.
+- MeadowBoot compiled a float literal of more than about 18 digits to the
+  wrong number, wrapping them through an `Int`, so that `Std.Num.Float.sin` and
+  `cos` differed from the compiler's. It now gives the nearest float to every
+  literal.
 - A function that performs two effects whose rows met in inference read
   with its effect's tail as a record's -- `forall r. () -> () ! { Ask, Tell |
   r }` -- in an editor's hover and wherever a type is shown, and was

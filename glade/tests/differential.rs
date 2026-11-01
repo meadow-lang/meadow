@@ -1144,6 +1144,22 @@ fn sized_numbers_are_stored_in_fields_and_arrays() {
 }
 
 #[test]
+fn a_float_literal_is_the_nearest_float_however_many_digits_it_has() {
+    assert_eq!(
+        agree("def result = 0.000000000060771005063039659766"),
+        "0.00000000006077100506303966"
+    );
+    assert_eq!(
+        agree("def result = 1234567890123456789012.5"),
+        "1234567890123456774144.0"
+    );
+    assert_eq!(
+        agree("def result = -0.1234567890123456789012345"),
+        "-0.12345678901234568"
+    );
+}
+
+#[test]
 fn float32_keeps_single_precision() {
     assert_eq!(
         agree("def result = _primAddF (toFloat32 1.5) (toFloat32 0.25)"),

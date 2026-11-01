@@ -14,6 +14,8 @@
 -- is written `null`: see `floatText`.
 
 use Std.Bool (not)
+use Std.Char as Ch
+use Std.Num.Float as F
 use Std.String as S
 use Std.String.Parse as P
 use Std.String.Parse.Char as C
@@ -373,7 +375,29 @@ fun member =
 -- of its own.
 fun float negative = P.map (\x -> Float (if negative then x * (0.0 - 1.0) else x)) L.float
 
-fun integer negative = P.map (\n -> Int (if negative then 0 - n else n)) L.decimal
+-- What an `Int` holds at most, and how far below zero it goes, to compare
+-- digits of the same length with.
+def mostInt : String = "9223372036854775807"
+
+def leastInt : String = "9223372036854775808"
+
+fun fitsInt negative (digits : String) : Bool =
+  let n = S.byteLength digits in
+  n < 19 or (n == 19 and digits <= (if negative then leastInt else mostInt))
+
+-- Digits an `Int` cannot hold are the nearest `Float`, as they are to most
+-- things that read JSON, rather than whatever they wrap round to.
+fun whole negative (digits : String) : Json =
+  if fitsInt negative digits then
+    (let n = digitsValue digits 0 (S.byteLength digits) 0 in
+     Int (if negative then 0 - n else n))
+  else (let x = F.fromDecimal digits 0 in Float (if negative then x * (0.0 - 1.0) else x))
+
+fun integer negative =
+  let text = \ds -> charsToString (V.toArray (P.chunkToTokens ds)) in
+  P.takeWhile1P "a digit" Ch.isDigit
+  |> P.map (\ds -> whole negative (text ds))
+  |> P.label "an integer"
 
 -- Numbers: an optional minus, digits, and an optional fraction and exponent.
 -- One with neither is an `Int`; one with either is a `Float`.
@@ -594,6 +618,25 @@ fun parsed text =
   assertTrue (isFloat (parsed "1.5")) "a fraction means Float"
 
 fun isFloat v = match v with | Float x -> True | _ -> False
+
+@test fun anIntegerPastAnIntIsTheNearestFloat () =
+  let a = assertEq (parsed "9223372036854775807") (Int 9223372036854775807) "the most" in
+  let b =
+    assertEq (parsed "-9223372036854775808") (Int (0 - 9223372036854775807 - 1)) "the least"
+  in
+  let c =
+    assertEq
+      (parsed "9223372036854775808")
+      (Float (F.fromDecimal "9223372036854775808" 0))
+      "one more"
+  in
+  let d =
+    assertEq
+      (parsed "-9223372036854775809")
+      (Float (0.0 - F.fromDecimal "9223372036854775809" 0))
+      "one less"
+  in
+  assertEq (parsed "100000000000000000000000") (Float (F.fromDecimal "1" 23)) "and far past"
 
 @test fun anErrorPointsAtTheSpot () =
   let text = "{\"a\": [1, 2,\n  ]}" in
