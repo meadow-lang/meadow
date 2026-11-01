@@ -9,7 +9,9 @@
 --
 -- The parser is built out of `Std.String.Parse`, over the characters of the
 -- input, and follows RFC 8259 with one deliberate gap, noted at `stringLit`.
--- The renderer is the inverse for everything the parser accepts.
+-- The renderer is the inverse for everything the parser accepts, and a float
+-- comes back the same float, bit for bit. What is not finite has no JSON and
+-- is written `null`: see `floatText`.
 
 use Std.Bool (not)
 use Std.String as S
@@ -21,6 +23,7 @@ use Std.Collections.Vector (vecFromArray)
 use Std.Tuple (fst, snd, pair)
 use Std.Maybe.Maybe.*
 use Std.Maybe as M
+use Std.Num.Float as F
 
 -- --- the tree ----------------------------------------------------------------
 
@@ -366,7 +369,9 @@ fun member =
 
 -- --- lexical -----------------------------------------------------------------
 
-fun float negative = P.map (\x -> Float (if negative then 0.0 - x else x)) L.float
+-- A minus is a multiplication, since `0.0 - 0.0` is `0.0` and `-0.0` is a float
+-- of its own.
+fun float negative = P.map (\x -> Float (if negative then x * (0.0 - 1.0) else x)) L.float
 
 fun integer negative = P.map (\n -> Int (if negative then 0 - n else n)) L.decimal
 
@@ -445,7 +450,7 @@ fun emit (out : Pieces s) (v : Json) : () ! { St s | e } =
   | Bool True -> say out "true"
   | Bool False -> say out "false"
   | Int n -> say out (show n)
-  | Float x -> say out (showFloat x)
+  | Float x -> say out (floatText x)
   | String s -> emitString out s
   | Array xs ->
       let a = say out "[" in
@@ -553,16 +558,14 @@ fun escapeOf (c : Int) : String =
 
 fun hexDigit (d : Int) : String = stringSlice "0123456789abcdef" d (d + 1)
 
--- Meadow has no float formatter, so this renders the integer part and a fixed
--- six fractional digits -- enough to round-trip the values this module's own
--- parser produces, and honest about being a placeholder.
-fun showFloat x =
-  let whole = floor x in
-  let frac = x - toFloat whole in
-  let scaled = floor ((if frac < 0.0 then 0.0 - frac else frac) * 1000000.0) in
-  S.concatAll [S.fromInt whole, ".", padLeft 6 (S.fromInt scaled)]
-
-fun padLeft width s = if S.byteLength s >= width then s else padLeft width (S.concat "0" s)
+-- A float as `show` writes it: the fewest digits that read back as that float,
+-- and always a point, so that what was a float is one when it is read. Its
+-- digits are never in an exponent, so this is JSON as it stands, however long.
+--
+-- JSON has no text for what is not finite, and `NaN` or `inf` would make the
+-- whole document one no parser reads. `null` is what JavaScript, serde_json
+-- and aeson write for them: no number is claimed, and `asFloat` of it says so.
+fun floatText (x : Float) : String = if F.isFinite x then show x else "null"
 
 -- --- tests -------------------------------------------------------------------
 
@@ -669,6 +672,70 @@ fun byGrammar (text : String) : Result String Json =
   let same = V.all (\t -> parse t == byGrammar t) texts in
   let a = assertTrue unread "the scanner vouches for none of these" in
   assertTrue same "and each is whatever the grammar makes of it"
+
+@test fun aFloatIsWrittenInFull () =
+  let a = assertEq (render (Float 3.141592653589793)) "3.141592653589793" "every digit" in
+  let b = assertEq (render (Float 0.1)) "0.1" "and no more than it needs" in
+  let c = assertEq (render (Float (0.0 - 1.5))) "-1.5" "below zero" in
+  let d = assertEq (render (Float (0.0 - 0.5))) "-0.5" "just below zero" in
+  let e = assertEq (render (Array [Float 1.5, Int 2])) "[1.5,2]" "inside an array" in
+  assertEq (renderIndented (Object [("x", Float 0.1)])) "{\n  \"x\": 0.1\n}" "and indented"
+
+-- `==` does not tell zero from minus zero; the text does.
+fun sameFloat (a : Json) (b : Json) : Bool = isFloat a and isFloat b and show a == show b
+
+@test fun theHardFloatsComeBackExactly () =
+  let texts =
+    [
+      "0.1", "1e21", "1e23", "1e-7", "5e-324", "1.7976931348623157e308", "-0.0",
+      "9007199254740994.0", "3.141592653589793", "6.283185307179586", "0.30000000000000004",
+      "2.2250738585072014e-308", "-1.5e-300", "1E+2",
+    ]
+  in
+  let once = V.filter (\t -> not (sameFloat (parsed (render (parsed t))) (parsed t))) texts in
+  let again = V.filter (\t -> render (parsed (render (parsed t))) != render (parsed t)) texts in
+  let a = assertEq once [] "what is written reads back the same" in
+  assertEq again [] "and writing it again changes nothing"
+
+@test fun whatIsWrittenIsJson () =
+  let floats = V.map parsed ["1e21", "1e23", "1e-7", "5e-324", "1.7976931348623157e308", "-0.0"] in
+  let a = assertTrue (V.all (\v -> M.isSome (quick (render v))) floats) "the scanner reads it" in
+  assertTrue (V.all (\v -> byGrammar (render v) == Ok v) floats) "and so does the grammar"
+
+@test fun aWholeFloatStaysAFloat () =
+  let a = assertEq (render (Float 3.0)) "3.0" "it keeps its point" in
+  let b = assertEq (parsed (render (Float 3.0))) (Float 3.0) "and is a float when read" in
+  let c = assertEq (parsed (render (parsed "1e3"))) (Float 1000.0) "as an exponent's is" in
+  assertEq (parsed (render (Int 3))) (Int 3) "where an integer is still an integer"
+
+@test fun whatIsNotFiniteIsNull () =
+  let forever = 1.0 / 0.0 in
+  let a = assertEq (render (Float (0.0 / 0.0))) "null" "not a number" in
+  let b = assertEq (render (Float forever)) "null" "infinity" in
+  let c = assertEq (render (Float (0.0 - forever))) "null" "and below" in
+  let d =
+    assertEq (render (Array [Float forever, Float 1.5])) "[null,1.5]" "the rest is untouched"
+  in assertEq (asFloat (parsed (render (Float forever)))) None "a reader is told there is no number"
+
+fun timesTwoTo (x : Float) (k : Int) : Float =
+  if k > 0 then timesTwoTo (x * 2.0) (k - 1) else if k < 0 then timesTwoTo (x * 0.5) (k + 1) else x
+
+-- A float from a generator's bits: every size, with all its mantissa in use.
+fun drawn (s : Int) : Float =
+  let x = timesTwoTo (toFloat (s >>> 11)) ((s >>> 1) % 2045 - 1074) in
+  if s < 0 then 0.0 - x else x
+
+fun stirred (s : Int) : Int = s * 6364136223846793005 + 1442695040888963407
+
+fun lostAmong (n : Int) (s : Int) (lost : [String]) : [String] =
+  if n == 0 then lost
+  else
+    (let x = drawn s in
+     let back = parsed (render (Float x)) in
+     lostAmong (n - 1) (stirred s) (if back == Float x then lost else V.pushBack lost (show x)))
+
+@test fun floatsOfEverySizeComeBack () =
+  assertEq (lostAmong 300 88172645463325252 []) [] "every one of them"
 
 @test fun renderingIsCompactAndRoundTrips () =
   let a = assertEq (render Null) "null" "null" in
