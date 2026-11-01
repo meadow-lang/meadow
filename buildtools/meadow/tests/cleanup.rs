@@ -220,8 +220,7 @@ fn a_thread_cancelled_as_its_connect_comes_back_leaves_no_socket_open() {
     ] {
         let (ok, out, err) = meadow(&dir, args);
         assert!(ok, "{args:?}: {err}");
-        assert_eq!(out, "all closed
-", "{args:?}");
+        assert_eq!(out, "all closed\n", "{args:?}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
