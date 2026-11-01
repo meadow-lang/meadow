@@ -166,6 +166,11 @@ beyond the last release is under _Unreleased_.
 
 ### Fixed
 
+- A Silo thread cancelled as its `Net.connect` or `Net.accept` came back could
+  leave the socket open for as long as the program ran, so the other end of
+  it waited forever. The call was counted twice, once in a frame the cancelled
+  thread never returned to, so it never seemed to end, and what it opened was
+  not closed.
 - A function that performs two effects whose rows met in inference read
   with its effect's tail as a record's -- `forall r. () -> () ! { Ask, Tell |
   r }` -- in an editor's hover and wherever a type is shown, and was

@@ -173,7 +173,11 @@ fn net(op: &str, arg: Val) -> Option<Build> {
         "tcpListen" => {
             let t = tuple(arg, 2, &what);
             let (host, port) = (text(t[0], &what), int(t[1]));
-            answered(net::listen(&host, port).map(Build::int))
+            // What it opens is this thread's: see `meadow_rt::net`. Only here
+            // and in `blocking`, which a thread can be cancelled out of: a
+            // call around that would never end.
+            let opened = net::owning(crate::sched::owner(), || net::listen(&host, port));
+            answered(opened.map(Build::int))
         }
         "tcpConnect" => {
             let t = tuple(arg, 2, &what);
@@ -339,8 +343,7 @@ pub unsafe extern "C" fn meadow_native(
         "Random" => random(&op, arg),
         "Time" => time(&op, arg),
         "Log" => log(&op, arg),
-        // What it opens is this thread's: see `meadow_rt::net`.
-        "Net" => meadow_rt::net::owning(crate::sched::owner(), || net(&op, arg)),
+        "Net" => net(&op, arg),
         _ => None,
     };
     match built {
