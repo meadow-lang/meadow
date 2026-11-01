@@ -519,6 +519,7 @@ fn compile_unit_inner(
     let mut resolver = Resolver::with_prelude(filename.clone(), var_base);
     resolver.set_package(ident);
     resolver.set_standalone(deps.is_empty());
+    resolver.set_expression_entry(opts.entry_is_expression);
     // Every dependency's types are *known* here: what a `use` can bring, and
     // what a canonical name means. A module names one only once it has asked
     // for it -- `use M (Ty)`, `use M` -- or the prelude re-exports it; a REPL

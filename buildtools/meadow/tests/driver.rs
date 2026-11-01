@@ -991,3 +991,44 @@ fn the_repl_shows_the_last_entry_in_each_ir_each_coloured_for_it() {
     let named = repl("def cut = 5\n:ir cut\n:q\n");
     assert!(named.contains("=== Core ==="), "{named}");
 }
+
+/// What a REPL session on `engine` answers, an entry at a time.
+fn answers(engine: &str, lines: &str) -> Vec<String> {
+    repl(&format!("{engine}\n{lines}:q\n"))
+        .lines()
+        .filter_map(|l| l.strip_prefix("= "))
+        .map(str::to_string)
+        .collect()
+}
+
+/// An entry is compiled as `def it = ...`, and a definition's own name is in
+/// its module's scope: `it` used to be the entry itself rather than the one
+/// before, which ran until the address space was gone, and the session with it.
+#[test]
+fn an_entry_reads_the_entries_before_it() {
+    for engine in [":vm", ":jit"] {
+        let says = |lines: &str, want: &[&str]| {
+            assert_eq!(answers(engine, lines), want, "{engine}: {lines:?}");
+        };
+        says("1 + 2\nit * 10\n", &["3", "30"]);
+        says("1 + 2\nit\nit + 1\n", &["3", "3", "4"]);
+        says("[1, 2]\n[it, it]\n", &["[1, 2]", "[[1, 2], [1, 2]]"]);
+        says("\"a\"\nit ++ \"b\"\n", &["\"a\"", "\"ab\""]);
+        says("(1, 2)\nfst it + snd it\n", &["(1, 2)", "3"]);
+        // A closure, called from a later entry and closing over an earlier one.
+        says("\\y -> y + 1\nit 2\n", &["<closure>", "3"]);
+        says("5\n\\y -> it + y\nit 4\n", &["5", "<closure>", "9"]);
+        // A definition reads what its name meant before it, as a `let` does.
+        says("def x = 5\nx * 2\n", &["5", "10"]);
+        says("def x = 5\ndef x = x * 2\nx\n", &["5", "10", "10"]);
+        // Inside a function its name is itself: that is how it can recurse.
+        says(
+            "def f = \\n -> if n == 0 then 1 else n * f (n - 1)\nf 5\n",
+            &["<closure>", "120"],
+        );
+        // With nothing before it there is nothing to read, and the session
+        // goes on.
+        says("it\n1\n", &["1"]);
+        says("def x = x + 1\n1\n", &["1"]);
+    }
+}

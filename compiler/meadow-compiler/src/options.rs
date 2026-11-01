@@ -58,6 +58,10 @@ pub struct Options {
     /// evaluated and shown, where `main` is called. A `def` of any other name
     /// has to be pure -- see the type checker's `check_pure_def`.
     pub entry_name: Option<&'static str>,
+    /// That value is an expression being run, as a line of the REPL is, and
+    /// not a definition the program wrote: it does not see its own name
+    /// anywhere, where a definition can call itself from inside a function.
+    pub entry_is_expression: bool,
     /// What `@cfg(…)` is tested against -- see [`crate::cfg`].
     pub cfg: Cfg,
 }
@@ -171,6 +175,7 @@ impl Options {
             strictness: Strictness::Lenient,
             debug_info: false,
             entry_name: None,
+            entry_is_expression: false,
             cfg: Cfg::host("debug", "jit"),
         }
     }
@@ -183,6 +188,7 @@ impl Options {
             strictness: Strictness::Strict,
             debug_info: false,
             entry_name: None,
+            entry_is_expression: false,
             cfg: Cfg::host("release", "aot"),
         }
     }

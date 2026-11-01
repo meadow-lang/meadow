@@ -123,12 +123,14 @@ _ : Int
 = 49
 ```
 
-An expression is labelled `_`; a declaration is labelled with its own name.
+An expression is labelled `_`; a declaration is labelled with its own name. The
+value of the last expression is `it`, which the next entry can use.
 
 Each entry is compiled as a unit of its own, which is why **defining a name
 twice shadows rather than replaces**: what was written before the second
 definition goes on using the first, and only new mentions reach the new one.
-`:module` lists both and marks the one that has been shadowed.
+`:module` lists both and marks the one that has been shadowed. So `def x = x * 2`
+doubles the `x` from before, as `let x = x * 2` would.
 
 Useful commands:
 
@@ -479,6 +481,14 @@ _be_ a function with effects, such as `def shout = \s -> println s`: building
 the closure does nothing, and the printing happens at each call. Effects belong
 inside functions, which run every time they are called — `main` among them,
 which the runtime calls once as the program.
+
+Nor can a `def` read itself while it is being made, since that would never
+finish. Outside of a function its own name means what the name meant before it,
+as in a `let`, and is an error if that is nothing: `def x = x + 1` is
+"undefined variable: x". Inside a function the value is there by the time the
+function runs, so `def fact = 
+ -> if n == 0 then 1 else n * fact (n - 1)`
+calls itself.
 
 ### Currying and partial application
 

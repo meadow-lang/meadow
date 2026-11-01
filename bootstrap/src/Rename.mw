@@ -133,20 +133,33 @@ use Std.Sort (sortOn, sort)
 -- And whether a binding here is a method -- an `impl`'s, or a trait's
 -- default -- whose name its own body does not see: there, the name is the
 -- trait's method.
+-- And what the top-level value being renamed binds, which it has no value for
+-- yet: outside of a function its body does not see these, and they mean what
+-- they would have without it (`meadow-rename`'s `defining`).
 @pub record Env = {
   scope : Scope,
   locals : [(String, Int);],
   top : Bool,
   assocs : HashMap String Int,
-  method : Bool
+  method : Bool,
+  defining : [Int]
 }
 
 @pub fun envOf (s : Scope) : Env =
-  Env { scope = s, locals = [;], top = True, assocs = H.empty, method = False }
+  Env { scope = s, locals = [;], top = True, assocs = H.empty, method = False, defining = [] }
 
 fun nested (env : Env) : Env = { env | top = False, method = False }
 
 fun asMethods (env : Env) : Env = { env | top = False, method = True }
+
+-- Inside a function: by the time it runs, the value it may be part of is there
+-- to be read, which is how a value that is a function calls itself.
+fun inFunction (env : Env) : Env = makingValue env []
+
+fun makingValue (env : Env) (own : [Int]) : Env =
+  { env | top = False, method = False, defining = own }
+
+fun atTop (env : Env) : Bool = env.top
 
 fun bindLocal (env : Env) (name : String) (id : Int) : Env =
   { env | locals = (name, id) :: env.locals }
@@ -178,9 +191,14 @@ fun lookupValue (env : Env) (name : String) : Maybe Int =
   match L.lookupAssoc name env.locals with
   | Just id -> Just id
   | None ->
-      (match H.lookup name env.scope.values with
-       | Just ids -> V.get ids 0
+      (match V.get (moduleValues env name) 0 with
+       | Just id -> Just id
        | None -> H.lookup name env.scope.base)
+
+-- The meanings `name` has in the module layer, its own names and its `use`s',
+-- less what is being defined.
+fun moduleValues (env : Env) (name : String) : [Int] =
+  V.filter (\id -> not (V.elem id env.defining)) (M.unwrapOr [] (H.lookup name env.scope.values))
 
 fun isMarked (name : String) : Bool = M.isSome (S.indexOf "#" name)
 
@@ -327,8 +345,11 @@ pass! {
         If { cond = lhs, yes = boolCon out env "True" (nameMeta out op), no = rhs }
     | Interp { texts, holes } -> interpolated out env here texts holes
     | Lam { later params, later body } ->
-        (let ps = V.map (\p -> p (nested env)) params in
-         Lam { params = ps, body = body (bindAll (nested env) (V.concatMap (patBinders out) ps)) })
+        (let ps = V.map (\p -> p (inFunction env)) params in
+         Lam {
+           params = ps,
+           body = body (bindAll (inFunction env) (V.concatMap (patBinders out) ps))
+         })
     | Let { later binds, later body } ->
         (let done =
            V.foldl
@@ -359,11 +380,14 @@ pass! {
         (let p = pat (nested env) in
          Ret { pat = p, body = body (bindAll (nested env) (patBinders out p)) })
     | Bind.Pat { later pat, later value } ->
-        (let v = value (nested env) in Bind.Pat { pat = pat env, value = v })
+        if atTop env then
+          (let p = pat env in
+           Bind.Pat { pat = p, value = value (makingValue env (V.map snd (patBinders out p))) })
+        else (let v = value (nested env) in Bind.Pat { pat = pat env, value = v })
     | Bind.Fun { name, later params, later ret, later body } ->
         (let n = textOf out name in
          let id = funId env n (nameMeta out name) in
-         let inner = if env.method then nested env else bindLocal (nested env) n id in
+         let inner = if env.method then inFunction env else bindLocal (inFunction env) n id in
          let ps = V.map (\p -> p inner) params in
          let within = bindAll inner (V.concatMap (patBinders out) ps) in
          Bind.Fun { id, params = ps, ret = M.map (\r -> r within) ret, body = body within })
@@ -506,15 +530,15 @@ fun valueCandidates (env : Env) (name : String) : [Int] =
   match L.lookupAssoc name env.locals with
   | Just id -> [id]
   | None ->
-      (match H.lookup name env.scope.values with
-       | Just ids -> V.foldl (\acc x -> if V.elem x acc then acc else V.pushBack acc x) [] ids
-       | None ->
-           (match H.lookup name env.scope.base with
-            | Just id -> [id]
-            | None ->
-                (if isMarked name and not (S.endsWith "#0" name) then
-                   valueCandidates env (unmarked name)
-                 else [])))
+      (let ids = moduleValues env name in
+       if V.isEmpty ids then
+         (match H.lookup name env.scope.base with
+          | Just id -> [id]
+          | None ->
+              (if isMarked name and not (S.endsWith "#0" name) then
+                 valueCandidates env (unmarked name)
+               else []))
+       else V.foldl (\acc x -> if V.elem x acc then acc else V.pushBack acc x) [] ids)
 
 -- A constructor's other meanings: several of one name, unless the record it
 -- is given picks one.
