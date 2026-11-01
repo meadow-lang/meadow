@@ -166,6 +166,10 @@ beyond the last release is under _Unreleased_.
 
 ### Fixed
 
+- `meadow cut` and `meadow run` said nothing when the program they ran
+  crashed: a signal left them as a plain failure with status 1, and an
+  exception on Windows as its own status with no word of what it was. They now
+  say what ended it, and leave with the shell's 128 and the signal on Unix.
 - A function that performs two effects whose rows met in inference read
   with its effect's tail as a record's -- `forall r. () -> () ! { Ask, Tell |
   r }` -- in an editor's hover and wherever a type is shown, and was
