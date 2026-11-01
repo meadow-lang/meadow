@@ -1119,7 +1119,7 @@ fn command() {
                         std::process::Command::new(&exe)
                             .args(&args)
                             .status()
-                            .map(|s| s.code().unwrap_or(1))
+                            .map(|s| meadow::status::exit_code(&exe, s))
                             .map_err(|e| format!("{}: {e}", exe.display()))
                     }),
                 Some(aot::Runtime::Glade) => {
@@ -1141,7 +1141,7 @@ fn command() {
                         std::process::Command::new(&exe)
                             .args(&args)
                             .status()
-                            .map(|s| s.code().unwrap_or(1))
+                            .map(|s| meadow::status::exit_code(&exe, s))
                             .map_err(|e| format!("{}: {e}", exe.display()))
                     })
                 }
@@ -1796,7 +1796,7 @@ fn finish(
                         eprintln!("error: could not run {}: {e}", exe.display());
                         std::process::exit(1);
                     });
-                std::process::exit(status.code().unwrap_or(1));
+                std::process::exit(meadow::status::exit_code(&exe, status));
             }
             // A release build of a lone file, or on a machine that cannot link
             // one: the JIT runs it, unless `aot` was asked for by name.
