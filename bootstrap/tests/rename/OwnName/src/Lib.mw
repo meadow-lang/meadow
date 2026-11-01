@@ -1,0 +1,12 @@
+-- A top-level value has no value of its own to read while it is being made,
+-- so outside of a function its body does not see its name: `limit` here is
+-- the one `use`d, as a `let` would have it. Inside a function it does, because
+-- by the time the function runs the value is there.
+
+use Limits (limit)
+
+@pub def limit = limit + 1
+
+@pub def countdown = \n -> if n == 0 then 0 else countdown (n - 1)
+
+@pub def inPair = (\n -> if n == 0 then 0 else fst inPair (n - 1), let inPair = 2 in inPair)

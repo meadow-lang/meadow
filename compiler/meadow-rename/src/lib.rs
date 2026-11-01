@@ -36,6 +36,14 @@ pub struct Resolver {
     embedded: Vec<(String, u64)>,
     /// Lexical scope stack: `(name, id)`, innermost last.
     scope: Vec<(InternedString, VarId)>,
+    /// What the top-level value being resolved binds, which it has no value
+    /// for yet. Evaluating the value would need the value, so outside of a
+    /// function its body does not see these names: they mean whatever they
+    /// meant before it, as in a `let`. See [`Resolver::resolve_bind`].
+    defining: Vec<VarId>,
+    /// The unit's value is an expression, which names nothing: see
+    /// [`Resolver::set_expression_entry`].
+    expression_entry: bool,
     /// Every id we've ever bound, for debugging / pretty-printing.
     names: HashMap<VarId, InternedString>,
     /// Top-level names bound ahead of time by [`declare_toplevel`], so mutually
@@ -362,6 +370,25 @@ fn has_macro(attrs: &[ast::Attr]) -> bool {
 }
 
 /// A name is a constructor iff it starts with an uppercase letter.
+/// Every name `pat` binds.
+fn pat_names(pat: &ast::LPat) -> Vec<&ast::Ident> {
+    match pat.value() {
+        ast::Pat::Var(n) => vec![n],
+        ast::Pat::As(n, p) => {
+            let mut names = vec![n];
+            names.extend(pat_names(p));
+            names
+        }
+        ast::Pat::Ann(p, _) => pat_names(p),
+        ast::Pat::View(_, p) => pat_names(p),
+        ast::Pat::Tuple(ps) | ast::Pat::List(ps) | ast::Pat::Vector(ps) | ast::Pat::Cons(_, ps) => {
+            ps.iter().flat_map(pat_names).collect()
+        }
+        ast::Pat::Record(fs, _) => fs.iter().flat_map(|(_, p)| pat_names(p)).collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn is_ctor_name(name: &str) -> bool {
     name.chars().next().is_some_and(|c| c.is_uppercase())
 }
@@ -562,6 +589,8 @@ impl Resolver {
             filename: filename.into(),
             embedded: Vec::new(),
             scope: Vec::new(),
+            defining: Vec::new(),
+            expression_entry: false,
             names: HashMap::new(),
             predeclared: HashMap::new(),
             tycons,
@@ -1277,7 +1306,7 @@ impl Resolver {
         }
         let mut found: Vec<VarId> = Vec::new();
         for (n, id) in &self.scope[base.min(module)..module.min(self.scope.len())] {
-            if *n == name && !found.contains(id) {
+            if *n == name && !found.contains(id) && !self.defining.contains(id) {
                 found.push(*id);
             }
         }
@@ -2361,22 +2390,28 @@ impl Resolver {
     }
 
     fn predeclare_pat(&mut self, pat: &ast::LPat) {
-        match pat.value() {
-            ast::Pat::Var(n) => {
-                self.predeclare_unique(n);
-            }
-            ast::Pat::As(n, p) => {
-                self.predeclare_unique(n);
-                self.predeclare_pat(p);
-            }
-            ast::Pat::Ann(p, _) => self.predeclare_pat(p),
-            ast::Pat::View(_, p) => self.predeclare_pat(p),
-            ast::Pat::Tuple(ps)
-            | ast::Pat::List(ps)
-            | ast::Pat::Vector(ps)
-            | ast::Pat::Cons(_, ps) => ps.iter().for_each(|p| self.predeclare_pat(p)),
-            ast::Pat::Record(fs, _) => fs.iter().for_each(|(_, p)| self.predeclare_pat(p)),
-            _ => {}
+        for name in pat_names(pat) {
+            self.predeclare_unique(name);
+        }
+    }
+
+    /// The unit's value, its `entry_name`, is an expression the caller is
+    /// running and not a definition anyone wrote: a line of the REPL. Nothing
+    /// in it was written to mean it, so it does not see its own name even
+    /// inside a function, where a definition would.
+    pub fn set_expression_entry(&mut self, expression: bool) {
+        self.expression_entry = expression;
+    }
+
+    /// What a function's body has of [`Resolver::defining`]: nothing, since
+    /// by the time a function runs the value is there to be read, and that
+    /// is how a value that is a function calls itself. Hand back what this
+    /// returns once the function is resolved.
+    fn enter_function(&mut self) -> Vec<VarId> {
+        if self.expression_entry {
+            self.defining.clone()
+        } else {
+            std::mem::take(&mut self.defining)
         }
     }
 
@@ -3475,10 +3510,28 @@ impl Resolver {
                 // has nothing to gain from being self-recursive under eager
                 // evaluation anyway.
                 //
-                // At the top level this changes nothing: `bind_defn` hands back
-                // the id `declare_toplevel` already reserved, so both orders
-                // resolve to the same binding and mutual recursion still works.
+                // At the top level the name is already in the module's scope,
+                // since `declare_toplevel` reserved it for mutual recursion,
+                // so that order alone would not do it: without `defining`,
+                // `def x = x * 2` would ask for `x` to compute `x`, for ever.
+                // Hidden, it reads what `x` meant before this definition --
+                // an import, or the last entry's in the REPL -- and is
+                // undefined if that is nothing.
+                let own = if top {
+                    pat_names(pat)
+                        .iter()
+                        .filter_map(|n| {
+                            self.predeclared
+                                .get(&(self.current.clone(), *n.value()))
+                                .copied()
+                        })
+                        .collect()
+                } else {
+                    self.defining.clone()
+                };
+                let outer = std::mem::replace(&mut self.defining, own);
                 let rexpr = self.resolve_expr(expr);
+                self.defining = outer;
                 self.toplevel = top;
                 let rpat = self.resolve_pat(pat);
                 self.toplevel = false;
@@ -3493,6 +3546,7 @@ impl Resolver {
                 self.toplevel = false;
                 let name_node = self.node(id, name.span);
                 let mark = self.mark();
+                let defining = self.enter_function();
                 let rparams = params.iter().map(|p| self.resolve_pat(p)).collect_vec();
                 // Resolved after the parameters, so a type variable a parameter
                 // introduced is the same one here: in
@@ -3504,6 +3558,7 @@ impl Resolver {
                     r
                 });
                 let rbody = self.resolve_expr(body);
+                self.defining = defining;
                 self.reset(mark);
                 if top && self.duplicates.contains(&name.span) {
                     // Reported already, and it shares the first definition's
@@ -3765,6 +3820,13 @@ impl Resolver {
                         Some(op @ ("+" | "-" | "*" | "/" | "<" | ">" | "<=" | ">=")) => {
                             format!("the float operators are gone: write `{op}`, as for integers")
                         }
+                        _ if self
+                            .defining
+                            .iter()
+                            .any(|id| self.names.get(id) == Some(&written)) =>
+                        {
+                            format!("`{written}` has no value yet: this is what defines it")
+                        }
                         _ => "not found in this scope".to_string(),
                     };
                     self.error(format!("undefined variable: {written}"), label, name.span);
@@ -3773,8 +3835,10 @@ impl Resolver {
             }
             ast::Expr::Lam(params, body) => {
                 let mark = self.mark();
+                let defining = self.enter_function();
                 let rparams = params.iter().map(|p| self.resolve_pat(p)).collect_vec();
                 let rbody = self.resolve_expr(body);
+                self.defining = defining;
                 self.reset(mark);
                 self.node(hir::Expr::Lam(rparams, rbody), expr.span)
             }

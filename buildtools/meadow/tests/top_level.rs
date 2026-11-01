@@ -73,3 +73,36 @@ fn a_def_in_a_recursive_group_is_held_to_the_same_rule() {
                def g = let _ = newRef (toInt 0) in f 0\n";
     assert!(errors(src).contains(RULE), "{}", errors(src));
 }
+
+// Making a value that needs itself cannot finish: it used to recurse until the
+// runtime ran out of address space, or spin for ever.
+
+#[test]
+fn a_def_has_no_value_of_its_own_to_read() {
+    for src in [
+        "def x : Int = x * 10\n",
+        "def x = x\n",
+        "def x = let y = x in y\n",
+        "def (x, y) = (1, x)\n",
+    ] {
+        let out = errors(src);
+        assert!(out.contains("undefined variable: x"), "{src}: {out}");
+    }
+}
+
+#[test]
+fn a_def_reads_what_its_name_meant_before_it() {
+    let src = "def min = min 1 2\n\
+               def result = min\n";
+    assert_eq!(eval_main_std(src), "1");
+}
+
+#[test]
+fn a_def_that_is_a_function_can_call_itself() {
+    let src = "def fact = \\n -> if n == 0 then 1 else n * fact (n - 1)\n\
+               def even = \\n -> if n == 0 then True else odd (n - 1)\n\
+               def odd = \\n -> if n == 0 then False else even (n - 1)\n\
+               def inPair = (\\n -> if n == 0 then 0 else fst inPair (n - 1), 2)\n\
+               def result = (fact 5, even 4, fst inPair 3)\n";
+    assert_eq!(eval_main_std(src), "(120, True, 0)");
+}

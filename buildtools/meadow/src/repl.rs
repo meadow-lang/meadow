@@ -111,6 +111,7 @@ impl TermValidator {
         let lex = tokenize(src);
         let (parsed, _) = parser::parse_repl(src, &lex.tokens);
         let Some(item) = parsed else { return meaning };
+        let is_expression = item.is_right();
         let entered = match item {
             Either::Left(decls) => decls,
             Either::Right(expr) => vec![synth_def("it", expr)],
@@ -144,6 +145,7 @@ impl TermValidator {
                 &deps,
                 Options {
                     entry_name: Some("it"),
+                    entry_is_expression: is_expression,
                     ..Options::debug()
                 },
             )
@@ -1483,9 +1485,11 @@ impl Session {
         let Some(item) = parsed else { return };
 
         // A bare expression is compiled as `def it = <expr>` so later lines can
-        // still refer to `it`, but `it` is an implementation detail and a poor
-        // label. Report it under the name the user actually asked about, or `_`
-        // when the expression has no name of its own.
+        // still refer to `it` -- which, in such an expression, means the entry
+        // before it: see `Options::entry_is_expression`. But `it` is an
+        // implementation detail and a poor label. Report it under the name the
+        // user actually asked about, or `_` when the expression has no name of
+        // its own.
         // An entry is one declaration, which is one node unless it is a
         // signature written over the clauses that define it -- then it is the
         // signature and the binding, and both go into the line's module.
@@ -1527,6 +1531,7 @@ impl Session {
             // A bare expression is run, not defined, so it may do anything.
             Options {
                 entry_name: Some("it"),
+                entry_is_expression: label.is_some(),
                 cfg: meadow_compiler::Cfg {
                     backend: match self.engine {
                         meadow::Engine::Vm => "vm",
