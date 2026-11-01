@@ -245,6 +245,24 @@ beyond the last release is under _Unreleased_.
   hovers, errors, `meadow build --types`, MeadowBoot -- going `a`, `b`, `c`,
   `d`, `g`, `h`, so a letter always says what kind of variable it is. A type
   with four or fewer prints as before.
+- `Std.Json` lost a float's bits both writing and reading it. `render` wrote
+  six decimals, cut off rather than rounded, so that every float in a `make!`
+  cache was damaged and came out a little lower each time it was written
+  again. Below zero it wrote another number (`-1.5` came out as `-2.500000`),
+  past an `Int`'s range a nonsense one, and it stopped the program on what is
+  not finite. It now writes what `show` writes, the fewest digits that read
+  back as that float, with a point even on a whole number, so a float stays a
+  float; and `null` for NaN and the infinities, which JSON has no text for,
+  so that the document stays JSON and no number is claimed. Reading goes
+  through `Std.String.Parse.Lexer.float`, which added its digits up in floats:
+  it lost bits at the ends of the range, read `5e-324` as zero and `0e999` as
+  not a number, and wrapped an exponent too long for an `Int`. It now gives
+  the nearest float to every text, by the new `Std.Num.Float.fromDecimal`, on
+  every engine, and a minus keeps the sign of zero. A cache written before
+  this still holds the damaged numbers, and rebuilding the compiler does not
+  clear all of it: Lingua's `make!` keeps a part of a unit under a key with no
+  compiler in it. Remove the `target` directory of anything built by a
+  Lingua-built compiler once, after rebuilding that compiler.
 - A Silo program that cannot spawn a thread could have its tracing collector
   free what its outermost frames held. A trace scans the stack up to where the
   program began, and that place was taken a little too low, so those frames
