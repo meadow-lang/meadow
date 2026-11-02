@@ -174,6 +174,57 @@ fun main () =
                 println "handed on: [${got}] then [${readSome s2}]"))
 "#;
 
+const CANCELLED_CONNECT: &str = r#"use Std.Thread as Thread
+use Std.Net as Net
+use Std.Result.Result.*
+
+fun portOf l = match Net.port l with | Ok p -> p | Err _ -> 0
+
+-- A connection is made a moment before the `connect` that made it comes back,
+-- on an I/O thread, so a cancel straight after the `accept` often falls
+-- between the two: the thread ends with its call under way, and what the call
+-- comes back with is closed as it does. Rounds of it, to land there; and so
+-- many, so fast, that a connection now and then finds no local port free.
+fun connecting q = match Net.connect "127.0.0.1" q with | Err _ -> connecting q | Ok c -> c
+
+fun rounds l q (n : Int) =
+  if n == 0 then "all closed"
+  else
+    (let never = Thread.newChannel () in
+     let client = Thread.spawn (\() -> let c = connecting q in Thread.receive never) in
+     match Net.accept l with
+     | Err why -> why
+     | Ok (s, peer) ->
+         let _ = Thread.cancel client in
+         let _ = Net.setTimeout s 3000 in
+         (match Net.readText s 64 with
+          | Ok "" -> let _ = Net.close s in rounds l q (n - 1)
+          | Ok t -> "read [${t}]"
+          | Err why -> "${n} to go: ${why}"))
+
+fun main () =
+  match Net.listen "127.0.0.1" 0 with
+  | Err why -> println why
+  | Ok l -> println (rounds l (portOf l) 500)
+"#;
+
+/// Silo alone: it is where a cancelled thread's call outlives the thread with
+/// a frame of its own to leave, and every round takes a port for two minutes
+/// on Windows, which the other tests here need too.
+#[test]
+fn a_thread_cancelled_as_its_connect_comes_back_leaves_no_socket_open() {
+    let dir = package("cancelled-connect", CANCELLED_CONNECT);
+    for args in [
+        &["run", "--runtime", "silo", "."][..],
+        &["run", "--release", "--runtime", "silo", "."],
+    ] {
+        let (ok, out, err) = meadow(&dir, args);
+        assert!(ok, "{args:?}: {err}");
+        assert_eq!(out, "all closed\n", "{args:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_thread_that_ends_closes_the_sockets_it_holds() {
     let dir = package("sockets", SOCKETS);
