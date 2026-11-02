@@ -245,6 +245,119 @@ fun atanhTerms (s2 : Float) (n : Int) (acc : Float) : Float =
     (let p = exp (y * ln (0.0 - x)) in if floor y % 2 == 0 then p else 0.0 - p)
   else 0.0 / 0.0
 
+-- --- reading a decimal --------------------------------------------------------
+
+-- The `Float` nearest the number `digits` × 10^`e`, ties to the even one, as
+-- IEEE 754 has it: what comes out is the float that text stands for, to the
+-- last bit, for every text. `digits` is decimal digits and nothing else.
+--
+--   fromDecimal "15" (0 - 1)     -- 1.5
+--   fromDecimal "5" (0 - 324)    -- the least float above zero
+--
+-- A number past the largest float is infinite and one nearer zero than half
+-- the smallest is zero, as `str::parse` and C's `strtod` have them. No text
+-- is too long: past `mostDigits` digits only whether any are left matters.
+@pub fun fromDecimal (digits : String) (e : Int) : Float =
+  let n = stringByteLength digits in
+  let start = pastZeros digits 0 n in
+  let count = n - start in
+  if count == 0 then 0.0
+  else if count > mostDigits then
+    (let kept = mostDigits in
+     let rest = allZeros digits (start + kept) n in
+     let tail = if rest then "" else "1" in
+     nearestOf
+       (concatStrings #[stringSlice digits start (start + kept), tail])
+       (e + count - kept - stringByteLength tail)
+       (count + e))
+  else nearestOf (stringSlice digits start n) e (count + e)
+
+-- More than the 768 digits the farthest tie between two floats can need, so
+-- what comes after them can only say which side of a tie this is.
+def mostDigits : Int = 800
+
+fun digitAt (s : String) (i : Int) : Int = toInt (stringByteAt s i) - 48
+
+fun pastZeros (s : String) (i : Int) (n : Int) : Int =
+  if i < n and digitAt s i == 0 then pastZeros s (i + 1) n else i
+
+fun allZeros (s : String) (i : Int) (n : Int) : Bool = pastZeros s i n == n
+
+-- `digits`, which do not start with a zero, × 10^`e`; `point` says how long
+-- its whole part is, so 10^(`point` - 1) <= it < 10^`point`. 1e309 is past
+-- every float and 1e-324 under half the least of them, so neither end needs
+-- a number that long worked out.
+fun nearestOf (digits : String) (e : Int) (point : Int) : Float =
+  if point > 309 then 1.0 / 0.0
+  else if point < 0 - 323 then 0.0
+  else if oneStep digits e then atOneStep digits e
+  else rounded (bigDigits digits 0 (toBigInt 0)) e point
+
+-- What one operation gets right by itself: digits a float holds exactly and
+-- a power of ten it holds exactly (the largest is 10^22), so that dividing or
+-- multiplying rounds once, and that is the rounding asked for.
+fun oneStep (digits : String) (e : Int) : Bool =
+  stringByteLength digits <= 18
+    and e <= 22
+    and e >= 0 - 22
+    and smallDigits digits 0 0 <= 9007199254740992
+
+fun atOneStep (digits : String) (e : Int) : Float =
+  let m = toFloat (smallDigits digits 0 0) in
+  if e < 0 then m / tenTo (0 - e) else m * tenTo e
+
+fun tenTo (k : Int) : Float = if k <= 0 then 1.0 else 10.0 * tenTo (k - 1)
+
+fun smallDigits (s : String) (i : Int) (acc : Int) : Int =
+  if i >= stringByteLength s then acc else smallDigits s (i + 1) (acc * 10 + digitAt s i)
+
+fun bigDigits (s : String) (i : Int) (acc : BigInt) : BigInt =
+  if i >= stringByteLength s then acc
+  else bigDigits s (i + 1) (acc * toBigInt 10 + toBigInt (digitAt s i))
+
+-- The number as a fraction, whole numbers over each other, and the division
+-- that gives a float's worth of its bits and a few more. A power of two
+-- brings the quotient to between 2^55 and 2^61, whatever the number's size:
+-- log2 10 is what turns `point` into how large it is, to within the one
+-- decimal place that `point` leaves open. Past that it is rounding, by hand,
+-- with `inexact` for what the division left.
+fun rounded (m : BigInt) (e : Int) (point : Int) : Float =
+  let shift = 60 - floor (toFloat point * 3.321928094887362) in
+  let over = if e < 0 then bigPower 10 (0 - e) else toBigInt 1 in
+  let top = if e > 0 then m * bigPower 10 e else m in
+  let num = if shift > 0 then top * bigPower 2 shift else top in
+  let den = if shift < 0 then over * bigPower 2 (0 - shift) else over in
+  ofQuotient (toInt (num / den)) (num % den != toBigInt 0) (0 - shift)
+
+fun bigPower (base : Int) (k : Int) : BigInt = toBigInt base ^ toBigInt k
+
+-- The nearest float to `q` (a little more if `inexact`) × 2^`at`. A float has
+-- 53 bits, or fewer below 2^-1022, where its last bit is 2^-1074 at the least.
+fun ofQuotient (q : Int) (inexact : Bool) (at : Int) : Float =
+  let whole = bitsOf q 0 - 53 + at in
+  let last = if whole < 0 - 1074 then 0 - 1074 else whole in
+  let drop = last - at in
+  if drop > 61 then 0.0
+  else
+    (let unit = 1 << drop in
+     let kept = q / unit in
+     let rest = q - kept * unit in
+     let half = unit / 2 in
+     let up = rest > half or (rest == half and (inexact or kept % 2 == 1)) in
+     scaledBy (toFloat (if up then kept + 1 else kept)) last)
+
+fun bitsOf (q : Int) (n : Int) : Int = if q == 0 then n else bitsOf (q / 2) (n + 1)
+
+-- `x` × 2^`k`, where that is a float. `ofQuotient` has seen to it that it is,
+-- so no step here rounds: going down, every step's answer is coarser than
+-- the end's; going up, the steps can only overflow, and so does the end.
+fun scaledBy (x : Float) (k : Int) : Float =
+  if k >= 30 then scaledBy (x * 1073741824.0) (k - 30)
+  else if k <= 0 - 30 then scaledBy (x / 1073741824.0) (k + 30)
+  else if k > 0 then scaledBy (x * 2.0) (k - 1)
+  else if k < 0 then scaledBy (x * 0.5) (k + 1)
+  else x
+
 -- --- tests -------------------------------------------------------------------
 
 use Std.Test (assertTrue, assertEq)
@@ -307,3 +420,60 @@ fun close (want : Float) (got : Float) : Bool =
   let d = assertEq (round 2.5) 3 "half away from zero" in
   let e = assertEq (round (0.0 - 2.5)) (0 - 3) "and below it" in
   assertEq (round 2.4) 2 "round down"
+
+-- The two ends of the range, built from their bits: no literal has to be
+-- trusted to spell them.
+def leastFloat : Float = scaledBy 1.0 (0 - 1074)
+
+def mostFloat : Float = scaledBy (toFloat 9007199254740991) 971
+
+@test fun fromDecimalReadsTheNearestFloat () =
+  let a = assertEq (fromDecimal "15" (0 - 1)) 1.5 "one step" in
+  let b = assertEq (fromDecimal "1" (0 - 1)) 0.1 "a tenth" in
+  let c = assertEq (fromDecimal "0000015" (0 - 1)) 1.5 "leading zeros count for nothing" in
+  let d = assertEq (fromDecimal "000" 7) 0.0 "nor does a zero's exponent" in
+  let e = assertEq (fromDecimal "17976931348623157" 292) mostFloat "the largest float" in
+  let f = assertEq (fromDecimal "5" (0 - 324)) leastFloat "the least" in
+  let g = assertEq (fromDecimal "49" (0 - 325)) leastFloat "and by its usual digits" in
+  let h =
+    assertEq
+      (fromDecimal "22250738585072014" (0 - 324))
+      (scaledBy 1.0 (0 - 1022))
+      "the least normal"
+  in
+  let i =
+    assertEq
+      (fromDecimal "2225073858507201" (0 - 323))
+      (scaledBy (toFloat 4503599627370495) (0 - 1074))
+      "the largest below it"
+  in assertEq (show (fromDecimal "1" 23)) "99999999999999991611392.0" "past what one step can do"
+
+@test fun aTieGoesToTheEvenFloat () =
+  let a = assertEq (fromDecimal "9007199254740993" 0) (toFloat 9007199254740992) "down" in
+  let b = assertEq (fromDecimal "9007199254740995" 0) (toFloat 9007199254740996) "up" in
+  let past = "90071992547409930000000000000000000001" in
+  assertEq (fromDecimal past (0 - 22)) (toFloat 9007199254740994) "and just past one is no tie"
+
+@test fun theEndsOfTheRangeAreRoundedLikeTheRest () =
+  let a = assertEq (fromDecimal "17976931348623158" 292) mostFloat "still the largest" in
+  let b = assertEq (fromDecimal "17976931348623159" 292) (1.0 / 0.0) "and past it, infinite" in
+  let c = assertEq (fromDecimal "1" 1000000000000) (1.0 / 0.0) "however far past" in
+  let d = assertEq (fromDecimal "0" 1000000000000) 0.0 "unless it is nothing" in
+  assertEq (fromDecimal "1" (0 - 1000000000000)) 0.0 "and far below, zero"
+
+-- 2^-1075 is half the least float, and the tie that takes the most digits.
+@test fun theDigitsThatDecideATieAreNeverDropped () =
+  let half = show (toBigInt 5 ^ toBigInt 1075) in
+  let zeros = zerosOf 100 in
+  let a = assertEq (fromDecimal half (0 - 1075)) 0.0 "a tie, and zero is even" in
+  let b =
+    assertEq
+      (fromDecimal (concatStrings #[half, zeros]) (0 - 1175))
+      0.0
+      "it is still one past the digits kept"
+  in assertEq
+       (fromDecimal (concatStrings #[half, zeros, "1"]) (0 - 1176))
+       leastFloat
+       "and not one with a digit after them"
+
+fun zerosOf (n : Int) : String = if n <= 0 then "" else concatStrings #["0", zerosOf (n - 1)]

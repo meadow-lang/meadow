@@ -28,6 +28,7 @@ use Std.Char as Ch
 use Std.Collections.Vector as V
 use Std.Collections.Vector (vecFromArray)
 use Std.String as S
+use Std.Num.Float as F
 use Std.Maybe.Maybe.*
 use Std.Tuple (pair, fst, snd)
 use Std.Ordering.Ordering.*
@@ -94,22 +95,28 @@ fun digits = P.takeWhile1P "a digit" Ch.isDigit
   let run = P.takeWhile1P "a hexadecimal digit" Ch.isHexDigit in
   run |> P.map (digitsIn 16) |> P.label "a hexadecimal integer"
 
-fun powTen n = if n <= 0 then 1.0 else 10.0 * powTen (n - 1)
-
-fun scale x e = if e >= 0 then x * powTen e else x / powTen (0 - e)
-
-fun fractionOf chunk = toFloat (digitsIn 10 chunk) / powTen (P.chunkLength chunk)
+fun digitText chunk = charsToString (V.toArray (P.chunkToTokens chunk))
 
 fun sign = P.option 1 (P.alt (P.mapTo 1 (C.char '+')) (P.mapTo (0 - 1) (C.char '-')))
 
--- `e7`, `E-3`, `e+2`: the power of ten.
+-- How large a power of ten is let grow: past every float, and more than any
+-- text has digits to make up for.
+def exponentLimit : Int = 1000000000000
+
+fun exponentDigits =
+  let grow = \acc c -> if acc > exponentLimit then acc else acc * 10 + digitOf c in
+  digits |> P.map (\ds -> V.foldl grow 0 (P.chunkToTokens ds)) |> P.label "an integer"
+
+-- `e7`, `E-3`, `e+2`: the power of ten. One too long for an `Int` stops at
+-- `exponentLimit`, rather than wrapping round to a small one.
 fun exponent =
   let mark = P.satisfy (\c -> c == 'e' or c == 'E') in
-  P.skipThen mark (P.lift2 (\s n -> s * n) sign decimal)
+  P.skipThen mark (P.lift2 (\s n -> s * n) sign exponentDigits)
 
+-- The float the text stands for, to the last bit: see `F.fromDecimal`.
 fun floatOf whole frac e =
-  let f = match frac with | Just ds -> fractionOf ds | None -> 0.0 in
-  scale (toFloat (digitsIn 10 whole) + f) e
+  let decimals = match frac with | Just ds -> digitText ds | None -> "" in
+  F.fromDecimal (S.concat (digitText whole) decimals) (e - S.byteLength decimals)
 
 -- An exponent is optional after a fraction, and required without one.
 fun exponentAfter frac =
@@ -137,7 +144,7 @@ fun signBy neg = P.alt (P.mapTo (\x -> x) (C.char '+')) (P.mapTo neg (C.char '-'
 
 -- `signed`, for a floating-point `p`.
 @pub fun signedFloat (sc : Parser s a) (p : Parser s f) : Parser s f =
-  signBy (\x -> 0.0 - x) |> lexeme sc |> P.option (\x -> x) |> P.keep p
+  signBy (\x -> x * (0.0 - 1.0)) |> lexeme sc |> P.option (\x -> x) |> P.keep p
 
 -- --- characters --------------------------------------------------------------
 
@@ -347,6 +354,35 @@ fun ok p text = P.runParser (P.thenSkip p P.eof) text
   let c = assertEq (ok float "2.5e-1") (Ok 0.25) "both" in
   let d = assertEq (ok (signedFloat sc float) "-0.5") (Ok (0.0 - 0.5)) "signed" in
   assertFalse (isOk (ok float "3")) "an integer is not a float"
+
+@test fun floatsAreReadToTheLastBit () =
+  let a =
+    assertEq
+      (ok float "0.30000000000000004")
+      (Ok (0.1 + 0.2))
+      "more digits than a sum of parts holds"
+  in
+  let b =
+    assertEq
+      (ok float "1.7976931348623157e308")
+      (ok float "17976931348623157e292")
+      "however it is written"
+  in
+  let c = assertTrue (ok float "5e-324" != Ok 0.0) "the least float is not zero" in
+  let d = assertEq (ok float "1e999") (Ok (1.0 / 0.0)) "past every float" in
+  let e =
+    assertEq
+      (ok float "1e99999999999999999999999")
+      (Ok (1.0 / 0.0))
+      "an exponent too long for an `Int`"
+  in
+  let f = assertEq (ok float "1e-99999999999999999999999") (Ok 0.0) "and below" in
+  assertEq (ok float "0e999") (Ok 0.0) "nothing, to any power, is nothing"
+
+@test fun aMinusKeepsTheSignOfZero () =
+  match ok (signedFloat sc float) "-0.0" with
+  | Ok x -> assertEq (1.0 / x) (0.0 - 1.0 / 0.0) "minus zero"
+  | Err _ -> assertTrue False "it should read"
 
 @test fun charLiteralsDecodeEscapes () =
   let str = P.skipThen (C.char '"') (P.manyTill charLiteral (C.char '"')) in

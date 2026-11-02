@@ -130,6 +130,48 @@ pub fn error(msg: impl AsRef<str>) {
     above_bar(&format!("{} {}", label("error:", "31"), msg.as_ref()));
 }
 
+/// How a program that `meadow` ran ended, if it did not end by itself: on
+/// Unix a signal, on Windows an exception, whose status is a code like any
+/// other and is told from one by its top bits.
+fn crash(status: std::process::ExitStatus) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal().map(|n| format!("signal {n}"))
+    }
+    #[cfg(windows)]
+    {
+        status
+            .code()
+            .map(|c| c as u32)
+            .filter(|c| *c >= 0xC000_0000)
+            .map(|c| format!("exception {c:#010x}"))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = status;
+        None
+    }
+}
+
+/// The code `meadow` leaves with after running `program` to its end. A crash
+/// is named, since the program said nothing and would otherwise look like one
+/// that failed quietly. On Unix it has no code of its own, and leaves with the
+/// shell's, 128 and the signal.
+pub fn exit_code(program: &std::path::Path, status: std::process::ExitStatus) -> i32 {
+    if let Some(how) = crash(status) {
+        error(format!("{} was ended by {how}", program.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(n) = status.signal() {
+            return 128 + n;
+        }
+    }
+    status.code().unwrap_or(1)
+}
+
 /// A compile error: its message, and where it is in the file, when that file
 /// can be read -- as a snippet with the place underlined.
 pub fn diagnostic(d: &meadow_compiler::diagnostics::Diagnostic) {
@@ -511,6 +553,42 @@ mod tests {
         assert_eq!(format!("{:>12}", "Compiling"), "   Compiling");
         assert_eq!(elapsed(Duration::from_millis(420)), "0.42s");
         assert_eq!(elapsed(Duration::from_secs(65)), "1m 05s");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_killed_by_a_signal_is_named_and_leaves_as_a_shell_would() {
+        let killed = std::process::Command::new("sh")
+            .args(["-c", "kill -SEGV $$"])
+            .status()
+            .unwrap();
+        assert_eq!(crash(killed).as_deref(), Some("signal 11"));
+        assert_eq!(exit_code(std::path::Path::new("sh"), killed), 139);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_program_ended_by_an_exception_is_named_and_keeps_its_status() {
+        let ended = std::process::Command::new("cmd")
+            .args(["/c", "exit -1073741819"])
+            .status()
+            .unwrap();
+        assert_eq!(crash(ended).as_deref(), Some("exception 0xc0000005"));
+        assert_eq!(exit_code(std::path::Path::new("cmd"), ended), -1073741819);
+    }
+
+    #[test]
+    fn a_program_that_fails_by_itself_is_not_a_crash() {
+        let failed = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
+            .args(if cfg!(windows) {
+                ["/c", "exit 3"]
+            } else {
+                ["-c", "exit 3"]
+            })
+            .status()
+            .unwrap();
+        assert_eq!(crash(failed), None);
+        assert_eq!(exit_code(std::path::Path::new("x"), failed), 3);
     }
 
     #[test]

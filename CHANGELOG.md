@@ -171,6 +171,10 @@ beyond the last release is under _Unreleased_.
   it waited forever. The call was counted twice, once in a frame the cancelled
   thread never returned to, so it never seemed to end, and what it opened was
   not closed.
+- `meadow cut` and `meadow run` said nothing when the program they ran
+  crashed: a signal left them as a plain failure with status 1, and an
+  exception on Windows as its own status with no word of what it was. They now
+  say what ended it, and leave with the shell's 128 and the signal on Unix.
 - A function that performs two effects whose rows met in inference read
   with its effect's tail as a record's -- `forall r. () -> () ! { Ask, Tell |
   r }` -- in an editor's hover and wherever a type is shown, and was
@@ -234,6 +238,15 @@ beyond the last release is under _Unreleased_.
   drive -- now remove each test's directory when it ends, passed or failed,
   and keep it in the build's `target/tmp`; `MEADOW_KEEP_TEST_DIRS=1` keeps
   them to look at.
+- `it` in the REPL is the entry before, so `1 + 2` then `it * 10` is `30`. An
+  entry is compiled as `def it = ...`, a top-level name is in scope in its own
+  body, and so `it` was the entry itself: it recursed until the runtime aborted
+  with "the old generation has used up its address space", taking the session
+  with it, or, as `it` alone, spun for ever. That was every top-level value
+  that mentioned itself, in a file as well. Outside of a function a `def` no
+  longer sees its own name: the name means what it meant before, an import or
+  an earlier entry, as in a `let`, and is undefined if that is nothing. Inside
+  a function it is the definition still, so `def f = \n -> f (n - 1)` recurses.
 - A type with five or more type variables printed `e`, `f`, `n` and `r` for
   plain variables too, the letters of an effect row, a fraction, a number and
   a record row, so a scheme could name two different variables `e`. Plain
@@ -241,6 +254,24 @@ beyond the last release is under _Unreleased_.
   hovers, errors, `meadow build --types`, MeadowBoot -- going `a`, `b`, `c`,
   `d`, `g`, `h`, so a letter always says what kind of variable it is. A type
   with four or fewer prints as before.
+- `Std.Json` lost a float's bits both writing and reading it. `render` wrote
+  six decimals, cut off rather than rounded, so that every float in a `make!`
+  cache was damaged and came out a little lower each time it was written
+  again. Below zero it wrote another number (`-1.5` came out as `-2.500000`),
+  past an `Int`'s range a nonsense one, and it stopped the program on what is
+  not finite. It now writes what `show` writes, the fewest digits that read
+  back as that float, with a point even on a whole number, so a float stays a
+  float; and `null` for NaN and the infinities, which JSON has no text for,
+  so that the document stays JSON and no number is claimed. Reading goes
+  through `Std.String.Parse.Lexer.float`, which added its digits up in floats:
+  it lost bits at the ends of the range, read `5e-324` as zero and `0e999` as
+  not a number, and wrapped an exponent too long for an `Int`. It now gives
+  the nearest float to every text, by the new `Std.Num.Float.fromDecimal`, on
+  every engine, and a minus keeps the sign of zero. A cache written before
+  this still holds the damaged numbers, and rebuilding the compiler does not
+  clear all of it: Lingua's `make!` keeps a part of a unit under a key with no
+  compiler in it. Remove the `target` directory of anything built by a
+  Lingua-built compiler once, after rebuilding that compiler.
 - A Silo program that cannot spawn a thread could have its tracing collector
   free what its outermost frames held. A trace scans the stack up to where the
   program began, and that place was taken a little too low, so those frames
