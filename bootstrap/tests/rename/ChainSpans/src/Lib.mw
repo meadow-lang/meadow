@@ -11,7 +11,6 @@ fun chainBoth (a : Int) (b : Int) (c : Bool) : Bool = c or (a + 1) <= (b + 1)
 
 fun inParens (a : Int) (b : Int) (c : Bool) : Bool = c or (a <= (b + 1))
 
-fun nested (a : Int) (b : Int) (c : Bool) : Bool =
-  c or (c and a <= (if c then a else b))
+fun nested (a : Int) (b : Int) (c : Bool) : Bool = c or (c and a <= (if c then a else b))
 
 fun loneOperand (c : Bool) (d : Bool) : Bool = (c) or (d)
