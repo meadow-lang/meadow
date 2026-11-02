@@ -31,6 +31,10 @@ use Std.Collections.Vector (Vector)
   -- The path of the program running: what a build tool tells one compiler
   -- from another by. Empty when the platform cannot say.
   currentExe : () -> String,
+  -- The directory this process runs in, as an absolute path: where a relative
+  -- path starts from. Empty when the platform cannot say, as when the directory
+  -- has been removed.
+  currentDir : () -> String,
   -- Whether standard input (0), output (1) or error (2) is a terminal rather
   -- than a file or a pipe: whether what is written there should be coloured.
   isTerminal : Int -> Bool,

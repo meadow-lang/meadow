@@ -2441,6 +2441,7 @@ fn native_process(op: &str, arg: Value) -> Result<Value, RuntimeError> {
         }
         "currentPid" => Value::Int(std::process::id() as i64),
         "currentExe" => sv(meadow_core::args::current_exe()),
+        "currentDir" => sv(meadow_core::args::current_dir()),
         "isTerminal" => Value::Bool(is_terminal(as_int(&arg)?)),
         "argv" => vector_value(meadow_core::args::get().into_iter().map(sv).collect()),
         "getEnv" => match std::env::var(&*as_str(&arg)?) {

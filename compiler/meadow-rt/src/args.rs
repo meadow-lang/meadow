@@ -41,3 +41,11 @@ pub fn current_exe() -> String {
         .map(|p| p.display().to_string())
         .unwrap_or_default()
 }
+
+/// The directory this process runs in, as `Process.currentDir` answers it.
+/// Empty when the platform cannot say, as when the directory has been removed.
+pub fn current_dir() -> String {
+    std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default()
+}
