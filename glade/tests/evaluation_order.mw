@@ -35,6 +35,8 @@ fun seen f =
 
 fun sub (a : Int) (b : Int) = a - b
 
+fun named (n : Int) = at 2 n
+
 fun views p =
   match p with
   | (at 1 (\n -> n) -> 0, at 9 (\n -> n) -> 0) -> 0
@@ -81,8 +83,16 @@ def result =
     -- Arms in order, each pattern left to right until it fails.
     seen (\u -> views (5, 6)),
     seen (\u -> (at 1 False and at 9 True) or (at 2 True or at 9 True)),
-    -- A pipe is the application it stands for: the function first.
-    seen (\u -> at 2 10 |> at 1 (\n -> n + 1)),
+    -- A pipe's value before what it is piped into, whatever that is; and the
+    -- value goes in when the call is made.
+    seen (\u -> at 1 10 |> at 2 (\n -> n + 1)),
+    seen (\u -> at 1 10 |> sub (at 2 3)),
+    seen (\u -> at 1 10 |> (at 2 sub) (at 3 3)),
+    seen (\u -> at 1 10 |> at 2 (\n -> at 3 n) |> at 4 (\n -> at 5 n)),
+    seen (\u -> at 1 10 |> named),
+    seen (\u -> at 1 10 |> (\n -> at 2 n)),
+    seen (\u -> at 1 10 |> (at 2 1 + _)),
+    -- `<|` is the other way round, so the function is what is written first.
     seen (\u -> at 1 (\n -> n + 1) <| at 2 10),
     -- A section is a function: what is in it runs at each application.
     seen (\u ->

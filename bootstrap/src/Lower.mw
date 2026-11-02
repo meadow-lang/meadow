@@ -1677,7 +1677,6 @@ pass! {
     | Expr { later first, later backs } ->
         applied
           out
-          False
           (spanning
              cx
              (V.pushFront backs first)
@@ -1686,18 +1685,15 @@ pass! {
                 (V.pushFront (childrenOf NodeBackPipe node) node)))
           cx.over
     | BackPipe { operand } -> operand
-    -- `x |> f |> g` is `g (f x)`: a left fold, the last applied to the rest.
+    -- `x |> f |> g`: a left fold, the last called with the rest.
     | PipeL { later first, later pipes } ->
-        applied
-          out
-          True
-          (spanning
-             cx
-             (V.pushFront pipes first)
-             (V.map
-                (\p -> orSpan cx.c (must NodeOrE p))
-                (V.pushFront (childrenOf NodePipe node) node)))
-          cx.over
+        (let ors = V.map (\p -> must NodeOrE p) (V.pushFront (childrenOf NodePipe node) node) in
+         piped
+           out
+           (V.zip
+              (spanning cx (V.pushFront pipes first) (V.map (orSpan cx.c) ors))
+              (V.map (inertOr cx.c) ors))
+           cx.over)
     | Pipe { operand } -> operand
     | OrE { later first, later ors } ->
         binFold
@@ -1844,19 +1840,90 @@ pass! {
 -- field `pat`, which this is not.
 fun patOf (c : Lc) b (s : GTree) = pat c b s
 
--- Parts applied one to the next, each application spanning what it joins:
--- the first to the rest (`f <| g <| x`), or, `last`, the last to the rest
--- (`x |> f |> g`).
-fun applied b (last : Bool) parts (over : Maybe Meta) =
+-- Parts applied one to the next, the first to the rest (`f <| g <| x`), each
+-- application spanning what it joins.
+fun applied b parts (over : Maybe Meta) =
   let n = V.len parts in
-  match V.get parts (if last then n - 1 else 0) with
+  match V.get parts 0 with
   | None -> newAstExprUnit b (spanMeta 0 0)
   | Just (f, own) ->
       if n == 1 then f over
       else
-        let rest = if last then V.take parts (n - 1) else V.drop parts 1 in
+        let rest = V.drop parts 1 in
         let m = M.unwrapOr (V.foldl (\acc p -> join acc (snd p)) own rest) over in
-        newAstExprApp b m (f None) [applied b last rest None]
+        newAstExprApp b m (f None) [applied b rest None]
+
+-- `x |> f |> g`: each part, with its span and whether it is inert, the last
+-- called with the rest, which are evaluated first. That is the plain call if
+-- either side is inert, and `(\$pipe -> f $pipe) rest` if not, as `pipe` in
+-- `meadow-parser` has it.
+fun piped b parts (over : Maybe Meta) =
+  let n = V.len parts in
+  match V.get parts (n - 1) with
+  | None -> newAstExprUnit b (spanMeta 0 0)
+  | Just last ->
+      let f = fst (fst last) in
+      if n == 1 then f over
+      else
+        let rest = V.take parts (n - 1) in
+        let lhs =
+          V.foldl (\acc p -> join acc (partSpan p)) (partSpan (V.getOr last rest 0)) (V.drop rest 1)
+        in
+        let whole = join lhs (partSpan last) in
+        let m = M.unwrapOr whole over in
+        let value = piped b rest None in
+        if snd last or (n == 2 and V.all snd rest) then newAstExprApp b m (f None) [value]
+        else
+          let name = named "$pipe" (spanMeta (metaEnd lhs) (metaEnd lhs)) in
+          let call = newAstExprApp b whole (f None) [newAstExprVar b lhs (nm b name)] in
+          newAstExprApp
+            b
+            m
+            (newAstExprLam b name.at [newAstPatVar b name.at (nm b name)] call)
+            [value]
+
+fun partSpan p : Meta = snd (fst p)
+
+-- Whether evaluating an operand of `|>` does nothing a program could see: a
+-- name, a literal or a function, as `inert` in `meadow-parser` has it. A `_`
+-- is not.
+fun inertOr (c : Lc) (s : GTree) : Bool =
+  let a = must NodeAndE s in
+  not (has NodeOrTail s or has NodeAndTail a)
+    and (match M.unwrapOr a (firstNode a) with
+     | GroupedLeaf operand -> inertOperand c operand
+     | _ -> False)
+
+fun inertOperand (c : Lc) (s : GTree) : Bool =
+  let base = must NodeBase s in
+  if has TokenMinus s then M.isSome (literalOf c base)
+  else if has NodeAtom base then False
+  else
+    match firstNode (must NodeHead base) with
+    | None -> True
+    | Just h ->
+        if R.kindOf h == NodeQualHead then True
+        else if R.kindOf h == NodeMacCall then False
+        else
+          (match childOf NodeClosedAtom h with
+           | Just ca -> not (has NodeFieldTail ca) and inertPrim c (M.unwrapOr ca (firstNode ca))
+           | None -> has NodeLamE h)
+
+fun inertPrim (c : Lc) (s : GTree) : Bool =
+  let k = R.kindOf s in
+  if k == NodeParen then
+    (let elems = childrenOf NodeElem s in
+     match V.len elems with
+     | 0 -> True
+     | 1 ->
+         let inner = must NodeExpr (V.getOr s elems 0) in
+         not (V.isEmpty (holesIn inner)) or inertExpr c inner
+     | _ -> False)
+  else k == NodeOpRef or k == NodeLitE or k == NodeVarE
+
+fun inertExpr (c : Lc) (s : GTree) : Bool =
+  let p = must NodePipeL s in
+  not (has NodeBackPipe s or has NodePipe p) and inertOr c (must NodeOrE p)
 
 -- `a or b or c` is `(a or b) or c`: each spanning what it joins, and so is
 -- its operator.
@@ -2215,8 +2282,7 @@ fun holesIn (s : GTree) : [Int] =
   else if k == NodePipeL then
     V.concatMap
       holesIn
-      (V.reverse
-         (V.pushFront (V.map (\p -> must NodeOrE p) (childrenOf NodePipe s)) (must NodeOrE s)))
+      (V.pushFront (V.map (\p -> must NodeOrE p) (childrenOf NodePipe s)) (must NodeOrE s))
   else if k == NodeLamE
     or k == NodeMacCall
     or k == NodeMacAtom

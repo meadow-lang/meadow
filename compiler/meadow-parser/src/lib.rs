@@ -2171,7 +2171,8 @@ where
             )
             .boxed();
 
-        // `x |> f` == `f x` (left-assoc); `f <| x` == `f x` (right-assoc, loosest).
+        // `x |> f` calls `f` with `x`, `x` first (left-assoc; see `pipe`);
+        // `f <| x` == `f x` (right-assoc, loosest).
         let app1 = |func: Located<Expr>, arg: Located<Expr>| {
             let span = func.span.extend(arg.span);
             Located::new(Expr::App(func, vec![arg]), span)
@@ -2180,7 +2181,7 @@ where
             .clone()
             .foldl(
                 just(Token::RPipe).ignore_then(or_expr.clone()).repeated(),
-                move |lhs, rhs| app1(rhs, lhs),
+                pipe,
             )
             .boxed();
         pipe_l
@@ -2202,6 +2203,61 @@ where
             })
             .boxed()
     })
+}
+
+/// What `lhs |> rhs` is: `rhs` called with `lhs`, with `lhs` evaluated first,
+/// as it is written.
+///
+/// That is the call `rhs lhs` wherever nothing can tell the two orders apart:
+/// when either side is [`inert`], evaluating it does nothing, so the plain
+/// call costs nothing and `x |> f` is exactly `f x` to everything after the
+/// parser. Otherwise the value is passed in first: `(\$pipe -> rhs $pipe) lhs`.
+/// A function applied where it stands is a `let` to the optimiser, but not to
+/// the type checker: the parameter is not generalised, as a `let` would be, and
+/// `rhs` is seen before `lhs`, as it is in a call, so that a pipe types the
+/// same whichever form it takes. `$pipe` is a name no source can spell, and
+/// `rhs` is never in the scope of another pipe's, which is around its own call.
+///
+/// The name and the function are written nowhere, so they have an empty span:
+/// a tool looking for what is at a position does not find them. The value keeps
+/// `lhs`'s span, which is where an error about it belongs.
+fn pipe(lhs: LExpr, rhs: LExpr) -> LExpr {
+    let span = rhs.span.extend(lhs.span);
+    if inert(&lhs) || inert(&rhs) {
+        return Located::new(Expr::App(rhs, vec![lhs]), span);
+    }
+    let name = InternedString::from(PIPED);
+    let at = Span::new(lhs.span.end, lhs.span.end);
+    let value = Located::new(Expr::Var(Located::new(name, at)), lhs.span);
+    let param = Located::new(Pat::Var(Located::new(name, at)), at);
+    let call = Located::new(Expr::App(rhs, vec![value]), span);
+    let function = Located::new(Expr::Lam(vec![param], call), at);
+    Located::new(Expr::App(function, vec![lhs]), span)
+}
+
+/// What [`pipe`] calls the value it passes in.
+const PIPED: &str = "$pipe";
+
+/// Whether `f` is the function [`pipe`] made, which is no lambda of the
+/// program's.
+fn is_piped(f: &LExpr) -> bool {
+    match f.value() {
+        Expr::Lam(params, _) => {
+            matches!(params.as_slice(), [p] if matches!(p.value(), Pat::Var(n) if &**n.value() == PIPED))
+        }
+        _ => false,
+    }
+}
+
+/// Whether evaluating `e` does nothing a program could see: a name, a literal
+/// or a function. A `_` is not, though it will be a name: it has to stay on its
+/// own side of a pipe to be numbered where it is written.
+fn inert(e: &LExpr) -> bool {
+    match e.value() {
+        Expr::Var(_) | Expr::Lit(_) | Expr::Unit | Expr::Qual(..) | Expr::Lam(..) => true,
+        Expr::Cons(_, args) => args.is_empty(),
+        _ => false,
+    }
 }
 
 /// Turn a parenthesised expression into a lambda if it contains `_` holes:
@@ -2253,6 +2309,16 @@ fn fill_holes(e: LExpr, n: &mut usize) -> LExpr {
         Expr::Unit => Expr::Unit,
         // A nested lambda owns any holes in its body.
         Expr::Lam(ps, b) => Expr::Lam(ps, b),
+        // A pipe's function is not one, and its sides are as they are written:
+        // the value, which is its argument, then what it is piped into.
+        Expr::App(f, args) if is_piped(&f) => {
+            let args = args.into_iter().map(|a| go(a, n)).collect();
+            let at = f.span;
+            let Expr::Lam(ps, body) = *f.value else {
+                unreachable!("`is_piped` is of a lambda")
+            };
+            Expr::App(Located::new(Expr::Lam(ps, go(body, n)), at), args)
+        }
         Expr::App(f, args) => Expr::App(go(f, n), args.into_iter().map(|a| go(a, n)).collect()),
         Expr::UnOp(op, x) => Expr::UnOp(op, go(x, n)),
         Expr::BinOp(op, l, r) => Expr::BinOp(op, go(l, n), go(r, n)),
@@ -2634,7 +2700,7 @@ fn lower_ident<'a, I: ValueInput<'a, Token = Token, Span = Span>>()
 /// An operator, as the name it is: any run of symbols the lexer makes an
 /// operator of, and the ones it gives tokens of their own. Not `::`, which is
 /// the list constructor's, nor `|>` and `<|`, which are application written
-/// backwards and forwards, nor anything that is punctuation: `=`, `->`, `|`,
+/// forwards and backwards, nor anything that is punctuation: `=`, `->`, `|`,
 /// `\\`, `@`, `.`.
 fn operator<'a, I: ValueInput<'a, Token = Token, Span = Span>>()
 -> impl Parser<'a, I, Ident, extra::Err<Rich<'a, Token, Span>>> + Clone {

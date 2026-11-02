@@ -767,7 +767,7 @@ fn everything_is_evaluated_in_the_order_it_is_written() {
 
 /// What `evaluation_order.mw` answers.
 const EVALUATION_ORDER: &str = "(123, 123, 123, 12, 12, 123, 123, 12, 12, 123, 12, 12, 12, \
-     1234, 12, 1234, 123, 12, 12, 12, 122, 1234567, 12)";
+     1234, 12, 1234, 123, 12, 12, 12, 123, 12345, 12, 12, 12, 12, 122, 1234567, 12)";
 
 #[test]
 fn resuming_twice_is_refused_everywhere() {

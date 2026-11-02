@@ -1233,6 +1233,10 @@ impl Names<'_> {
         let Some(name) = self.text.get(span.start as usize..span.end as usize) else {
             return;
         };
+        // No text is no name a person wrote: the value of a pipe, say.
+        if name.is_empty() {
+            return;
+        }
         let ty = self
             .types
             .get(id.id)
@@ -1267,7 +1271,11 @@ impl Names<'_> {
             hir::Pat::Var(id) => {
                 // A pattern variable's type is recorded on the pattern.
                 let span = id.span;
-                if let Some(name) = self.text.get(span.start as usize..span.end as usize) {
+                if let Some(name) = self
+                    .text
+                    .get(span.start as usize..span.end as usize)
+                    .filter(|n| !n.is_empty())
+                {
                     let ty = self
                         .types
                         .get(p.id)

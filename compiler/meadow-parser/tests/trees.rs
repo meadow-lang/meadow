@@ -132,6 +132,76 @@ fn an_expression_parses_on_its_own() {
     assert!(e.is_some());
 }
 
+/// The tree an expression parses to, with its spans taken out, for comparing
+/// with another written differently.
+fn shape(text: &str) -> String {
+    let tokens = lex(text);
+    let (e, errors) = parse_expr(&tokens, eoi(text));
+    assert!(errors.is_empty(), "{text}: {errors:?}");
+    let shown = format!("{:?}", e.expect("it parses"));
+    let mut out = String::new();
+    let mut rest = shown.as_str();
+    while let Some(at) = rest.find("span: ") {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        rest = &rest[rest.find('}').map_or(rest.len(), |i| i + 1)..];
+    }
+    out + rest
+}
+
+#[test]
+fn a_pipe_with_a_side_that_does_nothing_is_the_call() {
+    assert_eq!(shape("x |> f"), shape("f x"));
+    assert_eq!(shape("g y |> f"), shape("f (g y)"));
+    assert_eq!(shape("x |> f a"), shape("(f a) x"));
+    assert_eq!(shape("g y |> M.f"), shape("M.f (g y)"));
+    assert_eq!(shape("g y |> Just"), shape("(Just) (g y)"));
+    assert_eq!(shape(r"g y |> (\n -> n)"), shape(r"(\n -> n) (g y)"));
+    assert_eq!(shape("g y |> (_ + 1)"), shape("(_ + 1) (g y)"));
+    assert_eq!(shape("1 |> f a"), shape("(f a) 1"));
+    assert_eq!(shape("-1 |> f a"), shape("(f a) (-1)"));
+    assert_eq!(shape("() |> f a"), shape("(f a) ()"));
+}
+
+#[test]
+fn a_pipe_passes_its_value_in_where_the_order_could_show() {
+    // Only `$pipe` tells these from what a program could write itself, and no
+    // program can write it.
+    let spelled = |text: &str| shape(text).replace("pipeValue", "$pipe");
+    assert_eq!(
+        shape("g y |> f a"),
+        spelled(r"(\pipeValue -> (f a) pipeValue) (g y)")
+    );
+    // A field can fault, so it is not nothing.
+    assert_eq!(
+        shape("r.x |> f a"),
+        spelled(r"(\pipeValue -> (f a) pipeValue) r.x")
+    );
+    // The rest of a chain is the value of the pipe after it.
+    assert_eq!(
+        shape("g y |> f a |> h b"),
+        spelled(r"(\pipeValue -> (h b) pipeValue) ((\pipeValue -> (f a) pipeValue) (g y))")
+    );
+}
+
+#[test]
+fn the_holes_of_a_section_are_numbered_as_written_across_a_pipe() {
+    let spelled = |text: &str| shape(text).replace("pipeValue", "$pipe");
+    assert_eq!(
+        shape("(g _ |> f _)"),
+        spelled(r"\_hole0 _hole1 -> (\pipeValue -> (f _hole1) pipeValue) (g _hole0)")
+    );
+    assert_eq!(
+        shape("(_ |> f _)"),
+        spelled(r"\_hole0 _hole1 -> (\pipeValue -> (f _hole1) pipeValue) _hole0")
+    );
+    assert_eq!(
+        shape("(_ |> _)"),
+        spelled(r"\_hole0 _hole1 -> (\pipeValue -> _hole1 pipeValue) _hole0")
+    );
+    assert_eq!(shape("(_ |> f)"), shape(r"\_hole0 -> f _hole0"));
+}
+
 #[test]
 fn an_expression_entry_point_takes_the_whole_input_or_none_of_it() {
     // Application is juxtaposition, so `f x` is one expression -- but a `)` with

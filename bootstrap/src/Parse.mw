@@ -1997,8 +1997,8 @@ fun expr (c : Cx) (d : Int) (s : Syn) : [String] = exprOver c d s None
 
 fun exprOver (c : Cx) (d : Int) (s : Syn) (over : Maybe Meta) : [String] = exprIn c [] d s over
 
--- `f <| g <| x` is `f (g x)`; `x |> f |> g` is `g (f x)`: applications, each
--- spanning what it joins.
+-- `f <| g <| x` is `f (g x)`; `x |> f |> g` calls `f` with `x`, then `g` with
+-- that: applications, each spanning what it joins.
 fun exprIn (c : Cx) (hs : [Int]) (d : Int) (s : Syn) (over : Maybe Meta) : [String] =
   let parts = V.pushFront (childrenOf NodeBackPipe s) s in
   let pipes = V.map (\p -> must NodePipeL p) parts in
@@ -2024,8 +2024,10 @@ fun pipeL (c : Cx) (hs : [Int]) (d : Int) (s : Syn) (over : Maybe Meta) : [Strin
   let ors = V.pushFront (V.map (\p -> must NodeOrE p) (childrenOf NodePipe s)) (must NodeOrE s) in
   pipes c hs d ors over
 
--- A left fold: the last is applied to the rest.
-fun pipes (c : Cx) (hs : [Int]) (d : Int) (ors : [Syn]) (over : Maybe Meta) : [String] =
+-- A left fold: the last is called with the rest, which are evaluated first.
+-- That is the plain call if either side is inert, and `(\$pipe -> f $pipe)
+-- rest` if not, as `pipe` in `meadow-parser` has it.
+fun pipes(c : Cx) (hs : [Int]) (d : Int) (ors : [Syn]) (over : Maybe Meta) : [String] =
   let n = V.len ors in
   match V.get ors (n - 1) with
   | None -> []
@@ -2033,12 +2035,78 @@ fun pipes (c : Cx) (hs : [Int]) (d : Int) (ors : [Syn]) (over : Maybe Meta) : [S
       if n == 1 then orE c hs d f over
       else
         let rest = V.take ors (n - 1) in
-        let m = M.unwrapOr (V.foldl (\acc o -> join acc (orSpan c o)) (orSpan c f) rest) over in
-        node
-          d
-          "App"
-          m
-          (V.append (orE c hs (d + 1) f None) (many (d + 1) "args" [\k -> pipes c hs k rest None]))
+        let whole = V.foldl (\acc o -> join acc (orSpan c o)) (orSpan c f) rest in
+        let m = M.unwrapOr whole over in
+        let value = \k -> pipes c hs k rest None in
+        if inertOr c f or (n == 2 and V.all (inertOr c) rest) then
+          node d "App" m (V.append (orE c hs (d + 1) f None) (many (d + 1) "args" [value]))
+        else
+          let lhs =
+            V.foldl (\acc o -> join acc (orSpan c o)) (orSpan c (V.getOr f rest 0)) (V.drop rest 1)
+          in
+          let name = named "$pipe" (spanMeta (metaEnd lhs) (metaEnd lhs)) in
+          let call =
+            \k ->
+              node
+                k
+                "App"
+                whole
+                (V.append
+                   (orE c hs (k + 1) f None)
+                   (many (k + 1) "args" [\j -> node j "Var" lhs (ident (j + 1) name)]))
+          in
+          let param = \k -> node k "PVar" name.at (ident (k + 1) name) in
+          node
+            d
+            "App"
+            m
+            (V.append
+               (node
+                  (d + 1)
+                  "Lam"
+                  name.at
+                  (V.append (many (d + 2) "params" [param]) (call (d + 2))))
+               (many (d + 1) "args" [value]))
+
+-- Whether evaluating an operand of `|>` does nothing a program could see: a
+-- name, a literal or a function, as `inert` in `meadow-parser` has it. A `_`
+-- is not.
+fun inertOr (c : Cx) (s : Syn) : Bool =
+  let a = must NodeAndE s in
+  let ops = must NodeOps a in
+  not (has NodeOrTail s or has NodeAndTail a or has NodeInfixTail ops)
+    and inertOperand c (must NodeOperand ops)
+
+fun inertOperand (c : Cx) (s : Syn) : Bool =
+  let base = must NodeBase s in
+  if has TokenMinus s then M.isSome (literalOf c base)
+  else if has NodeAtom base then False
+  else
+    match firstNode (must NodeHead base) with
+    | None -> True
+    | Just h ->
+        if R.kindOf h == NodeQualHead then True
+        else if R.kindOf h == NodeMacCall then False
+        else
+          (match childOf NodeClosedAtom h with
+           | Just ca -> not (has NodeFieldTail ca) and inertPrim c (M.unwrapOr ca (firstNode ca))
+           | None -> has NodeLamE h)
+
+fun inertPrim (c : Cx) (s : Syn) : Bool =
+  let k = R.kindOf s in
+  if k == NodeParen then
+    (let elems = childrenOf NodeElem s in
+     match V.len elems with
+     | 0 -> True
+     | 1 ->
+         let inner = must NodeExpr (V.getOr s elems 0) in
+         not (V.isEmpty (holesIn inner)) or inertExpr c inner
+     | _ -> False)
+  else k == NodeOpRef or k == NodeLitE or k == NodeVarE
+
+fun inertExpr (c : Cx) (s : Syn) : Bool =
+  let p = must NodePipeL s in
+  not (has NodeBackPipe s or has NodePipe p) and inertOr c (must NodeOrE p)
 
 fun orE (c : Cx) (hs : [Int]) (d : Int) (s : Syn) (over : Maybe Meta) : [String] =
   binFold
@@ -2656,11 +2724,10 @@ fun holesIn (s : Syn) : [Int] =
       holesIn
       (V.pushFront (V.map (\p -> must NodePipeL p) (childrenOf NodeBackPipe s)) (must NodePipeL s))
   else if k == NodePipeL then
-    -- `x |> f |> g` is `g (f x)`: the last first.
+    -- `x |> f |> g`: as written, since a pipe keeps its sides in order.
     V.concatMap
       holesIn
-      (V.reverse
-         (V.pushFront (V.map (\p -> must NodeOrE p) (childrenOf NodePipe s)) (must NodeOrE s)))
+      (V.pushFront (V.map (\p -> must NodeOrE p) (childrenOf NodePipe s)) (must NodeOrE s))
   else if k == NodeLamE
     or k == NodeMacCall
     or k == NodeMacAtom

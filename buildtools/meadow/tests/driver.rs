@@ -284,6 +284,8 @@ fun check (name : String) f = let u = print "${name}: " in let v = f () in print
 
 fun sub (a : Int) (b : Int) = a - b
 
+fun named (n : Int) = at 2 n
+
 fun both u : Int ! { Exn String | e } = raise "a" + raise "b"
 
 fun args u : Int ! { Exn String | e } = sub (raise "first") (raise "second")
@@ -317,7 +319,11 @@ fun main () : () ! Eff =
       | _ -> at 9 0)
   in
   let u = check "and or" (\() -> (at 1 False and at 9 True) or (at 2 True or at 9 True)) in
-  let u = check "pipes" (\() -> (at 2 10 |> at 1 (\n -> n + 1), at 3 (\n -> n + 1) <| at 4 10)) in
+  let u = check "pipes" (\() -> (at 1 10 |> at 2 (\n -> n + 1), at 3 (\n -> n + 1) <| at 4 10)) in
+  let u = check "pipe into a call" (\() -> at 1 10 |> (at 2 sub) (at 3 3)) in
+  let u = check "pipeline" (\() -> at 1 1 |> at 2 (\n -> at 3 n) |> at 4 (\n -> at 5 n)) in
+  let u = check "pipe into a name" (\() -> at 1 10 |> named) in
+  let u = check "pipe into a section" (\() -> at 1 10 |> (at 2 1 + _)) in
   let u =
     check "handler" (\() ->
       handle at 1 0 + ask (at 2 1) + at 5 0 with {
@@ -352,6 +358,10 @@ if: 12
 match: 1234
 and or: 12
 pipes: 1234
+pipe into a call: 123
+pipeline: 12345
+pipe into a name: 12
+pipe into a section: 12
 handler: 1234567
 "#;
 

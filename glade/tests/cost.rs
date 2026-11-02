@@ -67,6 +67,38 @@ fn a_tail_recursive_loop_allocates_nothing() {
 }
 
 #[test]
+fn a_pipe_costs_what_the_call_costs() {
+    // `x` is evaluated first, which for most pipes is what a call does anyway,
+    // and for the rest takes a `let` the optimiser sees through. Either way
+    // nothing is left of it: not an instruction, not a slot, and a loop through
+    // one is still a loop.
+    let program = |call: &str| {
+        format!(
+            "fun step (n : Int) = n - 1
+             fun add (a : Int) (b : Int) = a + b
+             fun count (acc : Int) (n : Int) = if n == 0 then acc else {call}
+             def result = count 0 100000"
+        )
+    };
+    let plain = cost(&program("count (acc + 1) (step n)"));
+    assert_eq!(plain.0, "100000");
+    assert_eq!(cost(&program("step n |> count (acc + 1)")), plain);
+
+    let chained = |call: &str| {
+        format!(
+            "fun step (n : Int) = n - 1
+             fun add (a : Int) (b : Int) = a + b
+             fun total (acc : Int) (n : Int) =
+               if n == 0 then acc else total ({call}) (n - 1)
+             def result = total 0 100000"
+        )
+    };
+    let plain = cost(&chained("add 2 (add 1 (step acc))"));
+    assert_eq!(cost(&chained("step acc |> add 1 |> add 2")), plain);
+    assert_eq!(cost(&chained("acc |> step |> add 1 |> add 2")), plain);
+}
+
+#[test]
 fn a_known_call_does_not_build_a_closure() {
     // A saturated call to a top-level function is a jump. Under-applying it is
     // what a closure is *for*, and that path still allocates — the point is that

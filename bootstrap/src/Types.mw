@@ -566,9 +566,11 @@ fun rewriteRow (ar : Arena s) (row : Type) (label : String) (want : Type)
         let field = fresh ar in
         -- The rest is the same kind of row: an effect's tail stays an
         -- effect's, or it prints, and quantifies, as a record's.
-        let newRest = (match slotKind ar id with
-          | Effect -> freshEffect ar
-          | _ -> freshRow ar) in
+        let newRest =
+          (match slotKind ar id with
+           | Effect -> freshEffect ar
+           | _ -> freshRow ar)
+        in
         let v = stSetRef ar.level saved in
         (match requireLacks ar newRest ls with
          | Err x -> Err x
@@ -1023,11 +1025,11 @@ use Std.Test (assertEq)
     assertEq
       (showScheme
          (Scheme {
-           quant = [Plain, Plain, Plain, Plain, Plain, Effect],
-           preds = [],
-           ty = funcEff bounds (Tuple bounds) (RowExtend "Console" (Tuple []) (Bound 5)),
-           lacks = []
-         }))
+            quant = [Plain, Plain, Plain, Plain, Plain, Effect],
+            preds = [],
+            ty = funcEff bounds (Tuple bounds) (RowExtend "Console" (Tuple []) (Bound 5)),
+            lacks = []
+          }))
       "forall a b c d g e. a -> b -> c -> d -> g -> (a, b, c, d, g) ! { Console | e }"
       "the fifth type variable is not the row's `e`"
   in
@@ -1035,21 +1037,20 @@ use Std.Test (assertEq)
     assertEq
       (showScheme
          (Scheme {
-           quant = [Plain, Plain, Plain, Plain, Plain],
-           preds = [],
-           ty = Tuple bounds,
-           lacks = []
-         }))
+            quant = [Plain, Plain, Plain, Plain, Plain],
+            preds = [],
+            ty = Tuple bounds,
+            lacks = []
+          }))
       "forall a b c d g. (a, b, c, d, g)"
       "and it is the same with no row there"
   in
   let c =
     assertEq (showType (Tuple (V.map Var (V.range 0 6)))) "(a, b, c, d, g, h)" "free ones too"
-  in
-  assertEq
-    (S.join " " (V.map varName [3, 4, 7, 8, 10, 11, 21, 22, 23, 26, 44]))
-    "d g j k m o z aa ab ag ba"
-    "and past the letters, two of them"
+  in assertEq
+       (S.join " " (V.map varName [3, 4, 7, 8, 10, 11, 21, 22, 23, 26, 44]))
+       "d g j k m o z aa ab ag ba"
+       "and past the letters, two of them"
 
 @test fun aLoneEffectVariableIsLeftOut () =
   let s =

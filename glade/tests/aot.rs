@@ -241,7 +241,7 @@ fn everything_is_evaluated_in_the_order_it_is_written() {
     assert_eq!(
         agrees("order", include_str!("evaluation_order.mw")),
         "(123, 123, 123, 12, 12, 123, 123, 12, 12, 123, 12, 12, 12, \
-         1234, 12, 1234, 123, 12, 12, 12, 122, 1234567, 12)"
+         1234, 12, 1234, 123, 12, 12, 12, 123, 12345, 12, 12, 12, 12, 122, 1234567, 12)"
     );
 }
 

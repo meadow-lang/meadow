@@ -454,9 +454,21 @@ fn nested_handlers_and_performing_outwards() {
 fn everything_is_evaluated_in_the_order_it_is_written() {
     let src = include_str!("../../../glade/tests/evaluation_order.mw");
     let want = "(123, 123, 123, 12, 12, 123, 123, 12, 12, 123, 12, 12, 12, \
-                1234, 12, 1234, 123, 12, 12, 12, 122, 1234567, 12)";
+                1234, 12, 1234, 123, 12, 12, 12, 123, 12345, 12, 12, 12, 12, 122, 1234567, 12)";
     assert_eq!(run("evaluation_order", src), want);
     assert_eq!(run_o1("evaluation_order_o1", src), want);
+}
+
+/// A pipe that binds its value first is a call in tail position all the same:
+/// a loop through one runs in constant stack, however many times round.
+#[test]
+fn a_pipe_in_tail_position_is_a_tail_call() {
+    let src = "fun step (n : Int) = n - 1
+               fun count (acc : Int) (n : Int) =
+                 if n == 0 then acc else step n |> count (acc + 1)
+               def result = count 0 2000000";
+    assert_eq!(run("pipe_tail", src), "2000000");
+    assert_eq!(run_o1("pipe_tail_o1", src), "2000000");
 }
 
 // --- threads -----------------------------------------------------------------
