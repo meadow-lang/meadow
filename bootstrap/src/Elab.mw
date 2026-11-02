@@ -36,6 +36,7 @@ use MeadowBoot.Prims (primOps)
 use Std.Collections.Vector as V
 use Std.Collections.HashMap as H
 use Std.Collections.HashMap (HashMap)
+use Std.Num.Float as F
 use Std.String as S
 use Std.Maybe as M
 use Std.Maybe.Maybe.*
@@ -299,18 +300,15 @@ fun literal out (m : Meta) (lit : (String, String)) (t : Type) =
   else if fst lit == "char" then newCoreLitLChar out m (M.unwrapOr 0 (S.toInt text))
   else newCoreLitLStr out m text
 
--- The `Float` a literal's text writes: its digits as a whole number, over
--- the power of ten its point says -- one division, which rounds once, so
--- what comes of it is the nearest `Float` while the digits are few enough
--- to be one exactly.
+-- The `Float` a literal's text writes, the nearest to the last bit however
+-- many digits it has: its digits, and the power of ten its point says. A minus
+-- is a multiplication, since `-0.0` is a float of its own.
 fun fraction (text : String) : Float =
-  let parts = S.split "." text in
-  if V.len parts == 2 then
-    (let part = V.getOr "" parts 1 in
-     toFloat (M.unwrapOr 0 (S.toInt (V.getOr "" parts 0 ++ part))) / tenTo (stringByteLength part))
-  else toFloat (M.unwrapOr 0 (S.toInt text))
-
-fun tenTo (k : Int) : Float = if k <= 0 then 1.0 else 10.0 * tenTo (k - 1)
+  if S.startsWith "-" text then fraction (S.drop text 1) * (0.0 - 1.0)
+  else
+    (let parts = S.split "." text in
+     let part = V.getOr "" parts 1 in
+     F.fromDecimal (V.getOr "" parts 0 ++ part) (0 - stringByteLength part))
 
 -- The width a sized integer type's name says, as core writes it.
 fun widthOf (name : String) : Maybe String =

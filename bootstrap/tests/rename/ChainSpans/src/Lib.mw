@@ -1,0 +1,16 @@
+-- `and` and `or` come to constructors spanning what they join, so a rename
+-- shows that span: a chain among them is joined as it is written, and the
+-- parentheses at its ends are part of that, where those round a lone operand
+-- are not.
+
+fun chainLast (a : Int) (b : Int) (c : Bool) : Bool = c or a <= (b + 1)
+
+fun chainFirst (a : Int) (b : Int) (c : Bool) : Bool = (a + 1) <= b and c
+
+fun chainBoth (a : Int) (b : Int) (c : Bool) : Bool = c or (a + 1) <= (b + 1)
+
+fun inParens (a : Int) (b : Int) (c : Bool) : Bool = c or (a <= (b + 1))
+
+fun nested (a : Int) (b : Int) (c : Bool) : Bool = c or (c and a <= (if c then a else b))
+
+fun loneOperand (c : Bool) (d : Bool) : Bool = (c) or (d)
