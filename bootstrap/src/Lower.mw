@@ -1730,7 +1730,7 @@ pass! {
         (let plain = { cx | over = None } in
          let m =
            (match node with
-            | GroupedInfix l _ r -> join (opsSpan cx.c l) (opsSpan cx.c r)
+            | GroupedInfix l _ r -> join (chainSpan cx.c l) (chainSpan cx.c r)
             | _ -> spanOf node)
          in
          let name = S.trim (R.text op) in
@@ -2174,10 +2174,18 @@ fun andSpan (c : Lc) (s : GTree) : Meta =
     (opsSpan c (M.unwrapOr s (firstNode s)))
     (childrenOf NodeAndTail s)
 
--- A chain's span is its operands'.
+-- What is joined to what is around a chain: where it is written, the
+-- parentheses round an operand at either end included, as `meadow-parser`
+-- keeps it. A lone operand is not a chain, and has its own span.
 fun opsSpan (c : Lc) (s : GTree) : Meta =
   match s with
-  | GroupedInfix l _ r -> join (opsSpan c l) (opsSpan c r)
+  | GroupedInfix _ _ _ -> spanOf s
+  | _ -> chainSpan c s
+
+-- What a chain's operators apply to spans its operands, and no parentheses.
+fun chainSpan (c : Lc) (s : GTree) : Meta =
+  match s with
+  | GroupedInfix l _ r -> join (chainSpan c l) (chainSpan c r)
   | GroupedLeaf operand -> operandSpan c operand
   | _ -> spanOf s
 
