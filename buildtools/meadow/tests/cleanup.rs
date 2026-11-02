@@ -118,13 +118,19 @@ use Std.Net as Net
 use Std.Time (sleep)
 use Std.Result.Result.*
 
--- Whether connecting to `port` is refused within `n` tries.
+-- Whether connecting to `port` is refused within `n` tries. A try nobody
+-- accepts stays in the listener's backlog, and a full backlog refuses too, so
+-- `n` must stay well under its size for a refusal to mean the listener closed.
 fun refusedSoon port (n : Int) =
   if n == 0 then False
   else
     match Net.connect "127.0.0.1" port with
     | Err _ -> True
-    | Ok s -> let _ = Net.close s in let _ = sleep 10 in refusedSoon port (n - 1)
+    | Ok s -> let _ = Net.close s in let _ = sleep 100 in refusedSoon port (n - 1)
+
+-- A local port may be a moment coming free, and `accept` would wait forever
+-- for a connection that gave up.
+fun connecting q = match Net.connect "127.0.0.1" q with | Err _ -> connecting q | Ok c -> c
 
 fun readSome s = match Net.readText s 64 with | Ok t -> t | Err why -> why
 
@@ -142,13 +148,13 @@ fun main () =
   in
   let p = Thread.receive ports in
   let _ = Thread.cancel holder in
-  let _ = println (if refusedSoon p 500 then "listener closed" else "listener open") in
+  let _ = println (if refusedSoon p 50 then "listener closed" else "listener open") in
   match Net.listen "127.0.0.1" 0 with
   | Err why -> println why
   | Ok l ->
       let q = portOf l in
       -- So does a stream: this end reads to the end of it.
-      let client = Thread.spawn (\() -> let c = Net.connect "127.0.0.1" q in Thread.receive never) in
+      let client = Thread.spawn (\() -> let c = connecting q in Thread.receive never) in
       (match Net.accept l with
        | Err why -> println why
        | Ok (s, peer) ->
@@ -159,11 +165,9 @@ fun main () =
            let go = Thread.newChannel () in
            let opener =
              Thread.spawn (\() ->
-               match Net.connect "127.0.0.1" q with
-               | Err why -> ()
-               | Ok c ->
-                   let _ = Thread.spawn (\() -> let _ = Thread.receive go in Net.writeText c "hi") in
-                   ())
+               let c = connecting q in
+               let _ = Thread.spawn (\() -> let _ = Thread.receive go in Net.writeText c "hi") in
+               ())
            in
            let _ = Thread.await opener in
            (match Net.accept l with

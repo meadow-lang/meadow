@@ -191,6 +191,10 @@ last release is under _Unreleased_.
   it waited forever. The call was counted twice, once in a frame the cancelled
   thread never returned to, so it never seemed to end, and what it opened was
   not closed.
+- On every Glade backend, a listener stayed open after the thread that opened
+  it ended, for as long as the program ran: `Net.listen` was the one socket
+  call that did not say whose the socket was. A `connect` to it went on
+  succeeding, and nothing ever accepted it.
 - `meadow cut` and `meadow run` said nothing when the program they ran
   crashed: a signal left them as a plain failure with status 1, and an
   exception on Windows as its own status with no word of what it was. They now

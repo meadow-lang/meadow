@@ -327,7 +327,8 @@ impl Vm<'_> {
                 let t = self.tuple_arg(&what, arg, 2)?;
                 let host = self.str_arg(&what, t[0])?;
                 let port = int(self, t[1])?;
-                return Ok(Some(answered(net::listen(&host, port).map(Build::int))));
+                let opened = meadow_rt::net::owning(self.owner, || net::listen(&host, port));
+                return Ok(Some(answered(opened.map(Build::int))));
             }
             "tcpClose" => {
                 net::close(int(self, arg)?);
