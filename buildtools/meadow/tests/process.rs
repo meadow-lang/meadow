@@ -55,6 +55,47 @@ fn current_pid_is_positive() {
     insta::assert_snapshot!(eval_main_std("def result = currentPid () > 0\n"), @"True");
 }
 
+/// The directory a program runs in, on every backend: each answers it from
+/// code of its own, and Silo's and Glade's executables run apart from `meadow`.
+#[test]
+fn every_backend_says_where_the_program_runs() {
+    let dir = std::env::temp_dir().join(format!("meadow-current-dir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("Meadow.toml"), "[package]\nname = \"Here\"\n").unwrap();
+    std::fs::write(
+        dir.join("src/Main.mw"),
+        "use Std.Process (currentDir)\n\nfun main () = println (currentDir ())\n",
+    )
+    .unwrap();
+    let here = std::fs::canonicalize(&dir).unwrap();
+    for engine in [
+        &["--backend", "vm"][..],
+        &["--backend", "jit"],
+        &["--backend", "aot"],
+        &["--cek"],
+        &["--runtime", "silo"],
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_meadow"))
+            .current_dir(&dir)
+            .arg("run")
+            .args(engine)
+            .arg(".")
+            .output()
+            .expect("the meadow binary runs");
+        assert!(
+            out.status.success(),
+            "{engine:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let said = String::from_utf8_lossy(&out.stdout);
+        let said = std::path::Path::new(said.trim());
+        assert!(said.is_absolute(), "{engine:?} said {said:?}");
+        assert_eq!(std::fs::canonicalize(said).unwrap(), here, "{engine:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn env_roundtrip() {
     insta::assert_snapshot!(eval_main_std(

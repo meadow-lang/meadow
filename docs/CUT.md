@@ -324,6 +324,7 @@ a `str` error.
 | `Process.exit`                                     | `i64`                        | does not return                                             |
 | `Process.currentPid`                               | `unit`                       | `i64`                                                       |
 | `Process.currentExe`                               | `unit`                       | `str`                                                       |
+| `Process.currentDir`                               | `unit`                       | `str`                                                       |
 | `Process.isTerminal`                               | `i64`, a stream              | `bool`                                                      |
 | `Process.argv`                                     | `unit`                       | a sequence of `str`: see below                              |
 | `Process.getEnv`                                   | `str`                        | optional `str`                                              |

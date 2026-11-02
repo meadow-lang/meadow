@@ -1280,6 +1280,7 @@ impl<'p> Machine<'p> {
                 })
             }
             "Process.currentPid" => Value::Int(i64::from(std::process::id())),
+            "Process.currentDir" => Value::Str(Rc::from(meadow_rt::args::current_dir())),
             "Process.getEnv" => {
                 let name = text(&one(&vals)?)?;
                 match std::env::var(&*name) {

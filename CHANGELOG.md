@@ -39,6 +39,9 @@ last release is under _Unreleased_.
 
 ### Added
 
+- `Std.Process.currentDir ()` is the directory a process runs in, as an absolute
+  path, for a tool that must walk up from where it was started. It is empty when
+  the platform cannot say.
 - Threads can be cancelled: `Std.Thread.cancel t` asks `t` to stop, and
   `await t` then fails with "cancelled". A cancelled thread stops softly at
   its next operation the runtime answers -- a thread operation, the wait of a

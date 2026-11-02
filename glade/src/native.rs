@@ -596,6 +596,7 @@ impl Vm<'_> {
             },
             "currentPid" => Build::int(std::process::id() as i64),
             "currentExe" => Build::Str(meadow_rt::args::current_exe()),
+            "currentDir" => Build::Str(meadow_rt::args::current_dir()),
             "isTerminal" => match arg {
                 Value::Int(fd) => Build::At(Value::Bool(is_terminal(fd))),
                 other => {

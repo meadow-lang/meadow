@@ -565,6 +565,7 @@ fn process(op: &str, arg: Val) -> Option<Build> {
         },
         "currentPid" => Build::int(std::process::id() as i64),
         "currentExe" => Build::Str(meadow_rt::args::current_exe()),
+        "currentDir" => Build::Str(meadow_rt::args::current_dir()),
         "isTerminal" => match arg {
             Val::Int(fd) => Build::bool(is_terminal(fd)),
             other => fail(format!(
