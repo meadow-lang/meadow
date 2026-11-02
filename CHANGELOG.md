@@ -235,6 +235,15 @@ beyond the last release is under _Unreleased_.
   drive -- now remove each test's directory when it ends, passed or failed,
   and keep it in the build's `target/tmp`; `MEADOW_KEEP_TEST_DIRS=1` keeps
   them to look at.
+- `it` in the REPL is the entry before, so `1 + 2` then `it * 10` is `30`. An
+  entry is compiled as `def it = ...`, a top-level name is in scope in its own
+  body, and so `it` was the entry itself: it recursed until the runtime aborted
+  with "the old generation has used up its address space", taking the session
+  with it, or, as `it` alone, spun for ever. That was every top-level value
+  that mentioned itself, in a file as well. Outside of a function a `def` no
+  longer sees its own name: the name means what it meant before, an import or
+  an earlier entry, as in a `let`, and is undefined if that is nothing. Inside
+  a function it is the definition still, so `def f = \n -> f (n - 1)` recurses.
 - A type with five or more type variables printed `e`, `f`, `n` and `r` for
   plain variables too, the letters of an effect row, a fraction, a number and
   a record row, so a scheme could name two different variables `e`. Plain

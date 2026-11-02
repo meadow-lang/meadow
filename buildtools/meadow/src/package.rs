@@ -285,6 +285,7 @@ impl ProfileConfig {
             // profile is asking to keep it.
             debug_info: base.debug_info || self.profile.unwrap_or(false),
             entry_name: base.entry_name,
+            entry_is_expression: base.entry_is_expression,
             cfg: match self.cfg {
                 Some(flags) => base.cfg.with_flags(&flags),
                 None => base.cfg,
