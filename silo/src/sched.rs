@@ -1208,12 +1208,12 @@ pub fn sleep(ms: u64) {
 /// `work`'s answer: made by an I/O thread while this thread waits, where it
 /// is one of the scheduler's, or here and now.
 pub fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    // What it opens is this thread's, wherever it is made.
+    let owner = owner();
+    let work = move || meadow_rt::net::owning(owner, work);
     if !STARTED.load(Ordering::SeqCst) || !ctx::present() || segments::innermost().is_none() {
         return work();
     }
-    // Made on an I/O thread, for this thread: what it opens is this one's.
-    let owner = owner();
-    let work = move || meadow_rt::net::owning(owner, work);
     let slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
     let into = slot.clone();
     let woken = park(Request::Block(Box::new(move || {

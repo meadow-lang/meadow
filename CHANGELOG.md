@@ -172,6 +172,11 @@ beyond the last release is under _Unreleased_.
   wrong number, wrapping them through an `Int`, so that `Std.Num.Float.sin` and
   `cos` differed from the compiler's. It now gives the nearest float to every
   literal.
+- A Silo thread cancelled as its `Net.connect` or `Net.accept` came back could
+  leave the socket open for as long as the program ran, so the other end of
+  it waited forever. The call was counted twice, once in a frame the cancelled
+  thread never returned to, so it never seemed to end, and what it opened was
+  not closed.
 - `meadow cut` and `meadow run` said nothing when the program they ran
   crashed: a signal left them as a plain failure with status 1, and an
   exception on Windows as its own status with no word of what it was. They now
