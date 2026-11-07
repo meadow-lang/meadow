@@ -733,3 +733,68 @@ def idyll:Main/main (; k: ptr) =
     ));
     assert_eq!(nested.output, "yes");
 }
+
+#[test]
+fn a_clause_that_only_resumes_last_is_entered_where_its_operation_is_performed() {
+    // Entered there, a clause still performs to the handlers outside its own,
+    // and still goes the way its branches go; one that may not resume is
+    // given a resumption as before. Which it was is the evidence's entry; the
+    // `base` clauses name their resumption again, which keeps them off it.
+    let program = |clause: &str| {
+        format!(
+            "cut 0
+entry idyll:Main/main
+answer str
+
+effect idyll:Main/Ask {{ ask(i64) -> i64 }}
+effect idyll:Main/Base {{ base(unit) -> i64 }}
+
+def idyll:Main/main (; k: ptr) =
+  handle {{
+    idyll:Main/Base.base(u: unit; r: ptr, h: ptr) => let s: ptr = r in <s | resume(100; h)>;
+    return(x: i64; h: ptr) => <x | h>
+  }} in μ outer.
+    handle {{
+      idyll:Main/Ask.ask(n: i64; r: ptr, h: ptr) => {clause};
+      idyll:Main/Base.base(u: unit; r: ptr, h: ptr) => let s: ptr = r in <s | resume(1; h)>;
+      return(x: i64; h: ptr) => <x | h>
+    }} in μ b.
+      perform idyll:Main/Ask.ask(2; μ̃ a: i64.
+        perform idyll:Main/Ask.ask(3; μ̃ c: i64. prim add(a, c; b)))
+    ; outer
+  ; μ̃ n: i64. prim eq(n, 210; μ̃ u: unit. <\"no\" | k>, μ̃ u: unit. <\"yes\" | k>)
+"
+        )
+    };
+    let tail = meadow_rt::roles::evidence::TAIL;
+    for (clause, entered_here) in [
+        // `ask(2)` is 2 times what `base` answers, and `ask(3)` 10: 210 when
+        // `base` is the outer handler's 100, and 12 were it the inner's 1.
+        (
+            "perform idyll:Main/Base.base(unit; μ̃ m: i64. prim mod(n, 2; μ̃ odd: i64. \
+             prim eq(odd, 0; μ̃ x: unit. <r | resume(10; h)>, \
+             μ̃ x: unit. prim mul(n, m; μ̃ v: i64. <r | resume(v; h)>))))",
+            true,
+        ),
+        // 200 and 10, by a branch.
+        (
+            "prim eq(n, 2; μ̃ x: unit. <r | resume(10; h)>, μ̃ x: unit. <r | resume(200; h)>)",
+            true,
+        ),
+        // Resumed for `ask(2)`, and for `ask(3)` not: 210 is then the inner
+        // handler's value, and so the outer's.
+        (
+            "prim eq(n, 2; μ̃ x: unit. <210 | h>, μ̃ x: unit. <r | resume(n; h)>)",
+            false,
+        ),
+    ] {
+        let text = program(clause);
+        assert_eq!(runs(&text).output, "yes", "{clause}");
+        let lowered = meadow_cut::lower::lower(&parse(&text).unwrap()).unwrap();
+        assert_eq!(
+            lowered.tags.keys().any(|c| &**c == tail),
+            entered_here,
+            "{clause}"
+        );
+    }
+}
