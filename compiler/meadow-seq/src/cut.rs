@@ -343,6 +343,9 @@ impl Lower<'_> {
                         name: "apply".to_string(),
                         params: vec![binder(&x, rep_of(ty))],
                         conts: vec![ret],
+                        // Meadow's resumptions are all one-shot, so no
+                        // grade depends on a row: none is said.
+                        row: None,
                         body: inner,
                     }]),
                     k,
@@ -621,11 +624,13 @@ impl Lower<'_> {
                 effect_vars: Vec::new(),
                 params,
                 conts: vec!["k".to_string()],
+                row: None,
                 body: give(
                     Producer::Cocase(vec![Method {
                         name: "apply".to_string(),
                         params: vec![binder(&x, rep_of(pty))],
                         conts: vec![ret],
+                        row: None,
                         body: inside,
                     }]),
                     Consumer::Var("k".to_string()),
