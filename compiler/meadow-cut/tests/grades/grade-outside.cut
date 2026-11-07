@@ -1,0 +1,49 @@
+cut 0
+entry t:Main/main
+answer str
+
+effect t:Main/Choose { @many choose(unit) -> bool }
+effect t:Main/Ask { ask(i64) -> i64 }
+
+def t:Main/asks (n: i64; k: ptr) ! {t:Main/Ask} =
+  prim eq(n, 0;
+    μ̃ u: unit. prim sub(n, 1; μ̃ m: i64. t:Main/asks(m; μ̃ s: i64.
+      perform t:Main/Ask.ask(n; μ̃ a: i64. prim add(s, a; k)))),
+    μ̃ u: unit. <0 | k>)
+
+def t:Main/pick (n: i64; k: ptr) ! {t:Main/Ask, t:Main/Choose} =
+  prim eq(n, 0;
+    μ̃ u: unit.
+      perform t:Main/Choose.choose(unit; μ̃ c: bool.
+        t:Main/asks(n; μ̃ a: i64. prim sub(n, 1; μ̃ m: i64. t:Main/pick(m; μ̃ s: i64.
+          prim if(c; μ̃ u2: unit. prim add(s, a; k), μ̃ u3: unit. prim sub(s, a; k)))))),
+    μ̃ u: unit. <1 | k>)
+
+def t:Main/show (n: i64; k: ptr) ! {} =
+  prim lt(n, 0;
+    μ̃ u: unit. t:Main/nat(n; k),
+    μ̃ u: unit. prim sub(0, n; μ̃ m: i64. t:Main/nat(m; μ̃ s: str. prim concatStrings(["-", s]; k))))
+
+def t:Main/nat (n: i64; k: ptr) ! {} =
+  prim lt(n, 10;
+    μ̃ u: unit. prim div(n, 10; μ̃ q: i64. t:Main/nat(q; μ̃ hi: str. prim mod(n, 10; μ̃ r: i64.
+      t:Main/digit(r; μ̃ d: str. prim concatStrings([hi, d]; k))))),
+    μ̃ u: unit. t:Main/digit(n; k))
+
+def t:Main/digit (d: i64; k: ptr) ! {} =
+  prim add(d, 1; μ̃ e: i64. prim stringSlice("0123456789", d, e; k))
+
+def t:Main/main (; k: ptr) ! {} =
+  handle {
+    t:Main/Ask.ask(n: i64; r: ptr, h: ptr) =>
+      let s: ptr = r in prim mul(n, 3; μ̃ v: i64. <s | resume(v; h)>);
+    return(x: i64; h: ptr) => <x | h>
+  } in μ b.
+    handle {
+      t:Main/Choose.choose(u: unit; r: ptr, h: ptr) =>
+        <r | apply(true; μ̃ a: i64. <r | apply(false; μ̃ b2: i64. prim add(a, b2; h))>)>;
+      return(x: i64; h: ptr) => <x | h>
+    } in μ b3.
+      t:Main/pick(7; b3)
+    ; b
+  ; μ̃ n: i64. t:Main/show(n; k)

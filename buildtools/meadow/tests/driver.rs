@@ -835,6 +835,32 @@ fn a_program_of_cut_runs_on_glade_and_as_an_executable_of_silos() {
     assert!(err.contains("`μ`"), "{err}");
 }
 
+/// Programs of an operation resumed twice, on Silo, where the code no such
+/// operation can reach keeps its continuations as frames (`meadow_cut::grade`):
+/// a helper of frames called between `choose` and its handler, a handler of
+/// another effect inside `choose`'s, and one outside it, whose operation is
+/// performed by code of frames under `choose`'s handler and cut off the stack
+/// from there. Each answers as the interpreter does (`meadow-cut`'s tests).
+#[test]
+fn an_effect_resumed_twice_runs_beside_code_of_frames_on_silo() {
+    let dir = scratch("grades");
+    let grades = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../compiler/meadow-cut/tests/grades"
+    );
+    for (name, answer) in [
+        ("grade-helper", "57344"),
+        ("grade-inside", "57418"),
+        ("grade-outside", "128"),
+    ] {
+        let file = format!("{name}.cut");
+        std::fs::copy(format!("{grades}/{file}"), dir.join(&file)).unwrap();
+        let (ok, out, err) = meadow(&dir, &["cut", "--runtime", "silo", &file]);
+        assert!(ok, "{name}: {err}");
+        assert_eq!(out, answer, "{name}");
+    }
+}
+
 /// A handler in a loop, whose clause resumes as its last act, on Silo, for
 /// longer than a stack that grew with each operation would last. Two ways it
 /// grew: Cut's `perform` held its continuation in the search's objects, so it
