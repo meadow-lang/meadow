@@ -72,6 +72,10 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct Level {
     pub base: usize,
     pub stopped: usize,
+    /// Where a handler is running a clause on this stack, if one is: kept
+    /// with the stack so that it goes where the stack does. Nothing a trace
+    /// reads: see `crate::segments::Tail`.
+    pub(crate) tail: Option<crate::segments::Tail>,
 }
 
 /// Run `f` with where this stack stops: the lowest address of this frame,

@@ -110,6 +110,9 @@ pub struct Ctx {
     /// Segments suspended for a handler further out than their own, while
     /// that suspension lasts, innermost first: see `crate::segments::drive`.
     pub(crate) parked: Vec<Parked>,
+    /// A continuation a clause's last act resumed, on its way back to the
+    /// `drive` frame that ran the clause: see `crate::segments::Tail`.
+    pub(crate) bounce: Option<(Suspended, Word)>,
     pub next_handler: u32,
     /// String literals, made once per thread, by their bytes' address.
     pub literals: ByAddress<Word>,
@@ -167,6 +170,7 @@ impl Ctx {
             stopped: None,
             suspended: Vec::new(),
             parked: Vec::new(),
+            bounce: None,
             next_handler: 1,
             literals: ByAddress::default(),
             globals: Vec::new(),

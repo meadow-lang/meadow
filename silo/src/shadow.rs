@@ -17,7 +17,10 @@
 //! ```
 //!
 //! a stack allocation of the caller's, and the chain's head is a word only the
-//! running code touches. A descriptor is the one the value would be erased
+//! running code touches. A call whose frame holds nothing links one too, of no
+//! values: that the chain is as a clause began is how [`crate::segments`]
+//! knows nothing is waiting between the clause and a resumption it makes
+//! (`segments::Tail`). A descriptor is the one the value would be erased
 //! with, or [`TOKEN`] for a reuse token -- a block whose fields are already
 //! gone, which is freed rather than erased. Only a program that can capture a
 //! continuation builds records at all: see `meadow_llvm::emit`.

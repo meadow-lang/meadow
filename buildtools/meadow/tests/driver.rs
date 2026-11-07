@@ -835,6 +835,58 @@ fn a_program_of_cut_runs_on_glade_and_as_an_executable_of_silos() {
     assert!(err.contains("`μ`"), "{err}");
 }
 
+/// A handler in a loop, whose clause resumes as its last act, on Silo, for
+/// longer than a stack that grew with each operation would last. Two ways it
+/// grew: Cut's `perform` held its continuation in the search's objects, so it
+/// was built on the heap and what came after the `perform` ran inside the
+/// resumption, a frame deeper on the body's segment each time; and the clause
+/// resumed from inside the handler's `drive` frame, a `drive` frame deeper on
+/// the handler's. A million operations overflowed the first; ten million, the
+/// second.
+#[test]
+fn a_handler_in_a_loop_runs_as_long_as_the_loop_on_silo() {
+    let dir = scratch("handler-loop");
+    std::fs::write(
+        dir.join("asks.cut"),
+        "cut 0\nentry t:Main/main\nanswer str\n\n\
+         effect t:Main/Ask { ask(unit) -> i64 }\n\n\
+         def t:Main/loop (n: i64, acc: i64; k: ptr) =\n  prim eq(n, 0; μ̃ done: bool.\n    \
+         prim if(done; μ̃ u: unit.\n      prim sub(n, 1; μ̃ m: i64.\n        \
+         perform t:Main/Ask.ask(unit; μ̃ v: i64.\n          prim add(acc, v; μ̃ acc2: i64.\n            \
+         t:Main/loop(m, acc2; k)))), μ̃ u2: unit.\n      <acc | k>))\n\n\
+         def t:Main/main (; k: ptr) =\n  handle {\n    \
+         t:Main/Ask.ask(u: unit; r: ptr, h: ptr) => <r | resume(1; h)>;\n    \
+         return(x: i64; h: ptr) => <x | h>\n  } in μ b.\n    t:Main/loop(5000000, 0; b)\n  ; \
+         μ̃ n: i64. prim eq(n, 5000000; μ̃ u: unit. <\"short\" | k>, μ̃ u: unit. <\"asked\" | k>)\n",
+    )
+    .unwrap();
+    let (ok, out, err) = meadow(&dir, &["cut", "--runtime", "silo", "asks.cut"]);
+    assert!(ok, "{err}");
+    assert_eq!(out, "asked");
+    // Meadow's own lowering resumes from the clause as Cut's does, where a
+    // clause is more than `k e`.
+    let root = package(
+        &dir,
+        "asks",
+        "use Std.Console (println)\nuse Std.Process (currentPid)\n\n\
+         effect Ask {\n  ask : () -> Int,\n}\n\n\
+         fun sumAsks n acc = if n == 0 then acc else sumAsks (n - 1) (acc + ask ())\n\n\
+         fun main () =\n  let odd = currentPid () < 0 in\n  \
+         println (handle sumAsks 5000000 0 with { ask u k -> if odd then k 2 else k 1, })\n",
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
+        .current_dir(&root)
+        .args(["run", "--runtime", "silo", "."])
+        .output()
+        .expect("the meadow binary runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(answer(&String::from_utf8_lossy(&out.stdout)), "5000000");
+}
+
 /// What the REPL prints, given `input` a line at a time.
 fn repl(input: &str) -> String {
     use std::io::Write;

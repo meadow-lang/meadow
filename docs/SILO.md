@@ -580,6 +580,22 @@ the segment is over, and the runtime carries on with the continuation it took,
 on the stack the `handle` began on. Before this, a program that handled in a
 loop slowed down as it went, with an unfinished segment for every turn.
 
+**A clause that resumes last is resumed by its handler.** The handler runs a
+clause from its `drive` frame, on its own stack, and a resumption called there
+would drive the continuation from a new frame above the clause's -- one more
+for each operation of a handler in a loop, each only handing back what the one
+above answers, until the stack ran out: at ten million operations, in Meadow,
+of a clause that does more than `k e` -- one that does only that is called at
+the `perform`, and resumes nothing. So the `drive`
+frame says, on the stack's level, where the shadow chain was as the clause
+began; `meadow_reattach`, finding it as it was, for the same handler, hands
+the continuation back to that frame with a word no value is, which every frame
+between returns unchanged, and the frame drives it itself. The chain says
+nothing is still to run between them because every non-tail call of the
+emitted code links a record into it, in a program that can capture a
+continuation, whether its frame holds anything or not, and so does
+`meadow_enter`.
+
 **An abandoned continuation gives up what its frames hold.** A continuation
 never resumed is discarded when its stack object is erased, without unwinding:
 the native frames on its segment have no maps saying which slots hold
