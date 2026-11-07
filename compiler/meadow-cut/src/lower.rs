@@ -1124,11 +1124,17 @@ impl Lower {
             Vec::new(),
             sc.env.clone(),
         ));
-        // What both of the search's answers hold: the arguments, and where
-        // what the operation is resumed with goes.
-        let mut held = xs.clone();
-        held.push(kc);
-        let held = Self::once(&held);
+        // What both of the search's answers hold: the arguments. Where what
+        // the operation is resumed with goes is handed to the search and on
+        // to them, not held: so it is what the search is called with to
+        // answer through, which a frame may be, and the resumption keeps a
+        // continuation of theirs -- as `meadow_seq`'s operations do. Held, it
+        // was built on the heap, and the code after the `perform` ran inside
+        // the resumption, a frame deeper for every operation.
+        let caller = kc;
+        let kc = self.fresh(ax::Rep::Ref);
+        self.out.returns.insert(kc);
+        let held = Self::once(&xs);
 
         // Found: the entry, taken apart; a resumption made; the clause
         // entered with the arguments, the resumption, and what its handler's
@@ -1140,9 +1146,10 @@ impl Lower {
             self.fresh(ax::Rep::Ref),
             self.fresh(ax::Rep::Ref),
         );
+        let mut found_params = held.clone();
+        found_params.extend([entry, kc]);
         let mut in_entry = vec![k2, clause, target, rest];
-        in_entry.extend(held.iter().copied());
-        in_entry.push(entry);
+        in_entry.extend(found_params.iter().copied());
         let resumption = self.fresh(ax::Rep::Ref);
         let (v, after, unused, done) = (
             self.fresh(resumed),
@@ -1317,8 +1324,6 @@ impl Lower {
                 }),
             }
         };
-        let mut found_params = held.clone();
-        found_params.push(entry);
         let entry_tag = self.tag_of(meadow_rt::roles::evidence::ENTRY);
         let found = self.fresh(ax::Rep::Ref);
         self.out.continuations.insert(found);
@@ -1348,7 +1353,7 @@ impl Lower {
         // Not found: the runtime's, if it is one of its operations.
         let nothing = self.fresh(ax::Rep::Bits(desc::UNIT));
         let mut missing_params = held.clone();
-        missing_params.push(nothing);
+        missing_params.extend([nothing, kc]);
         let body = match native {
             Some((effect, name)) => self.native(effect, name, &xs, kc, resumed, &missing_params),
             None => S::Error(Box::leak(format!("unhandled effect {op}").into_boxed_str())),
@@ -1365,7 +1370,7 @@ impl Lower {
         ));
         sc.push(missing);
 
-        let sel = vec![ev, key, found, missing];
+        let sel = vec![ev, key, found, missing, caller];
         Ok(S::Substitute(
             sel.clone(),
             Box::new(Block {
@@ -1376,39 +1381,42 @@ impl Lower {
     }
 
     /// The block that looks an operation up: `(evidence, key, found,
-    /// missing)`, giving `found` the first entry whose key is `key`, or
-    /// `missing` `unit` if the evidence ends first.
+    /// missing, k)`, giving `found` the first entry whose key is `key`, or
+    /// `missing` `unit` if the evidence ends first -- and either `k`, where
+    /// what the operation is resumed with goes.
     fn search_block(&mut self) {
-        let (cur, key, found, missing) = (
+        let (cur, key, found, missing, k) = (
             self.fresh(ax::Rep::Ref),
             self.fresh(ax::Rep::Str),
             self.fresh(ax::Rep::Ref),
             self.fresh(ax::Rep::Ref),
+            self.fresh(ax::Rep::Ref),
         );
+        self.out.returns.insert(k);
         let (k2, clause, target, rest) = (
             self.fresh(ax::Rep::Str),
             self.fresh(ax::Rep::Ref),
             self.fresh(ax::Rep::Ref),
             self.fresh(ax::Rep::Ref),
         );
-        let params = vec![cur, key, found, missing];
-        let in_entry = vec![k2, clause, target, rest, cur, key, found, missing];
+        let params = vec![cur, key, found, missing, k];
+        let in_entry = vec![k2, clause, target, rest, cur, key, found, missing, k];
         let u = self.fresh(ax::Rep::Bits(desc::UNIT));
         let ended = S::Extern {
             op: Extern::Lit(Lit::Unit),
             args: Vec::new(),
             blocks: vec![Block {
-                params: vec![u, cur, key, found, missing],
+                params: vec![u, cur, key, found, missing, k],
                 body: S::Substitute(
-                    vec![missing, u],
+                    vec![missing, u, k],
                     Box::new(Block {
-                        params: vec![missing, u],
+                        params: vec![missing, u, k],
                         body: S::Invoke(missing, 0),
                     }),
                 ),
             }],
         };
-        let next = vec![rest, key, found, missing];
+        let next = vec![rest, key, found, missing, k];
         let body = S::Switch {
             scrutinee: cur,
             arms: vec![(
@@ -1432,9 +1440,9 @@ impl Lower {
                             Block {
                                 params: in_entry,
                                 body: S::Substitute(
-                                    vec![found, cur],
+                                    vec![found, cur, k],
                                     Box::new(Block {
-                                        params: vec![found, cur],
+                                        params: vec![found, cur, k],
                                         body: S::Invoke(found, 0),
                                     }),
                                 ),

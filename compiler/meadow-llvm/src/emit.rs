@@ -1347,7 +1347,7 @@ impl<'p> Module<'p> {
     /// chain, for the call it is about to wait on -- see
     /// `silo/src/shadow.rs`. Answers where the chain's head is and what it
     /// was, for putting back once the call returns; nothing when the program
-    /// cannot abandon a continuation, or `fr` holds nothing to give up.
+    /// cannot abandon a continuation.
     fn shadow_push(
         &mut self,
         fr: &Frame,
@@ -1359,9 +1359,9 @@ impl<'p> Module<'p> {
         }
         let mut held = Vec::new();
         self.shadow_entries(fr, env, &mut held);
-        if held.is_empty() {
-            return None;
-        }
+        // Linked even when it holds nothing: that the chain is as a clause
+        // began is how the runtime knows nothing is waiting between the
+        // clause and a resumption it makes (`silo::segments::Tail`).
         let words = 2 + 2 * held.len();
         let rec = f.t();
         f.alloca(format!("{rec} = alloca [{words} x i64]"));

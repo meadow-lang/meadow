@@ -185,7 +185,10 @@ fn run_main(entry: extern "C" fn() -> Word) -> (Box<Ctx>, Word) {
     // frame, where `entry`'s own frames go once it has returned, and those
     // would be above where a trace stops -- `main`'s continuation with them.
     let v = trace::stopped(|base| {
-        c.os_level = Some(trace::Level { base, stopped: 0 });
+        c.os_level = Some(trace::Level {
+            base,
+            ..Default::default()
+        });
         let v = entry();
         mains_releases(v);
         v

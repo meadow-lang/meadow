@@ -183,6 +183,14 @@ last release is under _Unreleased_.
 
 ### Fixed
 
+- A handler in a loop overflowed Silo's stack: a Cut program after about a
+  million operations, and a Meadow one whose clause does more than `k e` after
+  about ten million. Cut's `perform` kept its continuation in the objects that
+  search for the handler, so it was built on the heap, and what came after the
+  `perform` ran inside the resumption, a frame deeper for every operation. It
+  is handed to the search instead, and stays a frame. And a clause that
+  resumes as its last act left a frame of the runtime's on the handler's stack
+  for every operation: its handler now resumes the continuation itself.
 - `Std.Json` read an integer too long for an `Int` as whatever it wrapped round
   to. It now reads as the nearest `Float`, the one number that is close.
 - MeadowBoot compiled a float literal of more than about 18 digits to the

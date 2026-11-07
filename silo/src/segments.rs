@@ -225,7 +225,10 @@ pub extern "C" fn meadow_enter(target: Word, body: Word) -> Word {
     let base = corosensei::stack::Stack::base(&stack).get();
     let segment = Coroutine::with_stack(stack, move |y: &Yielder<Down, Up>, _: Down| {
         cx().running.push(y as *const _ as *const ());
-        cx().levels.push(crate::trace::Level { base, stopped: 0 });
+        cx().levels.push(crate::trace::Level {
+            base,
+            ..Default::default()
+        });
         let v = run(body, 0);
         cx().levels.pop();
         cx().running.pop();
@@ -319,7 +322,43 @@ fn drive(
                     };
                     let k =
                         heap::build(heap::STACK, id as u32, &[u64::from(handler)], &[desc::INT]);
-                    return run(then, k);
+                    let outer = set_tail(Some(Tail {
+                        shadow: here,
+                        handler,
+                    }));
+                    let v = run(then, k);
+                    set_tail(outer);
+                    // The clause's last act was to resume a continuation of
+                    // this handler's: it is driven here, as the frame
+                    // `meadow_reattach` would have made would drive it. An
+                    // answer of raw bits may be the same word, but then there
+                    // is no continuation waiting.
+                    let Some((
+                        Suspended {
+                            top:
+                                Parked {
+                                    segment: SendSegment(s),
+                                    shadow: sh,
+                                    ..
+                                },
+                            nested: mut inside,
+                            ..
+                        },
+                        code,
+                    )) = (if v == bounced() {
+                        cx().bounce.take()
+                    } else {
+                        None
+                    })
+                    else {
+                        return v;
+                    };
+                    segment = s;
+                    shadow = sh;
+                    mark = cx().parked.len();
+                    cx().parked.append(&mut inside);
+                    down = Down::Resume(code);
+                    continue;
                 }
                 let Some(y) = innermost() else { escaped() };
                 let inside = cx().parked.len() - mark;
@@ -401,7 +440,77 @@ pub extern "C" fn meadow_reattach(k: Word, code: Word) -> Word {
     else {
         crate::fail("continuation resumed more than once")
     };
+    if tail().is_some_and(|t| t.handler == handler && t.shadow == crate::shadow::head()) {
+        cx().bounce = Some((
+            Suspended {
+                top: Parked {
+                    segment: SendSegment(segment),
+                    shadow,
+                    level: Default::default(),
+                },
+                handler,
+                nested,
+            },
+            code,
+        ));
+        return bounced();
+    }
     drive(segment, Down::Resume(code), handler, nested, shadow)
+}
+
+/// Where a handler's `drive` frame is running a clause, on the stack it runs
+/// on: that stack's shadow chain as the clause began, and the handler.
+///
+/// A clause whose last act is to resume -- `op x k -> ... k v` -- is how a
+/// handler in a loop goes on, and resuming from inside the clause would put a
+/// `drive` frame for each operation on the handler's stack, under the
+/// clause's: frames that only hand back what the one above them answers, but
+/// that a stack runs out of all the same. So `meadow_reattach`, called where
+/// nothing between it and that `drive` frame is still to run, answers
+/// [`bounced`] instead, which every frame between hands straight back, and
+/// the `drive` frame resumes the continuation itself.
+///
+/// Nothing is still to run there exactly when the chain is as the clause
+/// began, for the same handler. A non-tail call of the emitted code links a
+/// record into the chain while it waits -- every one, in a program that can
+/// capture a continuation, whether its frame holds anything or not -- and so
+/// does `meadow_enter`, the one frame of the runtime's that does anything
+/// with what Meadow code answers it. The others hand it straight on: see
+/// `crate::shadow`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Tail {
+    shadow: Word,
+    handler: u32,
+}
+
+/// The stack running now: the innermost segment's, or the OS thread's own.
+fn level() -> Option<&'static mut crate::trace::Level> {
+    let c = cx();
+    match c.levels.last_mut() {
+        Some(l) => Some(l),
+        None => c.os_level.as_mut(),
+    }
+}
+
+fn tail() -> Option<Tail> {
+    level().and_then(|l| l.tail)
+}
+
+/// Say where the stack running now has a clause running, answering what it
+/// said before.
+fn set_tail(t: Option<Tail>) -> Option<Tail> {
+    match level() {
+        Some(l) => std::mem::replace(&mut l.tail, t),
+        None => None,
+    }
+}
+
+/// What a resumption answers when the `drive` frame below is to resume its
+/// continuation, which is then in the context: the address of a static,
+/// where nothing a program makes is.
+fn bounced() -> Word {
+    static BOUNCED: u64 = 0;
+    std::ptr::addr_of!(BOUNCED) as Word
 }
 
 /// The stack object numbered `id` was erased: its segments will never be
@@ -444,7 +553,10 @@ pub(crate) fn abandon(p: Parked) {
 /// operations and waits suspend through `y`.
 pub(crate) fn enter_thread(y: &Yielder<Down, Up>, base: usize) {
     cx().running.push(y as *const _ as *const ());
-    cx().levels.push(crate::trace::Level { base, stopped: 0 });
+    cx().levels.push(crate::trace::Level {
+        base,
+        ..Default::default()
+    });
 }
 
 pub(crate) fn leave_thread() {
