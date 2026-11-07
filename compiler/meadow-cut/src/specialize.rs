@@ -89,6 +89,7 @@ pub fn program(p: &Program) -> Program {
             effect_vars: d.effect_vars.clone(),
             params: d.params.iter().map(|b| known.binder(b)).collect(),
             conts: d.conts.clone(),
+            row: d.row.clone(),
             body: cx.statement(&d.body, &known),
         });
     }
@@ -282,6 +283,7 @@ impl Cx<'_> {
                         name: m.name.clone(),
                         params: m.params.iter().map(|b| k.binder(b)).collect(),
                         conts: m.conts.clone(),
+                        row: m.row.clone(),
                         body: self.statement(&m.body, k),
                     })
                     .collect(),

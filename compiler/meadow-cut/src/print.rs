@@ -198,6 +198,22 @@ impl Printer {
         self.out.push(')');
     }
 
+    /// ` ! {E, .. | e, ..}`, where the front end said.
+    fn row(&mut self, row: Option<&Row>) {
+        let Some(row) = row else { return };
+        self.out.push_str(" ! {");
+        let effects: Vec<String> = row.effects.iter().map(|e| e.to_string()).collect();
+        self.out.push_str(&effects.join(", "));
+        if !row.vars.is_empty() {
+            if !effects.is_empty() {
+                self.out.push(' ');
+            }
+            self.out.push_str("| ");
+            self.out.push_str(&row.vars.join(", "));
+        }
+        self.out.push('}');
+    }
+
     fn line(&mut self, indent: usize) {
         self.out.push('\n');
         self.out.push_str(&"  ".repeat(indent));
@@ -293,6 +309,7 @@ impl Printer {
                     self.line(indent + 1);
                     self.out.push_str(&m.name);
                     self.params(&m.params, &m.conts);
+                    self.row(m.row.as_ref());
                     self.out.push_str(" =>");
                     self.nested(&m.body, indent + 2);
                 }
@@ -541,6 +558,7 @@ pub fn listing(p: &Program) -> Listing {
         let mut pr = Printer::default();
         let _ = write!(pr.out, "def {}{generics} ", d.symbol);
         pr.params(&d.params, &d.conts);
+        pr.row(d.row.as_ref());
         pr.out.push_str(" =");
         pr.nested(&d.body, 1);
         declared(&mut out, &mut segments, &d.symbol, pr);

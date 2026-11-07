@@ -44,6 +44,13 @@ last release is under _Unreleased_.
 
 ### Added
 
+- A Cut definition, or a method of an object, may say what it can perform:
+  its row, `! {E, .. | e, ..}`, after its parameters (`docs/CUT.md`,
+  "Rows"). A row may name only effects that are declared, and only the
+  definition's own effect variables. Anything else is refused when the
+  program is read. Rows change nothing yet. They are what will let the back
+  end keep a program's continuations on the stack wherever no operation that
+  may resume twice can reach them.
 - `Std.Process.currentDir ()` is the directory a process runs in, as an absolute
   path, for a tool that must walk up from where it was started. It is empty when
   the platform cannot say.

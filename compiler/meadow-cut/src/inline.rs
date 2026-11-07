@@ -111,7 +111,19 @@ impl Fresh {
 
     /// `d` with every name it binds, its parameters among them, renamed.
     fn def(&mut self, d: &Def) -> Def {
+        self.renamed(d, false)
+    }
+
+    /// `d` renamed, as [`Fresh::def`], to be inlined into another
+    /// definition: one whose effect variables are not `d`'s, so that a row
+    /// in it naming one of `d`'s says nothing there, and is left unsaid.
+    fn copy(&mut self, d: &Def) -> Def {
+        self.renamed(d, !d.effect_vars.is_empty())
+    }
+
+    fn renamed(&mut self, d: &Def, forget: bool) -> Def {
         let mut r = Rename::new(self);
+        r.forget = forget;
         let mut out = d.clone();
         out.params = d.params.iter().map(|b| r.bind(b)).collect();
         out.conts = d.conts.iter().map(|k| r.bind_name(k)).collect();
@@ -132,6 +144,9 @@ struct Rename<'a> {
     fresh: &'a mut Fresh,
     map: HashMap<String, String>,
     undo: Vec<(String, Option<String>)>,
+    /// Whether a method's row that names an effect variable is dropped: see
+    /// [`Fresh::copy`].
+    forget: bool,
 }
 
 impl<'a> Rename<'a> {
@@ -140,6 +155,7 @@ impl<'a> Rename<'a> {
             fresh,
             map: HashMap::new(),
             undo: Vec::new(),
+            forget: false,
         }
     }
 
@@ -254,6 +270,10 @@ impl<'a> Rename<'a> {
                             name: m.name.clone(),
                             params: m.params.iter().map(|b| r.bind(b)).collect(),
                             conts: m.conts.iter().map(|k| r.bind_name(k)).collect(),
+                            row: m
+                                .row
+                                .clone()
+                                .filter(|row| !(r.forget && !row.vars.is_empty())),
                             body: r.statement(&m.body),
                         })
                     })
@@ -729,7 +749,7 @@ impl Simplify {
         if d.params.len() != args.len() || d.conts.len() != conts.len() {
             return Statement::Call(f.clone(), args, conts);
         }
-        let copy = self.fresh.def(d);
+        let copy = self.fresh.copy(d);
         count(&copy.body, false, &mut self.uses);
         self.stack.push(f.clone());
         let out = self.bound(&copy.params, args, &copy.conts, conts, &copy.body);

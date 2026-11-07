@@ -175,12 +175,14 @@ pub enum Producer {
     Array(Vec<Producer>),
 }
 
-/// A method of an object: `apply(x: i64; k: ptr) => s`.
+/// A method of an object: `apply(x: i64; k: ptr) ! {E} => s`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Method {
     pub name: String,
     pub params: Vec<Binder>,
     pub conts: Vec<String>,
+    /// What it may perform, if the front end says: see [`Row`].
+    pub row: Option<Row>,
     pub body: Statement,
 }
 
@@ -295,7 +297,7 @@ pub enum Kind {
     ManyEffect,
 }
 
-/// `def S <'a = d; e: Effect> (params; conts) = body`
+/// `def S <'a = d; e: Effect> (params; conts) ! {E | e} = body`
 #[derive(Clone, Debug, PartialEq)]
 pub struct Def {
     pub symbol: Symbol,
@@ -305,7 +307,19 @@ pub struct Def {
     pub effect_vars: Vec<(String, Kind)>,
     pub params: Vec<Binder>,
     pub conts: Vec<String>,
+    /// What it may perform, if the front end says.
+    pub row: Option<Row>,
     pub body: Statement,
+}
+
+/// `! {E, .. | e, ..}`: what a definition or a method may perform, once
+/// given its parameters, and does not handle itself -- the effects, each
+/// declared by an `effect`, and the effect variables of the definition
+/// it is in, whatever they stand for. `! {}` is nothing.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Row {
+    pub effects: Vec<Symbol>,
+    pub vars: Vec<String>,
 }
 
 /// `val S : rep = s`

@@ -188,6 +188,7 @@ pub fn program(p: &Program) -> Program {
             effect_vars: d.effect_vars.clone(),
             params,
             conts: d.conts.clone(),
+            row: d.row.clone(),
             body: body.expect("walked once already"),
         });
     }

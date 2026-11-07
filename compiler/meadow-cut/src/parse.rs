@@ -674,6 +674,7 @@ impl Parser {
             self.punct(">")?;
         }
         let (params, conts) = self.params()?;
+        let row = self.row()?;
         self.punct("=")?;
         let body = self.statement()?;
         Ok(Def {
@@ -682,8 +683,34 @@ impl Parser {
             effect_vars,
             params,
             conts,
+            row,
             body,
         })
+    }
+
+    /// `! {E, .. | e, ..}`, if it is there.
+    fn row(&mut self) -> R<Option<Row>> {
+        if !self.eat("!") {
+            return Ok(None);
+        }
+        self.punct("{")?;
+        let mut row = Row::default();
+        while matches!(self.peek(), Tok::Sym(_)) {
+            row.effects.push(self.symbol()?);
+            if !self.eat(",") {
+                break;
+            }
+        }
+        if self.eat("|") {
+            loop {
+                row.vars.push(self.ident()?);
+                if !self.eat(",") {
+                    break;
+                }
+            }
+        }
+        self.punct("}")?;
+        Ok(Some(row))
     }
 
     /// `(x: rep, ..; k: ptr, ..)`: values, then continuations. A
@@ -941,12 +968,14 @@ impl Parser {
                     while !self.is_punct("}") {
                         let name = self.ident()?;
                         let (params, conts) = self.params()?;
+                        let row = self.row()?;
                         self.punct("=>")?;
                         let body = self.statement()?;
                         methods.push(Method {
                             name,
                             params,
                             conts,
+                            row,
                             body,
                         });
                         if !self.eat(";") {
@@ -1046,95 +1075,139 @@ impl Parser {
 // --- constructors and vals -----------------------------------------------------------
 
 /// Settle each symbol written as a producer: a declared constructor, or a
-/// val. A symbol applied to arguments must be a constructor.
+/// val. A symbol applied to arguments must be a constructor. And check each
+/// row: its effects declared, its variables the definition's own.
 fn resolve(p: &mut Program) -> Result<(), String> {
-    let ctors: std::collections::HashSet<Symbol> = p
-        .datas
-        .iter()
-        .flat_map(|d| d.ctors.iter().map(|(k, _)| d.symbol.child(k)))
-        .collect();
-    let mut errors = Vec::new();
-    let mut fix = |s: &mut Statement| statement(s, &ctors, &mut errors);
+    let mut r = Resolver {
+        ctors: p
+            .datas
+            .iter()
+            .flat_map(|d| d.ctors.iter().map(|(k, _)| d.symbol.child(k)))
+            .collect(),
+        effects: p.effects.iter().map(|e| e.symbol.clone()).collect(),
+        vars: Vec::new(),
+        at: String::new(),
+        errors: Vec::new(),
+    };
     for v in &mut p.vals {
-        fix(&mut v.body);
+        r.vars.clear();
+        r.at = v.symbol.to_string();
+        r.statement(&mut v.body);
     }
     for d in &mut p.defs {
-        fix(&mut d.body);
+        r.vars = d.effect_vars.iter().map(|(e, _)| e.clone()).collect();
+        r.at = d.symbol.to_string();
+        r.row(d.row.as_ref(), &format!("`{}`", d.symbol));
+        r.statement(&mut d.body);
     }
-    match errors.first() {
+    match r.errors.first() {
         Some(e) => Err(e.clone()),
         None => Ok(()),
     }
 }
 
-fn statement(
-    s: &mut Statement,
-    ctors: &std::collections::HashSet<Symbol>,
-    errors: &mut Vec<String>,
-) {
-    match s {
-        Statement::Cut(p, c) => {
-            producer(p, ctors, errors);
-            consumer(c, ctors, errors);
-        }
-        Statement::Call(_, ps, cs) | Statement::Prim(_, ps, cs) => {
-            ps.iter_mut().for_each(|p| producer(p, ctors, errors));
-            cs.iter_mut().for_each(|c| consumer(c, ctors, errors));
-        }
-        Statement::Let(_, p, body) => {
-            producer(p, ctors, errors);
-            statement(body, ctors, errors);
-        }
-        Statement::Handle(h) => {
-            for c in &mut h.clauses {
-                statement(&mut c.body, ctors, errors);
-            }
-            statement(&mut h.ret.2, ctors, errors);
-            statement(&mut h.body, ctors, errors);
-            consumer(&mut h.cont, ctors, errors);
-        }
-        Statement::Perform(_, ps, c) => {
-            ps.iter_mut().for_each(|p| producer(p, ctors, errors));
-            consumer(c, ctors, errors);
-        }
-        Statement::Error(_) => {}
-    }
+struct Resolver {
+    ctors: std::collections::HashSet<Symbol>,
+    effects: std::collections::HashSet<Symbol>,
+    /// The effect variables of the definition being read: what a row in it
+    /// may name.
+    vars: Vec<String>,
+    /// The symbol of the definition or val being read.
+    at: String,
+    errors: Vec<String>,
 }
 
-fn producer(p: &mut Producer, ctors: &std::collections::HashSet<Symbol>, errors: &mut Vec<String>) {
-    match p {
-        Producer::Con(s, args) => {
-            args.iter_mut().for_each(|a| producer(a, ctors, errors));
-            if !ctors.contains(s) {
-                if args.is_empty() {
-                    *p = Producer::Val(s.clone());
-                } else {
-                    errors.push(format!("`{s}` is applied, but no data declares it"));
+impl Resolver {
+    /// A row names declared effects -- one that names an effect with no
+    /// operations, which no `effect` declares, is a slip of the front end's
+    /// that would grade its code wrongly -- and the variables of the
+    /// definition it is in.
+    fn row(&mut self, row: Option<&Row>, of: &str) {
+        let Some(row) = row else { return };
+        for e in &row.effects {
+            if !self.effects.contains(e) {
+                self.errors.push(format!(
+                    "the row of {of} names `{e}`, which no `effect` declares"
+                ));
+            }
+        }
+        for v in &row.vars {
+            if !self.vars.contains(v) {
+                self.errors.push(format!(
+                    "the row of {of} names `{v}`, which is not an effect variable of its definition"
+                ));
+            }
+        }
+    }
+
+    fn statement(&mut self, s: &mut Statement) {
+        match s {
+            Statement::Cut(p, c) => {
+                self.producer(p);
+                self.consumer(c);
+            }
+            Statement::Call(_, ps, cs) | Statement::Prim(_, ps, cs) => {
+                ps.iter_mut().for_each(|p| self.producer(p));
+                cs.iter_mut().for_each(|c| self.consumer(c));
+            }
+            Statement::Let(_, p, body) => {
+                self.producer(p);
+                self.statement(body);
+            }
+            Statement::Handle(h) => {
+                for c in &mut h.clauses {
+                    self.statement(&mut c.body);
+                }
+                self.statement(&mut h.ret.2);
+                self.statement(&mut h.body);
+                self.consumer(&mut h.cont);
+            }
+            Statement::Perform(_, ps, c) => {
+                ps.iter_mut().for_each(|p| self.producer(p));
+                self.consumer(c);
+            }
+            Statement::Error(_) => {}
+        }
+    }
+
+    fn producer(&mut self, p: &mut Producer) {
+        match p {
+            Producer::Con(s, args) => {
+                args.iter_mut().for_each(|a| self.producer(a));
+                if !self.ctors.contains(s) {
+                    if args.is_empty() {
+                        *p = Producer::Val(s.clone());
+                    } else {
+                        self.errors
+                            .push(format!("`{s}` is applied, but no data declares it"));
+                    }
                 }
             }
+            Producer::Tuple(ps) | Producer::Array(ps) => {
+                ps.iter_mut().for_each(|p| self.producer(p));
+            }
+            Producer::Record(fs) => fs.iter_mut().for_each(|(_, p)| self.producer(p)),
+            Producer::Mu(_, s) => self.statement(s),
+            Producer::Cocase(ms) => {
+                for m in ms {
+                    let of = format!("the method `{}` in `{}`", m.name, self.at);
+                    self.row(m.row.as_ref(), &of);
+                    self.statement(&mut m.body);
+                }
+            }
+            _ => {}
         }
-        Producer::Tuple(ps) | Producer::Array(ps) => {
-            ps.iter_mut().for_each(|p| producer(p, ctors, errors));
-        }
-        Producer::Record(fs) => fs.iter_mut().for_each(|(_, p)| producer(p, ctors, errors)),
-        Producer::Mu(_, s) => statement(s, ctors, errors),
-        Producer::Cocase(ms) => ms
-            .iter_mut()
-            .for_each(|m| statement(&mut m.body, ctors, errors)),
-        _ => {}
     }
-}
 
-fn consumer(c: &mut Consumer, ctors: &std::collections::HashSet<Symbol>, errors: &mut Vec<String>) {
-    match c {
-        Consumer::MuTilde(_, s) => statement(s, ctors, errors),
-        Consumer::Case(arms) => arms
-            .iter_mut()
-            .for_each(|a| statement(&mut a.body, ctors, errors)),
-        Consumer::Method(_, ps, cs) => {
-            ps.iter_mut().for_each(|p| producer(p, ctors, errors));
-            cs.iter_mut().for_each(|c| consumer(c, ctors, errors));
+    fn consumer(&mut self, c: &mut Consumer) {
+        match c {
+            Consumer::MuTilde(_, s) => self.statement(s),
+            Consumer::Case(arms) => arms.iter_mut().for_each(|a| self.statement(&mut a.body)),
+            Consumer::Method(_, ps, cs) => {
+                ps.iter_mut().for_each(|p| self.producer(p));
+                cs.iter_mut().for_each(|c| self.consumer(c));
+            }
+            Consumer::Var(_) | Consumer::Halt => {}
         }
-        Consumer::Var(_) | Consumer::Halt => {}
     }
 }

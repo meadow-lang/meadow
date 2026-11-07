@@ -595,6 +595,52 @@ def idyll:Search/all <e: ManyEffect> (...) = ...
 The default is `Effect`. A row containing a `@many` operation can be passed
 only where the variable is a `ManyEffect`.
 
+### Rows
+
+A definition, or a method of an object, may say what it can perform: its
+row, after its parameters.
+
+```text
+def idyll:Main/twice (f: ptr; k: ptr) ! {idyll:Main/Choose} = ...
+def idyll:Main/sumTo <e: ManyEffect> (f: ptr, n: i64; k: ptr) ! {idyll:Prelude/Ask | e} = ...
+def idyll:Main/lifted <e1: Effect, e2: ManyEffect> (...) ! {| e1, e2} = ...
+cocase { apply(x: i64; k: ptr) ! {idyll:Main/Choose} => ... }
+def idyll:Main/show (n: i64; k: ptr) ! {} = ...
+```
+
+A row is the effects, by the symbols their `effect` declarations give them,
+and then, after `|`, any of the definition's own effect variables, standing
+for whatever they are instantiated with. `! {}` performs nothing. What a row
+says is what the code can perform once it has its parameters, whether itself
+or through anything it calls, minus what it handles itself.
+
+A row is needed because the kinds of effect variables do not say everything.
+A definition with no variables at all can still call a function that performs
+a `@many` operation:
+
+```text
+def idyll:Main/twice (f: ptr; k: ptr) =
+  <f | apply(unit; μ̃ a: i64. <f | apply(unit; μ̃ b: i64. prim add(a, b; k))>)>
+```
+
+Only `f`'s type says what `f` performs. The front end knows it; Cut, which
+types every function as `ptr`, has to be told.
+
+- A missing row means unknown. The lowering then assumes the worst, which is
+  always sound.
+- A row may name only declared effects, so an effect with no operations,
+  which has no declaration, is left out. A row that names an undeclared
+  effect, or a variable that is not an effect variable of the definition it
+  is in, is refused when the program is read.
+- A method's variables are those of the definition the method is written
+  in.
+- The reference interpreter ignores rows. A row that is wrong is the front
+  end's error, and the lowering trusts it.
+
+The lowering does not use rows yet. It still grades a whole program at once:
+one `@many` operation anywhere puts every continuation on the heap. Rows are
+what will let it grade each effect instead.
+
 ### How the lowering chooses
 
 How an effect is lowered depends on its kind. The lowering decides from the
