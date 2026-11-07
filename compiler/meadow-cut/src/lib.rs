@@ -13,6 +13,7 @@
 //! run.
 
 pub mod any;
+pub mod grade;
 pub mod inline;
 pub mod interp;
 pub mod lower;

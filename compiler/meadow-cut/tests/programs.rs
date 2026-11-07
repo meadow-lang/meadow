@@ -860,3 +860,51 @@ def idyll:Main/main (; k: ptr) =
         );
     }
 }
+
+#[test]
+fn an_effect_resumed_twice_keeps_on_the_heap_only_the_code_that_can_reach_it() {
+    // Three programs of an operation resumed twice, `choose`. In each, the
+    // code whose row says it performs nothing keeps frames, and answers as
+    // the interpreter does; without rows, nothing does. An effect handled
+    // inside `choose`'s handler, by a handler whose body can perform
+    // `choose`, is graded with it, and one handled outside it is not --
+    // though code performing it runs under `choose`'s handler, and is cut
+    // off the stack from there.
+    let effect = |p: &meadow_cut::Program, name: &str| {
+        let e = p
+            .effects
+            .iter()
+            .find(|e| e.symbol.last() == name)
+            .expect("declared");
+        meadow_cut::grade::Grades::of(p).heap_effect(&e.symbol)
+    };
+    for (text, answer, ask_heap) in [
+        (include_str!("grades/grade-helper.cut"), "57344", None),
+        (include_str!("grades/grade-inside.cut"), "57418", Some(true)),
+        (include_str!("grades/grade-outside.cut"), "128", Some(false)),
+    ] {
+        assert_eq!(runs(text).output, answer);
+        let p = parse(text).unwrap();
+        assert!(effect(&p, "Choose"));
+        if let Some(heap) = ask_heap {
+            assert_eq!(effect(&p, "Ask"), heap, "{answer}");
+        }
+        let lowered = meadow_cut::lower::lower(&p).unwrap();
+        assert!(!lowered.frames.is_empty(), "{answer}: no frames");
+        let unsaid = parse(
+            &text
+                .lines()
+                .map(|l| {
+                    l.split(" ! {").next().unwrap_or(l).to_string()
+                        + if l.contains(" ! {") { " =" } else { "" }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        assert!(
+            meadow_cut::lower::lower(&unsaid).unwrap().frames.is_empty(),
+            "{answer}: frames without rows"
+        );
+    }
+}

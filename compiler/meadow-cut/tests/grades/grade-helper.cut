@@ -1,0 +1,38 @@
+cut 0
+entry t:Main/main
+answer str
+
+effect t:Main/Choose { @many choose(unit) -> bool }
+
+def t:Main/depth (n: i64; k: ptr) ! {} =
+  prim eq(n, 0;
+    μ̃ u: unit. prim sub(n, 1; μ̃ m: i64. t:Main/depth(m; μ̃ d: i64. prim add(d, 2; k))),
+    μ̃ u: unit. <0 | k>)
+
+def t:Main/pick (n: i64; k: ptr) ! {t:Main/Choose} =
+  prim eq(n, 0;
+    μ̃ u: unit.
+      perform t:Main/Choose.choose(unit; μ̃ c: bool.
+        prim if(c;
+          μ̃ u2: unit. prim sub(n, 1; μ̃ m: i64. t:Main/pick(m; k)),
+          μ̃ u3: unit. t:Main/depth(n; μ̃ d: i64. prim sub(n, 1; μ̃ m: i64.
+            t:Main/pick(m; μ̃ s: i64. prim add(s, d; k)))))),
+    μ̃ u: unit. <1 | k>)
+
+def t:Main/show (n: i64; k: ptr) ! {} =
+  prim lt(n, 10;
+    μ̃ u: unit. prim div(n, 10; μ̃ q: i64. t:Main/show(q; μ̃ hi: str. prim mod(n, 10; μ̃ r: i64.
+      t:Main/digit(r; μ̃ d: str. prim concatStrings([hi, d]; k))))),
+    μ̃ u: unit. t:Main/digit(n; k))
+
+def t:Main/digit (d: i64; k: ptr) ! {} =
+  prim add(d, 1; μ̃ e: i64. prim stringSlice("0123456789", d, e; k))
+
+def t:Main/main (; k: ptr) ! {} =
+  handle {
+    t:Main/Choose.choose(u: unit; r: ptr, h: ptr) =>
+      <r | apply(true; μ̃ a: i64. <r | apply(false; μ̃ b: i64. prim add(a, b; h))>)>;
+    return(x: i64; h: ptr) => <x | h>
+  } in μ b.
+    t:Main/pick(10; b)
+  ; μ̃ n: i64. t:Main/show(n; k)

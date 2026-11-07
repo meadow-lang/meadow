@@ -48,9 +48,11 @@ last release is under _Unreleased_.
   its row, `! {E, .. | e, ..}`, after its parameters (`docs/CUT.md`,
   "Rows"). A row may name only effects that are declared, and only the
   definition's own effect variables. Anything else is refused when the
-  program is read. Rows change nothing yet. They are what will let the back
-  end keep a program's continuations on the stack wherever no operation that
-  may resume twice can reach them.
+  program is read. With rows, a program with an operation that may be
+  resumed twice (`@many`) keeps its continuations as frames wherever no such
+  operation can reach them (`docs/CUT.md`, "How the lowering chooses"). One
+  `@many` operation anywhere used to put every continuation of the program
+  on the heap, and still does where a row is missing.
 - `Std.Process.currentDir ()` is the directory a process runs in, as an absolute
   path, for a tool that must walk up from where it was started. It is empty when
   the platform cannot say.

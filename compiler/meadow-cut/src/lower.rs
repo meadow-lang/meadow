@@ -242,11 +242,10 @@ fn lowered(p: &Program, prints: bool) -> R<Lowered> {
         defs: HashMap::new(),
         vals: HashMap::new(),
         literals: HashMap::new(),
-        frames: if p.effects.iter().any(|e| e.ops.iter().any(|o| o.many)) {
-            None
-        } else {
-            frame_kinds()
-        },
+        frames: None,
+        base: frame_kinds(),
+        grades: crate::grade::Grades::of(p),
+        kinds: Vec::new(),
         methods: Vec::new(),
     };
     l.declare(p)?;
@@ -279,6 +278,8 @@ fn lowered(p: &Program, prints: bool) -> R<Lowered> {
         let of = forced(&d.symbol);
         l.current = Some(of.clone());
         l.map.blocks.insert(Label(i as u32), of);
+        l.kinds = d.effect_vars.clone();
+        l.frames = l.graded(d.row.as_ref());
         let mut sc = Scope::default();
         // Each parameter's name first: one may be represented as a variable
         // whose descriptor is a parameter after it.
@@ -319,6 +320,9 @@ fn lowered(p: &Program, prints: bool) -> R<Lowered> {
     }
     l.current = None;
     l.rep_vars.clear();
+    // The values, and what C calls: code no row is said of.
+    l.kinds.clear();
+    l.frames = l.graded(None);
     l.start(p)?;
     l.exports(p)?;
     if l.handles {
@@ -374,11 +378,19 @@ struct Lower {
     /// literal, which costs nothing to write again -- what
     /// `meadow_core::globals::inline_literals` does to a program of core.
     literals: HashMap<Symbol, Producer>,
-    /// The kinds of continuation that are frames -- none named is every
-    /// kind -- or `None` where none is: a program with an operation that may
-    /// be resumed more than once keeps every continuation on the heap, where
-    /// resuming twice is invoking an object twice (`docs/CUT.md`).
+    /// The kinds of continuation that are frames in the code being lowered --
+    /// none named is every kind -- or `None` where none is: code that can
+    /// perform an operation that may be resumed more than once keeps every
+    /// continuation on the heap, where resuming twice is invoking an object
+    /// twice (`docs/CUT.md`, and [`crate::grade`]).
     frames: Option<Vec<String>>,
+    /// What `frames` is where the grades allow frames at all: what
+    /// `MEADOW_CUT_FRAMES` asks for.
+    base: Option<Vec<String>>,
+    grades: crate::grade::Grades,
+    /// The effect variables of the definition being lowered, and their kinds:
+    /// what a row in it means by its variables.
+    kinds: Vec<(String, crate::Kind)>,
     /// Every method any object of the program has, by name: a method's tag
     /// is its place here, so that a call need not know which object it has.
     methods: Vec<String>,
@@ -1171,7 +1183,7 @@ impl Lower {
         enter.extend(xs.iter().copied());
         enter.extend([resumption, now]);
         let enter_params = self.distinct(&enter);
-        let entered = if self.segmented() {
+        let entered = if self.segmented(&crate::grade::effect_of(op)) {
             // As `meadow_seq` has it: the operation's continuation is the
             // frames between here and its handler, which `Detach` cuts off
             // the stack and the resumption's `Reattach` puts back -- once,
@@ -1509,7 +1521,12 @@ impl Lower {
     /// `handle { clauses; return } in μ b. body ; c`.
     fn handle(&mut self, h: &crate::Handle, sc: &mut Scope, steps: &mut Vec<Step>) -> R<S> {
         let outer = sc.var(EV)?;
-        let kc = self.reify_as(&h.cont, sc, steps, self.framing("handle"))?;
+        // A handler of a heap effect gives its body no segment, and the body,
+        // which may be resumed twice or run under one that is, keeps its
+        // continuations on the heap ([`crate::grade`]). The effects handled
+        // beside one are heap too, so every `perform` of them agrees.
+        let segmented = self.base.is_some() && !self.grades.heap_handle(h);
+        let kc = self.reify_as(&h.cont, sc, steps, segmented && self.framing("handle"))?;
         // Where the handler's value goes, which a resumption changes.
         let target = self.fresh(ax::Rep::Ref);
         sc.push(target);
@@ -1522,7 +1539,7 @@ impl Lower {
         // operation that captures its continuation cuts off whole
         // (`docs/SILO.md`, "Effects: stack segments"). With every
         // continuation on the heap there is nothing on the stack to cut.
-        if self.segmented() {
+        if segmented {
             let entered = self.fresh(ax::Rep::Bits(desc::UNIT));
             sc.push(entered);
             steps.push(Step::Extern(
@@ -1652,7 +1669,13 @@ impl Lower {
         let mut body = sc.clone();
         body.vars.insert(h.body_cont.clone(), answers);
         body.vars.insert(EV.to_string(), ev);
-        self.statement(&h.body, &body)
+        let outside = self.frames.clone();
+        if !segmented {
+            self.frames = None;
+        }
+        let lowered = self.statement(&h.body, &body);
+        self.frames = outside;
+        lowered
     }
 
     /// Whether continuations of `kind` are frames.
@@ -1662,10 +1685,23 @@ impl Lower {
             .is_some_and(|ks| ks.is_empty() || ks.iter().any(|k| k == kind))
     }
 
-    /// Whether a handler's body runs on a stack segment of its own: wherever
-    /// any continuation is a frame, since a frame is the native stack's.
-    fn segmented(&self) -> bool {
-        self.frames.is_some()
+    /// What `frames` is in code of `row`: nothing, where it can perform a heap
+    /// effect ([`crate::grade`]).
+    fn graded(&self, row: Option<&crate::Row>) -> Option<Vec<String>> {
+        if self.grades.heap_code(row, &self.kinds) {
+            None
+        } else {
+            self.base.clone()
+        }
+    }
+
+    /// Whether an operation of effect `e` is handled on a stack segment, and
+    /// a `perform` of it cuts the segments between it and its handler off:
+    /// wherever continuations may be frames at all, since a frame is the
+    /// native stack's, unless `e` is a heap effect -- whatever the code
+    /// performing it is, since its handler decided.
+    fn segmented(&self, e: &Symbol) -> bool {
+        self.base.is_some() && !self.grades.heap_effect(e)
     }
 
     /// Whether `body`, which a `μ` names `k` for, can only go on by `k`: it
@@ -2071,7 +2107,12 @@ impl Lower {
                     let ev = self.fresh(ax::Rep::Ref);
                     inner.bind(EV, ev);
                     let params = inner.env.clone();
-                    let body = self.statement(&m.body, &inner)?;
+                    // Graded by what it can perform, wherever it is made.
+                    let its = self.graded(m.row.as_ref());
+                    let around = std::mem::replace(&mut self.frames, its);
+                    let body = self.statement(&m.body, &inner);
+                    self.frames = around;
+                    let body = body?;
                     let tag = self.method(&m.name)? as usize;
                     blocks[tag] = Block { params, body };
                 }

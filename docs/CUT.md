@@ -637,17 +637,27 @@ types every function as `ptr`, has to be told.
 - The reference interpreter ignores rows. A row that is wrong is the front
   end's error, and the lowering trusts it.
 
-The lowering does not use rows yet. It still grades a whole program at once:
-one `@many` operation anywhere puts every continuation on the heap. Rows are
-what will let it grade each effect instead.
+The lowering grades each effect by the rows, as the next section says.
 
 ### How the lowering chooses
 
-How an effect is lowered depends on its kind. The lowering decides from the
-kinds of a definition's effect variables, so a definition generic in its
-effects gets the strategy its caller's effects need:
+A frame, and a stack segment, can each be returned into once. So nothing
+between an operation that may be resumed twice and its handler may be
+either. And a `perform` must find, between it and its handler, what the
+handler set up: a segment to cut off, or none. Grading each place in the code
+by itself cannot promise both. Take a handler of a one-shot effect whose body
+can perform `choose`: it must not give its body a segment, so every `perform`
+of its effect, wherever it is, must expect none. So the lowering grades
+effects:
 
-- **`Effect`**: evidence passing (see [Evidence](#evidence)). A tail-resumptive
+- **A heap effect** is one with a `@many` operation, one whose handler's body
+  can perform a heap effect it does not handle, or one handled beside a heap
+  effect. A handler of a heap effect gives its body no segment, and a
+  `perform` of one cuts nothing off. The code between them keeps its
+  continuations on the heap, as the codata they are in Cut, so resuming twice
+  is invoking an object twice. No stack is ever copied.
+- **Every other effect** is lowered by evidence passing (see
+  [Evidence](#evidence)), with segments. A tail-resumptive
   clause, `op(x; r, k) => <r | apply(e; k)>` with `r` not otherwise used,
   is a plain call, made where the operation is performed, with the
   performing code's continuation for `k`. So is one that computes first:
@@ -655,13 +665,18 @@ effects gets the strategy its caller's effects need:
   calls and `perform`s, ends `<r | apply(e; k)>` or in an error, and `r` and
   `k` appear nowhere else. A `perform` in such a clause still reaches only
   the handlers outside its own. Any other clause captures the continuation as
-  a stack segment, which is resumed in place, at most once. This is Meadow's lowering
-  today, on both Glade (heap frame chunks) and Silo (native stack segments). A
-  resumption the front end proved is used at most once needs no run-time
-  check.
-- **`ManyEffect`**: the code between the handler and the `perform` keeps its
-  continuations on the heap, as the codata they are in Cut, so resuming twice
-  is invoking an object twice. No stack is ever copied.
+  a stack segment, which is resumed in place, at most once. This is Meadow's
+  own lowering, on both Glade (heap frame chunks) and Silo (native stack
+  segments). A resumption the front end proved is used at most once needs no
+  run-time check.
+
+Code keeps its continuations on the heap if its row may hold a heap effect.
+That is a row that names one, has a `ManyEffect` variable, has an `Effect`
+variable while some heap effect has no `@many` operation, or is missing
+while any effect is heap. Other code may keep frames: nothing it can perform
+is resumed twice, or handled without a segment, while its frames are live.
+A program with no `@many` operation has no heap effects, and keeps frames
+everywhere it can.
 
 A whole-program analysis may move a `@many` operation that every handler
 resumes at most once onto the `Effect` path. Nothing may depend on that, since
