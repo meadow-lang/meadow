@@ -36,6 +36,11 @@ last release is under _Unreleased_.
   numbered as they are written across a pipe, as they are everywhere else:
   `(_ |> f _)` takes the piped value first, where it used to take `f`'s
   argument first. `<|` is unchanged: `f <| x` is `f`, then `x`.
+- A Cut clause whose every way through ends by resuming, and that uses its
+  resumption for nothing else, is now called where its operation is
+  performed, as Meadow's own `op x k -> k e` already was. Its operation no
+  longer cuts the stack off or makes a resumption. Ten million such
+  operations take a quarter of a second on Silo, where they took two.
 
 ### Added
 

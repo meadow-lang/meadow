@@ -842,27 +842,36 @@ fn a_program_of_cut_runs_on_glade_and_as_an_executable_of_silos() {
 /// resumption, a frame deeper on the body's segment each time; and the clause
 /// resumed from inside the handler's `drive` frame, a `drive` frame deeper on
 /// the handler's. A million operations overflowed the first; ten million, the
-/// second.
+/// second. The clause `<r | resume(1; h)>` is now entered where `ask` is
+/// performed, and resumes nothing; the same clause with its resumption named
+/// again by a `let` is not, and is still resumed from its handler's segment.
 #[test]
 fn a_handler_in_a_loop_runs_as_long_as_the_loop_on_silo() {
     let dir = scratch("handler-loop");
-    std::fs::write(
-        dir.join("asks.cut"),
-        "cut 0\nentry t:Main/main\nanswer str\n\n\
-         effect t:Main/Ask { ask(unit) -> i64 }\n\n\
-         def t:Main/loop (n: i64, acc: i64; k: ptr) =\n  prim eq(n, 0; μ̃ done: bool.\n    \
-         prim if(done; μ̃ u: unit.\n      prim sub(n, 1; μ̃ m: i64.\n        \
-         perform t:Main/Ask.ask(unit; μ̃ v: i64.\n          prim add(acc, v; μ̃ acc2: i64.\n            \
-         t:Main/loop(m, acc2; k)))), μ̃ u2: unit.\n      <acc | k>))\n\n\
-         def t:Main/main (; k: ptr) =\n  handle {\n    \
-         t:Main/Ask.ask(u: unit; r: ptr, h: ptr) => <r | resume(1; h)>;\n    \
-         return(x: i64; h: ptr) => <x | h>\n  } in μ b.\n    t:Main/loop(5000000, 0; b)\n  ; \
-         μ̃ n: i64. prim eq(n, 5000000; μ̃ u: unit. <\"short\" | k>, μ̃ u: unit. <\"asked\" | k>)\n",
-    )
-    .unwrap();
-    let (ok, out, err) = meadow(&dir, &["cut", "--runtime", "silo", "asks.cut"]);
-    assert!(ok, "{err}");
-    assert_eq!(out, "asked");
+    for clause in [
+        "<r | resume(1; h)>",
+        "let again: ptr = r in <again | resume(1; h)>",
+    ] {
+        std::fs::write(
+            dir.join("asks.cut"),
+            format!(
+                "cut 0\nentry t:Main/main\nanswer str\n\n\
+                 effect t:Main/Ask {{ ask(unit) -> i64 }}\n\n\
+                 def t:Main/loop (n: i64, acc: i64; k: ptr) =\n  prim eq(n, 0; μ̃ done: bool.\n    \
+                 prim if(done; μ̃ u: unit.\n      prim sub(n, 1; μ̃ m: i64.\n        \
+                 perform t:Main/Ask.ask(unit; μ̃ v: i64.\n          prim add(acc, v; μ̃ acc2: i64.\n            \
+                 t:Main/loop(m, acc2; k)))), μ̃ u2: unit.\n      <acc | k>))\n\n\
+                 def t:Main/main (; k: ptr) =\n  handle {{\n    \
+                 t:Main/Ask.ask(u: unit; r: ptr, h: ptr) => {clause};\n    \
+                 return(x: i64; h: ptr) => <x | h>\n  }} in μ b.\n    t:Main/loop(5000000, 0; b)\n  ; \
+                 μ̃ n: i64. prim eq(n, 5000000; μ̃ u: unit. <\"short\" | k>, μ̃ u: unit. <\"asked\" | k>)\n"
+            ),
+        )
+        .unwrap();
+        let (ok, out, err) = meadow(&dir, &["cut", "--runtime", "silo", "asks.cut"]);
+        assert!(ok, "{clause}: {err}");
+        assert_eq!(out, "asked", "{clause}");
+    }
     // Meadow's own lowering resumes from the clause as Cut's does, where a
     // clause is more than `k e`.
     let root = package(

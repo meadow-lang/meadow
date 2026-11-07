@@ -227,6 +227,7 @@ fn lowered(p: &Program, prints: bool) -> R<Lowered> {
         map: Map::default(),
         current: None,
         handles: false,
+        tails: false,
         search: Label(0),
         rep_vars: HashMap::new(),
         descs: HashSet::new(),
@@ -341,6 +342,10 @@ struct Lower {
     /// Whether the program handles an effect anywhere: one that does not
     /// has no evidence to search, and performs straight to the runtime.
     handles: bool,
+    /// Whether any of its clauses is entered where its operation is
+    /// performed ([`tail_resumptive`]): the evidence then has entries of two
+    /// kinds, and the search and every `perform` look for both.
+    tails: bool,
     /// The block that finds an operation's entry in the evidence.
     search: Label,
     /// Each definition's parameters' representations, as written.
@@ -565,6 +570,7 @@ impl Lower {
             seen.statement(&v.body);
         }
         self.handles = seen.handles;
+        self.tails = seen.tails;
         self.search = Label(p.defs.len() as u32 + u32::from(p.entry.is_some()));
         if self.handles {
             // A resumption is a function.
@@ -1325,6 +1331,35 @@ impl Lower {
             }
         };
         let entry_tag = self.tag_of(meadow_rt::roles::evidence::ENTRY);
+        let mut arms = vec![(
+            entry_tag,
+            Block {
+                params: in_entry.clone(),
+                body: entered,
+            },
+        )];
+        if self.tails {
+            // A clause that only resumes, last (`tail_resumptive`): entered
+            // here, with the arguments and, for its own continuation, where
+            // what the operation is resumed with goes.
+            let mut enter = vec![clause];
+            enter.extend(xs.iter().copied());
+            enter.push(kc);
+            let params = self.distinct(&enter);
+            arms.push((
+                self.tag_of(meadow_rt::roles::evidence::TAIL),
+                Block {
+                    params: in_entry,
+                    body: S::Substitute(
+                        enter,
+                        Box::new(Block {
+                            params,
+                            body: S::Invoke(clause, 0),
+                        }),
+                    ),
+                },
+            ));
+        }
         let found = self.fresh(ax::Rep::Ref);
         self.out.continuations.insert(found);
         steps.push(Step::New(
@@ -1334,13 +1369,7 @@ impl Lower {
                 params: found_params.clone(),
                 body: S::Switch {
                     scrutinee: entry,
-                    arms: vec![(
-                        entry_tag,
-                        Block {
-                            params: in_entry,
-                            body: entered,
-                        },
-                    )],
+                    arms,
                     default: Box::new(Block {
                         params: found_params,
                         body: S::Error("the evidence holds what is not an entry"),
@@ -1417,40 +1446,52 @@ impl Lower {
             }],
         };
         let next = vec![rest, key, found, missing, k];
+        // An entry of either kind is looked at alike: which it is matters
+        // only to `found`.
+        let mut kinds = vec![meadow_rt::roles::evidence::ENTRY];
+        if self.tails {
+            kinds.push(meadow_rt::roles::evidence::TAIL);
+        }
+        let arms = kinds
+            .into_iter()
+            .map(|kind| {
+                (
+                    self.tag_of(kind),
+                    Block {
+                        params: in_entry.clone(),
+                        body: S::Extern {
+                            op: Extern::BranchPrim(Prim::Eq),
+                            args: vec![k2, key],
+                            blocks: vec![
+                                Block {
+                                    params: in_entry.clone(),
+                                    body: S::Substitute(
+                                        next.clone(),
+                                        Box::new(Block {
+                                            params: next.clone(),
+                                            body: S::Jump(self.search),
+                                        }),
+                                    ),
+                                },
+                                Block {
+                                    params: in_entry.clone(),
+                                    body: S::Substitute(
+                                        vec![found, cur, k],
+                                        Box::new(Block {
+                                            params: vec![found, cur, k],
+                                            body: S::Invoke(found, 0),
+                                        }),
+                                    ),
+                                },
+                            ],
+                        },
+                    },
+                )
+            })
+            .collect();
         let body = S::Switch {
             scrutinee: cur,
-            arms: vec![(
-                self.tag_of(meadow_rt::roles::evidence::ENTRY),
-                Block {
-                    params: in_entry.clone(),
-                    body: S::Extern {
-                        op: Extern::BranchPrim(Prim::Eq),
-                        args: vec![k2, key],
-                        blocks: vec![
-                            Block {
-                                params: in_entry.clone(),
-                                body: S::Substitute(
-                                    next.clone(),
-                                    Box::new(Block {
-                                        params: next,
-                                        body: S::Jump(self.search),
-                                    }),
-                                ),
-                            },
-                            Block {
-                                params: in_entry,
-                                body: S::Substitute(
-                                    vec![found, cur, k],
-                                    Box::new(Block {
-                                        params: vec![found, cur, k],
-                                        body: S::Invoke(found, 0),
-                                    }),
-                                ),
-                            },
-                        ],
-                    },
-                },
-            )],
+            arms,
             default: Box::new(Block {
                 params: params.clone(),
                 body: ended,
@@ -1490,10 +1531,21 @@ impl Lower {
                 sc.env.clone(),
             ));
         }
-        let entry = meadow_rt::roles::evidence::ENTRY;
-        let entry_tag = self.tag_of(entry);
+        self.tag_of(meadow_rt::roles::evidence::ENTRY);
         let mut ev = outer;
         for c in &h.clauses {
+            // A clause that only resumes, last, is entered where its
+            // operation is performed, with that code's continuation for its
+            // own and no resumption at all: its entry says so.
+            let tail = tail_resumptive(c);
+            let (body, conts, entry) = match &tail {
+                Some(body) => (body, vec![&c.cont], meadow_rt::roles::evidence::TAIL),
+                None => (
+                    &c.body,
+                    vec![&c.resumption, &c.cont],
+                    meadow_rt::roles::evidence::ENTRY,
+                ),
+            };
             // The clause: an object of what it mentions from around the
             // handler, the evidence outside it among that.
             let mut free = Free::default();
@@ -1501,9 +1553,9 @@ impl Lower {
                 .params
                 .iter()
                 .map(|b| b.name.as_str())
-                .chain([c.resumption.as_str(), c.cont.as_str()])
+                .chain(conts.iter().map(|k| k.as_str()))
                 .collect();
-            free.under(&bound, |f| f.statement(&c.body));
+            free.under(&bound, |f| f.statement(body));
             free.names.insert(EV.to_string());
             let mut inside = sc.clone();
             inside.vars.insert(EV.to_string(), outer);
@@ -1518,13 +1570,18 @@ impl Lower {
                 inner.bind(&b.name, n);
                 self.called(n, &b.name);
             }
-            for k in [&c.resumption, &c.cont] {
+            for k in conts {
                 let n = self.fresh(ax::Rep::Ref);
                 inner.bind(k, n);
                 self.called(n, k);
+                if tail.is_some() {
+                    // The performing code's: what it is called with to
+                    // answer through, which a frame may be.
+                    self.out.returns.insert(n);
+                }
             }
             let params = inner.env.clone();
-            let body = self.statement(&c.body, &inner)?;
+            let body = self.statement(body, &inner)?;
             let clause = self.fresh(ax::Rep::Ref);
             steps.push(Step::New(clause, captures, vec![Block { params, body }]));
             sc.push(clause);
@@ -1536,6 +1593,7 @@ impl Lower {
                 sc.env.clone(),
             ));
             let pushed = self.fresh(ax::Rep::Ref);
+            let entry_tag = self.tag_of(entry);
             steps.push(Step::Let(
                 pushed,
                 entry_tag,
@@ -2127,6 +2185,8 @@ struct Free {
     halt: bool,
     /// Whether a `handle` was met.
     handles: bool,
+    /// Whether a clause [`tail_resumptive`] was.
+    tails: bool,
 }
 
 impl Free {
@@ -2229,6 +2289,7 @@ impl Free {
             }
             Statement::Handle(h) => {
                 self.handles = true;
+                self.tails |= h.clauses.iter().any(|c| tail_resumptive(c).is_some());
                 for c in &h.clauses {
                     let names: Vec<&str> = c
                         .params
@@ -2245,6 +2306,95 @@ impl Free {
             }
             Statement::Error(_) => {}
         }
+    }
+}
+
+/// If `c` only ever resumes, and last, with what it computes without the
+/// resumption -- each way through its body ends `<r | resume(v; k)>` or in
+/// an error, and `r` and `k` are mentioned nowhere else -- its body with
+/// each of those `<v | k>`. Entered where its operation is performed, with
+/// that code's own continuation for `k`, it does just what resuming would
+/// have: what comes of `v` there goes where the clause's value goes, which
+/// is `k`. So it needs no resumption, and its operation no `Detach` -- as
+/// `meadow_seq`'s `tail_resumptive` has it for a clause `op x k -> k e`.
+/// (`resume` is `apply` by another name, so either is a resumption.)
+///
+/// Only the ways straight on are followed: a `μ̃`, a `case`'s arms, a
+/// `let`'s rest, and what a primitive, a call or a `perform` goes on to. A
+/// resumption under a `handle`, a `μ` or an object could be made from
+/// another segment, or later, or not at all; and a clause that goes on to
+/// a continuation from around its handler leaves by a way the performing
+/// code's stack does not have.
+fn tail_resumptive(c: &Clause) -> Option<Statement> {
+    let names = [c.resumption.as_str(), c.cont.as_str()];
+    if c.params.iter().any(|b| names.contains(&b.name.as_str())) {
+        return None;
+    }
+    tail_of(&c.body, names)
+}
+
+/// [`tail_resumptive`]'s walk of `s`, for the resumption `r` and the
+/// continuation `k`.
+fn tail_of(s: &Statement, [r, k]: [&str; 2]) -> Option<Statement> {
+    let clear = |xs: &[Producer]| {
+        let mut free = Free::default();
+        xs.iter().for_each(|x| free.producer(x));
+        !free.names.contains(r) && !free.names.contains(k)
+    };
+    let binds = |n: &str| n == r || n == k;
+    let on = |c: &Consumer| match c {
+        Consumer::MuTilde(b, body) if !binds(&b.name) => Some(Consumer::MuTilde(
+            b.clone(),
+            Box::new(tail_of(body, [r, k])?),
+        )),
+        Consumer::Case(arms) => arms
+            .iter()
+            .map(|a| {
+                if a.fields.iter().any(|b| binds(&b.name)) {
+                    return None;
+                }
+                Some(Arm {
+                    pattern: a.pattern.clone(),
+                    fields: a.fields.clone(),
+                    body: tail_of(&a.body, [r, k])?,
+                })
+            })
+            .collect::<Option<_>>()
+            .map(Consumer::Case),
+        _ => None,
+    };
+    match s {
+        Statement::Cut(Producer::Var(x), Consumer::Method(m, args, conts))
+            if x == r && (m == "resume" || m == "apply") =>
+        {
+            match (args.as_slice(), conts.as_slice()) {
+                ([v], [Consumer::Var(to)]) if to == k && clear(args) => {
+                    Some(Statement::Cut(v.clone(), Consumer::Var(k.to_string())))
+                }
+                _ => None,
+            }
+        }
+        Statement::Cut(p, c) if clear(std::slice::from_ref(p)) => {
+            Some(Statement::Cut(p.clone(), on(c)?))
+        }
+        Statement::Prim(op, args, conts) if clear(args) => Some(Statement::Prim(
+            op.clone(),
+            args.clone(),
+            conts.iter().map(&on).collect::<Option<_>>()?,
+        )),
+        Statement::Call(f, args, conts) if clear(args) => Some(Statement::Call(
+            f.clone(),
+            args.clone(),
+            conts.iter().map(&on).collect::<Option<_>>()?,
+        )),
+        Statement::Perform(op, args, c) if clear(args) => {
+            Some(Statement::Perform(op.clone(), args.clone(), on(c)?))
+        }
+        Statement::Let(b, p, rest) if !binds(&b.name) && clear(std::slice::from_ref(p)) => Some(
+            Statement::Let(b.clone(), p.clone(), Box::new(tail_of(rest, [r, k])?)),
+        ),
+        Statement::Error(e) => Some(Statement::Error(e.clone())),
+        _ => None,
     }
 }
 

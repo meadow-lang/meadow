@@ -603,8 +603,13 @@ effects gets the strategy its caller's effects need:
 
 - **`Effect`**: evidence passing (see [Evidence](#evidence)). A tail-resumptive
   clause, `op(x; r, k) => <r | apply(e; k)>` with `r` not otherwise used,
-  is a plain call. Any other clause captures the continuation as a stack
-  segment, which is resumed in place, at most once. This is Meadow's lowering
+  is a plain call, made where the operation is performed, with the
+  performing code's continuation for `k`. So is one that computes first:
+  each way through its body, along `μ̃`s, `case` arms, `let`s, primitives,
+  calls and `perform`s, ends `<r | apply(e; k)>` or in an error, and `r` and
+  `k` appear nowhere else. A `perform` in such a clause still reaches only
+  the handlers outside its own. Any other clause captures the continuation as
+  a stack segment, which is resumed in place, at most once. This is Meadow's lowering
   today, on both Glade (heap frame chunks) and Silo (native stack segments). A
   resumption the front end proved is used at most once needs no run-time
   check.
