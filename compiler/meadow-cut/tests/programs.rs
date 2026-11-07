@@ -463,6 +463,68 @@ fn a_reader_refuses_what_it_cannot_read() {
 }
 
 #[test]
+fn a_row_says_what_a_definition_or_a_method_performs_and_names_only_what_is_declared() {
+    // Every form a row takes, read, printed and read back the same, and run:
+    // a row is for the lowering, and changes nothing a program does.
+    let out = runs(
+        "cut 0
+entry idyll:Main/main
+answer str
+
+effect idyll:Main/Ask { ask(unit) -> i64 }
+effect idyll:Main/Choose { @many choose(unit) -> bool }
+
+def idyll:Main/twice <e: ManyEffect, f: Effect> (g: ptr; k: ptr) ! {idyll:Main/Choose | e, f} =
+  <g | apply(unit; μ̃ a: i64. <g | apply(unit; μ̃ b: i64. prim add(a, b; k))>)>
+
+def idyll:Main/one <e: Effect> (; k: ptr) ! {| e} = <1 | k>
+
+def idyll:Main/main (; k: ptr) ! {} =
+  handle {
+    idyll:Main/Ask.ask(u: unit; r: ptr, h: ptr) => <r | resume(20; h)>;
+    return(x: i64; h: ptr) => <x | h>
+  } in μ b.
+    idyll:Main/twice(cocase { apply(u: unit; j: ptr) ! {idyll:Main/Ask} =>
+      perform idyll:Main/Ask.ask(unit; j) }; μ̃ n: i64.
+      idyll:Main/one(; μ̃ o: i64. prim add(n, o; b)))
+  ; μ̃ n: i64. prim eq(n, 41; μ̃ u: unit. <\"no\" | k>, μ̃ u: unit. <\"yes\" | k>)
+",
+    );
+    assert_eq!(out.output, "yes");
+    let p = parse(&print::program(
+        &parse(
+            "cut 0\neffect idyll:A/E { e(unit) -> unit }\n\
+             def idyll:A/f <v: Effect> (; k: ptr) ! {idyll:A/E | v} = <1 | k>\n",
+        )
+        .unwrap(),
+    ))
+    .unwrap();
+    let row = p.defs[0].row.as_ref().expect("a row");
+    assert_eq!(row.effects.len(), 1);
+    assert_eq!(row.vars, ["v"]);
+    // An effect no `effect` declares -- one with no operations, say -- and a
+    // variable not the definition's own are refused, in a definition's row
+    // and in a method's.
+    for (text, says) in [
+        (
+            "def idyll:A/f (; k: ptr) ! {idyll:A/Div} = <1 | k>",
+            "`idyll:A/Div`, which no `effect` declares",
+        ),
+        (
+            "def idyll:A/f <e: Effect> (; k: ptr) ! {| e, d} = <1 | k>",
+            "`d`, which is not an effect variable",
+        ),
+        (
+            "def idyll:A/f (; k: ptr) = <cocase { apply(; j: ptr) ! {| e} => <1 | j> } | k>",
+            "the method `apply` in `idyll:A/f`",
+        ),
+    ] {
+        let e = parse(&format!("cut 0\n{text}\n")).unwrap_err();
+        assert!(e.contains(says), "{text}: {e}");
+    }
+}
+
+#[test]
 fn what_is_not_lowered_to_axcut_yet_is_refused_and_says_what() {
     let lowered = |text: &str| meadow_cut::lower::lower(&parse(text).expect("a program"));
     // A `μ` where an argument is wanted: nothing says how its value is

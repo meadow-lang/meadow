@@ -2561,6 +2561,7 @@ fn lazily(p: &Program) -> Program {
                 effect_vars: Vec::new(),
                 params: Vec::new(),
                 conts: vec!["#k".to_string()],
+                row: None,
                 body: Statement::Cut(Producer::Cocase(methods.clone()), k()),
             });
             continue;
@@ -2590,6 +2591,7 @@ fn lazily(p: &Program) -> Program {
             effect_vars: Vec::new(),
             params: Vec::new(),
             conts: vec!["#k".to_string()],
+            row: None,
             body,
         });
     }
@@ -2644,6 +2646,7 @@ fn started(whole: &Program, lazy: &mut Program) {
         effect_vars: Vec::new(),
         params: Vec::new(),
         conts: vec!["#k".to_string()],
+        row: None,
         body,
     });
     lazy.entry = Some(symbol);
@@ -2687,6 +2690,7 @@ fn rehalted(s: &Statement) -> Statement {
                         name: m.name.clone(),
                         params: m.params.clone(),
                         conts: m.conts.clone(),
+                        row: m.row.clone(),
                         body: rehalted(&m.body),
                     })
                     .collect(),
