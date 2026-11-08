@@ -330,6 +330,9 @@ cli! {
         names : [String] "The dependencies to bring forward: all of them, if none is named"
         path : Option String "The package whose dependencies they are" value "DIR"
         dryRun : Flag "Say what would change without changing it"
+        breaking
+          : Flag
+            "Move to a release that breaks the `version` asked for: raise it in `Meadow.toml`, and lock that"
       }
     | repl "Read entries and evaluate them" {}
     | lex "Each file's tokens, one a line, and then what is wrong in them" {
