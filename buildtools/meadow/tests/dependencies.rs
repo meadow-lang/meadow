@@ -837,3 +837,64 @@ fn a_git_dependency_may_be_a_directory_of_its_repository() {
         "{said:?}"
     );
 }
+
+// --- `meadow update` and releases ---------------------------------------------
+
+fn update(app: &Path, cache: &Path, breaking: bool, dry_run: bool) {
+    meadow::update::run(&meadow::update::Options {
+        dir: app.to_path_buf(),
+        only: Vec::new(),
+        dry_run,
+        breaking,
+        cache: Some(cache.to_path_buf()),
+    })
+    .expect("update");
+}
+
+fn locked_versions(app: &Path) -> Vec<Option<String>> {
+    Lock::load(app)
+        .packages
+        .iter()
+        .filter(|p| p.name == "Widget")
+        .map(|p| p.version.clone())
+        .collect()
+}
+
+/// `version = "0.2.0"` takes 0.2.1 and not 0.3.0, which breaks it, until
+/// `--breaking` raises it; a dry run of that changes nothing.
+#[test]
+fn an_update_stays_within_a_version_unless_it_is_told_to_break_it() {
+    let Some(repo) = released_repo("upd-breaking", &["0.2.0", "0.2.1", "0.3.0"]) else {
+        eprintln!("skipped: no usable git");
+        return;
+    };
+    let app = app_wanting("upd-breaking-app", &repo, "0.2.0");
+    let manifest = std::fs::read_to_string(app.join("Meadow.toml")).unwrap();
+    let cache = scratch("upd-breaking-cache");
+    let at = |v: &str| vec![Some(v.to_string())];
+
+    update(&app, &cache, false, false);
+    assert_eq!(locked_versions(&app), at("0.2.1"));
+    update(&app, &cache, false, false);
+    assert_eq!(locked_versions(&app), at("0.2.1"), "0.3.0 breaks 0.2");
+    assert_eq!(
+        std::fs::read_to_string(app.join("Meadow.toml")).unwrap(),
+        manifest
+    );
+
+    update(&app, &cache, true, true);
+    assert_eq!(locked_versions(&app), at("0.2.1"), "a dry run");
+    assert_eq!(
+        std::fs::read_to_string(app.join("Meadow.toml")).unwrap(),
+        manifest
+    );
+
+    update(&app, &cache, true, false);
+    let raised = std::fs::read_to_string(app.join("Meadow.toml")).unwrap();
+    assert!(raised.contains("version = \"0.3.0\" }"), "{raised}");
+    assert_eq!(
+        locked_versions(&app),
+        at("0.3.0"),
+        "one entry, at the new release"
+    );
+}
