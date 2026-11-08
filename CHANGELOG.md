@@ -41,6 +41,14 @@ last release is under _Unreleased_.
   performed, as Meadow's own `op x k -> k e` already was. Its operation no
   longer cuts the stack off or makes a resumption. Ten million such
   operations take a quarter of a second on Silo, where they took two.
+- A Cut `perform` looks its handler up with a search of its own, as each of
+  Meadow's own does: the evidence is walked with the arguments and the
+  continuation passed along, each entry's key compared with a constant, and
+  the clause found entered from there. It used to make two objects at every
+  `perform`, for what to do when the handler was found and when it was not,
+  and enter the clause through the first. Ten million operations answered by
+  a clause that only resumes take 66 ms on Silo, where they took 278: what
+  Meadow's own take.
 
 ### Added
 
@@ -197,6 +205,9 @@ last release is under _Unreleased_.
 
 ### Fixed
 
+- A Cut program that both handles an operation and exports a definition to C
+  was lowered with its `perform`s jumping to the wrong definition: the
+  search they share was numbered as if there were no exports.
 - A handler in a loop overflowed Silo's stack: a Cut program after about a
   million operations, and a Meadow one whose clause does more than `k e` after
   about ten million. Cut's `perform` kept its continuation in the objects that
