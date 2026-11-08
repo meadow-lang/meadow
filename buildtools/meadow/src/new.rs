@@ -683,8 +683,12 @@ pub fn ask(mut wizard: Wizard) -> std::io::Result<Option<Options>> {
             },
         )?;
         loop {
-            let frame = t.draw(|f| wizard.draw(f))?;
-            top = frame.area.y;
+            // The frame's area is where on the screen the questions are; what
+            // `draw` answers is the whole screen's.
+            t.draw(|f| {
+                top = f.area().y;
+                wizard.draw(f)
+            })?;
             match event::read()? {
                 // A key is reported pressed and released on some platforms;
                 // only the press is a keystroke.
