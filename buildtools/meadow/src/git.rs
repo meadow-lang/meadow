@@ -376,7 +376,19 @@ fn fetch_held(db: &Path, url: &str, reference: &GitRef) -> Result<(), String> {
     // Before git is told to fetch it: a url that is really an option, or a
     // remote-helper command, would otherwise run at build time.
     safe_url(url)?;
-    crate::status::status("Updating", format!("git repository `{url}`"));
+    // Said once a run: listing the releases and taking one are two fetches,
+    // and both saying so reads as two repositories.
+    static ANNOUNCED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let first = ANNOUNCED.lock().map_or(true, |mut said| {
+        let new = !said.iter().any(|u| u == url);
+        if new {
+            said.push(url.to_string());
+        }
+        new
+    });
+    if first {
+        crate::status::status("Updating", format!("git repository `{url}`"));
+    }
     if !db.join("HEAD").is_file() {
         if let Some(parent) = db.parent() {
             std::fs::create_dir_all(parent)
@@ -687,6 +699,16 @@ fn slug(url: &str) -> String {
     let mut h = std::hash::DefaultHasher::new();
     std::hash::Hasher::write(&mut h, url.as_bytes());
     format!("{name}-{:016x}", std::hash::Hasher::finish(&h))
+}
+
+/// The file at `path` in commit `rev` of `url`, read from what was fetched
+/// before: nothing is fetched for it.
+pub fn file_at(cache: &Path, url: &str, rev: &str, path: &str) -> Option<String> {
+    if !is_commit_id(rev) {
+        return None;
+    }
+    let db = cache.join("db").join(slug(url));
+    git(Some(&db), &["show", &format!("{rev}:{path}")]).ok()
 }
 
 /// A commit, short enough to read.

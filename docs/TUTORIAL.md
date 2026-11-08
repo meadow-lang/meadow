@@ -2547,9 +2547,16 @@ again takes the same thing, however many releases have happened since —
 Updating Widget 0.1.3 -> 0.1.4
 ```
 
-It never crosses a break: a `version = "0.1.0"` dependency does not move to
-`0.2.0`, however new that is. Moving across one is editing the manifest, or
-`meadow add` again — a decision, not an update.
+It never crosses a break on its own: a `version = "0.1.0"` dependency does not
+move to `0.2.0`, however new that is. It says that `0.2.0` is out, though:
+
+```
+Unchanged Widget 0.1.4: 0.2.0 is out, which breaks 0.1.4; `meadow update --breaking Widget` moves to it
+```
+
+Moving across a break is a decision, not an update: `meadow update --breaking`
+raises the `version` in the manifest to the newest release and locks it, and
+`--dry-run` says what it would raise first.
 
 A repository with no releases at all is followed by its default branch, which
 is what `{ git = "…" }` with no version means. `--branch`, `--tag` and `--rev`
@@ -4308,7 +4315,7 @@ as it comes.
 | `meadow fmt <path>`                                                         | format in place                                                                                                          |
 | `meadow fmt --check <path>`                                                 | report, exit 1 if anything differs                                                                                       |
 | `meadow lsp`                                                                | run the language server (editors start this)                                                                             |
-| `meadow update`                                                             | replace the binary with the latest release                                                                               |
+| `meadow update [--breaking] [<name>…]`                                      | bring dependencies forward in `Meadow.lock`; `--breaking` raises a `version` past a release that breaks it               |
 
 `--release` and `--debug` select a profile. Release requires every `match` to
 be exhaustive, compiles a `match` to a decision tree, and copies generic code

@@ -385,10 +385,13 @@ enum Cmd {
         dry_run: bool,
     },
     /// Bring a package's dependencies forward to what their branches and tags
-    /// now name, rewriting `Meadow.lock`.
+    /// now name, and to the newest release their `version` allows, rewriting
+    /// `Meadow.lock`. Each change says the version it went from and to.
     ///
-    /// The manifest is not touched: a dependency keeps the branch or tag it
-    /// follows. Updating the toolchain is `meadow self update`.
+    /// The manifest is not touched, unless `--breaking` is given: a dependency
+    /// keeps the branch or tag it follows, and `version = "0.2.0"` takes 0.2.5
+    /// but not 0.3.0, which breaks it. A newer release that breaks it is said
+    /// to be out. Updating the toolchain is `meadowup update`.
     Update {
         /// Only these, by name. Without any, every git dependency.
         #[arg(value_name = "NAME")]
@@ -399,6 +402,10 @@ enum Cmd {
         /// Say what would change without changing it.
         #[arg(long)]
         dry_run: bool,
+        /// Move to a release that breaks the `version` asked for: raise it in
+        /// `Meadow.toml` to the newest release, and lock that.
+        #[arg(long)]
+        breaking: bool,
     },
     /// Where toolchain management went. Hidden: it is here only to say so to
     /// anyone whose fingers still type it.
@@ -1314,11 +1321,14 @@ fn command() {
             only,
             path,
             dry_run,
+            breaking,
         }) => {
             if let Err(e) = meadow::update::run(&meadow::update::Options {
                 dir: path,
                 only,
                 dry_run,
+                breaking,
+                cache: None,
             }) {
                 status::error(e);
                 std::process::exit(1);

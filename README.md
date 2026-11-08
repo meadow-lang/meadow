@@ -170,6 +170,7 @@ meadow add owner/repo --tag v1  # ...at a tag (or `--branch`, `--rev`)
 meadow add ../util              # ...or a directory
 meadow update                   # bring dependencies forward, rewriting Meadow.lock
 meadow update json --dry-run    # ...one of them, and only say what would change
+meadow update --breaking        # ...past a release that breaks the `version` asked for
 meadow build --locked           # fail rather than change Meadow.lock (what CI wants)
 meadow build --offline          # never fetch; use what is already cached
 ```

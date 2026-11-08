@@ -41,6 +41,12 @@ last release is under _Unreleased_.
   performed, as Meadow's own `op x k -> k e` already was. Its operation no
   longer cuts the stack off or makes a resumption. Ten million such
   operations take a quarter of a second on Silo, where they took two.
+- `meadow update` says which version each dependency went from and to:
+  the release, or, for a dependency following a branch, the version its
+  manifest gives and the commit (`Scythe 0.2.0 (f7e5d965b) -> 0.3.0
+  (3d2afe126)`). A dependency held back by a newer release that breaks its
+  `version` is named, with that release. It used to say every dependency was
+  current, as if there were nothing newer.
 
 ### Added
 
@@ -52,6 +58,10 @@ last release is under _Unreleased_.
   it, where, and whether it gets a repository, and shows what it will make
   before it makes it. `meadow init --lib` makes a library too: a
   `src/Lib.mw` with a function and a test of it.
+- `meadow update --breaking` moves a dependency past a release that breaks
+  the `version` it asks for: the `version` in `Meadow.toml` is raised to the
+  newest release, and the lockfile follows. With `--dry-run` it says what it
+  would raise and changes nothing.
 - A Cut definition, or a method of an object, may say what it can perform:
   its row, `! {E, .. | e, ..}`, after its parameters (`docs/CUT.md`,
   "Rows"). A row may name only effects that are declared, and only the
