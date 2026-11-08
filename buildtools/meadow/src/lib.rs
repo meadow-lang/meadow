@@ -29,6 +29,7 @@ pub mod ir;
 pub mod linker;
 pub mod listing;
 pub mod lock;
+pub mod new;
 pub mod package;
 pub mod pgo;
 pub mod pipeline;

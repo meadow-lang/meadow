@@ -18,6 +18,7 @@ fn scratch(who: &str) -> meadow_scratch::Scratch {
 fn init_at(path: &Path, name: Option<&str>) -> Result<init::Created, String> {
     init::run(&init::Options {
         workspace: false,
+        lib: false,
         path: path.to_path_buf(),
         name: name.map(|s| s.to_string()),
     })

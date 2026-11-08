@@ -14,6 +14,9 @@
 //! unless a pattern there already covers it, and gets no `.gitignore`, since
 //! it builds into the workspace's `target`. `--workspace` makes the workspace
 //! itself -- see [`crate::workspace`].
+//!
+//! `--lib` makes a library instead: `src/Lib.mw`, with a function for others
+//! to use and a test of it, and no entry point.
 
 use crate::workspace::Workspace;
 use std::path::{Path, PathBuf};
@@ -25,6 +28,8 @@ pub struct Options {
     pub name: Option<String>,
     /// Make a workspace rather than a package -- see [`crate::workspace`].
     pub workspace: bool,
+    /// Make a library: `src/Lib.mw` rather than `src/Main.mw`.
+    pub lib: bool,
 }
 
 /// What was created, for the caller to report.
@@ -36,6 +41,9 @@ pub struct Created {
     /// The root of the workspace the new package was added to, if it was
     /// made inside one that did not already count it a member.
     pub joined: Option<PathBuf>,
+    /// The root of the workspace the new package was made in, whether or
+    /// not it had to be added to its members.
+    pub within: Option<PathBuf>,
 }
 
 pub fn run(opts: &Options) -> Result<Created, String> {
@@ -95,9 +103,14 @@ pub fn run(opts: &Options) -> Result<Created, String> {
     write_new(&root.join("Meadow.toml"), &manifest(&name), &mut files)?;
     // Left alone if it is already there: someone running this in a directory
     // that has sources wants the manifest, not a new `main`.
-    let main = src.join("Main.mw");
-    if !main.exists() {
-        write_new(&main, MAIN, &mut files)?;
+    let (file, template) = if opts.lib {
+        ("Lib.mw", LIB)
+    } else {
+        ("Main.mw", MAIN)
+    };
+    let first = src.join(file);
+    if !first.exists() {
+        write_new(&first, template, &mut files)?;
     }
 
     // A member builds into its workspace's `target`, which the workspace's
@@ -115,6 +128,7 @@ pub fn run(opts: &Options) -> Result<Created, String> {
         root: root.clone(),
         files,
         joined,
+        within: workspace.map(|ws| PathBuf::from(crate::workspace::shown(&ws.root))),
     })
 }
 
@@ -129,6 +143,7 @@ fn init_workspace(root: &Path) -> Result<Created, String> {
         root: root.to_path_buf(),
         files,
         joined: None,
+        within: None,
     })
 }
 
@@ -155,7 +170,7 @@ fn refuse_nesting(root: &Path) -> Result<(), String> {
 /// The workspace at or above `dir`, if there is one. A package being made is
 /// not a member yet, so this looks for the `[workspace]` itself rather than
 /// asking [`Workspace::find`], which would refuse it for not being one.
-fn enclosing_workspace(dir: &Path) -> Result<Option<Workspace>, String> {
+pub(crate) fn enclosing_workspace(dir: &Path) -> Result<Option<Workspace>, String> {
     let mut dir = Some(dir);
     while let Some(d) = dir {
         if d.join("Meadow.toml").is_file() {
@@ -248,6 +263,14 @@ fun main () : () ! Eff =
   println \"Hello, world!\"
 ";
 
+const LIB: &str = "\
+use Std.Test (assertEq)
+
+@pub fun add a b = a + b
+
+@test fun addsTwoNumbers () = assertEq (add 2 3) 5 \"two and three\"
+";
+
 /// The name a directory implies: what it is called, as a package name.
 ///
 /// A directory called `my-app` is perfectly ordinary and `my-app` is not a
@@ -277,7 +300,7 @@ fn directory_name(root: &Path) -> Result<String, String> {
 /// is — PascalCase, one identifier, no separators. A directory called
 /// `my-package` is perfectly ordinary and would produce a package nobody could
 /// name, and the moment to say so is now rather than at the first `use`.
-fn check_name(name: &str) -> Result<(), String> {
+pub fn check_name(name: &str) -> Result<(), String> {
     let bad = |why: &str| Err(format!("`{name}` is not a usable package name: {why}"));
 
     let Some(first) = name.chars().next() else {
