@@ -228,7 +228,8 @@ fn lowered(p: &Program, prints: bool) -> R<Lowered> {
         current: None,
         handles: false,
         tails: false,
-        search: Label(0),
+        lifted_base: 0,
+        lifted: Vec::new(),
         rep_vars: HashMap::new(),
         descs: HashSet::new(),
         params: HashMap::new(),
@@ -325,8 +326,18 @@ fn lowered(p: &Program, prints: bool) -> R<Lowered> {
     l.frames = l.graded(None);
     l.start(p)?;
     l.exports(p)?;
-    if l.handles {
-        l.search_block();
+    for d in std::mem::take(&mut l.lifted) {
+        let d =
+            d.ok_or_else(|| "a definition made while lowering was never written".to_string())?;
+        if d.label != Label(l.out.defs.len() as u32) {
+            return Err(format!(
+                "`{}` was numbered {:?} but lands at {}",
+                d.name,
+                d.label,
+                l.out.defs.len()
+            ));
+        }
+        l.out.defs.push(d);
     }
     // Every value represented as a variable has its descriptor wherever it
     // is: each environment that lacks one is given it.
@@ -350,8 +361,11 @@ struct Lower {
     /// performed ([`tail_resumptive`]): the evidence then has entries of two
     /// kinds, and the search and every `perform` look for both.
     tails: bool,
-    /// The block that finds an operation's entry in the evidence.
-    search: Label,
+    /// The label of the first definition made while lowering others -- each
+    /// `perform`'s search -- which are written after everything else.
+    lifted_base: u32,
+    /// Those definitions, in label order; `None` until each is written.
+    lifted: Vec<Option<ax::Def>>,
     /// Each definition's parameters' representations, as written.
     params: HashMap<Symbol, Vec<Rep>>,
     /// How the `μ` about to be lowered as an argument is represented.
@@ -583,7 +597,9 @@ impl Lower {
         }
         self.handles = seen.handles;
         self.tails = seen.tails;
-        self.search = Label(p.defs.len() as u32 + u32::from(p.entry.is_some()));
+        // After the definitions, the start and each export.
+        self.lifted_base =
+            p.defs.len() as u32 + u32::from(p.entry.is_some()) + p.exports.len() as u32;
         if self.handles {
             // A resumption is a function.
             names.insert("apply".to_string());
@@ -1135,39 +1151,41 @@ impl Lower {
             return Ok(self.native(effect, name, &xs, kc, resumed, &sc.env));
         }
         let ev = sc.var(EV)?;
-        let key = self.fresh(ax::Rep::Str);
-        sc.push(key);
-        steps.push(Step::Extern(
-            Extern::Lit(Lit::Sym(InternedString::from(op.to_string().as_str()))),
-            Vec::new(),
-            sc.env.clone(),
-        ));
-        // What both of the search's answers hold: the arguments. Where what
-        // the operation is resumed with goes is handed to the search and on
-        // to them, not held: so it is what the search is called with to
+        // The search is a definition of this `perform`'s own, as each of
+        // `meadow_seq`'s is: it walks the evidence with the arguments and
+        // where the operation's value goes riding along, tests each entry's
+        // key against a constant, and enters the clause it finds itself. So
+        // nothing is made to look an operation up. A search shared by every
+        // `perform` was handed what to do when it found the entry and when it
+        // did not, as two objects -- made, and freed, at every `perform` --
+        // and entered the first through a call.
+        //
+        // Where what the operation is resumed with goes is handed to the
+        // search and on, not held: so it is what the search is called with to
         // answer through, which a frame may be, and the resumption keeps a
-        // continuation of theirs -- as `meadow_seq`'s operations do. Held, it
-        // was built on the heap, and the code after the `perform` ran inside
-        // the resumption, a frame deeper for every operation.
+        // continuation of theirs. Held, it was built on the heap, and the
+        // code after the `perform` ran inside the resumption, a frame deeper
+        // for every operation.
         let caller = kc;
-        let kc = self.fresh(ax::Rep::Ref);
-        self.out.returns.insert(kc);
         let held = Self::once(&xs);
+        let (entry, kc) = (self.fresh(ax::Rep::Ref), self.fresh(ax::Rep::Ref));
+        self.out.returns.insert(kc);
+        let mut params = vec![entry];
+        params.extend(held.iter().copied());
+        params.push(kc);
+        let label = self.lift();
 
         // Found: the entry, taken apart; a resumption made; the clause
         // entered with the arguments, the resumption, and what its handler's
         // value goes to now.
-        let entry = self.fresh(ax::Rep::Ref);
         let (k2, clause, target, rest) = (
             self.fresh(ax::Rep::Str),
             self.fresh(ax::Rep::Ref),
             self.fresh(ax::Rep::Ref),
             self.fresh(ax::Rep::Ref),
         );
-        let mut found_params = held.clone();
-        found_params.extend([entry, kc]);
         let mut in_entry = vec![k2, clause, target, rest];
-        in_entry.extend(found_params.iter().copied());
+        in_entry.extend(params.iter().copied());
         let resumption = self.fresh(ax::Rep::Ref);
         let (v, after, unused, done) = (
             self.fresh(resumed),
@@ -1342,14 +1360,7 @@ impl Lower {
                 }),
             }
         };
-        let entry_tag = self.tag_of(meadow_rt::roles::evidence::ENTRY);
-        let mut arms = vec![(
-            entry_tag,
-            Block {
-                params: in_entry.clone(),
-                body: entered,
-            },
-        )];
+        let mut hits = vec![(meadow_rt::roles::evidence::ENTRY, entered)];
         if self.tails {
             // A clause that only resumes, last (`tail_resumptive`): entered
             // here, with the arguments and, for its own continuation, where
@@ -1357,123 +1368,34 @@ impl Lower {
             let mut enter = vec![clause];
             enter.extend(xs.iter().copied());
             enter.push(kc);
-            let params = self.distinct(&enter);
-            arms.push((
-                self.tag_of(meadow_rt::roles::evidence::TAIL),
-                Block {
-                    params: in_entry,
-                    body: S::Substitute(
-                        enter,
-                        Box::new(Block {
-                            params,
-                            body: S::Invoke(clause, 0),
-                        }),
-                    ),
-                },
-            ));
-        }
-        let found = self.fresh(ax::Rep::Ref);
-        self.out.continuations.insert(found);
-        steps.push(Step::New(
-            found,
-            held.clone(),
-            vec![Block {
-                params: found_params.clone(),
-                body: S::Switch {
-                    scrutinee: entry,
-                    arms,
-                    default: Box::new(Block {
-                        params: found_params,
-                        body: S::Error("the evidence holds what is not an entry"),
-                    }),
-                },
-            }],
-        ));
-        sc.push(found);
-
-        // Not found: the runtime's, if it is one of its operations.
-        let nothing = self.fresh(ax::Rep::Bits(desc::UNIT));
-        let mut missing_params = held.clone();
-        missing_params.extend([nothing, kc]);
-        let body = match native {
-            Some((effect, name)) => self.native(effect, name, &xs, kc, resumed, &missing_params),
-            None => S::Error(Box::leak(format!("unhandled effect {op}").into_boxed_str())),
-        };
-        let missing = self.fresh(ax::Rep::Ref);
-        self.out.continuations.insert(missing);
-        steps.push(Step::New(
-            missing,
-            held,
-            vec![Block {
-                params: missing_params,
-                body,
-            }],
-        ));
-        sc.push(missing);
-
-        let sel = vec![ev, key, found, missing, caller];
-        Ok(S::Substitute(
-            sel.clone(),
-            Box::new(Block {
-                params: sel,
-                body: S::Jump(self.search),
-            }),
-        ))
-    }
-
-    /// The block that looks an operation up: `(evidence, key, found,
-    /// missing, k)`, giving `found` the first entry whose key is `key`, or
-    /// `missing` `unit` if the evidence ends first -- and either `k`, where
-    /// what the operation is resumed with goes.
-    fn search_block(&mut self) {
-        let (cur, key, found, missing, k) = (
-            self.fresh(ax::Rep::Ref),
-            self.fresh(ax::Rep::Str),
-            self.fresh(ax::Rep::Ref),
-            self.fresh(ax::Rep::Ref),
-            self.fresh(ax::Rep::Ref),
-        );
-        self.out.returns.insert(k);
-        let (k2, clause, target, rest) = (
-            self.fresh(ax::Rep::Str),
-            self.fresh(ax::Rep::Ref),
-            self.fresh(ax::Rep::Ref),
-            self.fresh(ax::Rep::Ref),
-        );
-        let params = vec![cur, key, found, missing, k];
-        let in_entry = vec![k2, clause, target, rest, cur, key, found, missing, k];
-        let u = self.fresh(ax::Rep::Bits(desc::UNIT));
-        let ended = S::Extern {
-            op: Extern::Lit(Lit::Unit),
-            args: Vec::new(),
-            blocks: vec![Block {
-                params: vec![u, cur, key, found, missing, k],
-                body: S::Substitute(
-                    vec![missing, u, k],
+            let entered_with = self.distinct(&enter);
+            hits.push((
+                meadow_rt::roles::evidence::TAIL,
+                S::Substitute(
+                    enter,
                     Box::new(Block {
-                        params: vec![missing, u, k],
-                        body: S::Invoke(missing, 0),
+                        params: entered_with,
+                        body: S::Invoke(clause, 0),
                     }),
                 ),
-            }],
-        };
-        let next = vec![rest, key, found, missing, k];
-        // An entry of either kind is looked at alike: which it is matters
-        // only to `found`.
-        let mut kinds = vec![meadow_rt::roles::evidence::ENTRY];
-        if self.tails {
-            kinds.push(meadow_rt::roles::evidence::TAIL);
+            ));
         }
-        let arms = kinds
+        // An entry of either kind is looked at alike, and the next one looked
+        // at if its key is not this operation's.
+        let key = Lit::Sym(InternedString::from(op.to_string().as_str()));
+        let mut next = vec![rest];
+        next.extend(held.iter().copied());
+        next.push(kc);
+        let arms = hits
             .into_iter()
-            .map(|kind| {
+            .map(|(kind, hit)| {
                 (
                     self.tag_of(kind),
                     Block {
                         params: in_entry.clone(),
                         body: S::Extern {
-                            op: Extern::BranchPrim(Prim::Eq),
-                            args: vec![k2, key],
+                            op: Extern::BranchPrimK(Prim::Eq, key.clone()),
+                            args: vec![k2],
                             blocks: vec![
                                 Block {
                                     params: in_entry.clone(),
@@ -1481,19 +1403,13 @@ impl Lower {
                                         next.clone(),
                                         Box::new(Block {
                                             params: next.clone(),
-                                            body: S::Jump(self.search),
+                                            body: S::Jump(label),
                                         }),
                                     ),
                                 },
                                 Block {
                                     params: in_entry.clone(),
-                                    body: S::Substitute(
-                                        vec![found, cur, k],
-                                        Box::new(Block {
-                                            params: vec![found, cur, k],
-                                            body: S::Invoke(found, 0),
-                                        }),
-                                    ),
+                                    body: hit,
                                 },
                             ],
                         },
@@ -1501,21 +1417,52 @@ impl Lower {
                 )
             })
             .collect();
-        let body = S::Switch {
-            scrutinee: cur,
-            arms,
-            default: Box::new(Block {
-                params: params.clone(),
-                body: ended,
-            }),
+
+        // Not found: the runtime's, if it is one of its operations.
+        let missing = match native {
+            Some((effect, name)) => self.native(effect, name, &xs, kc, resumed, &params),
+            None => S::Error(Box::leak(format!("unhandled effect {op}").into_boxed_str())),
         };
-        debug_assert_eq!(self.search, Label(self.out.defs.len() as u32));
-        self.out.defs.push(ax::Def {
-            label: self.search,
-            name: InternedString::from("#perform"),
+        self.write_lifted(ax::Def {
+            label,
+            name: InternedString::from(format!("#perform {op}").as_str()),
             module: InternedString::from(""),
-            block: Block { params, body },
+            block: Block {
+                params: params.clone(),
+                body: S::Switch {
+                    scrutinee: entry,
+                    arms,
+                    default: Box::new(Block {
+                        params,
+                        body: missing,
+                    }),
+                },
+            },
         });
+
+        let mut call = vec![ev];
+        call.extend(held);
+        call.push(caller);
+        Ok(S::Substitute(
+            call.clone(),
+            Box::new(Block {
+                params: call,
+                body: S::Jump(label),
+            }),
+        ))
+    }
+
+    /// A label for a definition made while lowering another, which is
+    /// written after everything else once [`Lower::write_lifted`] is given it.
+    fn lift(&mut self) -> Label {
+        let label = Label(self.lifted_base + self.lifted.len() as u32);
+        self.lifted.push(None);
+        label
+    }
+
+    fn write_lifted(&mut self, d: ax::Def) {
+        let at = (d.label.0 - self.lifted_base) as usize;
+        self.lifted[at] = Some(d);
     }
 
     /// `handle { clauses; return } in μ b. body ; c`.

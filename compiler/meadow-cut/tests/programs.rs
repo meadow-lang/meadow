@@ -908,3 +908,60 @@ fn an_effect_resumed_twice_keeps_on_the_heap_only_the_code_that_can_reach_it() {
         );
     }
 }
+
+#[test]
+fn a_perform_searches_the_evidence_making_nothing() {
+    // Each `perform` is lowered to a search of its own, which compares keys
+    // with a constant and enters the clause it finds: what performs makes no
+    // object to look the operation up with. Its continuation is a frame, so
+    // the loop that asks makes nothing at all. A program that exports a
+    // definition as well numbers the searches after the export.
+    let text = "cut 0
+entry idyll:Main/main
+answer str
+
+effect idyll:Main/Ask { ask(unit) -> i64 }
+
+def idyll:Main/sum (n: i64, acc: i64; k: ptr) ! {idyll:Main/Ask} =
+  prim eq(n, 0; μ̃ u: unit.
+    prim sub(n, 1; μ̃ m: i64.
+      perform idyll:Main/Ask.ask(unit; μ̃ a: i64.
+        prim add(acc, a; μ̃ s: i64. idyll:Main/sum(m, s; k)))),
+    μ̃ u: unit. <acc | k>)
+
+def idyll:Main/twice (n: i64; k: ptr) ! {} = prim add(n, n; k)
+
+export \"twice\" = idyll:Main/twice -> i64
+
+def idyll:Main/main (; k: ptr) =
+  handle {
+    idyll:Main/Ask.ask(u: unit; r: ptr, h: ptr) => <r | resume(3; h)>;
+    return(x: i64; h: ptr) => <x | h>
+  } in μ b. idyll:Main/sum(1000, 0; b)
+  ; μ̃ n: i64. prim eq(n, 3000; μ̃ u: unit. <\"no\" | k>, μ̃ u: unit. <\"yes\" | k>)
+";
+    assert_eq!(runs(text).output, "yes");
+    let p = parse(text).unwrap();
+    let lowered = meadow_cut::lower::lower(&p).unwrap();
+    let listing = lowered.pretty();
+    // The first definition is `sum`, up to the next. What it makes is the
+    // continuation the operation answers, and that is a frame: the search,
+    // which it jumps to, makes nothing.
+    let sum = listing.split("\ndef ").next().expect("a definition");
+    let made: Vec<&str> = sum
+        .match_indices("new v")
+        .map(|(at, _)| {
+            let name = &sum[at + "new ".len()..];
+            &name[..name.find(' ').unwrap_or(name.len())]
+        })
+        .collect();
+    let framed: Vec<String> = lowered.frames.iter().map(|n| format!("v{}", n.0)).collect();
+    assert_eq!(made.len(), 1, "{sum}");
+    assert!(
+        framed.iter().any(|f| f == made[0]),
+        "{} is not a frame: {sum}",
+        made[0]
+    );
+    assert!(sum.contains("jump"), "{sum}");
+    lowered_agrees(&p, &runs(text));
+}
