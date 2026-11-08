@@ -1141,6 +1141,12 @@ struct Inherits {
     deps: Vec<String>,
 }
 
+/// The `version` a manifest's text gives its package, if it gives one.
+pub fn version_in(text: &str) -> Option<String> {
+    let has = text.lines().any(|l| l.trim_start().starts_with("version"));
+    has.then(|| parse_manifest(text, Path::new(".")).0.version)
+}
+
 /// A deliberately small line-based TOML reader — enough for `[package]` /
 /// `[dependencies]` with string or `{ path = "…" }` values, the `[profile.*]`
 /// and `[workspace*]` sections, and arrays of strings, which may run over
