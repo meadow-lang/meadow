@@ -58,11 +58,18 @@ last release is under _Unreleased_.
 
 ### Added
 
+- `meadow new MyApp` makes a package in a new directory, as `cargo new` does:
+  named after the directory (`my-app` makes `MyApp`), and a git repository
+  of its own unless it is inside one already or joins a workspace.
+  `--lib` makes a library, `--workspace` a workspace, and `--no-git` no
+  repository. With no path, at a terminal, it asks what to make, what to call
+  it, where, and whether it gets a repository, and shows what it will make
+  before it makes it. `meadow init --lib` makes a library too: a
+  `src/Lib.mw` with a function and a test of it.
 - `meadow update --breaking` moves a dependency past a release that breaks
   the `version` it asks for: the `version` in `Meadow.toml` is raised to the
   newest release, and the lockfile follows. With `--dry-run` it says what it
   would raise and changes nothing.
-
 - A Cut definition, or a method of an object, may say what it can perform:
   its row, `! {E, .. | e, ..}`, after its parameters (`docs/CUT.md`,
   "Rows"). A row may name only effects that are declared, and only the

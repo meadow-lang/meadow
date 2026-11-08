@@ -4310,7 +4310,8 @@ as it comes.
 | `meadow test [<path>] [<filter>]`                                           | run `@test` functions                                                                                                    |
 | `meadow test --test-threads N`, `--no-capture`                              | …`N` at a time instead of one per core; and writing what they print instead of keeping it for the failures               |
 | `meadow build -p app`, `meadow test --workspace [--exclude app]`            | in a [workspace](#workspaces): the members named, or all of them; `run`, `build`, `test` and `dis` take these            |
-| `meadow init [--workspace] <path>`                                          | create a package, or a workspace; a package made inside a workspace joins it                                             |
+| `meadow new [--lib \| --workspace] [<path>]`                                | create a package in a new directory with a git repository; with no path, asks at a terminal what to make                 |
+| `meadow init [--lib \| --workspace] <path>`                                 | create a package, or a workspace; a package made inside a workspace joins it                                             |
 | `meadow fmt <path>`                                                         | format in place                                                                                                          |
 | `meadow fmt --check <path>`                                                 | report, exit 1 if anything differs                                                                                       |
 | `meadow lsp`                                                                | run the language server (editors start this)                                                                             |

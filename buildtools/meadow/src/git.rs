@@ -624,6 +624,34 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// The top of the git repository `dir` is in, if it is in one -- and if there
+/// is a `git` to ask.
+pub fn repository_of(dir: &Path) -> Option<PathBuf> {
+    git(Some(dir), &["rev-parse", "--show-toplevel"])
+        .ok()
+        .map(|top| PathBuf::from(top.trim()))
+        .filter(|top| !top.as_os_str().is_empty())
+}
+
+/// Make `dir` a git repository of its own, as `meadow new` does.
+pub fn init_repository(dir: &Path) -> Result<(), String> {
+    let out = git_command(Some(dir))
+        .args(["init", "--quiet"])
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "`git` is not installed".to_string()
+            } else {
+                format!("could not run git: {e}")
+            }
+        })?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
 // --- where things are kept ----------------------------------------------------
 
 /// Where fetched repositories are kept when nothing says otherwise:

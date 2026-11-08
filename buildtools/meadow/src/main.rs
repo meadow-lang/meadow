@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use meadow::{
     Backend, Engine, OptLevel, Profile, Resolved, Strictness, aot, artifacts, format, init,
     listing::{self, Emit},
+    new,
     package::ProfileConfig,
     pipeline, runtime, status, test,
     workspace::{Selected, Selection},
@@ -257,6 +258,33 @@ enum Cmd {
         /// `[workspace]`, for packages made inside it to join.
         #[arg(long, conflicts_with = "name")]
         workspace: bool,
+        /// Create a library: a `src/Lib.mw`, with a function and a test of
+        /// it, rather than a `src/Main.mw`.
+        #[arg(long, conflicts_with = "workspace")]
+        lib: bool,
+    },
+    /// Create a package in a new directory: `meadow new MyApp`.
+    ///
+    /// With no path, at a terminal, it asks what to make, what to call it,
+    /// where, and whether it gets a git repository. The directory must not
+    /// exist yet -- `meadow init` is for one that does -- and is made a git
+    /// repository unless it is in one already, or joins a workspace.
+    New {
+        /// The directory to make. The package is named after it, as
+        /// `meadow init` names one: `my-app` makes `MyApp`.
+        path: Option<PathBuf>,
+        /// The package's name. Defaults to the directory's.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Create a library: a `src/Lib.mw` rather than a `src/Main.mw`.
+        #[arg(long, conflicts_with = "workspace")]
+        lib: bool,
+        /// Create a workspace, for packages made inside it to join.
+        #[arg(long, conflicts_with = "name")]
+        workspace: bool,
+        /// Do not make it a git repository.
+        #[arg(long)]
+        no_git: bool,
     },
     /// Add a dependency to a package's manifest.
     ///
@@ -1037,33 +1065,92 @@ fn command() {
             path,
             name,
             workspace,
+            lib,
         }) => match init::run(&init::Options {
             path,
             name,
             workspace,
+            lib,
         }) {
-            Ok(made) => {
-                if workspace {
-                    println!("created a workspace at {}", made.root.display());
-                } else {
-                    println!("created package `{}` at {}", made.name, made.root.display());
-                }
-                for f in &made.files {
-                    println!("  {}", nearby(f).display());
-                }
-                if let Some(ws) = &made.joined {
-                    println!(
-                        "added `{}` to the members of {}",
-                        made.name,
-                        nearby(ws).display()
-                    );
-                }
-            }
+            Ok(made) => created(&made, workspace),
             Err(e) => {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
         },
+        Some(Cmd::New {
+            path,
+            name,
+            lib,
+            workspace,
+            no_git,
+        }) => {
+            let kind = if workspace {
+                new::Kind::Workspace
+            } else if lib {
+                new::Kind::Lib
+            } else {
+                new::Kind::App
+            };
+            let opts = match path {
+                Some(path) => new::Options {
+                    path,
+                    name,
+                    kind,
+                    git: !no_git,
+                },
+                None => {
+                    use std::io::IsTerminal;
+                    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+                        eprintln!(
+                            "error: `meadow new` asks what to make only at a terminal; \
+                             name the directory instead: `meadow new MyApp`"
+                        );
+                        std::process::exit(1);
+                    }
+                    let mut wizard = new::Wizard::new(new::Context::here())
+                        .with_kind(kind)
+                        .with_git(!no_git);
+                    if let Some(n) = &name {
+                        wizard = wizard.with_name(n);
+                    }
+                    match new::ask(wizard) {
+                        Ok(Some(opts)) => opts,
+                        Ok(None) => {
+                            eprintln!("nothing was made");
+                            std::process::exit(1);
+                        }
+                        Err(e) => {
+                            eprintln!("error: could not ask at this terminal: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            };
+            match new::run(&opts) {
+                Ok(made) => {
+                    created(&made.created, opts.kind == new::Kind::Workspace);
+                    match &made.repository {
+                        new::Repository::Made => println!("  .git, a repository of its own"),
+                        new::Repository::Failed(e) => {
+                            status::warning(format!("no git repository was made: {e}"))
+                        }
+                        _ => {}
+                    }
+                    let dir = nearby(&made.created.root);
+                    let next = match opts.kind {
+                        new::Kind::App => "meadow run",
+                        new::Kind::Lib => "meadow test",
+                        new::Kind::Workspace => "meadow new MyPackage",
+                    };
+                    println!("next: cd {} && {next}", dir.display());
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some(Cmd::Cut {
             file,
             runtime,
@@ -1282,6 +1369,25 @@ fn exit_on_error<T>(result: Result<T, String>) -> T {
         eprintln!("error: {e}");
         std::process::exit(1);
     })
+}
+
+/// Say what `init` or `new` created.
+fn created(made: &init::Created, workspace: bool) {
+    if workspace {
+        println!("created a workspace at {}", made.root.display());
+    } else {
+        println!("created package `{}` at {}", made.name, made.root.display());
+    }
+    for f in &made.files {
+        println!("  {}", nearby(f).display());
+    }
+    if let Some(ws) = &made.joined {
+        println!(
+            "added `{}` to the members of {}",
+            made.name,
+            nearby(ws).display()
+        );
+    }
 }
 
 /// `path` as seen from the current directory, when it is inside it: `init`

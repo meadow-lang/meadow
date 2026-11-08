@@ -280,7 +280,17 @@ cli! {
       path : Maybe String "Where to make it"
       name : Option String "The package's name, where the directory's is not it" value "NAME"
       workspace : Flag "A workspace, rather than a package"
+      lib : Flag "A library: a `src/Lib.mw` rather than a `src/Main.mw`"
     }
+    | new
+      "Create a package in a new directory: `meadow new MyApp`, or, with no path, by answering what to make"
+      {
+        path : Maybe String "The directory to make, which the package is named after"
+        name : Option String "The package's name, where the directory's is not it" value "NAME"
+        lib : Flag "A library: a `src/Lib.mw` rather than a `src/Main.mw`"
+        workspace : Flag "A workspace, for packages made inside it to join"
+        noGit : Flag "Do not make it a git repository"
+      }
     | add "Add a dependency to a package's manifest" {
       what : String "The dependency: a name, a path or a repository"
       branch : Option String "The branch to follow" value "NAME"

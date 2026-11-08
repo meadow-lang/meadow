@@ -371,6 +371,7 @@ fn init_makes_a_workspace_and_members_join_it() {
         path: root.clone(),
         name: None,
         workspace: true,
+        lib: false,
     })
     .unwrap();
     assert!(made.files.contains(&root.join(".gitignore")));
@@ -380,6 +381,7 @@ fn init_makes_a_workspace_and_members_join_it() {
             path,
             name: None,
             workspace: false,
+            lib: false,
         })
         .unwrap()
     };
@@ -410,6 +412,7 @@ fn init_makes_a_workspace_and_members_join_it() {
         path: root.join("inner"),
         name: None,
         workspace: true,
+        lib: false,
     })
     .unwrap_err();
     assert!(err.contains("do not nest"), "{err}");
@@ -417,6 +420,7 @@ fn init_makes_a_workspace_and_members_join_it() {
         path: root.join("other"),
         name: Some("App".into()),
         workspace: false,
+        lib: false,
     })
     .unwrap_err();
     assert!(err.contains("already has a member called `App`"), "{err}");

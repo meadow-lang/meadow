@@ -137,6 +137,8 @@ examples/<name>` runs its tests.
 
 ```sh
 meadow                          # REPL
+meadow new                      # make a package, asking what kind and where
+meadow new my-app               # ...or in ./my-app, named MyApp (`--lib` for a library)
 meadow init                     # start a package here, named after the directory
 meadow init pkg --name myPkg    # ...or elsewhere, under a name you choose
 meadow run examples/Euler       # build a package and run `main`, on the VM and its JIT
