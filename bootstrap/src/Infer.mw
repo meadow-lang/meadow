@@ -2486,7 +2486,14 @@ fun inferImpl
   said : [String],
   -- Where each of those is: the module, and the byte it starts at (-1 for
   -- what is of no one place).
-  saidAt : [(Int, Int)]
+  saidAt : [(Int, Int)],
+  -- What each binding of the unit that was generalized came to -- every one
+  -- at the top, and each `let` that was -- as `meadow build --types` writes
+  -- it: what the language server shows of one.
+  general : HashMap Int Scheme,
+  -- Each binder whose type is no scheme -- a parameter, a handler's
+  -- continuation -- with that type, settled.
+  monos : HashMap Int Type
 }
 
 -- Infer unit `r`, whose dependencies exported `deps` -- their values' schemes
@@ -2657,6 +2664,14 @@ fun inferImpl
          problems = ofMain,
          said = stGetRef i.errors,
          saidAt = stGetRef i.errorsAt,
+         general,
+         monos =
+           V.foldl
+             (\h kv ->
+               (let sc : Scheme = snd kv in
+                if V.isEmpty sc.quant then H.insert (fst kv) (settled i.ar sc.ty) h else h))
+             H.empty
+             (H.toVec (stGetRef i.env)),
          dumps,
          schemes = exported,
          types = ownTypes i,
