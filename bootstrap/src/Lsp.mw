@@ -34,7 +34,7 @@ use MeadowBoot.Compiler (
 )
 use MeadowBoot.Unit (packageOf, absolute)
 use MeadowBoot.Rename (Binder)
-use MeadowBoot.Scopes (Source, Declared, Item, Export, builtinTyconNames)
+use MeadowBoot.Scopes (Source, Declared, Item, Export, Vis, builtinTyconNames)
 use MeadowBoot.Infer
 use MeadowBoot.Types (
   Type, Scheme, VarKind, Namer, newNamer, namerOf, showType, showScheme, showTypeIn, isFun, renderIn,
@@ -310,7 +310,12 @@ fun viewIn (uri : String) (path : String) (text : String) (file : String) (s : S
         if b.kind != "v" then []
         else
           match siteOf b with
-          | Just (f, from, to) -> if f == file then [(from, to, id)] else []
+          -- Only a name written there: what a derive declares stands at the
+          -- derive, and is not written anywhere.
+          | Just (f, from, to) ->
+              if f == file and to <= stringByteLength text and stringSlice text from to == b.name then
+                [(from, to, id)]
+              else []
           | None -> [])
       (V.range 0 (V.len binders))
   in View {
@@ -455,7 +460,11 @@ fun meadowHome () =
 -- knows: the document's own, one it imports, or the standard library's
 -- copy written out for an editor.
 fun pathNamed (v : View) (file : String) =
-  match V.find (\x -> srcFile (snd x) == file) v.study.sources with
+  -- A module of the library other than the document is the copy written
+  -- out, even from inside the library: the Rust server analyses a module of
+  -- it against the others as compiled into `meadow`.
+  let ownStd = S.startsWith "Std/" file and v.package == "Std" in
+  match (if ownStd then None else V.find (\x -> srcFile (snd x) == file) v.study.sources) with
   | Just (path, _) -> Just path
   | None ->
       (let pkg = M.unwrapOr "" (V.get (S.split "/" file) 0) in
@@ -681,7 +690,9 @@ fun namesAt (v : View) (o : Int) : [(Int, Int, Int, String)] =
         | Just (f, t, _) -> if covers f t o then [(f, t, 0 - 1 - k, "m")] else []
         | None -> [])
       (V.range 0 (V.len v.modules))
-  in stableSortBy (\r -> match r with | (f, t, _, _) -> t - f) (V.append around modules)
+  -- A module first, of two as long: the Rust compiler notes a `use`'s path
+  -- as modules before the names it brings.
+  in stableSortBy (\r -> match r with | (f, t, _, _) -> t - f) (V.append modules around)
 
 -- `xs` in order of `key`, those with the same key in the order they were.
 fun stableSortBy (key : a -> Int) (xs : [a]) : [a] =
@@ -773,7 +784,10 @@ fun targetIn (v : View) (f : Int) (t : Int) (id : Int) (value : Bool)
     : Result String (Int, Int, Int, Bool) =
   match siteOf (binderOf v id) with
   | Just (file, _, _) ->
-      if file == v.file or V.any (\x -> srcFile (snd x) == file) v.study.sources then
+      -- A module of the library is analysed on its own, the rest of the
+      -- library outside it.
+      if file == v.file
+        or v.package != "Std" and V.any (\x -> srcFile (snd x) == file) v.study.sources then
         Ok (f, t, id, value)
       else Err (outside (S.startsWith "Std/" file))
   | None -> Err (outside False)
@@ -841,7 +855,7 @@ fun renamed (ed : Editor) (v : View) (id : Int) (new : String) =
       (\u ->
         match u with
         | (f, from, to) ->
-            f != v.file and to > from and V.any (\x -> srcFile (snd x) == f) v.study.sources)
+            v.package != "Std" and f != v.file and to > from and V.any (\x -> srcFile (snd x) == f) v.study.sources)
       b.uses
   in
   let every = V.concat [site, mine, theirs] in
@@ -926,11 +940,13 @@ fun tokensOf (ed : Editor) (a : Asked) =
   | None -> J.jNull ()
   | Just v ->
       let toks = (lex v.text).tokens in
+      -- The last noted of those at one place: a `use`'s path is noted as
+      -- modules first, and a type it reaches -- `use M.Ty.*` -- after.
       let resolved =
         V.foldl
-          (\m x -> match x with | (f, _, _) -> H.insert f "m" m)
-          (V.foldl (\m n -> match n with | (f, _, _, k) -> H.insert f k m) H.empty v.names)
-          v.modules
+          (\m n -> match n with | (f, _, _, k) -> H.insert f k m)
+          (V.foldl (\m x -> match x with | (f, _, _) -> H.insert f "m" m) H.empty v.modules)
+          v.names
       in
       let functions = functionsOf v in
       let scope = scopeOf v in
@@ -1208,7 +1224,14 @@ fun viewDump (ed : Editor) (a : Asked) =
           J.jArray (V.map (\r -> match r with | (f, t, i) -> J.jString "${show f} ${show t} ${line i}") v.defs)
         ),
         ("calls", J.jArray (V.map (\c -> J.jString "${show (fst c)} ${show (snd c)}") v.calls)),
-        ("said", J.jArray (V.map J.jString v.study.inferred.said))
+        ("said", J.jArray (V.map J.jString v.study.inferred.said)),
+        (
+          "vars",
+          J.jArray
+            (V.map
+               (\x -> match x with | (f, t, ty) -> J.jString "${show f} ${show t} ${showType ty}")
+               v.typing.vars)
+        )
       ]
 
 -- --- modules, as a name of one is written -------------------------------------
@@ -1379,13 +1402,16 @@ record Typing = {
   funs : HashMap Int Int,
   -- Each mention of a value: where inference has it, and its type.
   vars : [(Int, Int, Type)],
+  -- Each `impl`'s method, by its binder: `#impl.Trait.method`.
+  methods : HashMap Int String,
   -- The module's top-level definitions that something could be started at:
   -- each `fun`'s binder and how many parameters it has, and each `def` of a
   -- single name's, with none.
   tops : [(Int, Int)]
 }
 
-def noTyping : Typing = Typing { nodes = [], binders = H.empty, funs = H.empty, vars = [], tops = [] }
+def noTyping : Typing =
+  Typing { nodes = [], binders = H.empty, funs = H.empty, vars = [], methods = H.empty, tops = [] }
 
 fun typingOf (s : Study) (file : String) : Typing =
   match V.find (\k -> M.map fst (V.get s.renamed.programs k) == Just file) (V.range 0 (V.len s.renamed.programs)) with
@@ -1400,7 +1426,19 @@ fun typedDecl (a : TypedArena) (d : TypedDecl) (acc : Typing) : Typing =
   | TypedDeclView.Bind r -> typedBind a r.bind { acc | tops = V.append acc.tops (topOf a r.bind) }
   | TypedDeclView.Attributed r -> typedDecl a r.decl acc
   | TypedDeclView.Trait r -> V.foldl (\t b -> typedBind a b t) acc r.defaults
-  | TypedDeclView.Impl r -> V.foldl (\t b -> typedBind a b t) acc r.methods
+  | TypedDeclView.Impl r ->
+      let traitName = typedNameText a r.tr in
+      let named =
+        V.foldl
+          (\h b ->
+            match viewTypedBind a b with
+            | TypedBindView.Fun f -> H.insert f.id traitName h
+            | _ -> h)
+          H.empty
+          r.methods
+      in
+      let withNames = { acc | methods = H.union acc.methods named } in
+      V.foldl (\t b -> typedBind a b t) withNames r.methods
   | _ -> acc
 
 -- A top-level binding as somewhere a program could start: a `fun`, or a
@@ -1511,7 +1549,10 @@ fun hoverText (v : View) (o : Int) : Maybe String =
       let general = M.andThen (\id -> schemeIn v id) var in
       let signature =
         match (var, general) with
-        | (Just id, Just sc) -> Just "${spellName (bindingName v id)} : ${showScheme sc}"
+        | (Just id, Just sc) ->
+            (match bindingName v id with
+             | Just n -> Just "${spellName n} : ${showScheme sc}"
+             | None -> Just (showScheme sc))
         | _ -> M.map showType (typeAt v o)
       in
       M.map
@@ -1544,10 +1585,24 @@ fun schemeIn (v : View) (id : Int) : Maybe Scheme =
 
 -- What a binding is called where the package exports it -- an `impl`'s
 -- method by the trait it is of -- or else as it is written.
-fun bindingName (v : View) (id : Int) : String =
-  match V.find (\(e : Export) -> e.binder == id and e.kind == "v") v.study.renamed.exports with
-  | Just (e : Export) -> e.name
-  | None -> (binderOf v id).name
+fun bindingName (v : View) (id : Int) : Maybe String =
+  let exported =
+    match V.find (\(e : Export) -> e.binder == id and e.kind == "v") v.study.renamed.exports with
+    | Just (e : Export) ->
+        (match e.vis with
+         | Vis.Exported -> Just e.name
+         | _ -> if v.study.renamed.anyVis then None else Just e.name)
+    | None -> None
+  in
+  -- An `impl`'s method is exported whatever is marked, under its trait.
+  match H.lookup id v.typing.methods with
+  | Just tr -> Just "#impl.${tr}.${(binderOf v id).name}"
+  | None ->
+      (match exported with
+       | Just n -> Just n
+       | None ->
+           if V.any (\d -> match d with | (_, _, i) -> i == id) v.defs then Just (binderOf v id).name
+           else None)
 
 -- A name as a person writes it: an operator's in brackets, `(+)`.
 fun spellName (n : String) : String =
@@ -2112,7 +2167,22 @@ fun labelPart ed (v : View) (types : HashMap String Int) (spelled : HashMap Stri
 -- alone; and a handler's continuation, which no node is.
 fun patched (s : Study) (file : String) (refs : [(Int, Int, Int)]) (t : Typing) : Typing =
   let exact = V.foldl (\h x -> match x with | (f, to, _) -> H.insert (f, to) True h) H.empty t.nodes in
-  let starting = V.foldl (\h x -> match x with | (f, _, ty) -> if H.member f h then h else H.insert f ty h) H.empty t.vars in
+  -- The smallest mention around a name: a function's, in a call, is as
+  -- wide as the call.
+  let around =
+    \f to ->
+      V.foldl
+        (\acc x ->
+          match x with
+          | (a, b, ty) ->
+              if a <= f and to <= b then
+                (match acc with
+                 | Just (a0, b0, _) -> if b - a < b0 - a0 then Just x else acc
+                 | None -> Just x)
+              else acc)
+        None
+        t.vars
+  in
   let mentions =
     V.concatMap
       (\r ->
@@ -2120,8 +2190,8 @@ fun patched (s : Study) (file : String) (refs : [(Int, Int, Int)]) (t : Typing) 
         | (f, to, _) ->
             if H.member (f, to) exact then []
             else
-              (match H.lookup f starting with
-               | Just ty -> [(f, to, ty)]
+              (match around f to with
+               | Just (_, _, ty) -> [(f, to, ty)]
                | None -> []))
       refs
   in
@@ -2143,6 +2213,7 @@ fun patched (s : Study) (file : String) (refs : [(Int, Int, Int)]) (t : Typing) 
        binders = t.binders,
        funs = t.funs,
        vars = t.vars,
+       methods = t.methods,
        tops = t.tops
      }
 
@@ -2334,6 +2405,16 @@ fun candidatesOf (ed : Editor) (v : View) =
           | None -> [])
       v.study.renamed.exports
   in
+  -- Of the library, every value of a name its prelude brings: what can be
+  -- written here without a `use`, every one of that name.
+  let flat =
+    V.foldl
+      (\h (i : Interface) ->
+        if i.package != "Std" then h
+        else V.foldl (\h2 (e : Export) -> if e.kind == "v" and e.flat then H.insert e.name True h2 else h2) h i.exports)
+      H.empty
+      v.study.imported
+  in
   let std =
     V.concatMap
       (\(i : Interface) ->
@@ -2341,7 +2422,7 @@ fun candidatesOf (ed : Editor) (v : View) =
         else
           V.concatMap
             (\(e : Export) ->
-              if e.kind != "v" or not e.flat or startsUpper e.name then []
+              if e.kind != "v" or not (H.member e.name flat) or startsUpper e.name then []
               else
                 match e.scheme with
                 | Just sc ->

@@ -486,6 +486,27 @@ impl Tally {
                         Some(json!({"tokens": y.len(), "from": near(&y)})),
                     )
                 }
+                // Two lists of offers, where they first part.
+                ("completion", Some(x), Some(y)) => {
+                    let none = Vec::new();
+                    let (xs, ys) = (
+                        x["items"].as_array().unwrap_or(&none),
+                        y["items"].as_array().unwrap_or(&none),
+                    );
+                    let at = xs.iter().zip(ys).position(|(p, q)| p != q).unwrap_or(xs.len().min(ys.len()));
+                    (
+                        Some(json!({"items": xs.len(), "at": at, "item": xs.get(at)})),
+                        Some(json!({"items": ys.len(), "at": at, "item": ys.get(at)})),
+                    )
+                }
+                // Two lists, where they first part.
+                (_, Some(Value::Array(xs)), Some(Value::Array(ys))) => {
+                    let at = xs.iter().zip(ys).position(|(p, q)| p != q).unwrap_or(xs.len().min(ys.len()));
+                    (
+                        Some(json!({"len": xs.len(), "at": at, "item": xs.get(at)})),
+                        Some(json!({"len": ys.len(), "at": at, "item": ys.get(at)})),
+                    )
+                }
                 _ => (r, b),
             };
             self.log.push_str(&format!(
