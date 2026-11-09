@@ -922,6 +922,35 @@ fn a_handler_in_a_loop_runs_as_long_as_the_loop_on_silo() {
     assert_eq!(answer(&String::from_utf8_lossy(&out.stdout)), "5000000");
 }
 
+/// A Silo program that runs out of stack on Windows says so, and which stack
+/// it was: the process used to end with `0xC00000FD` and not a word, since
+/// Rust's own report is installed by a Rust `main`, and a program of Silo's
+/// has a C one. That silence hid for weeks that MeadowBoot compiled by itself
+/// overflowed a handler's 256 MiB segment, not the main thread's gigabyte.
+#[cfg(windows)]
+#[test]
+fn a_silo_program_that_overflows_its_stack_says_so_on_windows() {
+    let dir = scratch("overflow");
+    let root = package(
+        &dir,
+        "deep",
+        "fun down (n : Int) : Int = if n == 0 then 0 else (down (n - 1) * 3) % 7 + n\n\n\
+         fun main () = println (show (down 1000000000))\n",
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_meadow"))
+        .current_dir(&root)
+        .args(["run", "--runtime", "silo", "."])
+        .output()
+        .expect("the meadow binary runs");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(
+        err.contains("silo: the program overflowed its stack")
+            && err.contains("in a stack of 1024 MiB"),
+        "{err}"
+    );
+}
+
 /// What the REPL prints, given `input` a line at a time.
 fn repl(input: &str) -> String {
     use std::io::Write;
