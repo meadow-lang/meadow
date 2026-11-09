@@ -634,8 +634,10 @@ fn compile_package(
             } else {
                 for meta in &attr.meta {
                     let feature = meta.name();
-                    match crate::channel::feature_problem(feature.value(), crate::channel::CHANNEL)
-                    {
+                    match crate::channel::feature_problem(
+                        feature.value(),
+                        crate::channel::accepting(),
+                    ) {
                         Some(msg) => problem(msg, feature.span),
                         None => asked.push(feature.value().to_string()),
                     }

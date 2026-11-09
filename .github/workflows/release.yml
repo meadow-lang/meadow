@@ -82,8 +82,13 @@ jobs:
         if: steps.checked.outputs.skip != 'true'
         with:
           node-version: "20"
+      # MeadowBoot, which the suite builds and compares, calls the Rust back end
+      # through `Std.Ffi`, unstable: a stable `meadow` takes it for building
+      # the compiler itself, as rustc's `RUSTC_BOOTSTRAP` does.
       - name: Check
         shell: bash
+        env:
+          MEADOW_BOOTSTRAP: "1"
         run: |
           tag=""
           if [ "${{ github.ref_type }}" = "tag" ] && [ "$MEADOW_CHANNEL" = "stable" ]; then

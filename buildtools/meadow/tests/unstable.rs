@@ -40,9 +40,10 @@ fn said(dir: &Path) -> String {
 
 /// What a package that asks for `ffi` rightly is told: nothing, by a build
 /// from a checkout or a nightly; and by a release's stable `meadow`, which
-/// takes no unstable feature, only that.
+/// takes no unstable feature, only that -- unless `MEADOW_BOOTSTRAP=1` says
+/// the compiler's own build is under way, as a release's checks do.
 fn accepted(said: &str) {
-    if meadow::channel::CHANNEL == "stable" {
+    if meadow::channel::accepting() == "stable" {
         assert!(
             said.contains("the feature `ffi` is unstable, and this is a stable `meadow`"),
             "{said}"

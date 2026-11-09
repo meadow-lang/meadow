@@ -59,6 +59,25 @@ pub fn feature_problem(feature: &str, channel: &str) -> Option<String> {
     })
 }
 
+/// The channel whose features a package may ask for: this build's, except
+/// that `MEADOW_BOOTSTRAP=1` lets a stable one take what nightly takes.
+///
+/// That is for building Meadow's own compiler, as `RUSTC_BOOTSTRAP` is for
+/// rustc's: MeadowBoot calls the Rust back end through `Std.Ffi`, and a
+/// release's stable `meadow` is what builds and tests it. Anything else that
+/// sets it gives up what stable promises, by its own say.
+pub fn accepting() -> &'static str {
+    accepting_on(CHANNEL, std::env::var("MEADOW_BOOTSTRAP").ok().as_deref())
+}
+
+fn accepting_on(channel: &'static str, bootstrap: Option<&str>) -> &'static str {
+    if channel == "stable" && bootstrap == Some("1") {
+        "nightly"
+    } else {
+        channel
+    }
+}
+
 /// What is wrong with building here, when the project's toolchain file asks
 /// for something this `meadow` is not: `wanted` is the file's one word.
 pub fn toolchain_problem(wanted: &str, channel: &str, number: &str) -> Option<String> {
@@ -139,6 +158,14 @@ mod tests {
         assert!(said.contains("meadowup default nightly"), "{said}");
         assert_eq!(feature_problem("ffi", "nightly"), None);
         assert_eq!(feature_problem("ffi", "dev"), None);
+    }
+
+    #[test]
+    fn the_compiler_s_own_build_takes_nightly_s_features_on_stable() {
+        assert_eq!(accepting_on("stable", Some("1")), "nightly");
+        assert_eq!(accepting_on("stable", None), "stable");
+        assert_eq!(accepting_on("stable", Some("yes")), "stable");
+        assert_eq!(accepting_on("dev", Some("1")), "dev");
     }
 
     #[test]

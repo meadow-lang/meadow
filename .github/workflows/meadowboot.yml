@@ -1,8 +1,10 @@
 # Build MeadowBoot -- the Meadow compiler written in Meadow -- for every
 # platform it runs on, and attach an archive of it to the release of the tag
-# pushed. Each archive holds MeadowBoot, the `meadow` it hands the back end to
-# (built from the same commit), and the standard library's sources, which it
-# compiles: MeadowBoot finds the other two beside itself. It holds too Silo's
+# pushed. Each archive holds MeadowBoot; `meadow-host`, the library of the
+# back end it calls in its own process, and the `meadow` it hands to where it
+# cannot load that (both built from the same commit); and the standard
+# library's sources, which it compiles: MeadowBoot finds the rest beside
+# itself. It holds too Silo's
 # runtime for each phone its system builds for, in `lib/<triple>/`, where that
 # `meadow` looks for a target's: Android's on every desktop, and iOS's on a
 # Mac. A build for one needs only the NDK, or Xcode, beside the archive.
@@ -91,13 +93,19 @@ jobs:
         shell: bash
         run: clang --version
 
+      # And `meadow-host`, the same `meadow` as a library, which MeadowBoot
+      # loads to run the back end in its own process.
       - name: Build meadow
         working-directory: buildtools
-        run: cargo build --release -p meadow
+        run: cargo build --release -p meadow -p meadow-host
 
-      # MeadowBoot's dependencies (Lingua, Scythe) are fetched by git.
+      # MeadowBoot's dependencies (Lingua, Scythe) are fetched by git. It
+      # calls `meadow-host` through `Std.Ffi`, which `MEADOW_BOOTSTRAP` lets
+      # whichever channel this `meadow` is take.
       - name: Build MeadowBoot
         shell: bash
+        env:
+          MEADOW_BOOTSTRAP: "1"
         run: |
           meadow=buildtools/target/release/meadow
           [ -f "$meadow.exe" ] && meadow="$meadow.exe"
@@ -110,10 +118,17 @@ jobs:
           [ "$RUNNER_OS" = "Windows" ] && exe=".exe"
           dir="meadowboot-${{ matrix.target }}"
           mkdir -p "$dir/lib/Std"
-          cp "bootstrap/target/release/native/silo/MeadowBoot$exe" "buildtools/target/release/meadow$exe" "$dir/"
+          case "$RUNNER_OS" in
+            Windows) host="meadow_host.dll" ;;
+            macOS) host="libmeadow_host.dylib" ;;
+            *) host="libmeadow_host.so" ;;
+          esac
+          cp "bootstrap/target/release/native/silo/MeadowBoot$exe" "buildtools/target/release/meadow$exe" "buildtools/target/release/$host" "$dir/"
           cp lib/Std/Meadow.toml "$dir/lib/Std/"
           cp -r lib/Std/src "$dir/lib/Std/"
-          if [ "$RUNNER_OS" != "Windows" ]; then strip "$dir/MeadowBoot" "$dir/meadow"; fi
+          # A library keeps the symbols it exports: `strip -x` drops only the
+          # local ones.
+          if [ "$RUNNER_OS" != "Windows" ]; then strip "$dir/MeadowBoot" "$dir/meadow"; strip -x "$dir/$host"; fi
           echo "BUNDLE=$dir" >> "$GITHUB_ENV"
 
       # Silo's runtime for each phone, built from this commit as the `meadow`

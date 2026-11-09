@@ -6,8 +6,8 @@
 //! It sits on top of the `meadow-compiler` workspace (front-end passes and the
 //! AxCut back end) and the two machines that can run the result: `meadow-glade`,
 //! the bytecode VM, and `meadow-eval`, the CEK machine. [`runtime`] picks
-//! between them. The `meadow` binary — CLI + REPL — is a thin shell over this
-//! crate.
+//! between them. The command line and REPL are [`cli`]; the `meadow` binary,
+//! and `meadow-host`'s library for MeadowBoot, each only call it.
 
 pub mod add;
 pub mod aot;
@@ -15,6 +15,7 @@ pub mod artifacts;
 pub mod cache;
 pub mod channel;
 pub mod clean;
+pub mod cli;
 pub mod complete;
 pub mod cut;
 pub mod dap;
@@ -23,6 +24,7 @@ pub mod expanded;
 pub mod finder;
 pub mod format;
 pub mod git;
+pub mod host;
 pub mod incremental;
 pub mod init;
 pub mod ir;

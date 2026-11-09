@@ -186,6 +186,23 @@ MEADOWBOOT_MEADOW=target/release/meadow cargo test -p meadow --test bootstrap
 `MEADOWBOOT_MEADOW` names the `meadow` that builds and runs MeadowBoot; the
 debug one the test is built with works too, slowly.
 
+## The back end, in the same process
+
+What MeadowBoot does not do itself -- building its Cut into a program, and
+the commands it has no code for yet -- is the Rust `meadow`'s. It loads that
+as a library, `meadow-host` (`buildtools/meadow-host`: `meadow_host.dll`,
+`libmeadow_host.so`, `libmeadow_host.dylib`), and calls its command line
+through `Std.Ffi`, so that MeadowBoot can be the program `meadow` runs with no
+second compiler beside it. It looks for the library where `MEADOW_HOST`
+says, then beside itself, as a release's archive has it. `MEADOW` naming a
+`meadow` program asks for that program instead, run as a process of its own,
+and so does a missing library.
+
+`Std.Ffi` is unstable, so a stable `meadow` builds MeadowBoot only with
+`MEADOW_BOOTSTRAP=1`, which lets it take what a nightly takes, as
+`RUSTC_BOOTSTRAP` does rustc. A build from a checkout, or a nightly, needs
+nothing.
+
 ## What the Rust compiler learned
 
 Writing a second compiler finds what the first one does that nothing else

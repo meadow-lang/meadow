@@ -58,6 +58,15 @@ last release is under _Unreleased_.
 
 ### Added
 
+- MeadowBoot runs the Rust back end in its own process: `meadow-host`, the
+  `meadow` command line built as a library, is loaded through `Std.Ffi` and
+  called for what MeadowBoot does not do itself -- building and running its
+  Cut, and the commands it has no code for yet. It used to start the Rust
+  `meadow` as a second program for each, so a MeadowBoot could not be
+  `meadow` without one beside it. MeadowBoot's archives carry the library,
+  and `MEADOW_HOST` names another. `MEADOW_BOOTSTRAP=1` lets a stable
+  `meadow` take unstable features, as `RUSTC_BOOTSTRAP` does rustc, for
+  building MeadowBoot, which uses `Std.Ffi` to do this.
 - `meadow new MyApp` makes a package in a new directory, as `cargo new` does:
   named after the directory (`my-app` makes `MyApp`), and a git repository
   of its own unless it is inside one already or joins a workspace.

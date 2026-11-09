@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["meadow", "meadow-find", "meadow-fmt", "meadow-lsp"]
+members = ["meadow", "meadow-find", "meadow-fmt", "meadow-host", "meadow-lsp"]
 
 [workspace.package]
 version = "0.5.0"
