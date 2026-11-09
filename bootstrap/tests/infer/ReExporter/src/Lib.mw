@@ -1,0 +1,3 @@
+-- Another package's function, exported again, as Doodle exports Bloom's
+-- styles.
+@pub use Exporter (dim)

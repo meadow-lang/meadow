@@ -1,0 +1,4 @@
+-- A function with no annotation, so generic in what it performs: what a
+-- package two along sees only through the package between, which exports it
+-- again.
+@pub fun dim (level : Int) = level - 1
