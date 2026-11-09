@@ -27,7 +27,8 @@
 //! [`meadowboot_s_language_server_answers_as_meadow_lsp_answers`].
 //!
 //! `MEADOW_LSP_DIRS` (comma-separated, from the repository's root) narrows
-//! the corpus; `MEADOW_LSP_EVERY=n` asks at every `n`th name only; and
+//! the corpus; `MEADOW_LSP_EVERY=n` asks at every `n`th name only, and
+//! `MEADOW_LSP_COMPLETE=n` completes at every `n`th place only; and
 //! `MEADOWBOOT_EXE` runs a MeadowBoot already built rather than building
 //! one. What each side answered, where they differ, is written to
 //! `lsp-differences.txt` in `CARGO_TARGET_TMPDIR`, or `MEADOW_LSP_OUT`.
@@ -608,6 +609,14 @@ fn both(
 /// The session for the files `files`, which are one package's (or one file
 /// of none), as both servers are sent it.
 fn session(t: &mut Tally, root: &Path, files: &[PathBuf], exe: &Path, every: usize) {
+    // The Rust server analyses a package again for each completion, which in
+    // a package the size of MeadowBoot's is seconds: `MEADOW_LSP_COMPLETE=n`
+    // asks at every `n`th place only.
+    let completing = std::env::var("MEADOW_LSP_COMPLETE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1usize)
+        .max(1);
     let mut servers = (rust_server(root), boot_server(root, exe));
     let init = json!({
         "processId": null,
@@ -731,7 +740,7 @@ fn session(t: &mut Tally, root: &Path, files: &[PathBuf], exe: &Path, every: usi
                 );
             }
             // Completion inside a name: what has been typed of it so far.
-            if k % (every * 7) == 0 && e - s > 2 {
+            if k % (every * 7 * completing) == 0 && e - s > 2 {
                 let mid = s + 2;
                 if text.is_char_boundary(mid) {
                     let at = position(text, mid);
@@ -747,7 +756,7 @@ fn session(t: &mut Tally, root: &Path, files: &[PathBuf], exe: &Path, every: usi
             }
         }
         for (k, at) in p.pipes.iter().chain(p.dots.iter()).enumerate() {
-            if k % every != 0 {
+            if k % (every * completing) != 0 {
                 continue;
             }
             // After `|> ` -- the space typed -- or right after the `.`.
