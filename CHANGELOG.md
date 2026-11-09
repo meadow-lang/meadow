@@ -58,6 +58,16 @@ last release is under _Unreleased_.
 
 ### Added
 
+- MeadowBoot has a language server of its own: `lsp` in MeadowBoot
+  (`bootstrap/src/Lsp.mw`), declared with Lingua's `lsp!`, answers hover, go
+  to definition, completion, inlay hints, code lenses, semantic tokens,
+  prepare rename and rename, formatting and diagnostics in the shapes
+  `meadow lsp` answers them, reading each document as part of its package as
+  MeadowBoot compiles it. A differential test,
+  `buildtools/meadow/tests/lsp_differential.rs`, sends both servers the same
+  session and says by kind of request how far they agree; it is ignored until
+  they do. Workspace symbols and `meadow/ir` are not answered yet, and
+  `lsp --check` is still `meadow`'s.
 - `meadow new MyApp` makes a package in a new directory, as `cargo new` does:
   named after the directory (`my-app` makes `MyApp`), and a git repository
   of its own unless it is inside one already or joins a workspace.

@@ -193,8 +193,25 @@ fun textAt (ed : Editor) (file : Int) (t : String) =
            load ed d.root)
         else ()
       in
-      let k = keyOf d.root in
-      setRef ed.edits (H.insert k (H.getOr 0 k (getRef ed.edits) + 1) (getRef ed.edits))
+      -- What the package is studied with changes only when a text differs
+      -- from what stood for that file before: opening a file as it is on
+      -- the disk changes nothing, and a package opened whole is studied
+      -- once, not once a file.
+      let before = if S.isEmpty d.text then builtText ed d else Just d.text in
+      if before == Just t then ()
+      else
+        (let k = keyOf d.root in
+         setRef ed.edits (H.insert k (H.getOr 0 k (getRef ed.edits) + 1) (getRef ed.edits)))
+
+-- The text a document's package was built with for its file, if it has
+-- been loaded.
+fun builtText (ed : Editor) (d : Doc) =
+  match H.lookup (keyOf d.root) (getRef ed.loaded) with
+  | Just (l : Loaded) ->
+      (match l.given with
+       | Ok g -> M.map snd (V.find (\x -> keyOf (fst x) == keyOf d.known) (unitSources g))
+       | Err _ -> None)
+  | None -> None
 
 -- The package at `root` studied, with each open document of it as the
 -- editor holds it: the last study, if nothing has changed since.
@@ -2479,7 +2496,7 @@ fun candidatesOf (ed : Editor) (v : View) =
     V.foldl
       (\h (i : Interface) ->
         if i.package != "Std" then h
-        else V.foldl (\h2 (e : Export) -> if V.isEmpty e.module then H.insert e.name True h2 else h2) h i.exports)
+        else V.foldl (\h2 (e : Export) -> if V.isEmpty e.module and not (S.startsWith "op:" e.owner) then H.insert e.name True h2 else h2) h i.exports)
       H.empty
       v.study.imported
   in

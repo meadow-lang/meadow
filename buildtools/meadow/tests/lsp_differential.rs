@@ -30,7 +30,7 @@
 //! the corpus; `MEADOW_LSP_EVERY=n` asks at every `n`th name only; and
 //! `MEADOWBOOT_EXE` runs a MeadowBoot already built rather than building
 //! one. What each side answered, where they differ, is written to
-//! `lsp-differences.txt` in `CARGO_TARGET_TMPDIR`.
+//! `lsp-differences.txt` in `CARGO_TARGET_TMPDIR`, or `MEADOW_LSP_OUT`.
 
 use meadow_compiler::lexer::{Token, tokenize};
 use meadow_compiler::source::{Source, SourceKind};
@@ -241,11 +241,23 @@ fn trace(pid: u32, way: &str, body: &str) {
     if std::env::var_os("MEADOW_LSP_TRACE").is_none() {
         return;
     }
-    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("lsp-trace-{pid}.txt"));
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(out) {
+    let out = out_dir().join(format!("lsp-trace-{pid}.txt"));
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(out)
+    {
         let cut = &body[..body.floor_char_boundary(400)];
         let _ = writeln!(f, "{way} {} {cut}", body.len());
     }
+}
+
+/// Where what the test writes goes: `MEADOW_LSP_OUT`, or the test's own
+/// scratch directory.
+fn out_dir() -> PathBuf {
+    std::env::var_os("MEADOW_LSP_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")))
 }
 
 /// How long a request may take, in seconds: the first in a package compiles
@@ -265,7 +277,11 @@ fn patience() -> u64 {
 fn uri_of(path: &Path) -> String {
     let raw = path.to_string_lossy();
     let plain = raw.strip_prefix(r"\\?\").unwrap_or(&raw).replace('\\', "/");
-    let mut out = String::from(if plain.starts_with('/') { "file://" } else { "file:///" });
+    let mut out = String::from(if plain.starts_with('/') {
+        "file://"
+    } else {
+        "file:///"
+    });
     for b in plain.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
@@ -349,20 +365,15 @@ fn points(text: &str) -> Points {
                 p.names.push((s, e));
                 let at_line_start = s == 0 || text.as_bytes()[s - 1] == b'\n';
                 let _ = at_line_start;
-                if i > 0
-                    && matches!(toks[i - 1].value(), Token::Fun | Token::Def)
-                    && {
-                        let st = toks[i - 1].span.start as usize;
-                        st == 0 || text.as_bytes()[st - 1] == b'\n'
-                    }
-                {
+                if i > 0 && matches!(toks[i - 1].value(), Token::Fun | Token::Def) && {
+                    let st = toks[i - 1].span.start as usize;
+                    st == 0 || text.as_bytes()[st - 1] == b'\n'
+                } {
                     p.defs.push(s);
                 }
             }
             Token::RPipe => p.pipes.push(e),
-            Token::Period
-                if i > 0 && matches!(toks[i - 1].value(), Token::UpperIdent(_)) =>
-            {
+            Token::Period if i > 0 && matches!(toks[i - 1].value(), Token::UpperIdent(_)) => {
                 p.dots.push(e)
             }
             _ => {}
@@ -467,7 +478,9 @@ impl Tally {
         *shown += 1;
         if *shown <= 200 {
             let cut = |v: &Option<Value>| {
-                let s = v.as_ref().map_or("(no answer)".to_string(), |v| v.to_string());
+                let s = v
+                    .as_ref()
+                    .map_or("(no answer)".to_string(), |v| v.to_string());
                 if s.len() > 1500 {
                     format!("{}…", &s[..s.floor_char_boundary(1500)])
                 } else {
@@ -479,8 +492,14 @@ impl Tally {
             let (r, b) = match (kind, &r, &b) {
                 ("tokens", Some(x), Some(y)) => {
                     let (x, y) = (decoded(x), decoded(y));
-                    let at = x.iter().zip(&y).position(|(p, q)| p != q).unwrap_or(x.len().min(y.len()));
-                    let near = |t: &Vec<[u64; 4]>| json!(t[at.saturating_sub(1)..(at + 3).min(t.len())].to_vec());
+                    let at = x
+                        .iter()
+                        .zip(&y)
+                        .position(|(p, q)| p != q)
+                        .unwrap_or(x.len().min(y.len()));
+                    let near = |t: &Vec<[u64; 4]>| {
+                        json!(t[at.saturating_sub(1)..(at + 3).min(t.len())].to_vec())
+                    };
                     (
                         Some(json!({"tokens": x.len(), "from": near(&x)})),
                         Some(json!({"tokens": y.len(), "from": near(&y)})),
@@ -493,7 +512,11 @@ impl Tally {
                         x["items"].as_array().unwrap_or(&none),
                         y["items"].as_array().unwrap_or(&none),
                     );
-                    let at = xs.iter().zip(ys).position(|(p, q)| p != q).unwrap_or(xs.len().min(ys.len()));
+                    let at = xs
+                        .iter()
+                        .zip(ys)
+                        .position(|(p, q)| p != q)
+                        .unwrap_or(xs.len().min(ys.len()));
                     (
                         Some(json!({"items": xs.len(), "at": at, "item": xs.get(at)})),
                         Some(json!({"items": ys.len(), "at": at, "item": ys.get(at)})),
@@ -501,7 +524,11 @@ impl Tally {
                 }
                 // Two lists, where they first part.
                 (_, Some(Value::Array(xs)), Some(Value::Array(ys))) => {
-                    let at = xs.iter().zip(ys).position(|(p, q)| p != q).unwrap_or(xs.len().min(ys.len()));
+                    let at = xs
+                        .iter()
+                        .zip(ys)
+                        .position(|(p, q)| p != q)
+                        .unwrap_or(xs.len().min(ys.len()));
                     (
                         Some(json!({"len": xs.len(), "at": at, "item": xs.get(at)})),
                         Some(json!({"len": ys.len(), "at": at, "item": ys.get(at)})),
@@ -571,7 +598,9 @@ fn both(
         progress(&format!("  meadow stopped answering at {method} {what}"));
     }
     if servers.1.gone && !was_b {
-        progress(&format!("  MeadowBoot stopped answering at {method} {what}"));
+        progress(&format!(
+            "  MeadowBoot stopped answering at {method} {what}"
+        ));
     }
     t.add(kind, what, r, b);
 }
@@ -616,7 +645,14 @@ fn session(t: &mut Tally, root: &Path, files: &[PathBuf], exe: &Path, every: usi
             .display()
             .to_string();
         let doc = json!({"textDocument": {"uri": uri}});
-        both(t, &mut servers, "tokens", &name, "textDocument/semanticTokens/full", doc.clone());
+        both(
+            t,
+            &mut servers,
+            "tokens",
+            &name,
+            "textDocument/semanticTokens/full",
+            doc.clone(),
+        );
         let end = position(text, text.len());
         both(
             t,
@@ -626,7 +662,14 @@ fn session(t: &mut Tally, root: &Path, files: &[PathBuf], exe: &Path, every: usi
             "textDocument/inlayHint",
             json!({"textDocument": {"uri": uri}, "range": {"start": {"line": 0, "character": 0}, "end": end}}),
         );
-        both(t, &mut servers, "lenses", &name, "textDocument/codeLens", doc.clone());
+        both(
+            t,
+            &mut servers,
+            "lenses",
+            &name,
+            "textDocument/codeLens",
+            doc.clone(),
+        );
         both(
             t,
             &mut servers,
@@ -646,9 +689,30 @@ fn session(t: &mut Tally, root: &Path, files: &[PathBuf], exe: &Path, every: usi
             let word = &text[*s..*e];
             let what = format!("{name}:{}:{} `{word}`", at["line"], at["character"]);
             let here = json!({"textDocument": {"uri": uri}, "position": at});
-            both(t, &mut servers, "hover", &what, "textDocument/hover", here.clone());
-            both(t, &mut servers, "definition", &what, "textDocument/definition", here.clone());
-            both(t, &mut servers, "prepareRename", &what, "textDocument/prepareRename", here.clone());
+            both(
+                t,
+                &mut servers,
+                "hover",
+                &what,
+                "textDocument/hover",
+                here.clone(),
+            );
+            both(
+                t,
+                &mut servers,
+                "definition",
+                &what,
+                "textDocument/definition",
+                here.clone(),
+            );
+            both(
+                t,
+                &mut servers,
+                "prepareRename",
+                &what,
+                "textDocument/prepareRename",
+                here.clone(),
+            );
             if renamed.insert(word.to_string()) {
                 let new = if word.starts_with(|c: char| c.is_uppercase()) {
                     "RenamedQ"
@@ -657,7 +721,14 @@ fn session(t: &mut Tally, root: &Path, files: &[PathBuf], exe: &Path, every: usi
                 };
                 let mut params = here.clone();
                 params["newName"] = json!(new);
-                both(t, &mut servers, "rename", &what, "textDocument/rename", params);
+                both(
+                    t,
+                    &mut servers,
+                    "rename",
+                    &what,
+                    "textDocument/rename",
+                    params,
+                );
             }
             // Completion inside a name: what has been typed of it so far.
             if k % (every * 7) == 0 && e - s > 2 {
@@ -680,7 +751,11 @@ fn session(t: &mut Tally, root: &Path, files: &[PathBuf], exe: &Path, every: usi
                 continue;
             }
             // After `|> ` -- the space typed -- or right after the `.`.
-            let at = if text[*at..].starts_with(' ') { at + 1 } else { *at };
+            let at = if text[*at..].starts_with(' ') {
+                at + 1
+            } else {
+                *at
+            };
             let pos = position(text, at);
             both(
                 t,
@@ -712,7 +787,14 @@ fn session(t: &mut Tally, root: &Path, files: &[PathBuf], exe: &Path, every: usi
     }
 
     for q in ["map", "fold", "Int -> Int", "String", "main"] {
-        both(t, &mut servers, "symbols", q, "workspace/symbol", json!({"query": q}));
+        both(
+            t,
+            &mut servers,
+            "symbols",
+            q,
+            "workspace/symbol",
+            json!({"query": q}),
+        );
     }
 
     // What is wrong after the server was told of every file.
@@ -730,7 +812,10 @@ fn session(t: &mut Tally, root: &Path, files: &[PathBuf], exe: &Path, every: usi
     // after each. A hover after the edit is answered after its diagnostics.
     if let Some((_, uri, text)) = texts.first() {
         for (version, changed) in [
-            (2, format!("{text}\ndef lspDifferentialBroken = notDeclaredAnywhere 1\n")),
+            (
+                2,
+                format!("{text}\ndef lspDifferentialBroken = notDeclaredAnywhere 1\n"),
+            ),
             (3, text.clone()),
         ] {
             let change = json!({"textDocument": {"uri": uri, "version": version}, "contentChanges": [{"text": changed}]});
@@ -738,7 +823,8 @@ fn session(t: &mut Tally, root: &Path, files: &[PathBuf], exe: &Path, every: usi
             servers.1.notes.clear();
             servers.0.notify("textDocument/didChange", change.clone());
             servers.1.notify("textDocument/didChange", change);
-            let here = json!({"textDocument": {"uri": uri}, "position": {"line": 0, "character": 0}});
+            let here =
+                json!({"textDocument": {"uri": uri}, "position": {"line": 0, "character": 0}});
             let _ = servers.0.ask("textDocument/hover", here.clone());
             let _ = servers.1.ask("textDocument/hover", here);
             let (rd, bd) = (servers.0.diagnostics(), servers.1.diagnostics());
@@ -754,20 +840,57 @@ fn session(t: &mut Tally, root: &Path, files: &[PathBuf], exe: &Path, every: usi
     // open, and a file closed -- what is published when it is, and what a
     // request about it is answered after.
     if let Some((path, uri, text)) = texts.first() {
-        let name = path.strip_prefix(repo()).unwrap_or(path).display().to_string();
+        let name = path
+            .strip_prefix(repo())
+            .unwrap_or(path)
+            .display()
+            .to_string();
         let first = points(text).names.first().map_or(0, |n| n.0);
         let here = json!({"textDocument": {"uri": uri}, "position": position(text, first), "context": {"includeDeclaration": true}});
-        both(t, &mut servers, "protocol", &format!("{name} references"), "textDocument/references", here.clone());
+        both(
+            t,
+            &mut servers,
+            "protocol",
+            &format!("{name} references"),
+            "textDocument/references",
+            here.clone(),
+        );
         let nowhere = json!({"textDocument": {"uri": uri_of(&root.join("nowhere.mw"))}, "position": {"line": 0, "character": 0}});
-        both(t, &mut servers, "protocol", "hover of a file not open", "textDocument/hover", nowhere);
+        both(
+            t,
+            &mut servers,
+            "protocol",
+            "hover of a file not open",
+            "textDocument/hover",
+            nowhere,
+        );
         servers.0.notes.clear();
         servers.1.notes.clear();
         let close = json!({"textDocument": {"uri": uri}});
         servers.0.notify("textDocument/didClose", close.clone());
         servers.1.notify("textDocument/didClose", close);
-        both(t, &mut servers, "protocol", &format!("{name} hover after it closed"), "textDocument/hover", here);
-        let said = |s: &Server| json!(s.notes.iter().map(|n| n["method"].clone()).collect::<Vec<_>>());
-        t.add("protocol", &format!("{name} what closing it published"), Some(said(&servers.0)), Some(said(&servers.1)));
+        both(
+            t,
+            &mut servers,
+            "protocol",
+            &format!("{name} hover after it closed"),
+            "textDocument/hover",
+            here,
+        );
+        let said = |s: &Server| {
+            json!(
+                s.notes
+                    .iter()
+                    .map(|n| n["method"].clone())
+                    .collect::<Vec<_>>()
+            )
+        };
+        t.add(
+            "protocol",
+            &format!("{name} what closing it published"),
+            Some(said(&servers.0)),
+            Some(said(&servers.1)),
+        );
     }
     servers.0.stop();
     servers.1.stop();
@@ -785,32 +908,53 @@ fn sessions(files: Vec<PathBuf>) -> Vec<(PathBuf, Vec<PathBuf>)> {
         }
     }
     let mut out: Vec<(PathBuf, Vec<PathBuf>)> = by.into_iter().collect();
-    out.extend(
-        alone
-            .into_iter()
-            .map(|f| (f.parent().map(Path::to_path_buf).unwrap_or_default(), vec![f])),
-    );
+    out.extend(alone.into_iter().map(|f| {
+        (
+            f.parent().map(Path::to_path_buf).unwrap_or_default(),
+            vec![f],
+        )
+    }));
     out
 }
 
 /// A line on standard error and in `lsp-progress.txt`, as each package goes.
 fn progress(line: &str) {
     eprintln!("{line}");
-    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("lsp-progress.txt");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(out) {
+    let out = out_dir().join("lsp-progress.txt");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(out)
+    {
         let _ = writeln!(f, "{line}");
     }
 }
 
 /// MeadowBoot's server answers every request as `meadow lsp` answers it.
 ///
-/// Not yet: run with `--ignored` to see how far. On 2026-11-09, over the
-/// whole corpus at every name, the two agreed as written in the pull request
-/// that added this test; the kinds MeadowBoot does not answer yet are
-/// hover, completion, inlay hints, code lenses, workspace symbols and
-/// `meadow/ir`, and Lingua's `lsp!` cannot yet say a refused rename as an
-/// error, publish diagnostics without `relatedInformation`, or leave out
-/// `positionEncoding` and `serverInfo`.
+/// Not yet, so it is ignored: run it with `--ignored` to see how far. On
+/// 2026-11-09, over `examples`, `benches` and `glade` at every name, the two
+/// agreed on 15336 of 16331 answers:
+///
+/// ```text
+/// completion       712 / 1013    hover           4608 / 4624
+/// definition      4614 / 4624    initialize         0 / 13
+/// diagnostics       32 / 45      ir                 0 / 47
+/// formatting        19 / 19      lenses            19 / 19
+/// hints             18 / 19      prepareRename   4624 / 4624
+/// protocol          26 / 52      rename           648 / 1148 (500 refusals)
+/// symbols            0 / 65      tokens            16 / 19
+/// ```
+///
+/// What is left is of three kinds. MeadowBoot does not answer workspace
+/// symbols (`meadow_find`'s search) or `meadow/ir` yet, and its completion
+/// lacks what an `impl` and a default method export (`#impl.Trait`). Lingua's
+/// `lsp!` cannot answer a request with an error -- the Rust server refuses a
+/// rename with one, and answers a method it does not know with its own -- nor
+/// publish a diagnostic without `relatedInformation`, nor leave
+/// `positionEncoding` and `serverInfo` out of `initialize`, nor forget a
+/// closed document without publishing for it. And the two compilers differ in
+/// a few answers: a `runSt`'s type at a use, what a derive mentions.
 #[test]
 #[ignore = "MeadowBoot's server does not agree with meadow lsp yet: see the doc comment"]
 fn meadowboot_s_language_server_answers_as_meadow_lsp_answers() {
@@ -831,13 +975,17 @@ fn meadowboot_s_language_server_answers_as_meadow_lsp_answers() {
     let mut t = Tally::default();
     for (root, files) in sessions(files) {
         let started = std::time::Instant::now();
-        let name = root.strip_prefix(repo()).unwrap_or(&root).display().to_string();
+        let name = root
+            .strip_prefix(repo())
+            .unwrap_or(&root)
+            .display()
+            .to_string();
         progress(&format!("{name} ({} files): started", files.len()));
         session(&mut t, &root, &files, &exe, every);
         progress(&format!("{name}: {:.0?}", started.elapsed()));
     }
     let report = t.report();
-    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("lsp-differences.txt");
+    let out = out_dir().join("lsp-differences.txt");
     let _ = std::fs::write(&out, format!("{report}\n{}", t.log));
     eprintln!("{report}\nwhat differs: {}", out.display());
     assert!(
