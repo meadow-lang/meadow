@@ -251,6 +251,19 @@ last release is under _Unreleased_.
 
 ### Fixed
 
+- `meadow fmt` no longer folds a `macro` into the declaration above it or
+  breaks its rules a word to a line. A `macro` that did not start at the
+  margin was read as more of what came before -- `Std.Cmp`'s two ran on
+  from `isEqualOrdering`'s last arm -- and every `macro`'s templates, which
+  hold declarations as often as an expression, were laid out as one
+  expression. A `macro` is now always kept as it is written, as a
+  declaration under `@fmt(skip)` is, and `Std.Cmp`'s and `Std.Ops`'s are
+  back as they were written.
+- `meadow fmt` lays out a function defined by clauses as one line where it
+  fits, and otherwise with each clause on a line of its own, a step in,
+  under its signature or its first clause. It used to read a clause's `|`
+  as an operator after the signature, so a long one broke inside a clause
+  and left its body to the left of its `|`.
 - MeadowBoot could not build Lingua: a value a package exports again from
   one of its own dependencies, as Doodle exports Bloom's styles, reached the
   packages after it with no type, so every use of it there shared one, and a

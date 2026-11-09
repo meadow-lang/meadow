@@ -508,6 +508,7 @@ impl<'a> Printer<'a> {
                         | "trait"
                         | "impl"
                         | "mod"
+                        | "macro"
                         | "infix"
                         | "infixl"
                         | "infixr"
@@ -543,22 +544,24 @@ impl<'a> Printer<'a> {
     /// The declaration `lo..hi`, laid out -- or as it is written, where
     /// `@fmt(skip)` is on it or on a line of its own before it, as
     /// `#[rustfmt::skip]` is on an item: for a table that reads as one, a
-    /// row to a line, whatever the width.
+    /// row to a line, whatever the width. A `macro` is always as it is
+    /// written: its rules are templates of what they expand to, declarations
+    /// as often as an expression, whose shape the tokens do not show.
     fn item(&mut self, lo: usize, hi: usize) -> Doc {
-        let (asks, alone) = self.skips(lo, hi);
+        let (asks, alone, word) = self.skips(lo, hi);
         let skip = std::mem::take(&mut self.skip) || asks;
         if alone {
             // Attributes and nothing else: the declaration is what follows.
             self.skip = skip;
-        } else if skip {
+        } else if skip || self.toks[word].text == "macro" {
             return self.written(lo, hi);
         }
         self.within(lo, hi, |p| p.decl())
     }
 
-    /// Whether `lo..hi` starts with an `@fmt(skip)` among its attributes, and
-    /// whether attributes are all it is.
-    fn skips(&self, lo: usize, hi: usize) -> (bool, bool) {
+    /// Whether `lo..hi` starts with an `@fmt(skip)` among its attributes,
+    /// whether attributes are all it is, and where what they are on starts.
+    fn skips(&self, lo: usize, hi: usize) -> (bool, bool, usize) {
         let (mut j, mut asks) = (lo, false);
         while j < hi && self.attr_at(j) {
             let named = |k: usize, what: &str| k < hi && self.toks[k].text == what;
@@ -572,7 +575,7 @@ impl<'a> Printer<'a> {
                 j + 2
             };
         }
-        (asks, j >= hi)
+        (asks, j >= hi, j)
     }
 
     /// Tokens `lo..hi` exactly as the source has them, comments and all.
@@ -636,8 +639,68 @@ impl<'a> Printer<'a> {
         cat(out)
     }
 
-    /// `fun name params : type = body`, a `def` or a `type`.
+    /// `fun name params : type = body`, a `def` or a `type`. A `fun` or a
+    /// `def` defined by clauses is one line where it fits, and has each
+    /// clause on a line of its own, a step in, under its signature or its
+    /// first clause where it does not:
+    ///
+    /// ```text
+    /// fun gcd : Int -> Int -> Int
+    ///   | gcd a 0 = a
+    ///   | gcd a b = gcd b (a % b)
+    /// ```
     fn binding(&mut self) -> Doc {
+        let bars = match self.toks.get(self.i + 1) {
+            Some(name) if matches!(self.toks[self.i].text, "fun" | "def") => {
+                self.clauses(self.i + 2, name.text)
+            }
+            _ => Vec::new(),
+        };
+        let Some(&first) = bars.first() else {
+            return self.plain_binding();
+        };
+        let end = self.end;
+        let head = if self.within(self.i, first, |p| p.find(p.i, "=")).is_some() {
+            self.within(self.i, first, |p| p.plain_binding())
+        } else {
+            self.heading = true;
+            let d = self.within(self.i, first, |p| p.chain(0, 4, true));
+            self.heading = false;
+            d
+        };
+        let mut out = vec![head];
+        for (k, &bar) in bars.iter().enumerate() {
+            let hi = bars.get(k + 1).copied().unwrap_or(end);
+            let bar_doc = self.t(bar);
+            let clause = self.within(bar + 1, hi, |p| p.plain_binding());
+            out.push(nest(2, cat(vec![Doc::Line, bar_doc, text(" "), clause])));
+        }
+        self.i = end;
+        group(cat(out))
+    }
+
+    /// Where each clause of the binding named `name` starts, from `from`: a
+    /// `|` outside brackets followed by the name, with an `=` before any
+    /// `->`. A `match`'s arm has its arrow first.
+    fn clauses(&self, from: usize, name: &str) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut j = from;
+        while let Some(bar) = self.find(j, "|") {
+            if self.toks.get(bar + 1).is_some_and(|n| n.text == name) {
+                let eq = self.find(bar + 1, "=");
+                let arrow = self.find(bar + 1, "->");
+                if eq.is_some_and(|e| arrow.is_none_or(|a| e < a)) {
+                    out.push(bar);
+                }
+            }
+            j = bar + 1;
+        }
+        out
+    }
+
+    /// A binding with no clauses after it: what is before its `=`, and its
+    /// body.
+    fn plain_binding(&mut self) -> Doc {
         let Some(eq) = self.find(self.i, "=") else {
             return self.seq(4);
         };
@@ -1798,6 +1861,34 @@ fun declareOp (acc : HashMap String Fixity) (f : Fixity) (o : Syntax Surface) : 
 fun declareOp (acc : HashMap String Fixity) (f : Fixity) (o : Syntax Surface)
     : HashMap String Fixity ! { Report | e } =
   acc
+"#,
+        );
+    }
+
+    #[test]
+    fn clauses_have_a_line_each_under_what_they_define() {
+        check(
+            r#"fun gcd : Int -> Int -> Int | gcd a 0 = a | gcd a b = gcd b (a % b)
+
+fun area (Shape.Circle r) = r * r | area (Shape.Square s) = s * s
+
+def value : Int | value = 3
+
+fun f x = match x with | f -> 1 | g -> 2
+
+fun greatest : Int -> Int -> Int | greatest a 0 = a | greatest a b = greatest b (a % b) + nothing + more
+"#,
+            r#"fun gcd : Int -> Int -> Int | gcd a 0 = a | gcd a b = gcd b (a % b)
+
+fun area (Shape.Circle r) = r * r | area (Shape.Square s) = s * s
+
+def value : Int | value = 3
+
+fun f x = match x with | f -> 1 | g -> 2
+
+fun greatest : Int -> Int -> Int
+  | greatest a 0 = a
+  | greatest a b = greatest b (a % b) + nothing + more
 "#,
         );
     }

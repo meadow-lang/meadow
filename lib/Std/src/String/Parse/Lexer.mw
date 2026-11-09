@@ -77,23 +77,26 @@ fun digitsIn base chunk = chunk |> P.chunkToTokens |> V.foldl (\acc c -> acc * b
 fun digits = P.takeWhile1P "a digit" Ch.isDigit
 
 -- A decimal integer, without a sign: `42`. See `signed` for one with.
-@pub fun decimal : Stream s => Parser s Int | decimal =
-  digits |> P.map (digitsIn 10) |> P.label "an integer"
+@pub fun decimal : Stream s => Parser s Int
+  | decimal = digits |> P.map (digitsIn 10) |> P.label "an integer"
 
 -- A binary integer, without its `0b`: `1011`.
-@pub fun binary : Stream s => Parser s Int | binary =
-  let run = P.takeWhile1P "a binary digit" (\c -> c == '0' or c == '1') in
-  run |> P.map (digitsIn 2) |> P.label "a binary integer"
+@pub fun binary : Stream s => Parser s Int
+  | binary =
+    let run = P.takeWhile1P "a binary digit" (\c -> c == '0' or c == '1') in
+    run |> P.map (digitsIn 2) |> P.label "a binary integer"
 
 -- An octal integer, without its `0o`: `755`.
-@pub fun octal : Stream s => Parser s Int | octal =
-  let run = P.takeWhile1P "an octal digit" (Ch.isBetween '0' '7') in
-  run |> P.map (digitsIn 8) |> P.label "an octal integer"
+@pub fun octal : Stream s => Parser s Int
+  | octal =
+    let run = P.takeWhile1P "an octal digit" (Ch.isBetween '0' '7') in
+    run |> P.map (digitsIn 8) |> P.label "an octal integer"
 
 -- A hexadecimal integer in either case, without its `0x`: `ff`.
-@pub fun hexadecimal : Stream s => Parser s Int | hexadecimal =
-  let run = P.takeWhile1P "a hexadecimal digit" Ch.isHexDigit in
-  run |> P.map (digitsIn 16) |> P.label "a hexadecimal integer"
+@pub fun hexadecimal : Stream s => Parser s Int
+  | hexadecimal =
+    let run = P.takeWhile1P "a hexadecimal digit" Ch.isHexDigit in
+    run |> P.map (digitsIn 16) |> P.label "a hexadecimal integer"
 
 fun digitText chunk = charsToString (V.toArray (P.chunkToTokens chunk))
 
@@ -127,11 +130,12 @@ fun exponentAfter frac =
 -- A floating-point number, without a sign: digits and a fraction, an
 -- exponent, or both -- `1.5`, `2e10`, `6.02e23`. A number with neither is not
 -- one: `3` is `decimal`'s.
-@pub fun float : Stream s => Parser s Float | float =
-  let fraction = P.optional (P.skipThen (C.char '.') digits) in
-  let parts = P.lift2 pair digits fraction in
-  let number = P.bind parts (\wf -> P.map (floatOf (fst wf) (snd wf)) (exponentAfter (snd wf))) in
-  number |> P.try |> P.label "a floating-point number"
+@pub fun float : Stream s => Parser s Float
+  | float =
+    let fraction = P.optional (P.skipThen (C.char '.') digits) in
+    let parts = P.lift2 pair digits fraction in
+    let number = P.bind parts (\wf -> P.map (floatOf (fst wf) (snd wf)) (exponentAfter (snd wf))) in
+    number |> P.try |> P.label "a floating-point number"
 
 -- A sign before a number, as a function to apply to it: `neg` for a minus.
 fun signBy neg = P.alt (P.mapTo (\x -> x) (C.char '+')) (P.mapTo neg (C.char '-'))
@@ -184,8 +188,9 @@ fun escaped = P.label "an escape sequence" (P.choice escapes)
 -- The quotes around a literal are the caller's:
 --
 --   P.skipThen (C.char '"') (P.manyTill L.charLiteral (C.char '"'))
-@pub fun charLiteral : (Stream s, PartialEq s) => Parser s Char | charLiteral =
-  P.label "a literal character" (P.alt (P.skipThen (C.char '\\') escaped) P.anySingle)
+@pub fun charLiteral : (Stream s, PartialEq s) => Parser s Char
+  | charLiteral =
+    P.label "a literal character" (P.alt (P.skipThen (C.char '\\') escaped) P.anySingle)
 
 -- --- indentation -------------------------------------------------------------
 --
@@ -216,8 +221,8 @@ fun columnFrom input i stop col =
 fun columnAt input off = columnFrom input (lineStart input off) off 1
 
 -- The column the parser has reached.
-@pub fun indentLevel : Stream s => Parser s Int | indentLevel =
-  P.pure columnAt |> P.keep P.getInput |> P.keep P.getOffset
+@pub fun indentLevel : Stream s => Parser s Int
+  | indentLevel = P.pure columnAt |> P.keep P.getInput |> P.keep P.getOffset
 
 -- Fail, having wanted a column that relates to `ref` as `want` says.
 @pub fun incorrectIndent (want : Ordering) (ref : a) (actual : b) : Parser s c =
