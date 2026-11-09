@@ -66,6 +66,7 @@ use Std.Result.Result.*
     ".*" as DotStar = OpIdent ".*",
     "<:" as Subtrait = OpIdent "<:",
     ":?" as DebugFmt = ConOpIdent ":?",
+    "@!" as InnerAt = OpIdent "@!",
     "_" = Wildcard,
     "\\" = Backslash,
     "<-" = LArrow,
@@ -144,10 +145,13 @@ use Std.Result.Result.*
     "rec" = LowerIdent "rec" after Let before LowerIdent _
   }
   grammar {
-    File = decls:Decl*
+    File = inner:InnerAttr* decls:Decl*
 
     -- --- declarations ---
 
+    -- `@!feature(ffi)`: an attribute of the module, before anything in it.
+    -- The two characters lex as one operator.
+    InnerAttr = "@!" name:AttrName args:AttrArgs?
     Decl = attrs:Attr* item:Item
     Item = fixity:Fixity | modDecl:ModDecl | useDecl:UseDecl | dataDecl:DataDecl
       | recordDecl:RecordDecl | effectDecl:EffectDecl | typeDecl:TypeDecl
@@ -220,6 +224,7 @@ use Std.Result.Result.*
          | "op"
          | "<:"
          | ".*"
+         | "@!"
          | "conop"
          | ":?"
          | "pattern"

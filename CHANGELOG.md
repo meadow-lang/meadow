@@ -66,7 +66,9 @@ last release is under _Unreleased_.
   `meadow` without one beside it. MeadowBoot's archives carry the library,
   and `MEADOW_HOST` names another. `MEADOW_BOOTSTRAP=1` lets a stable
   `meadow` take unstable features, as `RUSTC_BOOTSTRAP` does rustc, for
-  building MeadowBoot, which uses `Std.Ffi` to do this.
+  building MeadowBoot, which uses `Std.Ffi` to do this. MeadowBoot reads a
+  module's own attributes, `@!feature(ffi)`, as the Rust compiler does; it
+  could not parse a file that began with one.
 - `meadow new MyApp` makes a package in a new directory, as `cargo new` does:
   named after the directory (`my-app` makes `MyApp`), and a git repository
   of its own unless it is inside one already or joins a workspace.
