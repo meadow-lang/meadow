@@ -116,6 +116,7 @@ impl Server {
         let stdin = child.stdin.take().expect("its input");
         let stdout = child.stdout.take().expect("its output");
         let (tx, inbox) = channel();
+        let pid = child.id();
         std::thread::spawn(move || {
             let mut r = BufReader::new(stdout);
             loop {
@@ -141,6 +142,7 @@ impl Server {
                 if r.read_exact(&mut body).is_err() {
                     return;
                 }
+                trace(pid, "<-", &String::from_utf8_lossy(&body));
                 if let Ok(v) = serde_json::from_slice::<Value>(&body)
                     && tx.send(v).is_err()
                 {
@@ -163,6 +165,7 @@ impl Server {
             return;
         }
         let body = serde_json::to_string(v).expect("json");
+        trace(self.child.id(), "->", &body);
         let framed = format!("Content-Length: {}\r\n\r\n{body}", body.len());
         if self.stdin.write_all(framed.as_bytes()).is_err() || self.stdin.flush().is_err() {
             self.gone = true;
@@ -229,6 +232,19 @@ impl Server {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// With `MEADOW_LSP_TRACE` set, each message to and from server `pid`,
+/// a line each in `lsp-trace-<pid>.txt` in `CARGO_TARGET_TMPDIR`.
+fn trace(pid: u32, way: &str, body: &str) {
+    if std::env::var_os("MEADOW_LSP_TRACE").is_none() {
+        return;
+    }
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("lsp-trace-{pid}.txt"));
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(out) {
+        let cut = &body[..body.floor_char_boundary(400)];
+        let _ = writeln!(f, "{way} {} {cut}", body.len());
     }
 }
 
@@ -527,8 +543,15 @@ fn both(
     method: &str,
     params: Value,
 ) {
+    let (was_r, was_b) = (servers.0.gone, servers.1.gone);
     let r = servers.0.ask(method, params.clone());
     let b = servers.1.ask(method, params);
+    if servers.0.gone && !was_r {
+        progress(&format!("  meadow stopped answering at {method} {what}"));
+    }
+    if servers.1.gone && !was_b {
+        progress(&format!("  MeadowBoot stopped answering at {method} {what}"));
+    }
     t.add(kind, what, r, b);
 }
 
@@ -647,9 +670,14 @@ fn session(t: &mut Tally, root: &Path, files: &[PathBuf], exe: &Path, every: usi
                 json!({"textDocument": {"uri": uri}, "position": pos}),
             );
         }
+        // Core only: asked for `cut` of `orElse` in `benches/Latency`, the
+        // Rust server stopped answering anything (2026-11-09), and a server
+        // that does not answer would leave the rest of the package unasked.
+        // `MEADOW_LSP_IRS=core,cut,axcut` asks for the others too.
+        let irs = std::env::var("MEADOW_LSP_IRS").unwrap_or_else(|_| "core".to_string());
         for at in p.defs.iter().take(3) {
             let pos = position(text, *at);
-            for ir in ["core", "cut", "axcut"] {
+            for ir in irs.split(',') {
                 both(
                     t,
                     &mut servers,
@@ -701,6 +729,25 @@ fn session(t: &mut Tally, root: &Path, files: &[PathBuf], exe: &Path, every: usi
             );
         }
     }
+    // The protocol around the requests: a method neither answers, a file not
+    // open, and a file closed -- what is published when it is, and what a
+    // request about it is answered after.
+    if let Some((path, uri, text)) = texts.first() {
+        let name = path.strip_prefix(repo()).unwrap_or(path).display().to_string();
+        let first = points(text).names.first().map_or(0, |n| n.0);
+        let here = json!({"textDocument": {"uri": uri}, "position": position(text, first), "context": {"includeDeclaration": true}});
+        both(t, &mut servers, "protocol", &format!("{name} references"), "textDocument/references", here.clone());
+        let nowhere = json!({"textDocument": {"uri": uri_of(&root.join("nowhere.mw"))}, "position": {"line": 0, "character": 0}});
+        both(t, &mut servers, "protocol", "hover of a file not open", "textDocument/hover", nowhere);
+        servers.0.notes.clear();
+        servers.1.notes.clear();
+        let close = json!({"textDocument": {"uri": uri}});
+        servers.0.notify("textDocument/didClose", close.clone());
+        servers.1.notify("textDocument/didClose", close);
+        both(t, &mut servers, "protocol", &format!("{name} hover after it closed"), "textDocument/hover", here);
+        let said = |s: &Server| json!(s.notes.iter().map(|n| n["method"].clone()).collect::<Vec<_>>());
+        t.add("protocol", &format!("{name} what closing it published"), Some(said(&servers.0)), Some(said(&servers.1)));
+    }
     servers.0.stop();
     servers.1.stop();
 }
@@ -723,6 +770,15 @@ fn sessions(files: Vec<PathBuf>) -> Vec<(PathBuf, Vec<PathBuf>)> {
             .map(|f| (f.parent().map(Path::to_path_buf).unwrap_or_default(), vec![f])),
     );
     out
+}
+
+/// A line on standard error and in `lsp-progress.txt`, as each package goes.
+fn progress(line: &str) {
+    eprintln!("{line}");
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("lsp-progress.txt");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(out) {
+        let _ = writeln!(f, "{line}");
+    }
 }
 
 /// MeadowBoot's server answers every request as `meadow lsp` answers it.
@@ -754,13 +810,10 @@ fn meadowboot_s_language_server_answers_as_meadow_lsp_answers() {
     let mut t = Tally::default();
     for (root, files) in sessions(files) {
         let started = std::time::Instant::now();
+        let name = root.strip_prefix(repo()).unwrap_or(&root).display().to_string();
+        progress(&format!("{name} ({} files): started", files.len()));
         session(&mut t, &root, &files, &exe, every);
-        eprintln!(
-            "{} ({} files): {:.0?}",
-            root.strip_prefix(repo()).unwrap_or(&root).display(),
-            files.len(),
-            started.elapsed()
-        );
+        progress(&format!("{name}: {:.0?}", started.elapsed()));
     }
     let report = t.report();
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("lsp-differences.txt");

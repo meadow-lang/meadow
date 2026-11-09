@@ -28,7 +28,7 @@ use Lingua.Lang (Meta)
 use Lingua.Lang.Meta.*
 use Lingua.Diagnostic (Diagnostic, Severity)
 use Lingua.Diagnostic.Diagnostic.*
-use Lingua.Make (Given, unitImports, unitDir)
+use Lingua.Make (Given, unitImports, unitDir, unitSources)
 use MeadowBoot.Compiler (
   Interface, Study, studyUnit, unitDatabase, givenUnits, compilerFiles, setCompilerSource
 )
@@ -57,11 +57,14 @@ use Std.Maybe as M
 use Std.Maybe.Maybe.*
 use Std.Result.Result.*
 use Std.Path as Path
-use Std.Fs (readToString, writeString, exists)
+use Std.Fs (readToString, writeString, exists, createDirAll)
 use Std.Process (getEnv)
 use Std.Process as Proc
 use Std.Exn (toResult)
-use Std.Sort (sortOn)
+use Std.Sort (sortOn, sortBy)
+use Std.Ordering (Ordering)
+use MeadowBoot.Unit (stdDir, sourcesOf)
+use MeadowBoot.Types (Arena, newArena, fresh, freshQuantifiers, substBound, snapshot, rollback, unify)
 use Std.Char as C
 
 lsp! {
@@ -80,7 +83,12 @@ lsp! {
 record Doc = {
   uri : String,
   path : String,
-  text : String
+  text : String,
+  -- The package it is analysed in, and the file it is there: its own, or --
+  -- for a document that is no module of a package -- the one module of a
+  -- package made for it alone, as the Rust server analyses such a file.
+  root : String,
+  known : String
 }
 
 -- A package a document was opened in: its directory, and what it was
@@ -101,7 +109,9 @@ record Loaded = {
   studies : Ref (HashMap String (Int, Study)),
   -- Each open document's view, with the count of its package's changes it
   -- was made at.
-  views : Ref (HashMap Int (Int, View))
+  views : Ref (HashMap Int (Int, View)),
+  -- How often the standard library's sources write each word, once counted.
+  corpus : Ref (Maybe (HashMap String Int))
 }
 
 @pub fun newEditor () =
@@ -110,7 +120,8 @@ record Loaded = {
     loaded = newRef H.empty,
     edits = newRef H.empty,
     studies = newRef H.empty,
-    views = newRef H.empty
+    views = newRef H.empty,
+    corpus = newRef None
   }
 
 -- A path as the server compares it: the disk does not tell `C:` from `c:`,
@@ -121,10 +132,41 @@ fun keyOf (path : String) : String = S.toLower (Path.normalize (S.join "/" (S.sp
 -- is loaded, if it is in one that is not yet.
 fun openedAt (ed : Editor) (file : Int) (uri : String) =
   let path = absolute (pathOf uri) in
-  let u = setRef ed.docs (H.insert file (Doc { uri, path, text = "" }) (getRef ed.docs)) in
-  match packageOf path with
-  | Just root -> load ed root
-  | None -> ()
+  let inPackage =
+    match packageOf path with
+    | Just root ->
+        (let u = load ed root in
+         match H.lookup (keyOf root) (getRef ed.loaded) with
+         | Just (l : Loaded) ->
+             (match l.given with
+              | Ok g -> if V.any (\x -> keyOf (fst x) == keyOf path) (unitSources g) then Just root else None
+              | Err _ -> Just root)
+         | None -> None)
+    | None -> None
+  in
+  let doc =
+    match inPackage with
+    | Just root -> Doc { uri, path, text = "", root, known = path }
+    | None ->
+        (let root = aloneRoot path in
+         Doc { uri, path, text = "", root, known = Path.joinAll [root, "src", "Main.mw"] })
+  in setRef ed.docs (H.insert file doc (getRef ed.docs))
+
+-- Where the package made for a document that is no module of one is: a
+-- directory of its own, named for the document's path, in the scratch
+-- directory.
+fun aloneRoot (path : String) =
+  let tmp =
+    match getEnv "TEMP" with
+    | Just t -> t
+    | None -> M.unwrapOr "." (getEnv "TMP")
+  in
+  let safe =
+    S.fromChars (V.map (\c -> if C.isAlphaNum c then c else '_') (S.chars (keyOf path)))
+  in Path.joinAll [tmp, "meadowboot-lsp", safe]
+
+-- Whether `root` is a package made for one document alone.
+fun isAlone (root : String) : Bool = S.contains "meadowboot-lsp" root
 
 -- The package at `root`, built and read back, unless it was already.
 fun load (ed : Editor) (root : String) =
@@ -142,11 +184,17 @@ fun textAt (ed : Editor) (file : Int) (t : String) =
   | None -> ()
   | Just (d : Doc) ->
       let u = setRef ed.docs (H.insert file { d | text = t } (getRef ed.docs)) in
-      (match packageOf d.path with
-       | Just root ->
-           (let k = keyOf root in
-            setRef ed.edits (H.insert k (H.getOr 0 k (getRef ed.edits) + 1) (getRef ed.edits)))
-       | None -> ())
+      -- A document alone is made a package the first time its text is told.
+      let made =
+        if isAlone d.root and M.isNone (H.lookup (keyOf d.root) (getRef ed.loaded)) then
+          (let a = createDirAll (Path.join d.root "src") in
+           let b = writeString (Path.join d.root "Meadow.toml", "[package]\nname = \"main\"\nversion = \"0.1.0\"\n") in
+           let c = writeString (d.known, t) in
+           load ed d.root)
+        else ()
+      in
+      let k = keyOf d.root in
+      setRef ed.edits (H.insert k (H.getOr 0 k (getRef ed.edits) + 1) (getRef ed.edits))
 
 -- The package at `root` studied, with each open document of it as the
 -- editor holds it: the last study, if nothing has changed since.
@@ -173,7 +221,7 @@ fun studied (ed : Editor) (g : Given Interface) =
   let u =
     V.foldl
       (\acc (d : Doc) ->
-        match V.find (\f -> keyOf f == keyOf d.path) files with
+        match V.find (\f -> keyOf f == keyOf d.known) files with
         | Just f -> setCompilerSource db f d.text
         | None -> ())
       ()
@@ -216,9 +264,9 @@ fun viewAt (ed : Editor) (file : Int) (uri : String) (text : String) =
     match H.lookup file (getRef ed.docs) with
     | None -> None
     | Just (d : Doc) ->
-        (match packageOf d.path with
-         | None -> None
-         | Just root ->
+        (let root = d.root in
+         if S.isEmpty root then None
+         else
              (let n = H.getOr 0 (keyOf root) (getRef ed.edits) in
               match H.lookup file (getRef ed.views) with
               | Just (m, v) if m == n -> Just v
@@ -226,7 +274,7 @@ fun viewAt (ed : Editor) (file : Int) (uri : String) (text : String) =
                   (match studyOf ed root with
                    | None -> None
                    | Just (s : Study) ->
-                       (match V.find (\x -> keyOf (fst x) == keyOf d.path) s.sources with
+                       (match V.find (\x -> keyOf (fst x) == keyOf d.known) s.sources with
                         | None -> None
                         | Just (_, (src : Source)) ->
                             (let v = viewIn uri d.path text (srcFile src) s in
@@ -464,7 +512,7 @@ fun locationOf (ed : Editor) (v : View) (file : String) (from : Int) (to : Int) 
   else
     M.andThen
       (\path ->
-        (let open = V.find (\(d : Doc) -> keyOf d.path == keyOf path) (H.values (getRef ed.docs)) in
+        (let open = V.find (\(d : Doc) -> keyOf d.known == keyOf path) (H.values (getRef ed.docs)) in
          let text =
            match open with
            | Just (d : Doc) -> Just d.text
@@ -536,12 +584,9 @@ fun diagnosticsOf (ed : Editor) (file : Int) =
           (lex d.text).problems
       in
       let found =
-        match packageOf d.path with
+        match studyOf ed d.root with
         | None -> []
-        | Just root ->
-            (match studyOf ed root with
-             | None -> []
-             | Just (s : Study) -> studiedWrong s d)
+        | Just (s : Study) -> studiedWrong s d
       in
       let named =
         match viewAt ed file d.uri d.text with
@@ -553,18 +598,18 @@ fun studiedWrong (s : Study) (d : Doc) =
   let parsed =
     V.concatMap
       (\x ->
-        if keyOf (fst x) != keyOf d.path then []
+        if keyOf (fst x) != keyOf d.known then []
         else
           V.map
             (\e -> Diagnostic Severity.Error (snd e) (Meta (fst e) (fst e)) [] [])
             (snd x))
       s.parsed
   in
-  let grouped = V.concatMap (\x -> if keyOf (fst x) == keyOf d.path then snd x else []) s.grouped in
+  let grouped = V.concatMap (\x -> if keyOf (fst x) == keyOf d.known then snd x else []) s.grouped in
   let file =
     M.unwrapOr
       ""
-      (M.map (\x -> srcFile (snd x)) (V.find (\x -> keyOf (fst x) == keyOf d.path) s.sources))
+      (M.map (\x -> srcFile (snd x)) (V.find (\x -> keyOf (fst x) == keyOf d.known) s.sources))
   in
   let said =
     V.concatMap
@@ -844,7 +889,7 @@ fun textAndUri (ed : Editor) (v : View) (file : String) =
   else
     M.andThen
       (\path ->
-        (let open = V.find (\(d : Doc) -> keyOf d.path == keyOf path) (H.values (getRef ed.docs)) in
+        (let open = V.find (\(d : Doc) -> keyOf d.known == keyOf path) (H.values (getRef ed.docs)) in
          match open with
          | Just (d : Doc) -> Just (uriOfPath path, d.text)
          | None -> M.map (\t -> (uriOfPath path, t)) (Res.toMaybe (readToString path))))
@@ -1120,8 +1165,6 @@ fun backToLine (s : String) (k : Int) : Int =
 
 -- --- not yet answered as the Rust server answers ------------------------------
 
-fun completionOf (ed : Editor) (a : Asked) =
-  J.jObject [("isIncomplete", J.jBool True), ("items", J.jArray [])]
 
 
 -- What the server read of the document asked about: MeadowBoot's own
@@ -2127,3 +2170,562 @@ fun modulePathOf (v : View) (file : String) : [String] =
 fun ctorSpelling (canon : String) : String =
   let parts = S.split "." canon in
   if V.len parts <= 2 then canon else S.join "." (V.drop parts (V.len parts - 2))
+
+-- --- completion --------------------------------------------------------------
+
+-- What the cursor is asking for (`complete::Ask`): what a value piped can go
+-- into; what follows `Q.`; the path of a `use`, or the names it takes; a name
+-- being invented, which nothing existing is; or any name.
+data Ask
+  = Piped Int String
+  | Member String String
+  | UsePath [String] String
+  | UseNames [String] String
+  | Nothing String
+  | Name String
+
+-- Where the word the cursor is in starts: after the last character before
+-- it that is no letter, digit or `_`.
+fun wordStart (text : String) (offset : Int) : Int =
+  let cs = S.chars (stringSlice text 0 (min offset (stringByteLength text))) in
+  let rec back (i : Int) (at : Int) =
+    if i < 0 then 0
+    else
+      (let c = V.getOr ' ' cs i in
+       let w = utf8Width c in
+       if C.isAlphaNum c or c == '_' or C.code c > 127 and isWordChar c then back (i - 1) (at - w)
+       else at)
+  in back (V.len cs - 1) (min offset (stringByteLength text))
+
+-- A character of a word that is not ASCII: a letter or a digit, as Rust's
+-- `char::is_alphanumeric` has one -- taken here as any character past ASCII
+-- that is not a space or a symbol a source writes between words.
+fun isWordChar (c : Char) : Bool =
+  not (V.elem (C.code c) [160, 8594, 8592, 8658, 8656, 8212, 8211, 8230, 171, 187])
+
+fun utf8Width (c : Char) : Int =
+  let n = C.code c in
+  if n < 128 then 1 else if n < 2048 then 2 else if n < 65536 then 3 else 4
+
+fun askAt (text : String) (offset : Int) : Ask =
+  let ws = wordStart text offset in
+  let word = stringSlice text ws (min offset (stringByteLength text)) in
+  let before = stringSlice text 0 ws in
+  match usedRest (lineOfText before) with
+  | Just rest -> useAsk rest word
+  | None ->
+      if S.endsWith "." before then
+        (let upto = S.take before (stringByteLength before - 1) in
+         let q = S.drop upto (wordStart upto (stringByteLength upto)) in
+         match V.get (S.chars q) 0 with
+         | Just c -> if C.isUpper c then Ask.Member q word else Ask.Nothing word
+         | None -> Ask.Nothing word)
+      else
+        (let trimmed = S.trimEnd before in
+         if S.endsWith "|>" trimmed then
+           Ask.Piped (stringByteLength (S.trimEnd (S.take trimmed (stringByteLength trimmed - 2)))) word
+         else Ask.Name word)
+
+fun lineOfText (text : String) : String =
+  match lastIndexOf "\n" text with
+  | Just i -> S.drop text (i + 1)
+  | None -> text
+
+-- What follows `use` on a line that is one, `@pub use` too.
+fun usedRest (line : String) : Maybe String =
+  let l = S.trimStart line in
+  let l2 =
+    if S.startsWith "@" l then
+      (match V.find (\i -> C.isSpace (V.getOr ' ' (S.chars l) i)) (V.range 0 (V.len (S.chars l))) with
+       | Just i -> S.fromChars (V.drop (S.chars l) (i + 1))
+       | None -> "")
+    else l
+  in
+  let l3 = S.trimStart l2 in
+  if S.startsWith "use" l3 and stringByteLength l3 > 3 and C.isSpace (V.getOr 'x' (S.chars (S.drop l3 3)) 0) then
+    Just (S.drop l3 3)
+  else None
+
+fun useAsk (rest : String) (word : String) : Ask =
+  match lastIndexOf "(" rest with
+  | Just open ->
+      if not (S.contains ")" (S.drop rest open)) then Ask.UseNames (pathOfText (S.take rest open)) word
+      else useNoParen rest word
+  | None -> useNoParen rest word
+
+fun useNoParen (rest : String) (word : String) : Ask =
+  if V.elem "as" (V.filter (\w -> not (S.isEmpty w)) (S.split " " (S.join " " (S.split "\t" rest)))) then
+    Ask.Nothing word
+  else
+    Ask.UsePath
+      (let t = S.trim rest in
+       if S.endsWith "." t then pathOfText (S.take t (stringByteLength t - 1)) else [])
+      word
+
+fun pathOfText (text : String) : [String] =
+  let t = S.trim text in
+  if S.isEmpty t then [] else S.split "." t
+
+-- A value completion could offer: its name, its scheme, how near it is --
+-- 0 for the package, 3 for the standard library -- where it comes from, and
+-- how often the library's own source writes its name.
+record Candidate = {
+  name : String,
+  scheme : Scheme,
+  shown : String,
+  distance : Int,
+  from : String,
+  common : Int
+}
+
+-- How often each word is written in `text`.
+fun wordCounts (text : String) (into : HashMap String Int) : HashMap String Int =
+  let done =
+    V.foldl
+      (\acc c ->
+        match acc with
+        | (h, w) ->
+            if C.isAlphaNum c or c == '_' or C.code c > 127 and isWordChar c then (h, V.pushBack w c)
+            else if V.isEmpty w then acc
+            else (H.insert (S.fromChars w) (H.getOr 0 (S.fromChars w) h + 1) h, []))
+      (into, [])
+      (S.chars text)
+  in
+  match done with
+  | (h, w) -> if V.isEmpty w then h else H.insert (S.fromChars w) (H.getOr 0 (S.fromChars w) h + 1) h
+
+-- How often each name is written in the standard library's sources, counted
+-- once: what idiomatic Meadow reaches for.
+fun corpusOf (ed : Editor) =
+  match getRef ed.corpus with
+  | Just c -> c
+  | None ->
+      (let counted =
+         match stdDir () with
+         | Just dir ->
+             V.foldl
+               (\h f -> wordCounts (M.unwrapOr "" (Res.toMaybe (readToString f))) h)
+               H.empty
+               (sourcesOf dir)
+         | None -> H.empty
+       in
+       let u = setRef ed.corpus (Just counted) in
+       counted)
+
+-- Every value a completion could name, nearest first, as `gather_candidates`
+-- has them: what the package exports, then what the library's root does.
+fun candidatesOf (ed : Editor) (v : View) =
+  let corpus = corpusOf ed in
+  let own =
+    V.concatMap
+      (\(e : Export) ->
+        if e.kind != "v" or startsUpper e.name then []
+        else
+          match H.lookup e.binder v.study.inferred.schemes with
+          | Just sc ->
+              [Candidate {
+                 name = e.name,
+                 scheme = sc,
+                 shown = showScheme sc,
+                 distance = 0,
+                 from = if V.isEmpty e.module then "this package" else S.join "." e.module,
+                 common = H.getOr 0 e.name corpus
+               }]
+          | None -> [])
+      v.study.renamed.exports
+  in
+  let std =
+    V.concatMap
+      (\(i : Interface) ->
+        if i.package != "Std" then []
+        else
+          V.concatMap
+            (\(e : Export) ->
+              if e.kind != "v" or not e.flat or startsUpper e.name then []
+              else
+                match e.scheme with
+                | Just sc ->
+                    [Candidate {
+                       name = e.name,
+                       scheme = sc,
+                       shown = showScheme sc,
+                       distance = 3,
+                       from = "Std",
+                       common = H.getOr 0 e.name corpus
+                     }]
+                | None -> [])
+            i.exports)
+      v.study.imported
+  in
+  let sorted =
+    sortBy
+      (\(x : Candidate) (y : Candidate) -> compare (x.name, x.distance, x.shown) (y.name, y.distance, y.shown))
+      (V.append own std)
+  in
+  V.foldl
+    (\acc (c : Candidate) ->
+      match V.last acc with
+      | Just (p : Candidate) -> if p.name == c.name and p.shown == c.shown then acc else V.pushBack acc c
+      | None -> V.pushBack acc c)
+    []
+    sorted
+
+fun startsUpper (s : String) : Bool = M.unwrapOr False (M.map C.isUpper (V.get (S.chars s) 0))
+
+-- How a value fits a function it is piped into: as its first parameter, or
+-- its last with how many before it; whether that parameter is a type
+-- variable; and whether the call performs an effect (`PipeFit`).
+record Fit = {
+  last : Int,
+  generic : Bool,
+  effectful : Bool
+}
+
+-- Whether a value of type `subject` can be piped into a function of
+-- `scheme`, and how (`pipes_into`).
+fun pipesInto (scheme : Scheme) (subject : Type) : Maybe Fit =
+  runSt (\() ->
+    let ar = newArena () in
+    let seen = stNewRef H.empty in
+    let s2 = freshened ar seen subject in
+    let fresh = freshQuantifiers ar scheme in
+    let ty = substBound scheme.ty fresh in
+    let params = paramsOf ty in
+    if V.isEmpty params then None
+    else
+      (let generic = \t -> match t with | Var _ -> True | Bound _ -> True | _ -> False in
+       let performs =
+         \at -> V.any (\p -> match snd p with | RowEmpty -> False | Var _ -> False | _ -> True) (V.drop params at)
+       in
+       let fits =
+         \at ->
+           (let snap = snapshot ar in
+            let ok = match unify ar (fst (V.getOr (Error, Error) params at)) s2 with | Ok _ -> True | Err _ -> False in
+            let u = rollback ar snap in
+            ok)
+       in
+       if fits 0 then Just (Fit { last = 0, generic = generic (fst (V.getOr (Error, Error) params 0)), effectful = performs 0 })
+       else
+         (let last = V.len params - 1 in
+          if last > 0 and fits last then
+            Just (Fit { last, generic = generic (fst (V.getOr (Error, Error) params last)), effectful = performs last })
+          else None)))
+
+-- The parameters of a curried type, each with the effect of its arrow.
+fun paramsOf (t : Type) : [(Type, Type)] =
+  match t with
+  | Fun args ret eff -> V.append (V.map (\a -> (a, eff)) args) (paramsOf ret)
+  | _ -> []
+
+fun freshened (ar : Arena s) (seen : StRef s (HashMap Int Type)) (t : Type) : Type ! { St s | e } =
+  match t with
+  | Var id ->
+      (match H.lookup id (stGetRef seen) with
+       | Just x -> x
+       | None -> (let x = fresh ar in let u = stSetRef seen (H.insert id x (stGetRef seen)) in x))
+  | Con n args -> Con n (V.map (freshened ar seen) args)
+  | Fun args ret eff -> Fun (V.map (freshened ar seen) args) (freshened ar seen ret) (freshened ar seen eff)
+  | Tuple items -> Tuple (V.map (freshened ar seen) items)
+  | Record row -> Record (freshened ar seen row)
+  | RowExtend l f rest -> RowExtend l (freshened ar seen f) (freshened ar seen rest)
+  | other -> other
+
+-- The type of the value piped: the outermost typed node that ends where the
+-- `|>` begins, the first of those as long.
+fun subjectAt (v : View) (at : Int) : Maybe Type =
+  M.map
+    (\x -> match x with | (_, _, t) -> t)
+    (V.foldl
+       (\acc x ->
+         match x with
+         | (f, t, _) ->
+             if t != at then acc
+             else
+               (match acc with
+                | Just (f0, t0, _) -> if t - f > t0 - f0 then Just x else acc
+                | None -> Just x))
+       None
+       v.typing.nodes)
+
+-- An offer: a name, what goes in, whether that is a snippet, the detail
+-- beside it, where it came from, and its kind's number in the protocol.
+record Offer = {
+  label : String,
+  insert : String,
+  snippet : Bool,
+  detail : String,
+  from : String,
+  kind : Int
+}
+
+fun completionOf (ed : Editor) (a : Asked) =
+  let empty = J.jObject [("isIncomplete", J.jBool True), ("items", J.jArray [])] in
+  match viewOf ed a with
+  | None -> empty
+  | Just v ->
+      let offers =
+        match askAt v.text a.offset with
+        | Ask.Name word -> namesOffered ed v word
+        | Ask.Piped at word ->
+            (match subjectAt v at with
+             | Just subject -> pipedOffered ed v subject word
+             | None -> namesOffered ed v word)
+        | Ask.Member q word -> memberOffered v q word
+        | Ask.UsePath segs word -> underOffered v segs [9, 22] word
+        | Ask.UseNames segs word -> underOffered v segs [3, 22] word
+        | Ask.Nothing _ -> []
+      in
+      let start = wordStart v.text a.offset in
+      let range =
+        J.jObject [
+          ("start", posJson (position v.text (lineStarts v.text) start)),
+          ("end", M.unwrapOr (J.jNull ()) (J.get "position" a.params))
+        ]
+      in
+      J.jObject [
+        ("isIncomplete", J.jBool True),
+        (
+          "items",
+          J.jArray
+            (V.map
+               (\i ->
+                 match V.get offers i with
+                 | Just (o : Offer) ->
+                     J.jObject [
+                       ("label", J.jString o.label),
+                       ("kind", J.jInt o.kind),
+                       ("detail", J.jString o.detail),
+                       ("labelDetails", J.jObject [("description", J.jString o.from)]),
+                       ("sortText", J.jString (padded i)),
+                       ("filterText", J.jString o.label),
+                       ("insertTextFormat", J.jInt (if o.snippet then 2 else 1)),
+                       ("textEdit", J.jObject [("range", range), ("newText", J.jString o.insert)])
+                     ]
+                 | None -> J.jNull ())
+               (V.range 0 (V.len offers)))
+        )
+      ]
+
+fun padded (i : Int) : String =
+  let s = show i in
+  if stringByteLength s >= 4 then s else S.concatAll (V.map (\k -> "0") (V.range 0 (4 - stringByteLength s))) ++ s
+
+-- Every name that starts with `word`, best first: what this file uses
+-- most, then what the library does, then what is nearest.
+fun namesOffered (ed : Editor) (v : View) (word : String) =
+  let used = wordCounts v.text H.empty in
+  let ranked =
+    V.concatMap
+      (\(c : Candidate) ->
+        if not (S.startsWith word c.name) or S.startsWith "$" c.name then []
+        else
+          [(
+            [0, 0, 0 - H.getOr 0 c.name used, 0 - c.common, c.distance, 0, 0],
+            Offer { label = c.name, insert = c.name, snippet = False, detail = c.shown, from = c.from, kind = 3 }
+          )])
+      (candidatesOf ed v)
+  in V.map snd (stableSort byRank ranked)
+
+-- What `subject` can be piped into, best first (`complete::piped`).
+fun pipedOffered (ed : Editor) (v : View) (subject : Type) (word : String) =
+  let used = wordCounts v.text H.empty in
+  let ranked =
+    V.concatMap
+      (\(c : Candidate) ->
+        if not (S.startsWith word c.name) or S.startsWith "$" c.name then []
+        else
+          match pipesInto c.scheme subject with
+          | None -> []
+          | Just (f : Fit) ->
+              [(
+                [
+                  if f.generic then 1 else 0,
+                  if f.effectful then 1 else 0,
+                  0 - H.getOr 0 c.name used,
+                  0 - c.common,
+                  c.distance,
+                  f.last,
+                  if f.last == 0 then 0 else 1
+                ],
+                Offer {
+                  label = c.name,
+                  insert =
+                    if f.last == 0 then c.name
+                    else S.join " " (V.pushFront (V.map (\i -> "$" ++ "{${show (i + 1)}}") (V.range 0 f.last)) c.name),
+                  snippet = f.last > 0,
+                  detail = c.shown,
+                  from = c.from,
+                  kind = 3
+                }
+              )])
+      (candidatesOf ed v)
+  in V.map snd (stableSort byRank ranked)
+
+-- `xs` sorted by `cmp`, equal ones in the order they were.
+fun stableSort (cmp : a -> a -> Ordering) (xs : [a]) : [a] =
+  V.map
+    snd
+    (sortBy
+       (\p q ->
+         match cmp (snd p) (snd q) with
+         | Ordering.Equal -> compare (fst p) (fst q)
+         | other -> other)
+       (V.zip (V.range 0 (V.len xs)) xs))
+
+fun byRank (x : ([Int], Offer)) (y : ([Int], Offer)) : Ordering =
+  match (x, y) with
+  | ((r1, (o1 : Offer)), (r2, (o2 : Offer))) -> compare (r1, o1.label) (r2, o2.label)
+
+-- --- what a path reaches --------------------------------------------------------
+
+-- What sits directly under each dotted path (`PathIndex`): under a package
+-- its modules, under a module its modules, types and values, under a type
+-- its constructors. Each entry is a name, what it is -- the protocol's
+-- kind of completion item: 9 a module, 22 a type, 20 a constructor, 3 a
+-- value -- and its detail: a value's scheme, the type a constructor builds.
+fun pathIndex (v : View) : HashMap String [(String, Int, String)] =
+  let add =
+    \h path e ->
+      (let under = H.getOr [] path h in
+       match e with
+       | (n, k, _) ->
+           if V.any (\x -> match x with | (n2, k2, _) -> n2 == n and k2 == k) under then h
+           else H.insert path (V.pushBack under e) h)
+  in
+  let modulesTo =
+    \h segs ->
+      V.foldl
+        (\acc i -> add acc (S.join "." (V.take segs i)) (V.getOr "" segs i, 9, ""))
+        h
+        (V.range 0 (V.len segs))
+  in
+  let isType = \(owner : String) -> owner == "data" or owner == "record" or owner == "effect" or owner == "alias" in
+  -- The library's modules, as what it exports says them.
+  let std =
+    V.foldl
+      (\h (i : Interface) ->
+        if i.package != "Std" then h
+        else
+          V.foldl
+            (\acc (e : Export) ->
+              let here = V.pushFront e.module "Std" in
+              let at = S.join "." here in
+              let withModules = modulesTo acc here in
+              if e.kind == "t" and isType e.owner then add withModules at (e.name, 22, "")
+              else if e.kind == "c" then add withModules (at ++ "." ++ e.owner) (e.name, 20, e.owner)
+              else if e.kind == "v" then
+                add withModules at (e.name, 3, M.unwrapOr "" (M.map showScheme e.scheme))
+              else withModules)
+            h
+            i.exports)
+      H.empty
+      v.study.imported
+  in
+  -- And the package's own, by its name.
+  V.foldl
+    (\h (d : Declared) ->
+      let here = V.pushFront d.path v.package in
+      let at = S.join "." here in
+      V.foldl
+        (\acc (it : Item) ->
+          if it.kind == "t" and isType it.owner then add acc at (it.name, 22, "")
+          else if it.kind == "c" then add acc (at ++ "." ++ it.owner) (it.name, 20, it.owner)
+          else if it.kind == "v" then
+            (match V.find (\(e : Export) -> e.binder == it.id) v.study.renamed.exports with
+             | Just (e : Export) ->
+                 add acc at (it.name, 3, M.unwrapOr "" (M.map showScheme (H.lookup it.id v.study.inferred.schemes)))
+             | None -> acc)
+          else acc)
+        (modulesTo h here)
+        d.items)
+    std
+    v.study.renamed.modules
+
+-- Every path of the index whose last segments are `written`, shortest
+-- first.
+fun endingIn (index : HashMap String [(String, Int, String)]) (written : String) : [String] =
+  let want = S.split "." written in
+  let found =
+    V.filter
+      (\k ->
+        (let segs = S.split "." k in
+         V.len segs >= V.len want and V.drop segs (V.len segs - V.len want) == want))
+      (H.keys index)
+  in sortBy (\a b -> compare (stringByteLength a, a) (stringByteLength b, b)) found
+
+fun locatePath (index : HashMap String [(String, Int, String)]) (segments : [String]) : Maybe String =
+  let written = S.join "." segments in
+  if S.isEmpty written or not (V.isEmpty (H.getOr [] written index)) then Just written
+  else V.get (endingIn index written) 0
+
+-- The entries of the given kinds under `path` that start with `word`, each
+-- name once.
+fun entriesUnder index (path : String) (kinds : [Int]) (word : String) : [Offer] =
+  V.foldl
+    (\out e ->
+      match e with
+      | (n, k, detail) ->
+          if not (V.elem k kinds) or not (S.startsWith word n) or V.any (\(o : Offer) -> o.label == n) out then out
+          else
+            V.pushBack
+              out
+              (Offer {
+                 label = n,
+                 insert = n,
+                 snippet = False,
+                 detail = if S.isEmpty detail then describe k else detail,
+                 from = if S.isEmpty path then "this document" else path,
+                 kind = k
+               }))
+    []
+    (H.getOr [] path index)
+
+fun describe (k : Int) : String =
+  if k == 9 then "module" else if k == 22 then "type" else if k == 20 then "constructor" else "value"
+
+fun byLabel (xs : [Offer]) : [Offer] = stableSort (\(a : Offer) (b : Offer) -> compare a.label b.label) xs
+
+-- What follows `Q.` in an expression (`member`): under the module `Q` names,
+-- its values and its types' constructors; or, `Q` a type, its
+-- constructors.
+fun memberOffered (v : View) (q : String) (word : String) : [Offer] =
+  let index = pathIndex v in
+  match H.lookup q (aliasesIn v.text) with
+  | Just written ->
+      (match locatePath index (S.split "." written) with
+       | None -> []
+       | Just path ->
+           (let values = entriesUnder index path [3] word in
+            let ctors =
+              V.concatMap
+                (\e ->
+                  match e with
+                  | (n, 22, _) -> entriesUnder index "${path}.${n}" [20] word
+                  | _ -> [])
+                (H.getOr [] path index)
+            in byLabel (V.append values ctors)))
+  | None ->
+      (match V.find
+         (\p -> V.any (\e -> match e with | (_, k, _) -> k == 20) (H.getOr [] p index))
+         (endingIn index q) with
+       | Just path -> byLabel (entriesUnder index path [20] word)
+       | None -> [])
+
+fun underOffered (v : View) (segments : [String]) (kinds : [Int]) (word : String) : [Offer] =
+  let index = pathIndex v in
+  match locatePath index segments with
+  | Just path -> byLabel (entriesUnder index path kinds word)
+  | None -> []
+
+-- The aliases a document's `use`s make: `use Std.Maybe as M` makes `M`
+-- `Std.Maybe`.
+fun aliasesIn (text : String) : HashMap String String =
+  V.foldl
+    (\h line ->
+      (let words = V.filter (\w -> not (S.isEmpty w)) (S.split " " (S.join " " (S.split "\t" line))) in
+       let ws = if M.unwrapOr False (M.map (\w -> S.startsWith "@" w) (V.get words 0)) then V.drop words 1 else words in
+       match (V.get ws 0, V.get ws 1, V.get ws 2, V.get ws 3) with
+       | (Just "use", Just path, Just "as", Just alias) -> H.insert alias path h
+       | _ -> h))
+    H.empty
+    (S.lines text)

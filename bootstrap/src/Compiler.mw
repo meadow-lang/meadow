@@ -313,8 +313,10 @@ fun inferredOf
   inferred : Inferred,
   parsed : [(String, [(Int, String)])],
   grouped : [(String, [Diagnostic])],
-  -- Where each unit it imports is, by the name of its package.
-  homes : [(String, String)]
+  -- Where each unit it imports is, by the name of its package; and what
+  -- each tells it.
+  homes : [(String, String)],
+  imported : [Interface]
 }
 
 -- The unit `db` holds, studied: as `inferredOf` infers it, keeping all of
@@ -389,7 +391,8 @@ fun inferredOf
         homes =
           V.map
             (\k -> ((V.getOr (emptyInterface ()) imported k).package, V.getOr "" homes k))
-            (V.range 0 (V.len imported))
+            (V.range 0 (V.len imported)),
+        imported
       }
 
 -- The unit at `dir` checked and lowered, its types inferred once: what it
