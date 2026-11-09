@@ -32,9 +32,11 @@ mod Ast
 mod Lower
 mod Rename
 mod Scopes
+mod Lsp
 
 use Lingua (cli!)
 use MeadowBoot.Lex (lex, dump)
+use MeadowBoot.Lsp (serveServer)
 use MeadowBoot.Core (program, erase, linkedUnits, CoreProgram, coreFilePackage)
 use MeadowBoot.Expand (Call, readRound, writeAnswers, callText, seenAfter)
 use MeadowBoot.Scopes (Export)
@@ -383,6 +385,9 @@ cli! {
           : [String]
             "the files to read, each in a package; the standard library's sources are where `MEADOWBOOT_STD` says"
       }
+    | units
+      "Build the package at each of `roots` and every unit it depends on, as the language server reads them"
+      { roots : [String] "the packages' directories" }
     | cek
       "Compile each file's unit to core, run its `result` with the CEK machine, and say its value"
       { files : [String] "the files to read, each in a package" }
@@ -468,6 +473,10 @@ fun run (every : CliOptions) (cli : Cli) =
               (if V.isEmpty r.cfg then None else Just (S.join "," r.cfg)))
            r.files)
   | Cli.Expand r -> finish (expandRound r.files)
+  -- The language server is MeadowBoot's; `--check` is still `meadow`'s.
+  | Cli.Lsp r if V.isEmpty r.check -> serveServer ()
+  | Cli.Units r ->
+      finish (V.foldl (\ok root -> buildUnits "debug" (told ()) root and ok) True r.roots)
   -- What is not MeadowBoot's yet is `meadow`'s, asked the same way.
   | _ -> handedOn ()
 

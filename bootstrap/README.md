@@ -166,6 +166,40 @@ What is compared is each top-level binding's scheme, `from to name : scheme`,
 as `meadow build --types` writes it: quantifiers lettered by kind, `where` in
 front, an effect variable said once left out.
 
+## The language server
+
+The tools built on the Rust front end go with it, so `meadow lsp` is
+MeadowBoot's too: `src/Lsp.mw`, a server declared with Lingua's `lsp!`. What
+an editor shows should not change when the compiler behind it does, so the
+server answers what the Rust one (`buildtools/meadow-lsp`) answers, in the
+same shapes, and is held to it by a differential like every pass.
+
+Lingua speaks the protocol; every request is one of the language's own
+(`requests`), written in the Rust server's shape, and what the server says it
+can do is the Rust server's word for word (`capabilities`). A document is
+read as part of its package, as the Rust server reads it: when one is opened,
+the package is built -- by another run of this program, `units`, so that
+nothing the build prints reaches the editor -- and what each unit was
+compiled from is read back. The package is then studied (`Compiler.studyUnit`)
+with the open documents' texts standing for their files: renamed, its types
+inferred, and each document's names, types and macro calls read off that.
+A document in no package is studied as a package of its own, as the Rust
+server analyses one alone. Formatting is `meadow fmt`'s until MeadowBoot's
+formatter is ready.
+
+`buildtools/meadow/tests/lsp_differential.rs` starts both servers and sends
+them the same session: every file of a package opened, then hover, go to
+definition and prepare rename at every name, a rename of each name, semantic
+tokens, inlay hints, code lenses, formatting, completion after each `|>` and
+`.` and inside names, `meadow/ir`, workspace symbols, an edit and its undoing,
+and a close. It reports agreement by kind of request, and is ignored until
+the two agree. Where they cannot yet, the reason is one of three: MeadowBoot
+has not ported it (workspace symbols, `meadow/ir`); Lingua's `lsp!` cannot say
+it (a refusal as an error, diagnostics without `relatedInformation`,
+`initialize` without `positionEncoding` and `serverInfo`, notifications other
+than opening, changing and closing, a close that forgets the document); or
+the two compilers' answers differ, which is what the test is for.
+
 ## Running
 
 ```sh

@@ -1,0 +1,3312 @@
+-- The language server: `meadow lsp`, MeadowBoot's, declared with Lingua's
+-- `lsp!` over what the compiler already works out.
+--
+-- It answers what the Rust compiler's server answers
+-- (`buildtools/meadow-lsp`), in the same shapes: published diagnostics,
+-- hover, completion, go to definition, workspace symbols, formatting, inlay
+-- hints, code lenses, prepare rename and rename, semantic tokens, the
+-- custom `meadow/ir`. `buildtools/meadow/tests/lsp_differential.rs` drives
+-- both with the same messages and compares what they answer; where the two
+-- still differ, that test says how far.
+--
+-- Lingua speaks the protocol. Every request is one of the language's own
+-- (`requests`), so that each answer is written in the shape the Rust server
+-- writes it, and what the server says it can do is the Rust server's
+-- (`capabilities`).
+--
+-- A document belongs to its package, as it does for the Rust server: when
+-- one is opened, the package around it is built as `meadow build` would --
+-- the units it depends on first, by a run of this program, so that nothing
+-- the build prints reaches the editor -- and what each unit was compiled
+-- from is read back (`givenUnits`). The package is then compiled again, with
+-- the open documents' texts standing for their files, whenever one of them
+-- has changed since it last was.
+
+use Lingua (lsp!)
+use Lingua.Lsp (Asked, pathOf, rangeJson, lineStarts, position, uriOf)
+use Lingua.Lang (Meta)
+use Lingua.Lang.Meta.*
+use Lingua.Diagnostic (Diagnostic, Severity)
+use Lingua.Diagnostic.Diagnostic.*
+use Lingua.Make (Given, unitImports, unitDir, unitSources)
+use MeadowBoot.Compiler (
+  Interface, Study, studyUnit, unitDatabase, givenUnits, compilerFiles, setCompilerSource
+)
+use MeadowBoot.Unit (packageOf, absolute)
+use MeadowBoot.Rename (Binder)
+use MeadowBoot.Scopes (Source, Declared, Item, Export, Vis, builtinTyconNames)
+use MeadowBoot.Infer
+use MeadowBoot.Types (
+  Type, Scheme, VarKind, Namer, newNamer, namerOf, showType, showScheme, showTypeIn, isFun,
+  renderIn, renderResultIn, spelling
+)
+use MeadowBoot.Solve (Generalized)
+use Lingua.Lang (metaStart, metaEnd)
+use Lingua.Lsp (byteIn)
+use MeadowBoot.Types.Type.*
+use MeadowBoot.Tests (testsIn)
+use MeadowBoot.Lex (lex, Lexed, Token, Problem)
+use Std.Result as Res
+use Std.Json as J
+use Std.Json (Json)
+use Std.Collections.Vector as V
+use Std.Collections.HashMap as H
+use Std.Collections.HashMap (HashMap)
+use Std.String as S
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+use Std.Result.Result.*
+use Std.Path as Path
+use Std.Fs (readToString, writeString, exists, createDirAll)
+use Std.Process (getEnv)
+use Std.Process as Proc
+use Std.Exn (toResult)
+use Std.Sort (sortOn, sortBy)
+use Std.Ordering (Ordering)
+use MeadowBoot.Unit (stdDir, sourcesOf)
+use MeadowBoot.Types (
+  Arena, newArena, fresh, freshQuantifiers, substBound, snapshot, rollback, unify
+)
+use Std.Char as C
+
+lsp! {
+  pub Server "meadow" for Editor
+    | opened = openedAt
+    | text = textAt
+    | diagnostics = diagnosticsOf
+    | requests = editorRequests
+    | capabilities = editorCapabilities
+}
+
+-- --- what the server keeps ---------------------------------------------------
+
+-- An open document: where the editor says it is, where that is on the
+-- disk, and its text as the editor holds it.
+record Doc = {
+  uri : String,
+  path : String,
+  text : String,
+  -- The package it is analysed in, and the file it is there: its own, or --
+  -- for a document that is no module of a package -- the one module of a
+  -- package made for it alone, as the Rust server analyses such a file.
+  root : String,
+  known : String
+}
+
+-- A package a document was opened in: its directory, and what it was
+-- compiled from when it was last built -- or why it could not be.
+record Loaded = {
+  root : String,
+  given : Result String (Given Interface)
+}
+
+-- What the server keeps: the documents open, by Lingua's number for each;
+-- the packages they are in, by directory; and, for each package, how many
+-- times a document of it has changed, and the last study of it with the
+-- count it was made at.
+@pub record Editor = {
+  docs : Ref (HashMap Int Doc),
+  loaded : Ref (HashMap String Loaded),
+  edits : Ref (HashMap String Int),
+  studies : Ref (HashMap String (Int, Study)),
+  -- Each open document's view, with the count of its package's changes it
+  -- was made at.
+  views : Ref (HashMap Int (Int, View)),
+  -- How often the standard library's sources write each word, once counted.
+  corpus : Ref (Maybe (HashMap String Int))
+}
+
+@pub fun newEditor () =
+  Editor {
+    docs = newRef H.empty,
+    loaded = newRef H.empty,
+    edits = newRef H.empty,
+    studies = newRef H.empty,
+    views = newRef H.empty,
+    corpus = newRef None
+  }
+
+-- A path as the server compares it: the disk does not tell `C:` from `c:`,
+-- nor `\` from `/`.
+fun keyOf (path : String) : String = S.toLower (Path.normalize (S.join "/" (S.split "\\" path)))
+
+-- The document the editor opened as `file`, at `uri`: the package around it
+-- is loaded, if it is in one that is not yet.
+fun openedAt (ed : Editor) (file : Int) (uri : String) =
+  let path = absolute (pathOf uri) in
+  let inPackage =
+    match packageOf path with
+    | Just root ->
+        (let u = load ed root in
+         match H.lookup (keyOf root) (getRef ed.loaded) with
+         | Just (l : Loaded) ->
+             (match l.given with
+              | Ok g ->
+                  if V.any (\x -> keyOf (fst x) == keyOf path) (unitSources g) then Just root
+                  else None
+              | Err _ -> Just root)
+         | None -> None)
+    | None -> None
+  in
+  let doc =
+    match inPackage with
+    | Just root -> Doc { uri, path, text = "", root, known = path }
+    | None ->
+        (let root = aloneRoot path in
+         Doc { uri, path, text = "", root, known = Path.joinAll [root, "src", "Main.mw"] })
+  in setRef ed.docs (H.insert file doc (getRef ed.docs))
+
+-- Where the package made for a document that is no module of one is: a
+-- directory of its own, named for the document's path, in the scratch
+-- directory.
+fun aloneRoot (path : String) =
+  let tmp =
+    match getEnv "TEMP" with
+    | Just t -> t
+    | None -> M.unwrapOr "." (getEnv "TMP")
+  in
+  let safe = S.fromChars (V.map (\c -> if C.isAlphaNum c then c else '_') (S.chars (keyOf path))) in
+  Path.joinAll [tmp, "meadowboot-lsp", safe]
+
+-- Whether `root` is a package made for one document alone.
+fun isAlone (root : String) : Bool = S.contains "meadowboot-lsp" root
+
+-- The package at `root`, built and read back, unless it was already.
+fun load (ed : Editor) (root : String) =
+  if M.isSome (H.lookup (keyOf root) (getRef ed.loaded)) then ()
+  else
+    -- The build is another run of this program: what it says goes to it,
+    -- and not to the editor.
+    let built = Proc.run (Proc.currentExe ()) ["units", root] in
+    let given = givenUnits "debug" root root in
+    setRef ed.loaded (H.insert (keyOf root) (Loaded { root, given }) (getRef ed.loaded))
+
+-- An edit: the document's text, and its package's count of changes.
+fun textAt (ed : Editor) (file : Int) (t : String) =
+  match H.lookup file (getRef ed.docs) with
+  | None -> ()
+  | Just (d : Doc) ->
+      let u = setRef ed.docs (H.insert file { d | text = t } (getRef ed.docs)) in
+      -- A document alone is made a package the first time its text is told.
+      let made =
+        if isAlone d.root and M.isNone (H.lookup (keyOf d.root) (getRef ed.loaded)) then
+          (let a = createDirAll (Path.join d.root "src") in
+           let b =
+             writeString (
+               Path.join d.root "Meadow.toml",
+               "[package]\nname = \"main\"\nversion = \"0.1.0\"\n"
+             )
+           in
+           let c = writeString (d.known, t) in
+           load ed d.root)
+        else ()
+      in
+      -- What the package is studied with changes only when a text differs
+      -- from what stood for that file before: opening a file as it is on
+      -- the disk changes nothing, and a package opened whole is studied
+      -- once, not once a file.
+      let before = if S.isEmpty d.text then builtText ed d else Just d.text in
+      if before == Just t then ()
+      else
+        (let k = keyOf d.root in
+         setRef ed.edits (H.insert k (H.getOr 0 k (getRef ed.edits) + 1) (getRef ed.edits)))
+
+-- The text a document's package was built with for its file, if it has
+-- been loaded.
+fun builtText (ed : Editor) (d : Doc) =
+  match H.lookup (keyOf d.root) (getRef ed.loaded) with
+  | Just (l : Loaded) ->
+      (match l.given with
+       | Ok g -> M.map snd (V.find (\x -> keyOf (fst x) == keyOf d.known) (unitSources g))
+       | Err _ -> None)
+  | None -> None
+
+-- The package at `root` studied, with each open document of it as the
+-- editor holds it: the last study, if nothing has changed since.
+fun studyOf (ed : Editor) (root : String) =
+  let k = keyOf root in
+  let n = H.getOr 0 k (getRef ed.edits) in
+  match H.lookup k (getRef ed.studies) with
+  | Just (m, s) if m == n -> Just s
+  | _ ->
+      (match H.lookup k (getRef ed.loaded) with
+       | Just (l : Loaded) ->
+           (match l.given with
+            | Ok g ->
+                (let made = toResult (\() -> studied ed g) in
+                 match made with
+                 | Ok s ->
+                     (let u = setRef ed.studies (H.insert k (n, s) (getRef ed.studies)) in Just s)
+                 | Err _ -> None)
+            | Err _ -> None)
+       | None -> None)
+
+fun studied (ed : Editor) (g : Given Interface) =
+  let db = unitDatabase g in
+  let files = compilerFiles db 0 in
+  let u =
+    V.foldl
+      (\acc (d : Doc) ->
+        match V.find (\f -> keyOf f == keyOf d.known) files with
+        | Just f -> setCompilerSource db f d.text
+        | None -> ())
+      ()
+      (H.values (getRef ed.docs))
+  in studyUnit db (V.map fst (unitImports g))
+
+-- --- one document, as the requests read it -----------------------------------
+
+-- What the server knows of one open document: where it is, its text, its
+-- package's study, and -- read off the study -- every name written in it.
+-- `refs` are the values it mentions, each where and which binder; `names`
+-- the types, constructors and modules, each with its kind (`t`, `c`, `m`);
+-- `defs` the values it declares; `calls` where its macro calls are, whose
+-- expansions are not the document's to annotate.
+record View = {
+  file : String,
+  path : String,
+  uri : String,
+  text : String,
+  package : String,
+  study : Study,
+  refs : [(Int, Int, Int)],
+  names : [(Int, Int, Int, String)],
+  defs : [(Int, Int, Int)],
+  calls : [(Int, Int)],
+  -- Each module it mentions: where, and the module (`moduleRefs`).
+  modules : [(Int, Int, String)],
+  -- What inference says of it, and each constructor's full path by its
+  -- binder.
+  typing : Typing,
+  canons : HashMap Int String
+}
+
+fun viewOf (ed : Editor) (a : Asked) = viewAt ed a.file (uriOf a.docs a.file) a.text
+
+-- The view of document `file`, at `uri`, holding `text`.
+fun viewAt (ed : Editor) (file : Int) (uri : String) (text : String) =
+  if file < 0 then None
+  else
+    match H.lookup file (getRef ed.docs) with
+    | None -> None
+    | Just (d : Doc) ->
+        (let root = d.root in
+         if S.isEmpty root then None
+         else
+           (let n = H.getOr 0 (keyOf root) (getRef ed.edits) in
+            match H.lookup file (getRef ed.views) with
+            | Just (m, v) if m == n -> Just v
+            | _ ->
+                (match studyOf ed root with
+                 | None -> None
+                 | Just (s : Study) ->
+                     (match V.find (\x -> keyOf (fst x) == keyOf d.known) s.sources with
+                      | None -> None
+                      | Just (_, (src : Source)) ->
+                          (let v = viewIn uri d.path text (srcFile src) s in
+                           let u = setRef ed.views (H.insert file (n, v) (getRef ed.views)) in
+                           Just v)))))
+
+fun viewIn (uri : String) (path : String) (text : String) (file : String) (s : Study) : View =
+  let binders = s.renamed.binders in
+  let calls = macroCalls text in
+  let inside = \at -> V.any (\c -> fst c <= at and at <= snd c) calls in
+  let isName =
+    \from to ->
+      to > from
+        and to <= stringByteLength text
+        and not
+          (V.any
+             (\c -> c == ' ' or c == '\n' or c == '\t' or c == '\r')
+             (S.chars (stringSlice text from to)))
+  in
+  let derives = deriveAttrs text in
+  let kept =
+    \from to ->
+      to > from
+        and (not (inside from) or isName from to)
+        and not (V.any (\d -> fst d <= from and from < snd d) derives)
+  in
+  let uses =
+    V.concatMap
+      (\id ->
+        let b = V.getOr (emptyBinder ()) binders id in
+        V.concatMap
+          (\u ->
+            match u with
+            | (f, from, to) ->
+                -- In a macro call, only a value's name as written: what a
+                -- derive mentions stands at the trait it is named for.
+                if f == file
+                  and kept from to
+                  and (b.kind != "v"
+                     or not (inside from)
+                     or stringSlice text from to == b.name) then [(from, to, id, b.kind)]
+                else [])
+          b.uses)
+      (V.range 0 (V.len binders))
+  in
+  let defs =
+    V.concatMap
+      (\id ->
+        let b = V.getOr (emptyBinder ()) binders id in
+        if b.kind != "v" then []
+        else
+          match siteOf b with
+          -- Only a name written there: what a derive declares stands at the
+          -- derive, and is not written anywhere.
+          | Just (f, from, to) ->
+              if f == file
+                and to <= stringByteLength text
+                and stringSlice text from to == b.name then [(from, to, id)]
+              else []
+          | None -> [])
+      (V.range 0 (V.len binders))
+  in View {
+       file,
+       path,
+       uri,
+       text,
+       package = M.unwrapOr "" (V.get (S.split "/" file) 0),
+       study = s,
+       refs =
+         V.concatMap
+           (\x ->
+             match x with
+             | (f, t, id, k) -> if k == "v" then [(f, t, id)] else [])
+           uses,
+       names = V.filter (\x -> match x with | (_, _, _, k) -> k != "v") uses,
+       defs,
+       calls,
+       modules =
+         moduleRefs
+           text
+           (M.unwrapOr "" (V.get (S.split "/" file) 0))
+           (V.map (\(d : Declared) -> d.path) s.renamed.modules)
+           calls,
+       typing =
+         patched
+           s
+           file
+           text
+           (V.concatMap
+              (\x ->
+                match x with
+                | (f, t, id, k) -> if k == "v" then [(f, t, id)] else [])
+              uses)
+           (typingOf s file),
+       canons =
+         V.foldl
+           (\h (i : Item) ->
+             if i.kind == "c" and not (S.isEmpty i.canon) then H.insert i.id i.canon h else h)
+           H.empty
+           (V.append
+              (V.concatMap (\(d : Declared) -> d.items) s.renamed.modules)
+              s.renamed.depItems)
+     }
+
+fun emptyBinder () : Binder = Binder { name = "", kind = "", site = "-", uses = [], until = 0 - 1 }
+
+-- Where binder `b` is declared, as a file a dump names and the bytes its
+-- name is written over: `None` for what nothing declares.
+fun siteOf (b : Binder) : Maybe (String, Int, Int) =
+  match S.indexOf "@" b.site with
+  | None -> None
+  | Just at ->
+      (let file = S.take b.site at in
+       match S.toInt (S.drop b.site (at + 1)) with
+       | Just from ->
+           Just (file, from, if b.until >= 0 then b.until else from + stringByteLength b.name)
+       | None -> None)
+
+-- Where the document's macro calls are: each declaration at the top of the
+-- module that is a call -- `syntax! { … }` -- or carries a `@derive(…)`,
+-- from its first token to its last. What a macro writes stands at its call,
+-- and is not the document's to annotate or point into.
+fun macroCalls (text : String) : [(Int, Int)] =
+  let toks = (lex text).tokens in
+  let starts = lineStarts text in
+  -- Each declaration starts at a token at the start of its line that is not
+  -- inside brackets.
+  let opens =
+    V.foldl
+      (\acc i ->
+        match acc with
+        | (depth, found) ->
+            (let t = V.getOr (Lexed { token = Token.Error, from = 0, to = 0 }) toks i in
+             let atStart = snd (position text starts t.from) == 0 in
+             let found2 = if depth == 0 and atStart then V.pushBack found i else found in
+             (depth + bracket t.token, found2)))
+      (0, [])
+      (V.range 0 (V.len toks))
+  in
+  -- Attributes on lines of their own are the declaration's below them.
+  let firsts =
+    V.foldl
+      (\acc i ->
+        match V.last acc with
+        | Just prev ->
+            if onlyAttributes toks prev (i - 1) then V.pushBack (V.take acc (V.len acc - 1)) prev
+            else V.pushBack acc i
+        | None -> V.pushBack acc i)
+      []
+      (snd opens)
+  in V.concatMap
+       (\k ->
+         let first = V.getOr 0 firsts k in
+         let last = V.getOr (V.len toks) firsts (k + 1) - 1 in
+         if last < first then []
+         else if isCall toks first last then
+           [(
+             (V.getOr (Lexed { token = Token.Error, from = 0, to = 0 }) toks first).from,
+             (V.getOr (Lexed { token = Token.Error, from = 0, to = 0 }) toks last).to
+           )]
+         else [])
+       (V.range 0 (V.len firsts))
+
+-- Whether tokens `first` to `last` are attributes and nothing else.
+fun onlyAttributes (toks : [Lexed]) (first : Int) (last : Int) : Bool =
+  let tok = \i -> (V.getOr noToken toks i).token in
+  let rec go (i : Int) =
+    if i > last then True
+    else
+      match (tok i, tok (i + 1)) with
+      | (Token.At, Token.LowerIdent _) ->
+          (match tok (i + 2) with
+           | Token.LParen -> go (closing tok (i + 2) last)
+           | _ -> go (i + 2))
+      | _ -> False
+  in last >= first and go first
+
+fun bracket (t : Token) : Int =
+  match t with
+  | Token.LParen -> 1
+  | Token.LBrace -> 1
+  | Token.LBrack -> 1
+  | Token.RParen -> 0 - 1
+  | Token.RBrace -> 0 - 1
+  | Token.RBrack -> 0 - 1
+  | _ -> 0
+
+-- Whether the declaration from token `first` to `last` is a macro call: past
+-- its attributes, a name and a `!`; or one of its attributes a `@derive`.
+fun isCall (toks : [Lexed]) (first : Int) (last : Int) : Bool =
+  let tok = \i -> (V.getOr (Lexed { token = Token.Error, from = 0, to = 0 }) toks i).token in
+  let rec past (i : Int) (derives : Bool) =
+    if i > last then (i, derives)
+    else
+      match tok i with
+      | Token.At ->
+          (let named = tok (i + 1) in
+           let isDerive =
+             match named with
+             | Token.LowerIdent n -> n == "derive"
+             | _ -> False
+           in
+           -- `@name(…)`: past the bracket that closes it.
+           (match tok (i + 2) with
+            | Token.LParen -> past (closing tok (i + 2) last) (derives or isDerive)
+            | _ -> past (i + 2) (derives or isDerive)))
+      | _ -> (i, derives)
+  in match past first False with
+     | (i, derives) ->
+         derives
+           or (match (tok i, tok (i + 1)) with
+            | (Token.LowerIdent _, Token.Bang) -> True
+            | (Token.LowerIdent _, Token.DeclBang) -> True
+            | (Token.UpperIdent _, Token.Bang) -> True
+            | (Token.UpperIdent _, Token.DeclBang) -> True
+            | _ -> False)
+
+-- The token after the bracket that closes the one at `i`.
+fun closing tok (i : Int) (last : Int) : Int =
+  let rec go (j : Int) (depth : Int) =
+    if j > last then j
+    else (let d = depth + bracket (tok j) in if d == 0 then j + 1 else go (j + 1) d)
+  in go i 0
+
+-- --- places ------------------------------------------------------------------
+
+-- The version of `meadow` whose standard library's sources the Rust server
+-- writes out for an editor to open (`meadow::stdlib::extract_sources`):
+-- where a definition in the library is.
+def stdVersion : String = "0.5.0"
+
+-- `meadow`'s home: `MEADOW_HOME`, or `.meadow` in the user's.
+fun meadowHome () =
+  match getEnv "MEADOW_HOME" with
+  | Just h -> Just h
+  | None ->
+      (match getEnv "USERPROFILE" with
+       | Just u -> Just (Path.join u ".meadow")
+       | None -> M.map (\u -> Path.join u ".meadow") (getEnv "HOME"))
+
+-- The file a dump names `file` -- `Pkg/src/M.mw` -- of a package the view
+-- knows: the document's own, one it imports, or the standard library's
+-- copy written out for an editor.
+fun pathNamed (v : View) (file : String) =
+  -- A module of the library other than the document is the copy written
+  -- out, even from inside the library: the Rust server analyses a module of
+  -- it against the others as compiled into `meadow`.
+  let ownStd = S.startsWith "Std/" file and v.package == "Std" in
+  match (if ownStd then None else V.find (\x -> srcFile (snd x) == file) v.study.sources) with
+  | Just (path, _) -> Just path
+  | None ->
+      (let pkg = M.unwrapOr "" (V.get (S.split "/" file) 0) in
+       let rest = S.drop file (stringByteLength pkg + 1) in
+       if pkg == "Std" then
+         M.andThen
+           (\home ->
+             (let p = Path.joinAll [home, "std", stdVersion, "Std", S.drop rest 4] in
+              if exists p then Just p else None))
+           (meadowHome ())
+       else M.map (\x -> Path.join (snd x) rest) (V.find (\x -> fst x == pkg) v.study.homes))
+
+-- A path as a `file:` uri, as the Rust server writes one (`path_to_uri`):
+-- `/` between its parts, a drive's letter capital, and every byte that is
+-- not a letter, a digit or one of `-._~/:` escaped.
+@pub fun uriOfPath (path : String) : String =
+  let plain = if S.startsWith "\\\\?\\" path then S.drop path 4 else path in
+  let slashed = S.join "/" (S.split "\\" plain) in
+  let p =
+    if stringByteLength slashed >= 2 and stringSlice slashed 1 2 == ":" then
+      S.toUpper (stringSlice slashed 0 1) ++ S.drop slashed 1
+    else slashed
+  in
+  let prefix =
+    if S.startsWith "//" p then "file:" else if S.startsWith "/" p then "file://" else "file:///"
+  in
+  let hex = "0123456789ABCDEF" in
+  let pieces =
+    V.map
+      (\i ->
+        let b = toInt (stringByteAt p i) in
+        let keep =
+          (b >= 65 and b <= 90)
+            or (b >= 97 and b <= 122)
+            or (b >= 48 and b <= 57)
+            or b == 45
+            or b == 46
+            or b == 95
+            or b == 126
+            or b == 47
+            or b == 58
+        in if keep then stringSlice p i (i + 1)
+           else
+             "%" ++ stringSlice hex (b / 16) (b / 16 + 1) ++ stringSlice hex (b % 16) (b % 16 + 1))
+      (V.range 0 (stringByteLength p))
+  in prefix ++ S.concatAll pieces
+
+-- A place in a file a dump names, as a location: in the document itself,
+-- by its own uri and text; in another, by its path and its text as the
+-- editor holds it, or as the disk does.
+fun locationOf (ed : Editor) (v : View) (file : String) (from : Int) (to : Int) =
+  if file == v.file then Just (location v.uri v.text from to)
+  else
+    M.andThen
+      (\path ->
+        (let open =
+           V.find (\(d : Doc) -> keyOf d.known == keyOf path) (H.values (getRef ed.docs))
+         in
+         let text =
+           match open with
+           | Just (d : Doc) -> Just d.text
+           | None -> Res.toMaybe (readToString path)
+         in M.map (\t -> location (uriOfPath path) t from to) text))
+      (pathNamed v file)
+
+fun location (uri : String) (text : String) (from : Int) (to : Int) : Json =
+  J.jObject [("uri", J.jString uri), ("range", rangeJson text (lineStarts text) (Meta from to))]
+
+-- --- requests ----------------------------------------------------------------
+
+-- Every request the Rust server answers, answered here in its shape.
+def editorRequests =
+  [
+    ("textDocument/hover", \ed (a : Asked) -> hoverOf ed a),
+    ("textDocument/completion", \ed (a : Asked) -> completionOf ed a),
+    ("textDocument/definition", \ed (a : Asked) -> definitionOf ed a),
+    ("workspace/symbol", \ed (a : Asked) -> J.jArray []),
+    ("textDocument/formatting", \ed (a : Asked) -> formattingOf ed a),
+    ("textDocument/inlayHint", \ed (a : Asked) -> hintsOf ed a),
+    ("textDocument/codeLens", \ed (a : Asked) -> lensesOf ed a),
+    ("textDocument/prepareRename", \ed (a : Asked) -> prepareRenameOf ed a),
+    ("textDocument/rename", \ed (a : Asked) -> renameOf ed a),
+    ("textDocument/semanticTokens/full", \ed (a : Asked) -> tokensOf ed a),
+    ("meadow/ir", \ed (a : Asked) -> J.jNull ()),
+    ("meadowboot/view", \ed (a : Asked) -> viewDump ed a)
+  ]
+
+-- What the server says it can do, over what Lingua says of the requests
+-- above: the Rust server's capabilities, word for word.
+def editorCapabilities : [(String, Json)] =
+  [
+    ("textDocumentSync", J.jInt 1),
+    ("hoverProvider", J.jBool True),
+    (
+      "completionProvider",
+      J.jObject [("triggerCharacters", J.jArray [J.jString ">", J.jString " ", J.jString "."])]
+    ),
+    ("definitionProvider", J.jBool True),
+    ("documentFormattingProvider", J.jBool True),
+    ("renameProvider", J.jObject [("prepareProvider", J.jBool True)]),
+    (
+      "semanticTokensProvider",
+      J.jObject [
+        (
+          "legend",
+          J.jObject [
+            ("tokenTypes", J.jArray (V.map J.jString legend)),
+            ("tokenModifiers", J.jArray [])
+          ]
+        ),
+        ("full", J.jBool True)
+      ]
+    )
+  ]
+
+-- --- diagnostics -------------------------------------------------------------
+
+-- What is wrong in the document `file`: what lexing it finds, what parsing
+-- it does, and what its package's study says of it.
+fun diagnosticsOf (ed : Editor) (file : Int) =
+  match H.lookup file (getRef ed.docs) with
+  | None -> []
+  | Just (d : Doc) ->
+      let lexed =
+        V.map
+          (\(p : Problem) -> Diagnostic Severity.Error p.message (Meta p.from p.to) [] [])
+          (lex d.text).problems
+      in
+      let found =
+        match studyOf ed d.root with
+        | None -> []
+        | Just (s : Study) -> studiedWrong s d
+      in
+      let named =
+        match viewAt ed file d.uri d.text with
+        | Just v -> undeclared v
+        | None -> []
+      in V.concat [lexed, found, named]
+
+fun studiedWrong (s : Study) (d : Doc) =
+  let parsed =
+    V.concatMap
+      (\x ->
+        if keyOf (fst x) != keyOf d.known then []
+        else V.map (\e -> Diagnostic Severity.Error (snd e) (Meta (fst e) (fst e)) [] []) (snd x))
+      s.parsed
+  in
+  let grouped =
+    V.concatMap (\x -> if keyOf (fst x) == keyOf d.known then snd x else []) s.grouped
+  in
+  let file =
+    M.unwrapOr
+      ""
+      (M.map (\x -> srcFile (snd x)) (V.find (\x -> keyOf (fst x) == keyOf d.known) s.sources))
+  in
+  let said =
+    V.concatMap
+      (\k ->
+        match V.get s.inferred.saidAt k with
+        | Just (m, at) ->
+            (match V.get s.renamed.modules m with
+             | Just (dm : Declared) ->
+                 if dm.file == file and at >= 0 then
+                   [Diagnostic Severity.Error (V.getOr "" s.inferred.said k) (Meta at at) [] []]
+                 else []
+             | None -> [])
+        | None -> [])
+      (V.range 0 (V.len s.inferred.said))
+  in V.concat [parsed, grouped, said]
+
+-- --- names, and where they are declared ---------------------------------------
+
+fun covers (from : Int) (to : Int) (o : Int) : Bool = from <= o and o < to
+
+-- The value mentioned at `o`, as the Rust server finds it (`var_at`): the
+-- smallest mention around it -- of those as small, one declared in the
+-- document first -- or, standing on a declaration's name, what it declares.
+fun valueAt (v : View) (o : Int) : Maybe Int =
+  let here = \id -> V.any (\d -> match d with | (_, _, i) -> i == id) v.defs in
+  let around = V.filter (\r -> match r with | (f, t, _) -> covers f t o) v.refs in
+  let best =
+    V.foldl
+      (\acc r ->
+        match r with
+        | (f, t, id) ->
+            (let key = (t - f, if here id then 0 else 1) in
+             match acc with
+             | Just (k, _) -> if key < k then Just (key, id) else acc
+             | None -> Just (key, id)))
+      None
+      around
+  in match best with
+     | Just (_, id) -> Just id
+     | None ->
+         (let declared =
+            V.filter
+              (\d ->
+                match d with
+                | (f, t, _) -> covers f t o and isWord v.text f t)
+              v.defs
+          in M.map
+               (\d -> match d with | (_, _, id) -> id)
+               (V.foldl
+                  (\acc d ->
+                    match (acc, d) with
+                    | (Just (f0, t0, _), (f, t, _)) -> if t - f < t0 - f0 then Just d else acc
+                    | (None, _) -> Just d)
+                  None
+                  declared))
+
+-- Whether bytes `from` to `to` of `text` are one word: a name as written.
+fun isWord (text : String) (from : Int) (to : Int) : Bool =
+  to > from
+    and to <= stringByteLength text
+    and not
+      (V.any
+         (\c -> c == ' ' or c == '\n' or c == '\t' or c == '\r')
+         (S.chars (stringSlice text from to)))
+
+-- The types, constructors and modules mentioned around `o`, innermost
+-- first.
+fun namesAt (v : View) (o : Int) : [(Int, Int, Int, String)] =
+  let around = V.filter (\r -> match r with | (f, t, _, _) -> covers f t o) v.names in
+  let modules =
+    V.concatMap
+      (\k ->
+        match V.get v.modules k with
+        | Just (f, t, _) -> if covers f t o then [(f, t, 0 - 1 - k, "m")] else []
+        | None -> [])
+      (V.range 0 (V.len v.modules))
+  -- A module first, of two as long: the Rust compiler notes a `use`'s path
+  -- as modules before the names it brings.
+  in stableSortBy (\r -> match r with | (f, t, _, _) -> t - f) (V.append modules around)
+
+-- `xs` in order of `key`, those with the same key in the order they were.
+fun stableSortBy (key : a -> Int) (xs : [a]) : [a] =
+  V.map snd (sortOn (\p -> (key (snd p), fst p)) (V.zip (V.range 0 (V.len xs)) xs))
+
+fun binderOf (v : View) (id : Int) : Binder = V.getOr (emptyBinder ()) v.study.renamed.binders id
+
+-- Where binder `id` is declared, if that is somewhere the Rust server goes
+-- to: the document, another module of its package, or the standard
+-- library. What a package it depends on declares, it does not know where.
+fun declaredAt (v : View) (id : Int) : Maybe (String, Int, Int) =
+  match siteOf (binderOf v id) with
+  | Just (f, from, to) ->
+      if f == v.file
+        or S.startsWith "Std/" f
+        or V.any (\x -> srcFile (snd x) == f) v.study.sources then Just (f, from, to)
+      else None
+  | None -> None
+
+-- --- go to definition ----------------------------------------------------------
+
+-- Where what is at the position is declared (`definition_at`): the value
+-- there, if it is declared somewhere to go; or else the innermost type,
+-- constructor or module around it that is.
+fun definitionOf (ed : Editor) (a : Asked) =
+  match viewOf ed a with
+  | None -> J.jNull ()
+  | Just v ->
+      let byValue =
+        M.andThen
+          (\id ->
+            M.andThen
+              (\d -> match d with | (f, from, to) -> locationOf ed v f from to)
+              (declaredAt v id))
+          (valueAt v a.offset)
+      in match byValue with
+         | Just loc -> loc
+         | None ->
+             (let found =
+                V.foldl
+                  (\acc n ->
+                    if M.isSome acc then acc
+                    else
+                      match n with
+                      | (_, _, id, _) ->
+                          if id < 0 then
+                            M.andThen
+                              (\f -> locationOf ed v f 0 0)
+                              (M.andThen
+                                 (\m -> match m with | (_, _, name) -> moduleFile v name)
+                                 (V.get v.modules (0 - 1 - id)))
+                          else
+                            M.andThen
+                              (\d -> match d with | (f, from, to) -> locationOf ed v f from to)
+                              (declaredAt v id))
+                  None
+                  (namesAt v a.offset)
+              in
+              -- And a record's field, by the record it is of.
+              match found with
+              | Just loc -> loc
+              | None ->
+                  M.unwrapOr
+                    (J.jNull ())
+                    (M.andThen (fieldPlace ed v) (fieldDeclaredAt v a.offset)))
+
+-- --- rename ------------------------------------------------------------------
+
+-- What a rename at `o` renames, as the Rust server decides it
+-- (`rename_target`): the span the cursor is on, the binder, and whether it
+-- is a value; or why it cannot be renamed.
+fun renameTarget (v : View) (o : Int) : Result String (Int, Int, Int, Bool) =
+  match valueAt v o with
+  | Just id ->
+      let mine = V.filter (\r -> match r with | (f, t, i) -> i == id and covers f t o) v.refs in
+      let span =
+        match V.last mine with
+        | Just (f, t, _) -> Just (f, t)
+        | None ->
+            M.map
+              (\d -> match d with | (f, t, _) -> (f, t))
+              (V.find (\d -> match d with | (_, _, i) -> i == id) v.defs)
+      in (match span with
+          | None -> Err "nothing to rename here"
+          | Just (f, t) -> targetIn v f t id True)
+  | None ->
+      (match V.get (namesAt v o) 0 with
+       | None -> Err "nothing to rename here"
+       | Just (f, t, id, kind) ->
+           if kind == "m" then Err "a module is named by its file: rename the file"
+           else targetIn v f t id False)
+
+-- A target, if its binder is declared in the package: what is declared
+-- anywhere else is not this server's to rewrite.
+fun targetIn (v : View) (f : Int) (t : Int) (id : Int) (value : Bool)
+    : Result String (Int, Int, Int, Bool) =
+  match siteOf (binderOf v id) with
+  | Just (file, _, _) ->
+      -- A module of the library is analysed on its own, the rest of the
+      -- library outside it.
+      if file == v.file
+        or v.package != "Std" and V.any (\x -> srcFile (snd x) == file) v.study.sources then
+        Ok (f, t, id, value)
+      else Err (outside (S.startsWith "Std/" file))
+  | None -> Err (outside False)
+
+fun outside (known : Bool) : String =
+  if known then
+    "this is defined outside the package, so renaming it here would not match its definition"
+  else "nothing to rename here"
+
+-- Whether `new` may be what a binder is called: a name, and one that starts
+-- with a capital exactly when what it names is a type or a constructor.
+fun newNameOk (value : Bool) (new : String) : Result String () =
+  let cs = S.chars new in
+  match V.get cs 0 with
+  | None -> Err "a name cannot be empty"
+  | Just first ->
+      if not (C.isAlpha first or first == '_')
+        or not (V.all (\c -> C.isAlphaNum c or c == '_' or c == '\'') (V.drop cs 1)) then
+        Err "`${new}` is not a name"
+      else if not value and not (C.isUpper first) then
+        Err "`${new}` would have to start with a capital"
+      else if value and C.isUpper first then Err "`${new}` would read as a constructor"
+      else Ok ()
+
+fun prepareRenameOf (ed : Editor) (a : Asked) =
+  match viewOf ed a with
+  | None -> J.jNull ()
+  | Just v ->
+      (match renameTarget v a.offset with
+       | Ok (f, t, _, _) -> rangeJson v.text (lineStarts v.text) (Meta f t)
+       | Err _ -> J.jNull ())
+
+-- Every place the name at the position is written, made the new name: its
+-- declaration, and each mention of it in the package, file by file. A
+-- refusal is the Rust server's error; Lingua's requests answer only with a
+-- result, so it is answered with nothing.
+fun renameOf (ed : Editor) (a : Asked) =
+  match viewOf ed a with
+  | None -> J.jNull ()
+  | Just v ->
+      let new = M.unwrapOr "" (M.andThen J.asString (J.get "newName" a.params)) in
+      (match renameTarget v a.offset with
+       | Err _ -> J.jNull ()
+       | Ok (_, _, id, value) ->
+           (match newNameOk value new with
+            | Err _ -> J.jNull ()
+            | Ok _ -> renamed ed v id new))
+
+fun renamed (ed : Editor) (v : View) (id : Int) (new : String) =
+  let b = binderOf v id in
+  let site =
+    match siteOf b with
+    | Just (f, from, to) -> [(f, from, to)]
+    | None -> []
+  in
+  -- The document's own mentions as the requests read them, the rest of the
+  -- package's as the renamer wrote them.
+  let mine =
+    V.concatMap
+      (\r ->
+        match r with
+        | (f, t, i) -> if i == id then [(v.file, f, t)] else [])
+      (V.append v.refs (V.map (\n -> match n with | (f, t, i, _) -> (f, t, i)) v.names))
+  in
+  let theirs =
+    V.filter
+      (\u ->
+        match u with
+        | (f, from, to) ->
+            v.package != "Std"
+              and f != v.file
+              and to > from
+              and V.any (\x -> srcFile (snd x) == f) v.study.sources)
+      b.uses
+  in
+  let every = V.concat [site, mine, theirs] in
+  let files =
+    V.foldl
+      (\acc x ->
+        match x with
+        | (f, _, _) -> if V.elem f acc then acc else V.pushBack acc f)
+      []
+      every
+  in
+  let changes =
+    V.concatMap
+      (\f ->
+        let spans =
+          dedupSorted
+            (sortOn
+               (\x -> x)
+               (V.concatMap
+                  (\x ->
+                    match x with
+                    | (g, from, to) -> if g == f then [(from, to)] else [])
+                  every))
+        in match textAndUri ed v f with
+           | Just (uri, text) ->
+               [(
+                 uri,
+                 J.jArray
+                   (V.map
+                      (\s ->
+                        J.jObject [
+                          ("range", rangeJson text (lineStarts text) (Meta (fst s) (snd s))),
+                          ("newText", J.jString new)
+                        ])
+                      spans)
+               )]
+           | None -> [])
+      files
+  in J.jObject [("changes", J.jObject changes)]
+
+fun dedupSorted (xs : [(Int, Int)]) : [(Int, Int)] =
+  V.foldl (\acc x -> if V.last acc == Just x then acc else V.pushBack acc x) [] xs
+
+-- A file a dump names, as the editor is to be told of it: its uri, and its
+-- text as the editor holds it or as the disk does.
+fun textAndUri (ed : Editor) (v : View) (file : String) =
+  if file == v.file then Just (v.uri, v.text)
+  else
+    M.andThen
+      (\path ->
+        (let open =
+           V.find (\(d : Doc) -> keyOf d.known == keyOf path) (H.values (getRef ed.docs))
+         in match open with
+            | Just (d : Doc) -> Just (uriOfPath path, d.text)
+            | None -> M.map (\t -> (uriOfPath path, t)) (Res.toMaybe (readToString path))))
+      (pathNamed v file)
+
+-- --- semantic tokens -----------------------------------------------------------
+
+-- The classes, in the order the protocol indexes them: the Rust server's
+-- legend (`tokens::LEGEND`).
+def legend : [String] =
+  [
+    "keyword", "type", "enumMember", "function", "variable", "number", "string", "operator",
+    "namespace"
+  ]
+
+fun classIndex (name : String) : Int =
+  M.unwrapOr 4 (V.find (\i -> V.get legend i == Just name) (V.range 0 (V.len legend)))
+
+def noToken : Lexed = Lexed { token = Token.Error, from = 0, to = 0 }
+
+fun isPeriod (t : Token) : Bool = match t with | Token.Period -> True | _ -> False
+
+fun isMod (t : Token) : Bool = match t with | Token.Mod -> True | _ -> False
+
+fun srcFile (s : Source) : String = s.file
+
+-- Every token of the document that has a class, as the Rust server colours
+-- it (`tokens::classified`): a keyword, number, string or operator by its
+-- kind; a capitalised word by what it resolved to, or by what is in scope
+-- where it resolved to nothing; a small word a function where it has a
+-- function's type.
+fun tokensOf (ed : Editor) (a : Asked) =
+  match viewOf ed a with
+  -- A document whose package could not be studied is coloured by its
+  -- tokens alone, as the Rust server colours a file it could not compile.
+  | None -> if a.file < 0 then J.jNull () else tokensIn a.text [] [] H.empty ([], [])
+  | Just v -> tokensIn v.text v.names v.modules (functionsOf v) (scopeOf v)
+
+fun tokensIn (text : String) names modules functions scope =
+  let toks = (lex text).tokens in
+  -- The last noted of those at one place: a `use`'s path is noted as
+  -- modules first, and a type it reaches -- `use M.Ty.*` -- after.
+  let named = V.foldl (\m n -> match n with | (f, _, _, k) -> H.insert f k m) H.empty names in
+  let moduled = V.foldl (\m x -> match x with | (f, _, _) -> H.insert f "m" m) H.empty modules in
+  let classified =
+    V.foldl
+      (\acc i ->
+        match acc with
+        | (inUse, out) ->
+            (let t = V.getOr noToken toks i in
+             let inUse2 =
+               match t.token with
+               | Token.Use -> True
+               | Token.UpperIdent _ -> inUse
+               | Token.LowerIdent _ -> inUse
+               | Token.Period -> inUse
+               | Token.As -> inUse
+               | _ -> False
+             in
+             let nextIsPeriod = isPeriod (V.getOr noToken toks (i + 1)).token in
+             let declaresModule = i > 0 and isMod (V.getOr noToken toks (i - 1)).token in
+             let kind =
+               match t.token with
+               | Token.UpperIdent n ->
+                   if declaresModule then Just "namespace"
+                   else
+                     -- What resolved there, as the Rust server notes it: a
+                     -- qualifier's module after the name it qualifies, and a
+                     -- `use`'s path before what it brings.
+                     (match (if not inUse2 and H.member t.from moduled then Just "m"
+                       else M.orElse (H.lookup t.from moduled) (H.lookup t.from named)) with
+                      | Just k ->
+                          Just
+                            (if k == "c" then "enumMember"
+                             else if k == "t" then "type"
+                             else "namespace")
+                      | None ->
+                          if inUse2 then Just "namespace"
+                          else if nextIsPeriod then Just "namespace"
+                          else if V.elem n (fst scope) then Just "enumMember"
+                          else if V.elem n (snd scope) then Just "type"
+                          else Just "namespace")
+               | Token.LowerIdent _ ->
+                   Just (if H.member (t.from, t.to) functions then "function" else "variable")
+               | other -> fixedClass other
+             in match kind with
+                | Just k -> (inUse2, V.pushBack out (t.from, t.to, classIndex k))
+                | None -> (inUse2, out)))
+      (False, [])
+      (V.range 0 (V.len toks))
+  in
+  let starts = lineStarts text in
+  let placed =
+    V.concatMap
+      (\x ->
+        match x with
+        | (from, to, k) ->
+            (match (position text starts from, position text starts to) with
+             | ((l1, c1), (l2, c2)) -> if l1 != l2 then [] else [(l1, c1, c2 - c1, k)]))
+      (snd classified)
+  in J.jObject [("data", J.jArray (V.map J.jInt (encoded placed)))]
+
+-- A token's class by its kind alone, for every kind but a word.
+fun fixedClass (t : Token) : Maybe String =
+  match t with
+  | Token.Mod -> Just "keyword"
+  | Token.Use -> Just "keyword"
+  | Token.Def -> Just "keyword"
+  | Token.Fun -> Just "keyword"
+  | Token.Let -> Just "keyword"
+  | Token.In -> Just "keyword"
+  | Token.Match -> Just "keyword"
+  | Token.With -> Just "keyword"
+  | Token.If -> Just "keyword"
+  | Token.Then -> Just "keyword"
+  | Token.Else -> Just "keyword"
+  | Token.Data -> Just "keyword"
+  | Token.Record -> Just "keyword"
+  | Token.Effect -> Just "keyword"
+  | Token.Handle -> Just "keyword"
+  | Token.Type -> Just "keyword"
+  | Token.Trait -> Just "keyword"
+  | Token.Impl -> Just "keyword"
+  | Token.Where -> Just "keyword"
+  | Token.Infix -> Just "keyword"
+  | Token.Infixl -> Just "keyword"
+  | Token.Infixr -> Just "keyword"
+  | Token.As -> Just "keyword"
+  | Token.And -> Just "keyword"
+  | Token.Or -> Just "keyword"
+  | Token.Int _ -> Just "number"
+  | Token.Real _ -> Just "number"
+  | Token.Str _ -> Just "string"
+  | Token.InterpStart _ -> Just "string"
+  | Token.InterpMid _ -> Just "string"
+  | Token.InterpEnd _ -> Just "string"
+  | Token.Char _ -> Just "string"
+  | Token.OpIdent _ -> Just "operator"
+  | Token.ConOpIdent _ -> Just "operator"
+  | Token.Plus -> Just "operator"
+  | Token.Minus -> Just "operator"
+  | Token.Star -> Just "operator"
+  | Token.Slash -> Just "operator"
+  | Token.Percent -> Just "operator"
+  | Token.Caret -> Just "operator"
+  | Token.Eq -> Just "operator"
+  | Token.EqEq -> Just "operator"
+  | Token.Neq -> Just "operator"
+  | Token.Lt -> Just "operator"
+  | Token.Gt -> Just "operator"
+  | Token.Leq -> Just "operator"
+  | Token.Geq -> Just "operator"
+  | Token.Bang -> Just "operator"
+  | Token.DeclBang -> Just "operator"
+  | Token.RArrow -> Just "operator"
+  | Token.LArrow -> Just "operator"
+  | Token.ColonColon -> Just "operator"
+  | Token.LPipe -> Just "operator"
+  | Token.RPipe -> Just "operator"
+  | Token.Backslash -> Just "operator"
+  | Token.At -> Just "operator"
+  | Token.Dollar -> Just "operator"
+  | _ -> None
+
+-- Each token relative to the one before it, as the protocol has them.
+fun encoded (placed : [(Int, Int, Int, Int)]) : [Int] =
+  match V.foldl
+    (\acc p ->
+      match (acc, p) with
+      | ((out, pl, pc), (l, c, len, k)) ->
+          (V.append out [l - pl, (if l == pl then c - pc else c), len, k, 0], l, c))
+    ([], 0, 0)
+    placed with
+  | (out, _, _) -> out
+
+-- The words that are functions, by where each is written: those a typed
+-- node of a function's type is written over. (Not yet read off the types.)
+fun functionsOf (v : View) : HashMap (Int, Int) Bool =
+  let typed =
+    V.foldl
+      (\h x ->
+        match x with
+        | (f, t, ty) -> if isFun ty then H.insert (f, t) True h else h)
+      H.empty
+      v.typing.nodes
+  in
+  -- And each `fun`'s name, where it is declared: one that takes something.
+  V.foldl
+    (\h kv ->
+      match siteOf (binderOf v (fst kv)) with
+      | Just (f, from, to) -> if f == v.file and snd kv > 0 then H.insert (from, to) True h else h
+      | None -> h)
+    typed
+    (H.toVec v.typing.funs)
+
+-- What is in scope by spelling, for a capitalised word nothing resolved: the
+-- constructors, then the types, the package and the library declare.
+fun scopeOf (v : View) : ([String], [String]) =
+  V.foldl
+    (\acc (b : Binder) ->
+      match acc with
+      | (cs, ts) ->
+          (match siteOf b with
+           | None -> acc
+           | Just _ ->
+               (let bare = M.unwrapOr b.name (V.last (S.split "." b.name)) in
+                if b.kind == "c" then (V.pushBack cs bare, ts)
+                else if b.kind == "t" then (cs, V.pushBack ts bare)
+                else acc)))
+    ([], [])
+    v.study.renamed.binders
+
+-- --- formatting ----------------------------------------------------------------
+
+-- The Rust compiler's `meadow`: where `MEADOW` says, the one beside this
+-- program, or the one on the path.
+fun meadowExe () =
+  match getEnv "MEADOW" with
+  | Just m -> m
+  | None ->
+      (match Path.parent (Proc.currentExe ()) with
+       | Just dir ->
+           (let beside = Path.join dir "meadow.exe" in
+            if exists beside then beside
+            else (let unix = Path.join dir "meadow" in if exists unix then unix else "meadow"))
+       | None -> "meadow")
+
+-- The document set out by `meadow fmt`, which MeadowBoot's formatter is not
+-- ready to stand for yet, as one edit from the first line that changes to
+-- the last (`format::edits`).
+fun formattingOf (ed : Editor) (a : Asked) =
+  if a.file < 0 then J.jNull ()
+  else
+    let tmp =
+      match getEnv "TEMP" with
+      | Just t -> t
+      | None -> M.unwrapOr "." (getEnv "TMP")
+    in
+    let scratch = Path.join tmp "meadowboot-lsp-${show a.file}.mw" in
+    let w = writeString (scratch, a.text) in
+    match Proc.run (meadowExe ()) ["fmt", "--stdout", scratch] with
+    | Ok (code, out, _) -> if code == 0 then J.jArray (edits a.text out) else J.jArray []
+    | Err _ -> J.jArray []
+
+fun edits (old : String) (new : String) : [Json] =
+  if old == new then []
+  else
+    let ol = stringByteLength old in
+    let nl = stringByteLength new in
+    let byte = \s i -> toInt (stringByteAt s i) in
+    let start = lineStartBefore old (samePrefix old new 0) in
+    let room = min (ol - start) (nl - start) in
+    let tail = backToLine old (sameSuffix old new room 0) in
+    [J.jObject [
+       ("range", rangeJson old (lineStarts old) (Meta start (ol - tail))),
+       ("newText", J.jString (stringSlice new start (nl - tail)))
+     ]]
+
+fun byteOf (s : String) (i : Int) : Int = toInt (stringByteAt s i)
+
+fun samePrefix (a : String) (b : String) (i : Int) : Int =
+  if i < stringByteLength a and i < stringByteLength b and byteOf a i == byteOf b i then
+    samePrefix a b (i + 1)
+  else i
+
+fun lineStartBefore (s : String) (i : Int) : Int =
+  if i <= 0 then 0 else if byteOf s (i - 1) == 10 then i else lineStartBefore s (i - 1)
+
+fun sameSuffix (a : String) (b : String) (room : Int) (k : Int) : Int =
+  let al = stringByteLength a in
+  let bl = stringByteLength b in
+  if k < room and byteOf a (al - 1 - k) == byteOf b (bl - 1 - k) then sameSuffix a b room (k + 1)
+  else k
+
+fun backToLine (s : String) (k : Int) : Int =
+  if k > 0 and byteOf s (stringByteLength s - k - 1) != 10 then backToLine s (k - 1) else k
+
+-- --- not yet answered as the Rust server answers ------------------------------
+
+-- What the server read of the document asked about: MeadowBoot's own
+-- request, for finding out why it answers as it does.
+fun viewDump (ed : Editor) (a : Asked) =
+  match viewOf ed a with
+  | None ->
+      J.jObject [
+        ("view", J.jNull ()),
+        ("docs", J.jInt (H.size (getRef ed.docs))),
+        (
+          "loaded",
+          J.jArray
+            (V.map
+               (\(l : Loaded) ->
+                 J.jString
+                   (match l.given with
+                    | Ok _ -> l.root
+                    | Err why -> "${l.root}: ${why}"))
+               (H.values (getRef ed.loaded)))
+        )
+      ]
+  | Just v ->
+      let line = \i -> "${(binderOf v i).name} ${(binderOf v i).kind} ${(binderOf v i).site}" in
+      J.jObject [
+        ("file", J.jString v.file),
+        (
+          "sources",
+          J.jArray (V.map (\x -> J.jString "${fst x} = ${srcFile (snd x)}") v.study.sources)
+        ),
+        ("homes", J.jArray (V.map (\x -> J.jString "${fst x} = ${snd x}") v.study.homes)),
+        ("binders", J.jInt (V.len v.study.renamed.binders)),
+        (
+          "refs",
+          J.jArray
+            (V.map
+               (\r ->
+                 match r with
+                 | (f, t, i) -> J.jString "${show f} ${show t} ${line i}")
+               v.refs)
+        ),
+        (
+          "names",
+          J.jArray
+            (V.map
+               (\r ->
+                 match r with
+                 | (f, t, i, k) -> J.jString "${show f} ${show t} ${line i}")
+               v.names)
+        ),
+        (
+          "defs",
+          J.jArray
+            (V.map
+               (\r ->
+                 match r with
+                 | (f, t, i) -> J.jString "${show f} ${show t} ${line i}")
+               v.defs)
+        ),
+        ("calls", J.jArray (V.map (\c -> J.jString "${show (fst c)} ${show (snd c)}") v.calls)),
+        ("said", J.jArray (V.map J.jString v.study.inferred.said)),
+        (
+          "vars",
+          J.jArray
+            (V.map
+               (\x ->
+                 match x with
+                 | (f, t, id, ty) -> J.jString "${show f} ${show t} ${show id} ${showType ty}")
+               v.typing.vars)
+        )
+      ]
+
+-- --- modules, as a name of one is written -------------------------------------
+
+-- Every mention of a module in the document, as the Rust compiler notes one
+-- (`NameRef::Module`): each segment of a `use`'s path, as far as it goes --
+-- `Std`, `Std.Collections`, `Std.Collections.Vector` -- the name an `as`
+-- gives it, and that name where it qualifies another, `V.map`. Each is
+-- where, and the module by its package and path: a module of the
+-- document's own package by that package's name, though the `use` may
+-- leave it off.
+fun moduleRefs (text : String) (pkg : String) (own : [[String]]) (calls : [(Int, Int)])
+    : [(Int, Int, String)] =
+  let toks = (lex text).tokens in
+  let inside = \at -> V.any (\c -> fst c <= at and at <= snd c) calls in
+  let word =
+    \(t : Lexed) ->
+      match t.token with
+      | Token.UpperIdent n -> Just n
+      | Token.LowerIdent n -> Just n
+      | _ -> None
+  in
+  let moduleOf =
+    \prefix ->
+      let first = V.getOr "" prefix 0 in
+      let local = if first == pkg then V.drop prefix 1 else prefix in
+      if first == pkg or V.elem local own then S.join "." (V.pushFront local pkg)
+      else S.join "." prefix
+  in
+  -- Each `use`: the segments of its path, each with where it is written,
+  -- and the name it gives the module, if any.
+  let rec path (i : Int) (segs : [(String, Int, Int)]) =
+    match word (V.getOr noToken toks i) with
+    | Just n ->
+        (let t = V.getOr noToken toks i in
+         let segs2 = V.pushBack segs (n, t.from, t.to) in
+         if isPeriod (V.getOr noToken toks (i + 1)).token
+           and M.isSome (word (V.getOr noToken toks (i + 2))) then path (i + 2) segs2
+         else (segs2, i + 1))
+    | None -> (segs, i)
+  in
+  let uses =
+    V.concatMap
+      (\i ->
+        let t = V.getOr noToken toks i in
+        match t.token with
+        | Token.Use ->
+            if inside t.from then []
+            else
+              (match path (i + 1) [] with
+               | (segs, after) ->
+                   let names = V.map (\s -> match s with | (n, _, _) -> n) segs in
+                   let alias =
+                     match ((V.getOr noToken toks after).token, V.get toks (after + 1)) with
+                     | (Token.As, Just (a : Lexed)) ->
+                         (match a.token with
+                          | Token.UpperIdent n -> Just (n, a.from, a.to)
+                          | _ -> None)
+                     | _ -> None
+                   in [(segs, names, alias)])
+        | _ -> [])
+      (V.range 0 (V.len toks))
+  in
+  let mentioned =
+    V.concatMap
+      (\u ->
+        match u with
+        | (segs, names, alias) ->
+            (let along =
+               V.map
+                 (\k ->
+                   match V.getOr ("", 0, 0) segs k with
+                   | (_, from, to) -> (from, to, moduleOf (V.take names (k + 1))))
+                 (V.range 0 (V.len segs))
+             in match alias with
+                | Just (_, from, to) -> V.pushBack along (from, to, moduleOf names)
+                | None -> along))
+      uses
+  in
+  let aliases =
+    V.foldl
+      (\h u ->
+        match u with
+        | (_, names, Just (n, _, _)) -> H.insert n (moduleOf names) h
+        | _ -> h)
+      H.empty
+      uses
+  in
+  let inUse = V.concatMap (\m -> match m with | (from, _, _) -> [from]) mentioned in
+  let qualifiers =
+    V.concatMap
+      (\i ->
+        let t = V.getOr noToken toks i in
+        match t.token with
+        | Token.UpperIdent n ->
+            if V.elem t.from inUse or not (isPeriod (V.getOr noToken toks (i + 1)).token) then []
+            else
+              (match H.lookup n aliases with
+               | Just m -> [(t.from, t.to, m)]
+               | None -> [])
+        | _ -> [])
+      (V.range 0 (V.len toks))
+  in V.append mentioned qualifiers
+
+-- The file a module is, by its package and path: the document's own
+-- package's, or the standard library's, whose root is its prelude.
+fun moduleFile (v : View) (m : String) : Maybe String =
+  let segs = S.split "." m in
+  let first = V.getOr "" segs 0 in
+  if first == v.package then
+    M.map
+      (\(d : Declared) -> d.file)
+      (V.find (\(d : Declared) -> d.path == V.drop segs 1) v.study.renamed.modules)
+  else if first == "Std" then
+    Just
+      (if V.len segs == 1 then "Std/src/Prelude.mw" else "Std/src/${S.join "/" (V.drop segs 1)}.mw")
+  else None
+
+-- --- what is wrong, by name -------------------------------------------------------
+
+-- A name written in the document that nothing declares, as the renamer
+-- leaves one: a value with a binder of its own, declared nowhere; a type,
+-- constructor or module that is a use of the binder every such name shares.
+fun undeclared (v : View) : [Diagnostic] =
+  V.concatMap
+    (\(b : Binder) ->
+      let says =
+        if S.startsWith "?" b.site and b.name != "?" then Just "undefined variable: "
+        else if S.isEmpty b.name and b.site == "-" and b.kind == "t" and b.until < 0 then
+          Just "unknown type "
+        else if S.isEmpty b.name and b.site == "-" and b.kind == "c" then
+          Just "unknown constructor "
+        else if S.isEmpty b.name and b.site == "-" and b.kind == "m" then Just "no module "
+        else None
+      in match says with
+         | None -> []
+         | Just what ->
+             V.concatMap
+               (\u ->
+                 match u with
+                 | (f, from, to) ->
+                     if f != v.file or to > stringByteLength v.text then []
+                     else
+                       (let written = stringSlice v.text from to in
+                        if S.isEmpty b.name
+                          and b.kind != "m"
+                          and (not (named written) or V.elem written builtinTyconNames) then []
+                        else
+                          [Diagnostic
+                             Severity.Error
+                             (what ++ (if S.isEmpty b.name then "`${written}`" else b.name))
+                             (Meta from to)
+                             []
+                             []]))
+               b.uses)
+    v.study.renamed.binders
+
+-- --- types, as inference left them ------------------------------------------------
+
+-- What inference says of the document's module: every expression and
+-- pattern, where it is and its type; the type of each binder a pattern
+-- makes; and each `fun`'s binder and how many parameters it is written
+-- with.
+record Typing = {
+  nodes : [(Int, Int, Type)],
+  binders : HashMap Int Type,
+  funs : HashMap Int Int,
+  -- Each mention of a value: where inference has it, and its type.
+  vars : [(Int, Int, Int, Type)],
+  -- Each record field written, where, by its record's canonical name and
+  -- its own -- `*.x` where the record is not known (`Namespace::Field`).
+  fields : [(Int, Int, String)],
+  -- Each `impl`'s method, by its binder: `#impl.Trait.method`.
+  methods : HashMap Int String,
+  -- The module's top-level definitions that something could be started at:
+  -- each `fun`'s binder and how many parameters it has, and each `def` of a
+  -- single name's, with none.
+  tops : [(Int, Int)]
+}
+
+def noTyping : Typing =
+  Typing {
+    nodes = [],
+    binders = H.empty,
+    funs = H.empty,
+    vars = [],
+    fields = [],
+    methods = H.empty,
+    tops = []
+  }
+
+fun typingOf (s : Study) (file : String) : Typing =
+  match V.find
+    (\k -> M.map fst (V.get s.renamed.programs k) == Just file)
+    (V.range 0 (V.len s.renamed.programs)) with
+  | None -> noTyping
+  | Just k ->
+      (match V.get s.inferred.typed k with
+       | Just (TypedProgram a root) ->
+           V.foldl (\acc d -> typedDecl a d acc) noTyping (typedModuleDecls a root)
+       | None -> noTyping)
+
+fun typedDecl (a : TypedArena) (d : TypedDecl) (acc : Typing) : Typing =
+  match viewTypedDecl a d with
+  | TypedDeclView.Bind r -> typedBind a r.bind { acc | tops = V.append acc.tops (topOf a r.bind) }
+  | TypedDeclView.Attributed r -> typedDecl a r.decl acc
+  | TypedDeclView.Trait r -> V.foldl (\t b -> typedBind a b t) acc r.defaults
+  | TypedDeclView.Impl r ->
+      let traitName = typedNameText a r.tr in
+      let named =
+        V.foldl
+          (\h b ->
+            match viewTypedBind a b with
+            | TypedBindView.Fun f -> H.insert f.id traitName h
+            | _ -> h)
+          H.empty
+          r.methods
+      in
+      let withNames = { acc | methods = H.union acc.methods named } in
+      V.foldl (\t b -> typedBind a b t) withNames r.methods
+  | _ -> acc
+
+-- A top-level binding as somewhere a program could start: a `fun`, or a
+-- `def` of one name.
+fun topOf (a : TypedArena) (b : TypedBind) : [(Int, Int)] =
+  match viewTypedBind a b with
+  | TypedBindView.Fun r -> [(r.id, V.len r.params)]
+  | TypedBindView.Pat r ->
+      (match viewTypedPat a r.pat with
+       | TypedPatView.Var p -> [(p.id, 0)]
+       | _ -> [])
+
+fun typedBind (a : TypedArena) (b : TypedBind) (acc : Typing) : Typing =
+  match viewTypedBind a b with
+  | TypedBindView.Fun r ->
+      let withName = { acc | funs = H.insert r.id (V.len r.params) acc.funs } in
+      typedExpr a r.body (V.foldl (\t p -> typedPat a p t) withName r.params)
+  | TypedBindView.Pat r -> typedExpr a r.value (typedPat a r.pat acc)
+
+fun noted (acc : Typing) (m : Meta) (t : Type) : Typing =
+  match m with
+  | Meta from to -> { acc | nodes = V.pushBack acc.nodes (from, to, t) }
+
+fun typedPat (a : TypedArena) (p : TypedPat) (acc : Typing) : Typing =
+  let t = typTypedPat a p in
+  let here = noted acc (metaTypedPat a p) t in
+  match viewTypedPat a p with
+  | TypedPatView.Var r -> { here | binders = H.insert r.id t here.binders }
+  | TypedPatView.As r -> typedPat a r.pat { here | binders = H.insert r.id t here.binders }
+  | TypedPatView.Ann r -> typedPat a r.pat here
+  | TypedPatView.Cons r -> V.foldl (\x q -> typedPat a q x) here r.args
+  | TypedPatView.Tuple r -> V.foldl (\x q -> typedPat a q x) here r.items
+  | TypedPatView.Array r -> V.foldl (\x q -> typedPat a q x) here r.items
+  | TypedPatView.Vector r -> V.foldl (\x q -> typedPat a q x) here r.items
+  | TypedPatView.List r -> V.foldl (\x q -> typedPat a q x) here r.items
+  | TypedPatView.Record r ->
+      V.foldl
+        (\x f ->
+          typedPat
+            a
+            (typedPatFieldPat a f)
+            (fieldAt
+               x
+               (metaTypedName a (typedPatFieldName a f))
+               t
+               (typedNameText a (typedPatFieldName a f))))
+        here
+        r.fields
+  | TypedPatView.View r -> typedPat a r.pat (typedExpr a r.fn here)
+  | _ -> here
+
+fun typedExpr (a : TypedArena) (e : TypedExpr) (acc : Typing) : Typing =
+  let here = noted acc (metaTypedExpr a e) (typTypedExpr a e) in
+  let each = \x es -> V.foldl (\t c -> typedExpr a c t) x es in
+  match viewTypedExpr a e with
+  | TypedExprView.Var r ->
+      (match metaTypedExpr a e with
+       | Meta from to ->
+           { here | vars = V.pushBack here.vars (from, to, typedRefId a r.ref, typTypedExpr a e) })
+  | TypedExprView.Lam r -> typedExpr a r.body (V.foldl (\t p -> typedPat a p t) here r.params)
+  | TypedExprView.App r -> each (typedExpr a r.func here) r.args
+  | TypedExprView.Let r -> typedExpr a r.body (V.foldl (\t b -> typedBind a b t) here r.binds)
+  | TypedExprView.If r -> typedExpr a r.no (typedExpr a r.yes (typedExpr a r.cond here))
+  | TypedExprView.Match r ->
+      V.foldl
+        (\t arm ->
+          let withPat = typedPat a (typedArmPat a arm) t in
+          let withGuard =
+            match typedArmGuard a arm with
+            | Just g -> typedExpr a g withPat
+            | None -> withPat
+          in typedExpr a (typedArmBody a arm) withGuard)
+        (typedExpr a r.scrutinee here)
+        r.arms
+  | TypedExprView.Tuple r -> each here r.items
+  | TypedExprView.Array r -> each here r.items
+  | TypedExprView.List r -> each here r.items
+  | TypedExprView.Cons r -> each here r.args
+  | TypedExprView.Record r ->
+      let ty = typTypedExpr a e in
+      let fields =
+        V.foldl
+          (\t f ->
+            typedExpr
+              a
+              (typedExprFieldValue a f)
+              (fieldAt
+                 t
+                 (metaTypedName a (typedExprFieldName a f))
+                 ty
+                 (typedNameText a (typedExprFieldName a f))))
+          here
+          r.fields
+      in (match r.base with
+          | Just b -> typedExpr a b fields
+          | None -> fields)
+  | TypedExprView.Update r ->
+      let ty = typTypedExpr a r.base in
+      V.foldl
+        (\t f ->
+          typedExpr
+            a
+            (typedExprFieldValue a f)
+            (fieldAt
+               t
+               (metaTypedName a (typedExprFieldName a f))
+               ty
+               (typedNameText a (typedExprFieldName a f))))
+        (typedExpr a r.base here)
+        r.fields
+  | TypedExprView.Proj r ->
+      typedExpr
+        a
+        r.target
+        (fieldAt here (metaTypedName a r.label) (typTypedExpr a r.target) (typedNameText a r.label))
+  | TypedExprView.Handle r ->
+      let body = typedExpr a r.body here in
+      let arms =
+        V.foldl
+          (\t h -> typedExpr a (typedHArmBody a h) (typedPat a (typedHArmParam a h) t))
+          body
+          r.arms
+      in (match r.ret with
+          | Just x -> typedExpr a (typedRetBody a x) (typedPat a (typedRetPat a x) arms)
+          | None -> arms)
+  | _ -> here
+
+-- --- hover ---------------------------------------------------------------------
+
+-- What the name at the position is, as markdown (`hover_at`): a
+-- constructor's full path; a binding's name and scheme, where it was
+-- generalized; anything else, the type of the smallest node around it --
+-- and the comment above a binding the document declares.
+fun hoverOf (ed : Editor) (a : Asked) =
+  match viewOf ed a with
+  | None -> J.jNull ()
+  | Just v ->
+      (match hoverText v a.offset with
+       | None -> J.jNull ()
+       | Just md ->
+           J.jObject
+             [("contents", J.jObject [("kind", J.jString "markdown"), ("value", J.jString md)])])
+
+fun hoverText (v : View) (o : Int) : Maybe String =
+  let innermost = V.get (namesAt v o) 0 in
+  match innermost with
+  | Just (_, _, id, "c") -> Just "```meadow\n${ctorPath v id}\n```"
+  | _ ->
+      let var = valueAt v o in
+      let general = M.andThen (\id -> schemeIn v id) var in
+      let signature =
+        match (var, general) with
+        | (Just id, Just sc) ->
+            (match bindingName v id with
+             | Just n -> Just "${spellName n} : ${showScheme sc}"
+             | None -> Just (showScheme sc))
+        | _ -> M.map showType (typeAt v o)
+      in M.map
+           (\sig ->
+             let doc =
+               M.andThen
+                 (\id ->
+                   M.andThen
+                     (\d -> match d with | (from, _, _) -> docAbove v.text from)
+                     (V.find (\d -> match d with | (_, _, i) -> i == id) v.defs))
+                 var
+             in match doc with
+                | Just text -> "```meadow\n${sig}\n```\n\n---\n\n${text}"
+                | None -> "```meadow\n${sig}\n```")
+           signature
+
+-- What a binding of the package came to: generalized, or as the package
+-- exports it.
+fun schemeIn (v : View) (id : Int) : Maybe Scheme =
+  match H.lookup id v.study.inferred.general with
+  | Just sc -> Just sc
+  | None ->
+      (match siteOf (binderOf v id) with
+       | Just (f, _, _) ->
+           if f == v.file or V.any (\x -> srcFile (snd x) == f) v.study.sources then
+             H.lookup id v.study.inferred.schemes
+           else None
+       | None -> None)
+
+-- What a binding is called where the package exports it -- an `impl`'s
+-- method by the trait it is of -- or else as it is written.
+fun bindingName (v : View) (id : Int) : Maybe String =
+  let exported =
+    match V.find (\(e : Export) -> e.binder == id and e.kind == "v") v.study.renamed.exports with
+    | Just (e : Export) ->
+        (match e.vis with
+         | Vis.Exported -> Just e.name
+         | _ -> if v.study.renamed.anyVis then None else Just e.name)
+    | None -> None
+  in
+  -- An `impl`'s method is exported whatever is marked, under its trait.
+  match H.lookup id v.typing.methods with
+  | Just tr -> Just "#impl.${tr}.${(binderOf v id).name}"
+  | None ->
+      (match exported with
+       | Just n -> Just n
+       | None ->
+           if V.any (\d -> match d with | (_, _, i) -> i == id) v.defs then
+             Just (binderOf v id).name
+           else None)
+
+-- A name as a person writes it: an operator's in brackets, `(+)`.
+fun spellName (n : String) : String =
+  match V.get (S.chars n) 0 with
+  | Just c -> if C.isAlphaNum c or c == '_' then n else "(${n})"
+  | None -> n
+
+-- The type of the smallest expression or pattern around `o`: of those as
+-- small, the first.
+fun typeAt (v : View) (o : Int) : Maybe Type =
+  M.map
+    (\x -> match x with | (_, _, t) -> t)
+    (V.foldl
+       (\acc x ->
+         match x with
+         | (f, t, _) ->
+             if not (covers f t o) then acc
+             else
+               (match acc with
+                | Just (f0, t0, _) -> if t - f < t0 - f0 then Just x else acc
+                | None -> Just x))
+       None
+       v.typing.nodes)
+
+-- A constructor as a `use` would spell its path: package, module, type and
+-- its own name.
+fun ctorPath (v : View) (id : Int) : String =
+  let b = binderOf v id in
+  match (H.lookup id v.canons, siteOf b) with
+  | (Just c, Just (f, _, _)) ->
+      -- A document alone is no package anyone can name: its own
+      -- constructors are shown from the module down.
+      (let alone =
+         f == v.file and V.any (\x -> S.contains "meadowboot-lsp" (fst x)) v.study.sources
+       in S.join
+            "."
+            (V.concat [
+               if alone then [] else [M.unwrapOr "" (V.get (S.split "/" f) 0)],
+               modulePathOf v f,
+               [ctorSpelling c]
+             ]))
+  | (Just c, None) -> ctorSpelling c
+  | _ ->
+      if b.name == "True" or b.name == "False" then "Bool.${b.name}"
+      else if b.name == "Nil" or b.name == "Cons" then "List.${b.name}"
+      else b.name
+
+-- The run of `--` comments right above the line `at` is on, without their
+-- dashes (`doc_above`).
+fun docAbove (text : String) (at : Int) : Maybe String =
+  let before = stringSlice text 0 at in
+  let pieces = S.split "\n" before in
+  let lines =
+    V.map
+      (\l -> if S.endsWith "\r" l then S.take l (stringByteLength l - 1) else l)
+      (if V.last pieces == Just "" then V.take pieces (V.len pieces - 1) else pieces)
+  in
+  let above = V.drop (V.reverse lines) 1 in
+  let found =
+    V.foldl
+      (\acc l ->
+        match acc with
+        | (out, done) ->
+            if done then acc
+            else
+              (let t = S.trim l in
+               if S.isEmpty t and V.isEmpty out then acc
+               else if S.startsWith "--" t then (V.pushBack out (S.trim (S.drop t 2)), False)
+               else (out, True)))
+      ([], False)
+      above
+  in
+  let out = fst found in
+  if V.isEmpty out then None else Just (S.join "\n" (V.reverse out))
+
+-- --- code lenses ---------------------------------------------------------------
+
+-- A "Debug" above each top-level definition of the document, and a "Test"
+-- before it above each `@test` (`CodeLensRequest`).
+fun lensesOf (ed : Editor) (a : Asked) =
+  match viewOf ed a with
+  | None -> if a.file < 0 then J.jNull () else J.jArray []
+  | Just v ->
+      J.jArray
+        (V.concatMap
+           (\f ->
+             match f with
+             | (id, from, to, params, test) ->
+                 let b = binderOf v id in
+                 let range = rangeJson v.text (lineStarts v.text) (Meta from to) in
+                 let line = fst (position v.text (lineStarts v.text) from) in
+                 let signature = signatureOf v id in
+                 let debug =
+                   J.jObject [
+                     ("range", range),
+                     (
+                       "command",
+                       J.jObject [
+                         ("title", J.jString "▶ Debug"),
+                         ("command", J.jString "meadow.debugFunction"),
+                         (
+                           "arguments",
+                           J.jArray
+                             [J.jObject [
+                                ("uri", J.jString v.uri),
+                                ("name", J.jString b.name),
+                                ("params", J.jInt params),
+                                ("signature", J.jString signature),
+                                ("line", J.jInt line)
+                              ]]
+                         )
+                       ]
+                     )
+                   ]
+                 in match test with
+                    | Just qualified ->
+                        [
+                          J.jObject [
+                            ("range", range),
+                            (
+                              "command",
+                              J.jObject [
+                                ("title", J.jString "▶ Test"),
+                                ("command", J.jString "meadow.testFunction"),
+                                (
+                                  "arguments",
+                                  J.jArray
+                                    [J.jObject [
+                                       ("uri", J.jString v.uri),
+                                       ("name", J.jString b.name),
+                                       ("test", J.jString qualified)
+                                     ]]
+                                )
+                              ]
+                            )
+                          ],
+                          debug
+                        ]
+                    | None -> [debug])
+           (functionsIn v))
+
+-- The document's top-level definitions, each its binder, where its name is
+-- written, how many parameters it has and, for an `@test`, the name `meadow
+-- test` knows it by -- none in the standard library, whose tests are of the
+-- copy `meadow` was built with. What a macro wrote is not among them.
+fun functionsIn (v : View) : [(Int, Int, Int, Int, Maybe String)] =
+  let tests = if v.package == "Std" then [] else testsIn v.text in
+  let path =
+    M.unwrapOr
+      []
+      (M.map
+         (\(d : Declared) -> d.path)
+         (V.find (\(d : Declared) -> d.file == v.file) v.study.renamed.modules))
+  in V.concatMap
+       (\top ->
+         match top with
+         | (id, params) ->
+             let b = binderOf v id in
+             (match siteOf b with
+              | Just (f, from, to) ->
+                  if f != v.file or V.any (\c -> fst c <= from and from <= snd c) v.calls then []
+                  else
+                    [(
+                      id,
+                      from,
+                      to,
+                      params,
+                      if V.elem b.name tests then Just (qualifiedTest v path b.name) else None
+                    )]
+              | None -> []))
+       v.typing.tops
+
+-- A test's name as `meadow test` prints and matches it.
+fun qualifiedTest (v : View) (path : [String]) (name : String) : String =
+  if V.isEmpty path then name else "${S.join "." path}.${name}"
+
+-- What a definition is, as a hover would show it, its type's trailing
+-- effect left off where nothing else names it.
+fun signatureOf (v : View) (id : Int) : String =
+  match H.lookup id v.study.inferred.general with
+  | Just sc -> withoutLoneEffect (bodyOf sc)
+  | None ->
+      (match H.lookup id v.typing.binders with
+       | Just t -> withoutLoneEffect (showTypeIn (numberClasses v) t)
+       | None -> "")
+
+-- The variables of the unit's types that are over numbers, by their kind.
+fun numberClasses (v : View) : HashMap Int VarKind =
+  V.foldl
+    (\h n ->
+      match n with
+      | (id, frac) -> H.insert id (if frac then VarKind.Frac else VarKind.Num) h)
+    H.empty
+    v.study.inferred.numbers
+
+-- A scheme's type, its variables named as a node's type has them named:
+-- in the order they are written, each by its kind.
+fun bodyOf (sc : Scheme) : String =
+  showTypeIn
+    (V.foldl
+       (\h i ->
+         match V.getOr VarKind.Plain sc.quant i with
+         | VarKind.Plain -> h
+         | k -> H.insert (1000000000 + i) k h)
+       H.empty
+       (V.range 0 (V.len sc.quant)))
+    (unbound sc.ty)
+
+-- A scheme's type with each quantifier a variable again, numbered past any
+-- the type has, so that it is named as a node's type is.
+fun unbound (t : Type) : Type =
+  match t with
+  | Bound i -> Var (1000000000 + i)
+  | Con n args -> Con n (V.map unbound args)
+  | Fun ps r e -> Fun (V.map unbound ps) (unbound r) (unbound e)
+  | Tuple ts -> Tuple (V.map unbound ts)
+  | Record row -> Record (unbound row)
+  | RowExtend l f rest -> RowExtend l (unbound f) (unbound rest)
+  | other -> other
+
+-- `t` without a trailing `! e` whose variable is mentioned nowhere else.
+fun withoutLoneEffect (t : String) : String =
+  match lastIndexOf " ! " t with
+  | None -> t
+  | Just at ->
+      let body = S.take t at in
+      let var = S.drop t (at + 3) in
+      let cs = S.chars var in
+      let small = M.unwrapOr False (M.map C.isLower (V.get cs 0)) in
+      let plain = V.all (\c -> C.isAlphaNum c or c == '\'') cs in
+      let words =
+        S.split
+          " "
+          (S.fromChars
+             (V.map (\c -> if C.isAlphaNum c or c == '\'' then c else ' ') (S.chars body)))
+      in if small and plain and not (V.elem var words) then body else t
+
+fun lastIndexOf (needle : String) (s : String) : Maybe Int =
+  let n = stringByteLength needle in
+  V.find
+    (\i -> stringSlice s i (i + n) == needle)
+    (V.reverse (V.range 0 (max 0 (stringByteLength s - n + 1))))
+
+-- --- inlay hints ---------------------------------------------------------------
+
+-- What is hinted, as the walk goes: the namer the declaration being walked
+-- names its variables with, each hint so far -- where, and its parts, each
+-- text or a type's name -- and what each type name a hint spells stands
+-- for.
+record Hinting = {
+  namer : Namer,
+  hints : [(Int, [(String, Bool)])],
+  spelled : HashMap String String
+}
+
+fun withNamer (h : Hinting) (nm : Namer) : Hinting =
+  Hinting { namer = nm, hints = h.hints, spelled = h.spelled }
+
+fun withHints (h : Hinting) (hs : [(Int, [(String, Bool)])]) : Hinting =
+  Hinting { namer = h.namer, hints = hs, spelled = h.spelled }
+
+fun withSpelled (h : Hinting) (sp : HashMap String String) : Hinting =
+  Hinting { namer = h.namer, hints = h.hints, spelled = sp }
+
+-- What the hints are read with: the arena, the types of binders that are
+-- no node's, each generalized binding's type over the variables the typed
+-- tree has, and the kind of every variable that is not a plain type's.
+record HintCx = {
+  a : TypedArena,
+  view : View,
+  classes : HashMap Int VarKind
+}
+
+-- Every hint of the document, as the Rust server makes them
+-- (`Walk::bind_decl`): a parameter's or a `let`'s type around its name,
+-- `(x : Int)`, and a function's result after its last parameter, where it
+-- has none written -- each declaration's variables named afresh.
+fun hintsIn (v : View) : Hinting =
+  let none = Hinting { namer = newNamer, hints = [], spelled = H.empty } in
+  match V.find
+    (\k -> M.map fst (V.get v.study.renamed.programs k) == Just v.file)
+    (V.range 0 (V.len v.study.renamed.programs)) with
+  | None -> none
+  | Just k ->
+      (match V.get v.study.inferred.typed k with
+       | Just (TypedProgram a root) ->
+           let cx = HintCx { a, view = v, classes = classesOf v } in
+           let start = Hinting { namer = namerOf cx.classes, hints = [], spelled = H.empty } in
+           V.foldl (\h d -> hintDecl cx d h) start (typedModuleDecls a root)
+       | None -> none)
+
+-- The kind of each variable of the unit's types that is not a plain type's:
+-- each generalized binding's quantifiers', and the numbers'.
+fun classesOf (v : View) : HashMap Int VarKind =
+  V.foldl
+    (\h (g : Generalized) ->
+      V.foldl
+        (\h2 i ->
+          match (V.get g.scheme.quant i, V.get g.vars i) with
+          | (Just k, Just var) -> (match k with | VarKind.Plain -> h2 | _ -> H.insert var k h2)
+          | _ -> h2)
+        h
+        (V.range 0 (V.len g.scheme.quant)))
+    (numberClasses v)
+    (H.values v.study.inferred.generics)
+
+fun hintDecl (cx : HintCx) (d : TypedDecl) (h : Hinting) : Hinting =
+  match viewTypedDecl cx.a d with
+  | TypedDeclView.Bind r -> hintBind cx r.bind False (withNamer h (namerOf cx.classes))
+  | TypedDeclView.Attributed r -> hintDecl cx r.decl h
+  | TypedDeclView.Trait r -> V.foldl (\x b -> hintBind cx b False x) h r.defaults
+  | TypedDeclView.Impl r -> V.foldl (\x b -> hintBind cx b False x) h r.methods
+  | _ -> h
+
+fun hintBind (cx : HintCx) (b : TypedBind) (hint : Bool) (h : Hinting) : Hinting =
+  match viewTypedBind cx.a b with
+  | TypedBindView.Fun r ->
+      let withParams = V.foldl (\x p -> hintPat cx p True x) h r.params in
+      let walked : Hinting = hintExpr cx r.body withParams in
+      if M.isSome r.ret then walked
+      else
+        (match V.last r.params with
+         | None -> walked
+         | Just last ->
+             (match resultOf cx r.id (V.len r.params) with
+              | None -> walked
+              | Just (ret, eff) ->
+                  (match renderResultIn walked.namer ret eff with
+                   | (text, nm) ->
+                       (let after = metaEnd (metaTypedPat cx.a last) in
+                        let parts = V.pushFront (partsOf text) (" : ", False) in
+                        let h2 = noteSpellings (withNamer walked nm) (fnType cx r.id) in
+                        withHints h2 (appendAt h2.hints after parts)))))
+  | TypedBindView.Pat r -> hintExpr cx r.value (hintPat cx r.pat hint h)
+
+-- A function's type as the typed tree's types have it: its scheme, each
+-- quantifier the variable behind it.
+fun fnType (cx : HintCx) (id : Int) : Type =
+  match H.lookup id cx.view.study.inferred.generics with
+  | Just (g : Generalized) -> overVars g.vars g.scheme.ty
+  | None ->
+      (match H.lookup id cx.view.study.inferred.general with
+       | Just (sc : Scheme) -> sc.ty
+       | None -> M.unwrapOr Type.Error (H.lookup id cx.view.study.inferred.monos))
+
+fun overVars (vars : [Int]) (t : Type) : Type =
+  match t with
+  | Bound i -> Var (V.getOr (1000000000 + i) vars i)
+  | Con n args -> Con n (V.map (overVars vars) args)
+  | Fun ps r e -> Fun (V.map (overVars vars) ps) (overVars vars r) (overVars vars e)
+  | Tuple ts -> Tuple (V.map (overVars vars) ts)
+  | Record row -> Record (overVars vars row)
+  | RowExtend l f rest -> RowExtend l (overVars vars f) (overVars vars rest)
+  | other -> other
+
+-- What a function of `arity` parameters answers, and the effect of its last
+-- arrow -- none, if that is a variable nothing else names (`result_hint`).
+fun resultOf (cx : HintCx) (id : Int) (arity : Int) : Maybe (Type, Type) =
+  let whole = fnType cx id in
+  let rec peel (t : Type) (n : Int) (eff : Type) =
+    if n == 0 then Just (t, eff) else match t with | Fun _ ret e -> peel ret (n - 1) e | _ -> None
+  in match peel whole arity RowEmpty with
+     | Just (ret, Var x) -> Just (ret, if occurrences whole x <= 1 then RowEmpty else Var x)
+     | other -> other
+
+fun occurrences (t : Type) (x : Int) : Int =
+  match t with
+  | Var y -> if x == y then 1 else 0
+  | Con _ args -> V.foldl (\n a -> n + occurrences a x) 0 args
+  | Tuple args -> V.foldl (\n a -> n + occurrences a x) 0 args
+  | Fun ps r e -> V.foldl (\n a -> n + occurrences a x) (occurrences r x + occurrences e x) ps
+  | Record r -> occurrences r x
+  | RowExtend _ f rest -> occurrences f x + occurrences rest x
+  | _ -> 0
+
+-- `parts` added to the hint at `at`, if there is one, or as one of their
+-- own.
+fun appendAt (hints : [(Int, [(String, Bool)])]) (at : Int) (parts : [(String, Bool)])
+    : [(Int, [(String, Bool)])] =
+  match V.find (\i -> M.map fst (V.get hints i) == Just at) (V.range 0 (V.len hints)) with
+  | Just i ->
+      V.map
+        (\j ->
+          let x = V.getOr (0, []) hints j in
+          if j == i then (fst x, V.append (snd x) parts) else x)
+        (V.range 0 (V.len hints))
+  | None -> V.pushBack hints (at, parts)
+
+-- Each type and effect name `t` writes, by its spelling: what a hint's
+-- names are linked to.
+fun noteSpellings (h : Hinting) (t : Type) : Hinting =
+  match t with
+  | Con name args ->
+      V.foldl
+        (\x a -> noteSpellings x a)
+        (withSpelled h (H.insert (spelling name) name h.spelled))
+        args
+  | Tuple ts -> V.foldl (\x a -> noteSpellings x a) h ts
+  | Fun ps r e -> noteSpellings (noteSpellings (V.foldl (\x a -> noteSpellings x a) h ps) r) e
+  | Record row -> noteSpellings h row
+  | RowExtend label f rest ->
+      let named =
+        if M.unwrapOr False (M.map C.isUpper (V.get (S.chars label) 0)) or S.contains "." label then
+          withSpelled h (H.insert (spelling label) label h.spelled)
+        else h
+      in noteSpellings (noteSpellings named f) rest
+  | _ -> h
+
+-- A binder's hint, `(name : T)`, around bytes `from` to `to`.
+fun hintBinder (cx : HintCx) (from : Int) (to : Int) (t : Type) (h : Hinting) : Hinting =
+  if to <= from then h
+  else
+    match renderIn h.namer t with
+    | (text, nm) ->
+        let h2 = noteSpellings (withNamer h nm) t in
+        withHints
+          h2
+          (V.append h2.hints [
+             (from, [("(", False)]),
+             (to, V.pushBack (V.pushFront (partsOf text) (" : ", False)) (")", False))
+           ])
+
+fun hintPat (cx : HintCx) (p : TypedPat) (hint : Bool) (h : Hinting) : Hinting =
+  let m = metaTypedPat cx.a p in
+  match viewTypedPat cx.a p with
+  | TypedPatView.Var r ->
+      if hint then hintBinder cx (metaStart m) (metaEnd m) (typTypedPat cx.a p) h else h
+  | TypedPatView.As r ->
+      let named =
+        match siteOf (binderOf cx.view r.id) with
+        | Just (_, from, to) -> if hint then hintBinder cx from to (typTypedPat cx.a p) h else h
+        | None -> h
+      in hintPat cx r.pat False named
+  | TypedPatView.Ann r -> hintPat cx r.pat False h
+  | TypedPatView.Cons r -> V.foldl (\x q -> hintPat cx q hint x) h r.args
+  | TypedPatView.Tuple r -> V.foldl (\x q -> hintPat cx q hint x) h r.items
+  | TypedPatView.Array r -> V.foldl (\x q -> hintPat cx q hint x) h r.items
+  | TypedPatView.Vector r -> V.foldl (\x q -> hintPat cx q hint x) h r.items
+  | TypedPatView.List r -> V.foldl (\x q -> hintPat cx q hint x) h r.items
+  | TypedPatView.Record r ->
+      V.foldl (\x f -> hintPat cx (typedPatFieldPat cx.a f) hint x) h r.fields
+  | TypedPatView.View r -> hintPat cx r.pat hint (hintExpr cx r.fn h)
+  | _ -> h
+
+fun hintExpr (cx : HintCx) (e : TypedExpr) (h : Hinting) : Hinting =
+  let a = cx.a in
+  let each = \x es -> V.foldl (\t c -> hintExpr cx c t) x es in
+  match viewTypedExpr a e with
+  | TypedExprView.Lam r -> hintExpr cx r.body (V.foldl (\t p -> hintPat cx p True t) h r.params)
+  | TypedExprView.App r -> each (hintExpr cx r.func h) r.args
+  | TypedExprView.Let r -> hintExpr cx r.body (V.foldl (\t b -> hintBind cx b True t) h r.binds)
+  | TypedExprView.If r -> hintExpr cx r.no (hintExpr cx r.yes (hintExpr cx r.cond h))
+  | TypedExprView.Match r ->
+      V.foldl
+        (\t arm ->
+          let withPat = hintPat cx (typedArmPat a arm) True t in
+          let withGuard =
+            match typedArmGuard a arm with
+            | Just g -> hintExpr cx g withPat
+            | None -> withPat
+          in hintExpr cx (typedArmBody a arm) withGuard)
+        (hintExpr cx r.scrutinee h)
+        r.arms
+  | TypedExprView.Tuple r -> each h r.items
+  | TypedExprView.Array r -> each h r.items
+  | TypedExprView.List r -> each h r.items
+  | TypedExprView.Cons r -> each h r.args
+  | TypedExprView.Record r ->
+      let fields = V.foldl (\t f -> hintExpr cx (typedExprFieldValue a f) t) h r.fields in
+      (match r.base with
+       | Just b -> hintExpr cx b fields
+       | None -> fields)
+  | TypedExprView.Update r ->
+      V.foldl (\t f -> hintExpr cx (typedExprFieldValue a f) t) (hintExpr cx r.base h) r.fields
+  | TypedExprView.Proj r -> hintExpr cx r.target h
+  | TypedExprView.Handle r ->
+      let body = hintExpr cx r.body h in
+      let arms =
+        V.foldl
+          (\t arm ->
+            let withParam = hintPat cx (typedHArmParam a arm) True t in
+            let resume = typedHArmResume a arm in
+            let withResume =
+              match (
+                siteOf (binderOf cx.view resume),
+                H.lookup resume cx.view.study.inferred.monos
+              ) with
+              | (Just (_, from, to), Just ty) -> hintBinder cx from to ty withParam
+              | _ -> withParam
+            in hintExpr cx (typedHArmBody a arm) withResume)
+          body
+          r.arms
+      in (match r.ret with
+          | Just x -> hintExpr cx (typedRetBody a x) (hintPat cx (typedRetPat a x) True arms)
+          | None -> arms)
+  | _ -> h
+
+-- A rendered type in parts, each capitalised name -- a type's or an
+-- effect's -- one of its own, to be linked (`hint_parts`).
+fun partsOf (rendered : String) : [(String, Bool)] =
+  let ident = \c -> C.isAlphaNum c or c == '_' or c == '\'' or C.code c > 127 in
+  let flush =
+    \st ->
+      match st with
+      | (parts, text, word) ->
+          if S.isEmpty word then st
+          else if M.unwrapOr False (M.map C.isUpper (V.get (S.chars word) 0)) then
+            (
+              V.pushBack (if S.isEmpty text then parts else V.pushBack parts (text, False)) (
+                word,
+                True
+              ),
+              "",
+              ""
+            )
+          else (parts, text ++ word, "")
+  in
+  let done =
+    V.foldl
+      (\st c ->
+        if ident c then (match st with | (p, t, w) -> (p, t, w ++ S.fromChars [c]))
+        else
+          (match flush st with
+           | (p, t, w) -> (p, t ++ S.fromChars [c], w)))
+      ([], "", "")
+      (S.chars rendered)
+  in match flush done with
+     | (parts, text, _) -> if S.isEmpty text then parts else V.pushBack parts (text, False)
+
+-- The document's hints between bytes `from` and `to`, as the protocol has
+-- them: each type name in a label linked to where the type is declared.
+fun hintsOf (ed : Editor) (a : Asked) =
+  match viewOf ed a with
+  | None -> if a.file < 0 then J.jNull () else J.jArray []
+  | Just v ->
+      let from = byteIn a ["range", "start"] in
+      let to = byteIn a ["range", "end"] in
+      let inside = \at -> V.any (\c -> fst c <= at and at <= snd c) v.calls in
+      let types = typeSites v in
+      let hinted = hintsIn v in
+      let spelled = hinted.spelled in
+      let starts = lineStarts v.text in
+      J.jArray
+        (V.concatMap
+           (\x ->
+             match x with
+             | (at, parts) ->
+                 if at < from or at > to or inside at then []
+                 else
+                   [J.jObject [
+                      ("position", posJson (position v.text starts at)),
+                      ("label", J.jArray (V.map (labelPart ed v types spelled) parts)),
+                      ("kind", J.jInt 1)
+                    ]])
+           hinted.hints)
+
+fun posJson (p : (Int, Int)) : Json =
+  J.jObject [("line", J.jInt (fst p)), ("character", J.jInt (snd p))]
+
+-- Each type the package and what it depends on declare, by its canonical
+-- name: its binder.
+fun typeSites (v : View) : HashMap String Int =
+  V.foldl
+    (\h (i : Item) ->
+      if i.kind == "t" and not (S.isEmpty i.canon) then H.insert i.canon i.id h else h)
+    H.empty
+    (V.append
+       (V.concatMap (\(d : Declared) -> d.items) v.study.renamed.modules)
+       v.study.renamed.depItems)
+
+fun labelPart
+    ed
+    (v : View)
+    (types : HashMap String Int)
+    (spelled : HashMap String String)
+    (part : (String, Bool)) =
+  match part with
+  | (text, False) -> J.jObject [("value", J.jString text)]
+  | (name, True) ->
+      let canonical = M.unwrapOr name (H.lookup name spelled) in
+      let place =
+        M.andThen
+          (\id ->
+            M.andThen
+              (\d -> match d with | (f, from, to) -> locationOf ed v f from to)
+              (declaredAt v id))
+          (H.lookup canonical types)
+      in (match place with
+          | Just loc ->
+              J.jObject [
+                ("value", J.jString name),
+                ("location", loc),
+                ("tooltip", J.jString "type `${name}`")
+              ]
+          | None -> J.jObject [("value", J.jString name)])
+
+-- What inference says of the document, with a type where the renamer has a
+-- name the typed tree does not span as the Rust compiler does: a value a
+-- qualifier reaches, `V.map`, whose mention the tree has at the qualifier
+-- alone; and a handler's continuation, which no node is.
+-- Where the qualifier of a name at `f` starts -- `V` of `V.map` -- if it
+-- has one.
+fun qualifierBefore (text : String) (f : Int) : Maybe Int =
+  if f < 2 or stringSlice text (f - 1) f != "." then None
+  else
+    let rec back (i : Int) =
+      if i > 0 and isWordByte (byteOf text (i - 1)) then back (i - 1) else i
+    in
+    let q = back (f - 1) in
+    if q < f - 1 and byteOf text q >= 65 and byteOf text q <= 90 then Just q else None
+
+fun isWordByte (b : Int) : Bool =
+  (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or (b >= 48 and b <= 57) or b == 95
+
+fun patched (s : Study) (file : String) (text : String) (refs : [(Int, Int, Int)]) (t : Typing)
+    : Typing =
+  let exact =
+    V.foldl (\h x -> match x with | (f, to, _) -> H.insert (f, to) True h) H.empty t.nodes
+  in
+  let byBinder =
+    V.foldl
+      (\h x ->
+        match x with
+        | (_, _, id, _) -> H.insert id (V.pushBack (H.getOr [] id h) x) h)
+      H.empty
+      t.vars
+  in
+  -- The mention of the same binder the typed tree has for a name: the
+  -- smallest around it, or else the one that starts nearest it.
+  let mentionOf =
+    \f to id ->
+      V.foldl
+        (\acc x ->
+          match x with
+          | (a, b, _, ty) ->
+              (let near = if a > f then a - f else f - a in
+               let key = if a <= f and to <= b then (0, b - a) else (1, near) in
+               if key >= (1, 64) then acc
+               else
+                 match acc with
+                 | Just (k, _) -> if key < k then Just (key, ty) else acc
+                 | None -> Just (key, ty)))
+        None
+        (H.getOr [] id byBinder)
+  in
+  let mentions =
+    V.concatMap
+      (\r ->
+        match r with
+        | (f, to, id) ->
+            if H.member (f, to) exact then []
+            else
+              (match mentionOf f to id with
+               | Just (_, ty) -> if inUse text f then [] else [(f, to, ty)]
+               | None -> []))
+      refs
+  in
+  let continuations =
+    V.concatMap
+      (\id ->
+        match (V.get s.renamed.binders id, H.lookup id s.inferred.monos) with
+        | (Just (b : Binder), Just ty) ->
+            (if b.kind != "v" then []
+             else
+               match siteOf b with
+               | Just (f, from, to) ->
+                   if f == file and not (H.member (from, to) exact) then [(from, to, ty)] else []
+               | None -> [])
+        | _ -> [])
+      (V.range 0 (V.len s.renamed.binders))
+  in
+  -- What a derive writes stands at its attribute, and is no expression
+  -- of the document's: the Rust compiler gives it no place to be found at.
+  let derives = deriveAttrs text in
+  let written =
+    V.filter
+      (\x ->
+        match x with
+        | (f, _, _) -> not (V.any (\d -> fst d <= f and f < snd d) derives))
+      t.nodes
+  in Typing {
+       nodes = V.concat [written, mentions, continuations],
+       binders = t.binders,
+       funs = t.funs,
+       vars = t.vars,
+       fields = t.fields,
+       methods = t.methods,
+       tops = t.tops
+     }
+
+-- Whether `s` is a name: a letter or `_`, then letters, digits, `_` and `'`.
+fun named (s : String) : Bool =
+  match V.get (S.chars s) 0 with
+  | Just c ->
+      (C.isAlpha c or c == '_')
+        and V.all (\x -> C.isAlphaNum x or x == '_' or x == '\'') (S.chars s)
+  | None -> False
+
+-- The module a file a dump names is, by its path in its package: the
+-- document's own package's as the renamer has it; another's from where its
+-- file is, its root -- `Main`, `Lib`, the library's `Prelude` -- none.
+fun modulePathOf (v : View) (file : String) : [String] =
+  match V.find (\(d : Declared) -> d.file == file) v.study.renamed.modules with
+  | Just (d : Declared) -> d.path
+  | None ->
+      (let parts = S.split "/" file in
+       let inner = V.drop parts 2 in
+       let last = V.getOr "" inner (V.len inner - 1) in
+       let bare =
+         V.pushBack
+           (V.take inner (V.len inner - 1))
+           (if S.endsWith ".mw" last then S.take last (stringByteLength last - 3) else last)
+       in if bare == ["Main"] or bare == ["Lib"] or bare == ["Prelude"] then [] else bare)
+
+-- A canonical constructor's last two segments: its type's name and its own.
+fun ctorSpelling (canon : String) : String =
+  let parts = S.split "." canon in
+  if V.len parts <= 2 then canon else S.join "." (V.drop parts (V.len parts - 2))
+
+-- --- completion --------------------------------------------------------------
+
+-- What the cursor is asking for (`complete::Ask`): what a value piped can go
+-- into; what follows `Q.`; the path of a `use`, or the names it takes; a name
+-- being invented, which nothing existing is; or any name.
+data Ask
+  = Piped Int String
+  | Member String String
+  | UsePath [String] String
+  | UseNames [String] String
+  | Nothing String
+  | Name String
+
+-- Where the word the cursor is in starts: after the last character before
+-- it that is no letter, digit or `_`.
+fun wordStart (text : String) (offset : Int) : Int =
+  let cs = S.chars (stringSlice text 0 (min offset (stringByteLength text))) in
+  let rec back (i : Int) (at : Int) =
+    if i < 0 then 0
+    else
+      (let c = V.getOr ' ' cs i in
+       let w = utf8Width c in
+       if C.isAlphaNum c or c == '_' or C.code c > 127 and isWordChar c then back (i - 1) (at - w)
+       else at)
+  in back (V.len cs - 1) (min offset (stringByteLength text))
+
+-- A character of a word that is not ASCII: a letter or a digit, as Rust's
+-- `char::is_alphanumeric` has one -- taken here as any character past ASCII
+-- that is not a space or a symbol a source writes between words.
+fun isWordChar (c : Char) : Bool =
+  not (V.elem (C.code c) [160, 8594, 8592, 8658, 8656, 8212, 8211, 8230, 171, 187])
+
+fun utf8Width (c : Char) : Int =
+  let n = C.code c in
+  if n < 128 then 1 else if n < 2048 then 2 else if n < 65536 then 3 else 4
+
+fun askAt (text : String) (offset : Int) : Ask =
+  let ws = wordStart text offset in
+  let word = stringSlice text ws (min offset (stringByteLength text)) in
+  let before = stringSlice text 0 ws in
+  match usedRest (lineOfText before) with
+  | Just rest -> useAsk rest word
+  | None ->
+      if S.endsWith "." before then
+        (let upto = S.take before (stringByteLength before - 1) in
+         let q = S.drop upto (wordStart upto (stringByteLength upto)) in
+         match V.get (S.chars q) 0 with
+         | Just c -> if C.isUpper c then Ask.Member q word else Ask.Nothing word
+         | None -> Ask.Nothing word)
+      else
+        (let trimmed = S.trimEnd before in
+         if S.endsWith "|>" trimmed then
+           Ask.Piped
+             (stringByteLength (S.trimEnd (S.take trimmed (stringByteLength trimmed - 2))))
+             word
+         else Ask.Name word)
+
+fun lineOfText (text : String) : String =
+  match lastIndexOf "\n" text with
+  | Just i -> S.drop text (i + 1)
+  | None -> text
+
+-- What follows `use` on a line that is one, `@pub use` too.
+fun usedRest (line : String) : Maybe String =
+  let l = S.trimStart line in
+  let l2 =
+    if S.startsWith "@" l then
+      (match V.find
+         (\i -> C.isSpace (V.getOr ' ' (S.chars l) i))
+         (V.range 0 (V.len (S.chars l))) with
+       | Just i -> S.fromChars (V.drop (S.chars l) (i + 1))
+       | None -> "")
+    else l
+  in
+  let l3 = S.trimStart l2 in
+  if S.startsWith "use" l3
+    and stringByteLength l3 > 3
+    and C.isSpace (V.getOr 'x' (S.chars (S.drop l3 3)) 0) then Just (S.drop l3 3)
+  else None
+
+fun useAsk (rest : String) (word : String) : Ask =
+  match lastIndexOf "(" rest with
+  | Just open ->
+      if not (S.contains ")" (S.drop rest open)) then
+        Ask.UseNames (pathOfText (S.take rest open)) word
+      else useNoParen rest word
+  | None -> useNoParen rest word
+
+fun useNoParen (rest : String) (word : String) : Ask =
+  if V.elem
+    "as"
+    (V.filter (\w -> not (S.isEmpty w)) (S.split " " (S.join " " (S.split "\t" rest)))) then
+    Ask.Nothing word
+  else
+    Ask.UsePath
+      (let t = S.trim rest in
+       if S.endsWith "." t then pathOfText (S.take t (stringByteLength t - 1)) else [])
+      word
+
+fun pathOfText (text : String) : [String] =
+  let t = S.trim text in
+  if S.isEmpty t then [] else S.split "." t
+
+-- A value completion could offer: its name, its scheme, how near it is --
+-- 0 for the package, 3 for the standard library -- where it comes from, and
+-- how often the library's own source writes its name.
+record Candidate = {
+  name : String,
+  scheme : Scheme,
+  shown : String,
+  distance : Int,
+  from : String,
+  common : Int
+}
+
+-- How often each word is written in `text`.
+fun wordCounts (text : String) (into : HashMap String Int) : HashMap String Int =
+  let done =
+    V.foldl
+      (\acc c ->
+        match acc with
+        | (h, w) ->
+            if C.isAlphaNum c or c == '_' or C.code c > 127 and isWordChar c then
+              (h, V.pushBack w c)
+            else if V.isEmpty w then acc
+            else (H.insert (S.fromChars w) (H.getOr 0 (S.fromChars w) h + 1) h, []))
+      (into, [])
+      (S.chars text)
+  in match done with
+     | (h, w) ->
+         if V.isEmpty w then h else H.insert (S.fromChars w) (H.getOr 0 (S.fromChars w) h + 1) h
+
+-- How often each name is written in the standard library's sources, counted
+-- once: what idiomatic Meadow reaches for.
+fun corpusOf (ed : Editor) =
+  match getRef ed.corpus with
+  | Just c -> c
+  | None ->
+      (let counted =
+         match stdDir () with
+         | Just dir ->
+             V.foldl
+               (\h f -> wordCounts (M.unwrapOr "" (Res.toMaybe (readToString f))) h)
+               H.empty
+               (sourcesOf dir)
+         | None -> H.empty
+       in
+       let u = setRef ed.corpus (Just counted) in
+       counted)
+
+-- Every value a completion could name, nearest first, as `gather_candidates`
+-- has them: what the package exports, then what the library's root does.
+fun candidatesOf (ed : Editor) (v : View) =
+  let corpus = corpusOf ed in
+  let own =
+    V.concatMap
+      (\(e : Export) ->
+        if e.kind != "v" or startsUpper e.name or not (shown v.study.renamed.anyVis e) then []
+        else
+          match H.lookup e.binder v.study.inferred.schemes with
+          | Just sc ->
+              [Candidate {
+                 name = e.name,
+                 scheme = sc,
+                 shown = showScheme sc,
+                 distance = 0,
+                 from = if V.isEmpty e.module then "this package" else S.join "." e.module,
+                 common = H.getOr 0 e.name corpus
+               }]
+          | None -> [])
+      v.study.renamed.exports
+  in
+  -- Of the library, every value of a name its prelude brings: what can be
+  -- written here without a `use`, every one of that name.
+  let flat =
+    V.foldl
+      (\h (i : Interface) ->
+        if i.package != "Std" then h
+        else
+          V.foldl
+            (\h2 (e : Export) ->
+              if V.isEmpty e.module and not (S.startsWith "op:" e.owner) then
+                H.insert e.name True h2
+              else h2)
+            h
+            i.exports)
+      H.empty
+      v.study.imported
+  in
+  let std =
+    V.concatMap
+      (\(i : Interface) ->
+        if i.package != "Std" then []
+        else
+          V.concatMap
+            (\(e : Export) ->
+              if e.kind != "v"
+                or not (H.member e.name flat)
+                or startsUpper e.name
+                or not (shown True e) then []
+              else
+                match e.scheme with
+                | Just sc ->
+                    [Candidate {
+                       name = e.name,
+                       scheme = sc,
+                       shown = showScheme sc,
+                       distance = 3,
+                       from = "Std",
+                       common = H.getOr 0 e.name corpus
+                     }]
+                | None -> [])
+            i.exports)
+      v.study.imported
+  in
+  let sorted =
+    sortBy
+      (\(x : Candidate) (y : Candidate) ->
+        compare (x.name, x.distance, x.shown) (y.name, y.distance, y.shown))
+      (V.append own std)
+  in V.foldl
+       (\acc (c : Candidate) ->
+         match V.last acc with
+         | Just (p : Candidate) ->
+             if p.name == c.name and p.shown == c.shown then acc else V.pushBack acc c
+         | None -> V.pushBack acc c)
+       []
+       sorted
+
+fun startsUpper (s : String) : Bool = M.unwrapOr False (M.map C.isUpper (V.get (S.chars s) 0))
+
+-- How a value fits a function it is piped into: as its first parameter, or
+-- its last with how many before it; whether that parameter is a type
+-- variable; and whether the call performs an effect (`PipeFit`).
+record Fit = {
+  last : Int,
+  generic : Bool,
+  effectful : Bool
+}
+
+-- Whether a value of type `subject` can be piped into a function of
+-- `scheme`, and how (`pipes_into`).
+fun pipesInto (scheme : Scheme) (subject : Type) : Maybe Fit =
+  runSt (\() ->
+    let ar = newArena () in
+    let seen = stNewRef H.empty in
+    let s2 = freshened ar seen subject in
+    let fresh = freshQuantifiers ar scheme in
+    let ty = substBound scheme.ty fresh in
+    let params = paramsOf ty in
+    if V.isEmpty params then None
+    else
+      (let generic =
+         \t ->
+           match t with
+           | Var _ -> True
+           | Bound _ -> True
+           | _ -> False
+       in
+       let performs =
+         \at ->
+           V.any
+             (\p ->
+               match snd p with
+               | RowEmpty -> False
+               | Var _ -> False
+               | _ -> True)
+             (V.drop params at)
+       in
+       let fits =
+         \at ->
+           (let snap = snapshot ar in
+            let ok =
+              match unify ar (fst (V.getOr (Error, Error) params at)) s2 with
+              | Ok _ -> True
+              | Err _ -> False
+            in
+            let u = rollback ar snap in
+            ok)
+       in if fits 0 then
+            Just
+              (Fit {
+                 last = 0,
+                 generic = generic (fst (V.getOr (Error, Error) params 0)),
+                 effectful = performs 0
+               })
+          else
+            (let last = V.len params - 1 in
+             if last > 0 and fits last then
+               Just
+                 (Fit {
+                    last,
+                    generic = generic (fst (V.getOr (Error, Error) params last)),
+                    effectful = performs last
+                  })
+             else None)))
+
+-- The parameters of a curried type, each with the effect of its arrow.
+fun paramsOf (t : Type) : [(Type, Type)] =
+  match t with
+  | Fun args ret eff -> V.append (V.map (\a -> (a, eff)) args) (paramsOf ret)
+  | _ -> []
+
+fun freshened (ar : Arena s) (seen : StRef s (HashMap Int Type)) (t : Type) : Type ! { St s | e } =
+  match t with
+  | Var id ->
+      (match H.lookup id (stGetRef seen) with
+       | Just x -> x
+       | None ->
+           (let x = fresh ar in
+            let u = stSetRef seen (H.insert id x (stGetRef seen)) in
+            x))
+  | Con n args -> Con n (V.map (freshened ar seen) args)
+  | Fun args ret eff ->
+      Fun (V.map (freshened ar seen) args) (freshened ar seen ret) (freshened ar seen eff)
+  | Tuple items -> Tuple (V.map (freshened ar seen) items)
+  | Record row -> Record (freshened ar seen row)
+  | RowExtend l f rest -> RowExtend l (freshened ar seen f) (freshened ar seen rest)
+  | other -> other
+
+-- The type of the value piped: the outermost typed node that ends where the
+-- `|>` begins, the first of those as long.
+fun subjectAt (v : View) (at : Int) : Maybe Type =
+  M.map
+    (\x -> match x with | (_, _, t) -> t)
+    (V.foldl
+       (\acc x ->
+         match x with
+         | (f, t, _) ->
+             if t != at then acc
+             else
+               (match acc with
+                | Just (f0, t0, _) -> if t - f > t0 - f0 then Just x else acc
+                | None -> Just x))
+       None
+       v.typing.nodes)
+
+-- An offer: a name, what goes in, whether that is a snippet, the detail
+-- beside it, where it came from, and its kind's number in the protocol.
+record Offer = {
+  label : String,
+  insert : String,
+  snippet : Bool,
+  detail : String,
+  from : String,
+  kind : Int
+}
+
+fun completionOf (ed : Editor) (a : Asked) =
+  let empty = J.jObject [("isIncomplete", J.jBool True), ("items", J.jArray [])] in
+  match viewOf ed a with
+  | None -> empty
+  | Just v ->
+      let offers =
+        match askAt v.text a.offset with
+        | Ask.Name word -> namesOffered ed v word
+        | Ask.Piped at word ->
+            (match subjectAt v at with
+             | Just subject -> pipedOffered ed v subject word
+             | None -> namesOffered ed v word)
+        | Ask.Member q word -> memberOffered v q word
+        | Ask.UsePath segs word -> underOffered v segs [9, 22] word
+        | Ask.UseNames segs word -> underOffered v segs [3, 22] word
+        | Ask.Nothing _ -> []
+      in
+      let start = wordStart v.text a.offset in
+      let range =
+        J.jObject [
+          ("start", posJson (position v.text (lineStarts v.text) start)),
+          ("end", M.unwrapOr (J.jNull ()) (J.get "position" a.params))
+        ]
+      in J.jObject [
+           ("isIncomplete", J.jBool True),
+           (
+             "items",
+             J.jArray
+               (V.map
+                  (\i ->
+                    match V.get offers i with
+                    | Just (o : Offer) ->
+                        J.jObject [
+                          ("label", J.jString o.label),
+                          ("kind", J.jInt o.kind),
+                          ("detail", J.jString o.detail),
+                          ("labelDetails", J.jObject [("description", J.jString o.from)]),
+                          ("sortText", J.jString (padded i)),
+                          ("filterText", J.jString o.label),
+                          ("insertTextFormat", J.jInt (if o.snippet then 2 else 1)),
+                          (
+                            "textEdit",
+                            J.jObject [("range", range), ("newText", J.jString o.insert)]
+                          )
+                        ]
+                    | None -> J.jNull ())
+                  (V.range 0 (V.len offers)))
+           )
+         ]
+
+fun padded (i : Int) : String =
+  let s = show i in
+  if stringByteLength s >= 4 then s
+  else S.concatAll (V.map (\k -> "0") (V.range 0 (4 - stringByteLength s))) ++ s
+
+-- Every name that starts with `word`, best first: what this file uses
+-- most, then what the library does, then what is nearest.
+fun namesOffered (ed : Editor) (v : View) (word : String) =
+  let used = wordCounts v.text H.empty in
+  let ranked =
+    V.concatMap
+      (\(c : Candidate) ->
+        if not (S.startsWith word c.name) or S.startsWith "$" c.name then []
+        else
+          [(
+            [0, 0, 0 - H.getOr 0 c.name used, 0 - c.common, c.distance, 0, 0],
+            Offer {
+              label = c.name,
+              insert = c.name,
+              snippet = False,
+              detail = c.shown,
+              from = c.from,
+              kind = 3
+            }
+          )])
+      (candidatesOf ed v)
+  in V.map snd (stableSort byRank ranked)
+
+-- What `subject` can be piped into, best first (`complete::piped`).
+fun pipedOffered (ed : Editor) (v : View) (subject : Type) (word : String) =
+  let used = wordCounts v.text H.empty in
+  let ranked =
+    V.concatMap
+      (\(c : Candidate) ->
+        if not (S.startsWith word c.name) or S.startsWith "$" c.name then []
+        else
+          match pipesInto c.scheme subject with
+          | None -> []
+          | Just (f : Fit) ->
+              [(
+                [
+                  if f.generic then 1 else 0,
+                  if f.effectful then 1 else 0,
+                  0 - H.getOr 0 c.name used,
+                  0 - c.common,
+                  c.distance,
+                  f.last,
+                  if f.last == 0 then 0 else 1
+                ],
+                Offer {
+                  label = c.name,
+                  insert =
+                    if f.last == 0 then c.name
+                    else
+                      S.join
+                        " "
+                        (V.pushFront
+                           (V.map (\i -> "$" ++ "{${show (i + 1)}}") (V.range 0 f.last))
+                           c.name),
+                  snippet = f.last > 0,
+                  detail = c.shown,
+                  from = c.from,
+                  kind = 3
+                }
+              )])
+      (candidatesOf ed v)
+  in V.map snd (stableSort byRank ranked)
+
+-- `xs` sorted by `cmp`, equal ones in the order they were.
+fun stableSort (cmp : a -> a -> Ordering) (xs : [a]) : [a] =
+  V.map
+    snd
+    (sortBy
+       (\p q ->
+         match cmp (snd p) (snd q) with
+         | Ordering.Equal -> compare (fst p) (fst q)
+         | other -> other)
+       (V.zip (V.range 0 (V.len xs)) xs))
+
+fun byRank (x : ([Int], Offer)) (y : ([Int], Offer)) : Ordering =
+  match (x, y) with
+  | ((r1, (o1 : Offer)), (r2, (o2 : Offer))) -> compare (r1, o1.label) (r2, o2.label)
+
+-- --- what a path reaches --------------------------------------------------------
+
+-- What sits directly under each dotted path (`PathIndex`): under a package
+-- its modules, under a module its modules, types and values, under a type
+-- its constructors. Each entry is a name, what it is -- the protocol's
+-- kind of completion item: 9 a module, 22 a type, 20 a constructor, 3 a
+-- value -- and its detail: a value's scheme, the type a constructor builds.
+fun pathIndex (v : View) =
+  let add =
+    \h path e ->
+      (let under = H.getOr [] path h in
+       match e with
+       | (n, k, _) ->
+           if V.any (\x -> match x with | (n2, k2, _) -> n2 == n and k2 == k) under then h
+           else H.insert path (V.pushBack under e) h)
+  in
+  let modulesTo =
+    \h segs ->
+      V.foldl
+        (\acc i -> add acc (S.join "." (V.take segs i)) (V.getOr "" segs i, 9, ""))
+        h
+        (V.range 0 (V.len segs))
+  in
+  let isType =
+    \(owner : String) ->
+      owner == "data" or owner == "record" or owner == "effect" or owner == "alias"
+  in
+  -- The library's modules, as what it exports says them.
+  let std =
+    V.foldl
+      (\h (i : Interface) ->
+        if i.package != "Std" then h
+        else
+          V.foldl
+            (\acc (e : Export) ->
+              let declaredHere = siteModule e.site == Just e.module in
+              let here = V.pushFront e.module "Std" in
+              let at = S.join "." here in
+              let withModules = modulesTo acc here in
+              if not (shown True e) or e.kind != "v" and not declaredHere then withModules
+              else if e.kind == "t" and isType e.owner then add withModules at (e.name, 22, "")
+              else if e.kind == "c" then
+                add withModules (at ++ "." ++ e.owner) (e.name, 20, e.owner)
+              else if e.kind == "v" then
+                add withModules at (e.name, 3, M.unwrapOr "" (M.map showScheme e.scheme))
+              else withModules)
+            h
+            i.exports)
+      (stdModules ())
+      v.study.imported
+  in
+  -- And the package's own, by its name.
+  V.foldl
+    (\h (d : Declared) ->
+      let here = V.pushFront d.path v.package in
+      let at = S.join "." here in
+      V.foldl
+        (\acc (it : Item) ->
+          if it.kind == "t" and isType it.owner then add acc at (it.name, 22, "")
+          else if it.kind == "c" then add acc (at ++ "." ++ it.owner) (it.name, 20, it.owner)
+          else if it.kind == "v" then
+            (match V.find (\(e : Export) -> e.binder == it.id) v.study.renamed.exports with
+             | Just (e : Export) ->
+                 add acc at (
+                   it.name,
+                   3,
+                   M.unwrapOr "" (M.map showScheme (H.lookup it.id v.study.inferred.schemes))
+                 )
+             | None -> acc)
+          else acc)
+        (modulesTo h here)
+        d.items)
+    std
+    v.study.renamed.modules
+
+-- Every path of the index whose last segments are `written`, shortest
+-- first.
+fun endingIn (index : HashMap String [(String, Int, String)]) (written : String) : [String] =
+  let want = S.split "." written in
+  let found =
+    V.filter
+      (\k ->
+        (let segs = S.split "." k in
+         V.len segs >= V.len want and V.drop segs (V.len segs - V.len want) == want))
+      (H.keys index)
+  in sortBy (\a b -> compare (stringByteLength a, a) (stringByteLength b, b)) found
+
+fun locatePath (index : HashMap String [(String, Int, String)]) (segments : [String])
+    : Maybe String =
+  let written = S.join "." segments in
+  if S.isEmpty written or not (V.isEmpty (H.getOr [] written index)) then Just written
+  else V.get (endingIn index written) 0
+
+-- The entries of the given kinds under `path` that start with `word`, each
+-- name once.
+fun entriesUnder index (path : String) (kinds : [Int]) (word : String) : [Offer] =
+  V.foldl
+    (\out e ->
+      match e with
+      | (n, k, detail) ->
+          if not (V.elem k kinds)
+            or not (S.startsWith word n)
+            or V.any (\(o : Offer) -> o.label == n) out then out
+          else
+            V.pushBack
+              out
+              (Offer {
+                 label = n,
+                 insert = n,
+                 snippet = False,
+                 detail = if S.isEmpty detail then describe k else detail,
+                 from = if S.isEmpty path then "this document" else path,
+                 kind = k
+               }))
+    []
+    (H.getOr [] path index)
+
+fun describe (k : Int) : String =
+  if k == 9 then "module"
+  else if k == 22 then "type"
+  else if k == 20 then "constructor"
+  else "value"
+
+fun byLabel (xs : [Offer]) : [Offer] =
+  stableSort (\(a : Offer) (b : Offer) -> compare a.label b.label) xs
+
+-- What follows `Q.` in an expression (`member`): under the module `Q` names,
+-- its values and its types' constructors; or, `Q` a type, its
+-- constructors.
+fun memberOffered (v : View) (q : String) (word : String) =
+  let index = pathIndex v in
+  match H.lookup q (aliasesIn v.text) with
+  | Just written ->
+      (match locatePath index (S.split "." written) with
+       | None -> []
+       | Just path ->
+           (let values = entriesUnder index path [3] word in
+            let ctors =
+              V.concatMap
+                (\e ->
+                  match e with
+                  | (n, 22, _) -> entriesUnder index "${path}.${n}" [20] word
+                  | _ -> [])
+                (H.getOr [] path index)
+            in byLabel (V.append values ctors)))
+  | None ->
+      (match V.find
+         (\p -> V.any (\e -> match e with | (_, k, _) -> k == 20) (H.getOr [] p index))
+         (endingIn index q) with
+       | Just path -> byLabel (entriesUnder index path [20] word)
+       | None -> [])
+
+fun underOffered (v : View) (segments : [String]) (kinds : [Int]) (word : String) =
+  let index = pathIndex v in
+  match locatePath index segments with
+  | Just path -> byLabel (entriesUnder index path kinds word)
+  | None -> []
+
+-- The aliases a document's `use`s make: `use Std.Maybe as M` makes `M`
+-- `Std.Maybe`.
+fun aliasesIn (text : String) : HashMap String String =
+  V.foldl
+    (\h line ->
+      (let words =
+         V.filter (\w -> not (S.isEmpty w)) (S.split " " (S.join " " (S.split "\t" line)))
+       in
+       let ws =
+         if M.unwrapOr False (M.map (\w -> S.startsWith "@" w) (V.get words 0)) then V.drop words 1
+         else words
+       in match (V.get ws 0, V.get ws 1, V.get ws 2, V.get ws 3) with
+          | (Just "use", Just path, Just "as", Just alias) -> H.insert alias path h
+          | _ -> h))
+    H.empty
+    (S.lines text)
+
+-- A field `label` of a record of type `t`, written at `m`.
+fun fieldAt (acc : Typing) (m : Meta) (t : Type) (label : String) : Typing =
+  let key =
+    match t with
+    | Con rec0 _ -> "${rec0}.${label}"
+    | _ -> "*.${label}"
+  in match m with
+     | Meta from to -> { acc | fields = V.pushBack acc.fields (from, to, key) }
+
+-- Where each record field of the package is declared, by its record's
+-- canonical name and its own: each file a dump names, and where in it.
+fun fieldSites (s : Study) : HashMap String (String, Int, Int) =
+  V.foldl
+    (\h k ->
+      match (V.get s.renamed.programs k, V.get s.inferred.typed k, V.get s.renamed.modules k) with
+      | (Just (file, _), Just (TypedProgram a root), Just (d : Declared)) ->
+          V.foldl (\h2 decl -> recordFields a decl file d h2) h (typedModuleDecls a root)
+      | _ -> h)
+    H.empty
+    (V.range 0 (V.len s.renamed.programs))
+
+fun recordFields (a : TypedArena) (decl : TypedDecl) (file : String) (d : Declared) h =
+  match viewTypedDecl a decl with
+  | TypedDeclView.Attributed r -> recordFields a r.decl file d h
+  | TypedDeclView.Record r ->
+      let name = typedNameText a r.name in
+      let canon =
+        M.unwrapOr
+          name
+          (M.map
+             (\(i : Item) -> i.canon)
+             (V.find (\(i : Item) -> i.kind == "t" and i.name == name) d.items))
+      in V.foldl
+           (\h2 f ->
+             match metaTypedName a (typedFieldName a f) with
+             | Meta from to ->
+                 H.insert "${canon}.${typedNameText a (typedFieldName a f)}" (file, from, to) h2)
+           h
+           r.fields
+  | _ -> h
+
+-- Where the field written around `o` is declared, if anywhere this
+-- server goes: by its record, or -- the record not known -- the first by
+-- name of the records with a field so called.
+fun fieldDeclaredAt (v : View) (o : Int) : Maybe (String, Int, Int) =
+  -- A field's declaration is a mention of it too.
+  let declared =
+    V.concatMap
+      (\kv ->
+        match kv with
+        | (k, (f, a, b)) -> if f == v.file then [(a, b, k)] else [])
+      (H.toVec (fieldSites v.study))
+  in
+  let around =
+    stableSortBy
+      (\x -> match x with | (f, t, _) -> t - f)
+      (V.filter
+         (\x -> match x with | (f, t, _) -> covers f t o)
+         (V.append v.typing.fields declared))
+  in match V.get around 0 with
+     | None -> None
+     | Just (_, _, key) ->
+         let sites = fieldSites v.study in
+         if S.startsWith "*." key then
+           (let suffix = S.drop key 1 in
+            let keys =
+              sortBy (\x y -> compare x y) (V.filter (\k -> S.endsWith suffix k) (H.keys sites))
+            in M.andThen (\k -> H.lookup k sites) (V.get keys 0))
+         else H.lookup key sites
+
+fun fieldPlace ed (v : View) (site : (String, Int, Int)) =
+  match site with | (f, from, to) -> locationOf ed v f from to
+
+-- Whether a package that says what it exports -- `gated` -- shows `e` to
+-- the packages after it: what is `@pub`, and what is exported whatever is
+-- marked, an `impl`'s.
+fun shown (gated : Bool) (e : Export) : Bool =
+  if not gated or S.startsWith "#" e.name then True
+  else match e.vis with | Vis.Exported -> True | _ -> False
+
+-- The module a site of the library is in, by its path: `Std/src/A/B.mw@9`
+-- is `[A, B]`, its prelude and root none.
+fun siteModule (site : String) : Maybe [String] =
+  match S.indexOf "@" site with
+  | None -> None
+  | Just at ->
+      (let file = S.take site at in
+       if not (S.startsWith "Std/src/" file) then None
+       else
+         (let rel = S.drop file 8 in
+          let bare = if S.endsWith ".mw" rel then S.take rel (stringByteLength rel - 3) else rel in
+          let path = S.split "/" bare in
+          Just (if path == ["Prelude"] or path == ["Lib"] then [] else path)))
+
+-- Every module of the library, under `Std` and each module on the way:
+-- what a path completes to before anything in it is.
+fun stdModules () =
+  match stdDir () with
+  | None -> H.empty
+  | Just dir ->
+      (let src = Path.join dir "src" in
+       V.foldl
+         (\h f ->
+           let rel = S.drop (keyOf f) (stringByteLength (keyOf src) + 1) in
+           let bare = if S.endsWith ".mw" rel then S.take rel (stringByteLength rel - 3) else rel in
+           let segs = V.pushFront (S.split "/" (realCase f src bare)) "Std" in
+           if segs == ["Std", "Prelude"] or segs == ["Std", "Lib"] then h
+           else
+             V.foldl
+               (\h2 i ->
+                 (let at = S.join "." (V.take segs i) in
+                  let e = (V.getOr "" segs i, 9, "") in
+                  let under = H.getOr [] at h2 in
+                  if V.any (\x -> match x with | (n, k, _) -> n == fst3 e and k == 9) under then h2
+                  else H.insert at (V.pushBack under e) h2))
+               h
+               (V.range 1 (V.len segs)))
+         H.empty
+         (sourcesOf dir))
+
+fun fst3 (t : (a, b, c)) : a = match t with | (x, _, _) -> x
+
+-- `bare`, a file's path under `src` as `keyOf` lowered it, as the file
+-- spells it.
+fun realCase (f : String) (src : String) (bare : String) : String =
+  let plain = S.join "/" (S.split "\\" f) in
+  let start = stringByteLength plain - stringByteLength bare - 3 in
+  if start < 0 then bare else stringSlice plain start (start + stringByteLength bare)
+
+-- Whether byte `f` of `text` is on a line that is a `use`: what a `use`
+-- names is no expression, and has no type.
+fun inUse (text : String) (f : Int) : Bool =
+  let line = S.trimStart (lineOfText (stringSlice text 0 f)) in
+  let bare =
+    if S.startsWith "@" line then
+      (match S.indexOf " " line with
+       | Just i -> S.trimStart (S.drop line i)
+       | None -> line)
+    else line
+  in S.startsWith "use " bare
+
+-- Where each `@derive(…)` of the document is, from its `@` to its `)`.
+fun deriveAttrs (text : String) : [(Int, Int)] =
+  let toks = (lex text).tokens in
+  let tok = \i -> V.getOr noToken toks i in
+  V.concatMap
+    (\i ->
+      match ((tok i).token, (tok (i + 1)).token, (tok (i + 2)).token) with
+      | (Token.At, Token.LowerIdent "derive", Token.LParen) ->
+          (let close = closing (\j -> (tok j).token) (i + 2) (V.len toks) in
+           [((tok i).from, (tok (close - 1)).to)])
+      | _ -> [])
+    (V.range 0 (V.len toks))
