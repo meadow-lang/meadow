@@ -1137,7 +1137,6 @@ fun fixedClass (t : Token) : Maybe String =
   | Token.Infix -> Just "keyword"
   | Token.Infixl -> Just "keyword"
   | Token.Infixr -> Just "keyword"
-  | Token.End -> Just "keyword"
   | Token.As -> Just "keyword"
   | Token.And -> Just "keyword"
   | Token.Or -> Just "keyword"
