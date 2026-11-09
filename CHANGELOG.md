@@ -223,6 +223,14 @@ last release is under _Unreleased_.
 
 ### Fixed
 
+- Glade compiles MeadowBoot's own Cut. It used to refuse it with "no run of
+  64 free registers": an array literal of tuples, each made where the array
+  is from values computed before it, left a value in every third register, so
+  the array had no run of free registers to be read from although most of the
+  file was free. Where an instruction wants a run of registers -- an array, a
+  record, a constructor's fields in a match -- the values in the way are now
+  moved aside first, and a call through an object that finds no run for its
+  arguments puts them at the bottom of the file, as a jump does.
 - A Cut program that both handles an operation and exports a definition to C
   was lowered with its `perform`s jumping to the wrong definition: the
   search they share was numbered as if there were no exports.
