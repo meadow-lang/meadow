@@ -1172,11 +1172,11 @@ fun functionsOf (v : View) : HashMap (Int, Int) Bool =
       H.empty
       v.typing.nodes
   in
-  -- And each `fun`'s name, where it is declared.
+  -- And each `fun`'s name, where it is declared: one that takes something.
   V.foldl
     (\h kv ->
       match siteOf (binderOf v (fst kv)) with
-      | Just (f, from, to) -> if f == v.file then H.insert (from, to) True h else h
+      | Just (f, from, to) -> if f == v.file and snd kv > 0 then H.insert (from, to) True h else h
       | None -> h)
     typed
     (H.toVec v.typing.funs)
