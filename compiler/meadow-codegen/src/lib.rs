@@ -97,6 +97,14 @@
 //!   values in the highest registers -- which also lowers the top of the
 //!   file, where windows are laid. Never a descriptor: other values are read
 //!   through those. See [`Gen::make_room`].
+//! * **A window** -- the run of registers an array, a record, a primitive of
+//!   three arguments or a match's fields is read from or loaded into -- has
+//!   to be free in a row, not only free. Registers come free wherever names
+//!   die, so a file a third full can have no run of 64 in it. Where a
+//!   statement lays one and there is none, the values in the emptiest run
+//!   are moved out of it first, and an `invoke` with nowhere to gather its
+//!   arguments puts them at the bottom of the file as a `jump` does. See
+//!   [`Window`].
 //! * **Reloading** is a `Field` from the block, where a statement reads the
 //!   value. A spilled value keeps its place in the environment, which is an
 //!   ordered list -- a `jump` and an `invoke` hand it over by position -- and
@@ -1002,16 +1010,22 @@ impl<'a> Gen<'a> {
         }
         // Nothing above the environment: any run it does not use, which is
         // as safe -- filling it overwrites nothing the environment holds.
-        let used = regs_of(env);
-        (0..=REGISTERS.saturating_sub(n))
-            .find(|&b| (b..b + n).all(|r| !used.contains(&(r as Reg))))
+        // There is one: `make_room` saw to it, told of the window.
+        free_run(&regs_of(env), n)
             .map(|b| {
                 self.track(b + n);
                 b as Reg
             })
             .ok_or_else(|| Error {
-                msg: format!("no run of {n} free registers, with the environment spilled"),
+                msg: format!("no run of {n} free registers for a window"),
             })
+    }
+
+    /// Whether [`Gen::window`] finds a run of `n` registers in `env`.
+    fn has_window(&self, env: &Env, n: usize) -> bool {
+        let used = regs_of(env);
+        let above = used.iter().map(|r| *r as usize + 1).max().unwrap_or(0);
+        above + n <= REGISTERS || free_run(&used, n).is_some()
     }
 
     /// Where a windowed instruction should read its arguments from.
@@ -1150,22 +1164,44 @@ impl<'a> Gen<'a> {
     }
 
     fn emit_stmt(&mut self, s: &'a Statement, env: Env) -> Result<(), Error> {
-        // Room for what this statement reads, in registers.
+        // Room for what this statement reads, in registers, and for the
+        // window it may lay.
         let env = match s {
-            Statement::Let { fields, .. } if fields.len() > WIDE => self.make_room(env, &[])?,
-            Statement::Let { fields, .. } => self.make_room(env, fields)?,
-            Statement::Switch { scrutinee, .. } => {
-                self.make_room(env, std::slice::from_ref(scrutinee))?
+            Statement::Let { fields, .. } if fields.len() > WIDE => {
+                self.make_room(env, &[], Window::No)?
+            }
+            Statement::Let { fields, .. } => self.make_room(env, fields, Window::No)?,
+            Statement::Switch {
+                scrutinee,
+                arms,
+                default,
+            } => {
+                // An arm binds its fields in a window, unless there are too
+                // many to load at once.
+                let fields = arms
+                    .iter()
+                    .filter_map(|(_, arm)| arm.params.len().checked_sub(default.params.len()))
+                    .filter(|n| *n <= WIDE)
+                    .max()
+                    .unwrap_or(0);
+                self.make_room(env, std::slice::from_ref(scrutinee), Window::Of(fields))?
             }
             // Its captures may stay where they are: see `Plan`.
-            Statement::New { .. } => self.make_room(env, &[])?,
+            Statement::New { .. } => self.make_room(env, &[], Window::No)?,
             Statement::Extern { op, args, .. } => {
                 if (matches!(op, Extern::Array) && args.len() > ARRAY_CHUNK)
                     || (matches!(op, Extern::Record(_)) && args.len() > WIDE)
                 {
-                    self.make_room(env, &[])?
+                    self.make_room(env, &[], Window::No)?
                 } else {
-                    self.make_room(env, args)?
+                    // What `emit_extern` gathers: an array's elements, a
+                    // record's fields, a primitive's arguments past two.
+                    let window = match op {
+                        Extern::Array | Extern::Record(_) => Window::OfReads,
+                        Extern::Prim(_) if args.len() > 2 => Window::OfReads,
+                        _ => Window::No,
+                    };
+                    self.make_room(env, args, window)?
                 }
             }
             // Handing control over: everything comes back, in its place --
@@ -1423,7 +1459,20 @@ impl<'a> Gen<'a> {
             Statement::Invoke(target, tag) => {
                 let (env, srcs) = self.hand_over(env, Some(*target))?;
                 let obj = reg_of(&env, *target)?;
-                let base = self.gather(&env, &srcs)?;
+                // A window for the arguments where the file has one. Where it
+                // has not -- up to two hundred arguments, reloaded wherever
+                // registers were free -- they go to the bottom of the file as
+                // a jump's do, the object after them: nothing reads the
+                // environment after an invoke, so all of it may be written.
+                let (obj, base) = if run_of(&srcs).is_some() || self.has_window(&env, srcs.len()) {
+                    (obj, self.gather(&env, &srcs)?)
+                } else {
+                    let mut all = srcs.clone();
+                    all.push(obj);
+                    self.parallel_move(&all)?;
+                    self.track(all.len());
+                    (srcs.len() as Reg, 0)
+                };
                 let method = u8::try_from(*tag).map_err(|_| Error {
                     msg: format!("method {tag} does not fit an invoke operand"),
                 })?;
@@ -1636,19 +1685,95 @@ impl<'a> Gen<'a> {
     /// `env` with `reads` in registers, spilling first if the file is too
     /// full for what the statement will want -- see the module docs,
     /// "Spilling".
-    fn make_room(&mut self, env: Env, reads: &[Name]) -> Result<Env, Error> {
+    ///
+    /// `window` says what run of free registers the statement may lay a
+    /// window in ([`Gen::window`]): for that, there have to be so many
+    /// registers free *and* free in a row. The first is a matter of how much is
+    /// live, and spilling answers it. The second is not: registers come free
+    /// wherever names die, and a file a third full can have no run of 64 in it
+    /// -- every third register held, say, by the elements of an array literal
+    /// each computed in three. So where there is no such run, the values in
+    /// the way are moved out of it ([`Gen::open_run`]).
+    fn make_room(&mut self, env: Env, reads: &[Name], window: Window) -> Result<Env, Error> {
         let spilled_reads = reads
             .iter()
             .filter(|n| matches!(env.loc(**n), Some(Loc::Field(..))))
             .count();
         let mut env = env;
-        if env.regs().count() + spilled_reads > SPILL_ABOVE {
-            // Down far enough that what is to be reloaded fits as well.
-            let to = SPILL_TO.min(SPILL_ABOVE.saturating_sub(spilled_reads));
+        let run = match window {
+            Window::No => 0,
+            // Reads already in a run are read where they are.
+            Window::OfReads if in_place(&env, reads) => 0,
+            Window::OfReads => reads.len(),
+            Window::Of(n) => n,
+        };
+        let wanted = env.regs().count() + spilled_reads;
+        if wanted > SPILL_ABOVE || wanted + run > REGISTERS {
+            // Down far enough that what is to be reloaded fits as well, and
+            // the window beside it -- and the block spilled to.
+            let to = SPILL_TO
+                .min(SPILL_ABOVE.saturating_sub(spilled_reads))
+                .min(REGISTERS.saturating_sub(run + spilled_reads + 1));
             env = self.spill(env, reads, to)?;
         }
         for n in reads {
             self.reload(&mut env, *n)?;
+        }
+        // Reloaded, the reads may have come to be a run themselves.
+        let in_a_run = matches!(window, Window::OfReads) && in_place(&env, reads);
+        if run > 0 && !in_a_run {
+            env = self.open_run(env, run)?;
+        }
+        Ok(env)
+    }
+
+    /// `env` with a run of `n` registers it does not use, moving values out of
+    /// the way if it has none.
+    ///
+    /// The run taken is the one with the fewest values in it, the highest of
+    /// those, so that the moves are few and the bottom of the file, where a
+    /// jump wants its values, is left alone. A value moved changes where it
+    /// is, never its place in the environment, as with a reload.
+    fn open_run(&mut self, mut env: Env, n: usize) -> Result<Env, Error> {
+        let used = regs_of(&env);
+        if free_run(&used, n).is_some() {
+            return Ok(env);
+        }
+        let Some(top) = REGISTERS.checked_sub(n) else {
+            return err(format!("a window of {n} registers is wider than the file"));
+        };
+        let held = |b: usize| (b..b + n).filter(|r| used.contains(&(*r as Reg))).count();
+        let base = (0..=top)
+            .rev()
+            .min_by_key(|b| held(*b))
+            .expect("a file at least as wide as the window has a run");
+        let run = base..base + n;
+        let mut taken = used.clone();
+        let mut moving: Vec<Reg> = used
+            .iter()
+            .copied()
+            .filter(|r| run.contains(&(*r as usize)))
+            .collect();
+        moving.sort_unstable();
+        moving.dedup();
+        for from in moving {
+            let Some(to) = (0..REGISTERS)
+                .map(|r| r as Reg)
+                .find(|r| !run.contains(&(*r as usize)) && !taken.contains(r))
+            else {
+                return err(format!(
+                    "no run of {n} free registers, with {} of them in use",
+                    used.len()
+                ));
+            };
+            self.track(to as usize + 1);
+            self.emit(Instr::new(Op::Move, to, from, 0, 0));
+            taken.push(to);
+            for e in env.entries.iter_mut() {
+                if e.1 == Loc::Reg(from) {
+                    e.1 = Loc::Reg(to);
+                }
+            }
         }
         Ok(env)
     }
@@ -1778,7 +1903,7 @@ impl<'a> Gen<'a> {
         let mut env = env;
         let mut packs: Vec<Name> = Vec::new();
         for chunk in names[ARGS_KEPT..].chunks(PACK) {
-            env = self.make_room(env, chunk)?;
+            env = self.make_room(env, chunk, Window::No)?;
             let srcs = chunk
                 .iter()
                 .map(|n| reg_of(&env, *n))
@@ -1801,7 +1926,7 @@ impl<'a> Gen<'a> {
             .chain(packs.iter().copied())
             .collect();
         let reads: Vec<Name> = kept.iter().copied().chain(except).collect();
-        env = self.make_room(env, &reads)?;
+        env = self.make_room(env, &reads, Window::No)?;
         let srcs = kept
             .iter()
             .map(|n| reg_of(&env, *n))
@@ -1882,7 +2007,7 @@ impl<'a> Gen<'a> {
         let after = seq::still_used(rest);
         for (k, chunk) in fields.chunks(ARRAY_CHUNK).enumerate() {
             for (j, f) in chunk.iter().enumerate() {
-                env = self.make_room(env, &[*f, obj])?;
+                env = self.make_room(env, &[*f, obj], Window::Of(3))?;
                 let (o, v) = (reg_of(&env, obj)?, reg_of(&env, *f)?);
                 // `setField obj i v`, its operands in a window above everything
                 // live, the index loaded straight into it.
@@ -1927,7 +2052,7 @@ impl<'a> Gen<'a> {
     ) -> Result<(), Error> {
         let after = seq::still_used(&block.body);
         let (first, rest) = args.split_at(ARRAY_CHUNK);
-        let mut env = self.make_room(env, first)?;
+        let mut env = self.make_room(env, first, Window::OfReads)?;
         let srcs = first
             .iter()
             .map(|n| reg_of(&env, *n))
@@ -1951,7 +2076,7 @@ impl<'a> Gen<'a> {
         let gone = self.finished(first, rest, &after);
         self.give_up(&mut env, &gone, &[acc]);
         for (i, (label, x)) in labels[ARRAY_CHUNK..].iter().zip(rest).enumerate() {
-            env = self.make_room(env, &[*x, acc])?;
+            env = self.make_room(env, &[*x, acc], Window::No)?;
             let (r, v) = (reg_of(&env, acc)?, reg_of(&env, *x)?);
             let out = self.free(&env)?;
             let id = self.label(*label);
@@ -1980,7 +2105,7 @@ impl<'a> Gen<'a> {
         let concat = self.prim(Prim::ArrayConcat);
         let mut acc: Option<Name> = None;
         for (k, chunk) in args.chunks(ARRAY_CHUNK).enumerate() {
-            env = self.make_room(env, chunk)?;
+            env = self.make_room(env, chunk, Window::OfReads)?;
             let srcs = chunk
                 .iter()
                 .map(|n| reg_of(&env, *n))
@@ -2260,6 +2385,35 @@ fn run_of(srcs: &[Reg]) -> Option<Reg> {
         .enumerate()
         .all(|(i, r)| *r == first + i as Reg)
         .then_some(first)
+}
+
+/// What run of free registers a statement may lay a window in
+/// ([`Gen::window`]), beside the registers of what it reads: what
+/// [`Gen::make_room`] must leave room for.
+#[derive(Debug, Clone, Copy)]
+enum Window {
+    No,
+    /// One its reads are copied into, in order -- unless they are such a run
+    /// already, and are read where they are ([`Gen::gather`]).
+    OfReads,
+    /// One of this many registers, loaded with something else: a match's
+    /// fields, `setField`'s operands.
+    Of(usize),
+}
+
+/// Whether `reads` are in a run of registers, in order: what
+/// [`Gen::gather`] reads where it is, with no window.
+fn in_place(env: &Env, reads: &[Name]) -> bool {
+    reads
+        .iter()
+        .map(|r| env.reg(*r))
+        .collect::<Option<Vec<_>>>()
+        .is_some_and(|srcs| run_of(&srcs).is_some())
+}
+
+/// The lowest base of a run of `n` registers none of `used` is in.
+fn free_run(used: &[Reg], n: usize) -> Option<usize> {
+    (0..=REGISTERS.checked_sub(n)?).find(|&b| (b..b + n).all(|r| !used.contains(&(r as Reg))))
 }
 
 /// Order the moves that put `srcs[i]` into register `i`, as `(dst, src)` pairs.
