@@ -922,6 +922,26 @@ fun writeRowFrom (nm : Namer) (row : Type) (hidden : [Int]) (first : Bool) (acc 
 -- `t` on its own.
 @pub fun showType (t : Type) : String = fst (writeType newNamer t top [])
 
+-- `t` named by `nm`, which goes on naming what it has not named yet: what
+-- the Rust compiler's `Renderer::render` does, several types sharing one
+-- naming.
+@pub fun renderIn (nm : Namer) (t : Type) : (String, Namer) = writeType nm t top []
+
+-- A function's result after its last arrow: the type it answers, and the
+-- arrow's effect if it has one (`Renderer::render_result`).
+@pub fun renderResultIn (nm : Namer) (ret : Type) (eff : Type) : (String, Namer) =
+  match writeType nm ret top [] with
+  | (r, n2) -> (match effectSuffix n2 eff [] with | (e, n3) -> (r ++ e, n3))
+
+-- The same, each of `classes` -- a variable that is no plain type's -- named
+-- by its kind, as the Rust compiler's `Renderer::for_table` names one.
+@pub fun showTypeIn (classes : HashMap Int VarKind) (t : Type) : String =
+  fst (writeType (namerOf classes) t top [])
+
+-- A namer that names each of `classes` by its kind.
+@pub fun namerOf (classes : HashMap Int VarKind) : Namer =
+  Namer { names = H.empty, next = 0, classes, classNext = H.empty, boundKinds = [] }
+
 -- An effect quantifier that is written once and is no labelled row's tail
 -- says nothing, and is left out: `forall a e. a -> a ! e` is `forall a. a -> a`.
 @pub fun hiddenEffectVars (scheme : Scheme) : [Int] =

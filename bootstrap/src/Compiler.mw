@@ -305,6 +305,96 @@ fun inferredOf
            done.types
          )
 
+-- A unit as the language server reads it (`Lsp`): each module's file and
+-- what the renamer made of it, the names resolved, the types inferred, and
+-- what is wrong in each file before that -- its parse, and its operators.
+@pub record Study = {
+  sources : [(String, Source)],
+  renamed : Renamed,
+  inferred : Inferred,
+  parsed : [(String, [(Int, String)])],
+  grouped : [(String, [Diagnostic])],
+  -- Where each unit it imports is, by the name of its package; and what
+  -- each tells it.
+  homes : [(String, String)],
+  imported : [Interface]
+}
+
+-- The unit `db` holds, studied: as `inferredOf` infers it, keeping all of
+-- it. `homes` are the directories of the units it imports, in their order.
+@pub fun studyUnit db (homes : [String]) =
+  let files = compilerFiles db 0 in
+  let modules = modulesOf files in
+  let imported = compilerImported db 0 in
+  let triples =
+    V.map
+      (\f -> (f, compilerSource db f, if S.endsWith ".mw" f then compilerGrouped db f else None))
+      files
+  in
+  let asts =
+    V.concatMap
+      (\f ->
+        match compilerLowered db f with
+        | Just (ast, _, _) -> [(f, ast)]
+        | None -> [])
+      modules
+  in
+  let parsed =
+    V.map
+      (\f ->
+        match compilerParsed db f with
+        | Err errs -> (f, errs)
+        | Ok _ -> (f, []))
+      modules
+  in
+  let grouped =
+    V.map
+      (\f ->
+        match compilerGrouped db f with
+        | Just (_, ds) -> (f, ds)
+        | None -> (f, []))
+      modules
+  in match unitOf
+       shownCfg
+       (compilerHome db 0)
+       imported
+       (tableOf (compilerFixities db 0))
+       triples
+       asts with
+     | (sources, r) ->
+         let deps =
+           V.map
+             (\x ->
+               match x with
+               | (name, (i : Interface)) ->
+                   DepExports { name, exports = i.exports, anyVis = i.anyVis })
+             (namedDeps triples imported)
+         in
+         let texts =
+           H.fromVec
+             (V.concatMap
+                (\x ->
+                  match x with
+                  | (path, text, _) ->
+                      (match V.find (\s -> fst s == path) sources with
+                       | Just (_, src) -> [(fileOf src, text)]
+                       | None -> []))
+                triples)
+         in
+         let done = inferUnit r deps (V.map (\(i : Interface) -> i.types) imported) texts in
+         Study {
+           sources,
+           renamed = r,
+           inferred = done,
+           parsed,
+           grouped,
+           homes =
+             V.map
+               (\k -> ((V.getOr (emptyInterface ()) imported k).package, V.getOr "" homes k))
+               (V.range 0 (V.len imported)),
+           imported
+         }
+
 -- The unit at `dir` checked and lowered, its types inferred once: what it
 -- exports, each with its scheme; whether it says; what it knows about
 -- types; and, entered at its `entry` if it is to have one -- or `None`, for

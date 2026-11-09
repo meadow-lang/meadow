@@ -80,6 +80,16 @@ last release is under _Unreleased_.
   the error's type, so what is wrong with it is said once; and a name
   written through a qualifier nothing names is refused, as `module `Nope`
   is not in scope here`.
+- MeadowBoot has a language server of its own: `lsp` in MeadowBoot
+  (`bootstrap/src/Lsp.mw`), declared with Lingua's `lsp!`, answers hover, go
+  to definition, completion, inlay hints, code lenses, semantic tokens,
+  prepare rename and rename, formatting and diagnostics in the shapes
+  `meadow lsp` answers them, reading each document as part of its package as
+  MeadowBoot compiles it. A differential test,
+  `buildtools/meadow/tests/lsp_differential.rs`, sends both servers the same
+  session and says by kind of request how far they agree; it is ignored until
+  they do. Workspace symbols and `meadow/ir` are not answered yet, and
+  `lsp --check` is still `meadow`'s.
 - A Silo program that runs out of stack on Windows says so: how deep it got,
   in a stack of what size -- the main thread's gigabyte, or a green thread's
   or a handler's 256 MiB -- and where in the executable. It used to end with
