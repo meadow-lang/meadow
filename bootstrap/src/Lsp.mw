@@ -320,7 +320,13 @@ fun viewIn (uri : String) (path : String) (text : String) (file : String) (s : S
              (\c -> c == ' ' or c == '\n' or c == '\t' or c == '\r')
              (S.chars (stringSlice text from to)))
   in
-  let kept = \from to -> to > from and (not (inside from) or isName from to) in
+  let derives = deriveAttrs text in
+  let kept =
+    \from to ->
+      to > from
+        and (not (inside from) or isName from to)
+        and not (V.any (\d -> fst d <= from and from < snd d) derives)
+  in
   let uses =
     V.concatMap
       (\id ->
@@ -2425,8 +2431,16 @@ fun patched (s : Study) (file : String) (text : String) (refs : [(Int, Int, Int)
                | None -> [])
         | _ -> [])
       (V.range 0 (V.len s.renamed.binders))
+  in
+  -- What a derive writes stands at its attribute, and is no expression
+  -- of the document's: the Rust compiler gives it no place to be found at.
+  let derives = deriveAttrs text in
+  let written =
+    V.filter
+      (\x -> match x with | (f, _, _) -> not (V.any (\d -> fst d <= f and f < snd d) derives))
+      t.nodes
   in Typing {
-       nodes = V.concat [t.nodes, mentions, continuations],
+       nodes = V.concat [written, mentions, continuations],
        binders = t.binders,
        funs = t.funs,
        vars = t.vars,
@@ -3256,3 +3270,16 @@ fun inUse (text : String) (f : Int) : Bool =
        | None -> line)
     else line
   in S.startsWith "use " bare
+
+-- Where each `@derive(…)` of the document is, from its `@` to its `)`.
+fun deriveAttrs (text : String) : [(Int, Int)] =
+  let toks = (lex text).tokens in
+  let tok = \i -> V.getOr noToken toks i in
+  V.concatMap
+    (\i ->
+      match ((tok i).token, (tok (i + 1)).token, (tok (i + 2)).token) with
+      | (Token.At, Token.LowerIdent "derive", Token.LParen) ->
+          (let close = closing (\j -> (tok j).token) (i + 2) (V.len toks) in
+           [((tok i).from, (tok (close - 1)).to)])
+      | _ -> [])
+    (V.range 0 (V.len toks))
