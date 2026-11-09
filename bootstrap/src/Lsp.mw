@@ -37,8 +37,8 @@ use MeadowBoot.Rename (Binder)
 use MeadowBoot.Scopes (Source, Declared, Item, Export, Vis, builtinTyconNames)
 use MeadowBoot.Infer
 use MeadowBoot.Types (
-  Type, Scheme, VarKind, Namer, newNamer, namerOf, showType, showScheme, showTypeIn, isFun, renderIn,
-  renderResultIn, spelling
+  Type, Scheme, VarKind, Namer, newNamer, namerOf, showType, showScheme, showTypeIn, isFun,
+  renderIn, renderResultIn, spelling
 )
 use MeadowBoot.Solve (Generalized)
 use Lingua.Lang (metaStart, metaEnd)
@@ -64,7 +64,9 @@ use Std.Exn (toResult)
 use Std.Sort (sortOn, sortBy)
 use Std.Ordering (Ordering)
 use MeadowBoot.Unit (stdDir, sourcesOf)
-use MeadowBoot.Types (Arena, newArena, fresh, freshQuantifiers, substBound, snapshot, rollback, unify)
+use MeadowBoot.Types (
+  Arena, newArena, fresh, freshQuantifiers, substBound, snapshot, rollback, unify
+)
 use Std.Char as C
 
 lsp! {
@@ -139,7 +141,9 @@ fun openedAt (ed : Editor) (file : Int) (uri : String) =
          match H.lookup (keyOf root) (getRef ed.loaded) with
          | Just (l : Loaded) ->
              (match l.given with
-              | Ok g -> if V.any (\x -> keyOf (fst x) == keyOf path) (unitSources g) then Just root else None
+              | Ok g ->
+                  if V.any (\x -> keyOf (fst x) == keyOf path) (unitSources g) then Just root
+                  else None
               | Err _ -> Just root)
          | None -> None)
     | None -> None
@@ -161,9 +165,8 @@ fun aloneRoot (path : String) =
     | Just t -> t
     | None -> M.unwrapOr "." (getEnv "TMP")
   in
-  let safe =
-    S.fromChars (V.map (\c -> if C.isAlphaNum c then c else '_') (S.chars (keyOf path)))
-  in Path.joinAll [tmp, "meadowboot-lsp", safe]
+  let safe = S.fromChars (V.map (\c -> if C.isAlphaNum c then c else '_') (S.chars (keyOf path))) in
+  Path.joinAll [tmp, "meadowboot-lsp", safe]
 
 -- Whether `root` is a package made for one document alone.
 fun isAlone (root : String) : Bool = S.contains "meadowboot-lsp" root
@@ -188,7 +191,12 @@ fun textAt (ed : Editor) (file : Int) (t : String) =
       let made =
         if isAlone d.root and M.isNone (H.lookup (keyOf d.root) (getRef ed.loaded)) then
           (let a = createDirAll (Path.join d.root "src") in
-           let b = writeString (Path.join d.root "Meadow.toml", "[package]\nname = \"main\"\nversion = \"0.1.0\"\n") in
+           let b =
+             writeString (
+               Path.join d.root "Meadow.toml",
+               "[package]\nname = \"main\"\nversion = \"0.1.0\"\n"
+             )
+           in
            let c = writeString (d.known, t) in
            load ed d.root)
         else ()
@@ -227,7 +235,8 @@ fun studyOf (ed : Editor) (root : String) =
             | Ok g ->
                 (let made = toResult (\() -> studied ed g) in
                  match made with
-                 | Ok s -> (let u = setRef ed.studies (H.insert k (n, s) (getRef ed.studies)) in Just s)
+                 | Ok s ->
+                     (let u = setRef ed.studies (H.insert k (n, s) (getRef ed.studies)) in Just s)
                  | Err _ -> None)
             | Err _ -> None)
        | None -> None)
@@ -284,19 +293,19 @@ fun viewAt (ed : Editor) (file : Int) (uri : String) (text : String) =
         (let root = d.root in
          if S.isEmpty root then None
          else
-             (let n = H.getOr 0 (keyOf root) (getRef ed.edits) in
-              match H.lookup file (getRef ed.views) with
-              | Just (m, v) if m == n -> Just v
-              | _ ->
-                  (match studyOf ed root with
-                   | None -> None
-                   | Just (s : Study) ->
-                       (match V.find (\x -> keyOf (fst x) == keyOf d.known) s.sources with
-                        | None -> None
-                        | Just (_, (src : Source)) ->
-                            (let v = viewIn uri d.path text (srcFile src) s in
-                             let u = setRef ed.views (H.insert file (n, v) (getRef ed.views)) in
-                             Just v)))))
+           (let n = H.getOr 0 (keyOf root) (getRef ed.edits) in
+            match H.lookup file (getRef ed.views) with
+            | Just (m, v) if m == n -> Just v
+            | _ ->
+                (match studyOf ed root with
+                 | None -> None
+                 | Just (s : Study) ->
+                     (match V.find (\x -> keyOf (fst x) == keyOf d.known) s.sources with
+                      | None -> None
+                      | Just (_, (src : Source)) ->
+                          (let v = viewIn uri d.path text (srcFile src) s in
+                           let u = setRef ed.views (H.insert file (n, v) (getRef ed.views)) in
+                           Just v)))))
 
 fun viewIn (uri : String) (path : String) (text : String) (file : String) (s : Study) : View =
   let binders = s.renamed.binders in
@@ -306,7 +315,10 @@ fun viewIn (uri : String) (path : String) (text : String) (file : String) (s : S
     \from to ->
       to > from
         and to <= stringByteLength text
-        and not (V.any (\c -> c == ' ' or c == '\n' or c == '\t' or c == '\r') (S.chars (stringSlice text from to)))
+        and not
+          (V.any
+             (\c -> c == ' ' or c == '\n' or c == '\t' or c == '\r')
+             (S.chars (stringSlice text from to)))
   in
   let kept = \from to -> to > from and (not (inside from) or isName from to) in
   let uses =
@@ -330,8 +342,9 @@ fun viewIn (uri : String) (path : String) (text : String) (file : String) (s : S
           -- Only a name written there: what a derive declares stands at the
           -- derive, and is not written anywhere.
           | Just (f, from, to) ->
-              if f == file and to <= stringByteLength text and stringSlice text from to == b.name then
-                [(from, to, id)]
+              if f == file
+                and to <= stringByteLength text
+                and stringSlice text from to == b.name then [(from, to, id)]
               else []
           | None -> [])
       (V.range 0 (V.len binders))
@@ -342,7 +355,12 @@ fun viewIn (uri : String) (path : String) (text : String) (file : String) (s : S
        text,
        package = M.unwrapOr "" (V.get (S.split "/" file) 0),
        study = s,
-       refs = V.concatMap (\x -> match x with | (f, t, id, k) -> if k == "v" then [(f, t, id)] else []) uses,
+       refs =
+         V.concatMap
+           (\x ->
+             match x with
+             | (f, t, id, k) -> if k == "v" then [(f, t, id)] else [])
+           uses,
        names = V.filter (\x -> match x with | (_, _, _, k) -> k != "v") uses,
        defs,
        calls,
@@ -352,13 +370,25 @@ fun viewIn (uri : String) (path : String) (text : String) (file : String) (s : S
            (M.unwrapOr "" (V.get (S.split "/" file) 0))
            (V.map (\(d : Declared) -> d.path) s.renamed.modules)
            calls,
-       typing = patched s file text (V.concatMap (\x -> match x with | (f, t, id, k) -> if k == "v" then [(f, t, id)] else []) uses) (typingOf s file),
+       typing =
+         patched
+           s
+           file
+           text
+           (V.concatMap
+              (\x ->
+                match x with
+                | (f, t, id, k) -> if k == "v" then [(f, t, id)] else [])
+              uses)
+           (typingOf s file),
        canons =
          V.foldl
            (\h (i : Item) ->
              if i.kind == "c" and not (S.isEmpty i.canon) then H.insert i.id i.canon h else h)
            H.empty
-           (V.append (V.concatMap (\(d : Declared) -> d.items) s.renamed.modules) s.renamed.depItems)
+           (V.append
+              (V.concatMap (\(d : Declared) -> d.items) s.renamed.modules)
+              s.renamed.depItems)
      }
 
 fun emptyBinder () : Binder = Binder { name = "", kind = "", site = "-", uses = [], until = 0 - 1 }
@@ -403,8 +433,10 @@ fun macroCalls (text : String) : [(Int, Int)] =
       let last = V.getOr (V.len toks) firsts (k + 1) - 1 in
       if last < first then []
       else if isCall toks first last then
-        [((V.getOr (Lexed { token = Token.Error, from = 0, to = 0 }) toks first).from,
-          (V.getOr (Lexed { token = Token.Error, from = 0, to = 0 }) toks last).to)]
+        [(
+          (V.getOr (Lexed { token = Token.Error, from = 0, to = 0 }) toks first).from,
+          (V.getOr (Lexed { token = Token.Error, from = 0, to = 0 }) toks last).to
+        )]
       else [])
     (V.range 0 (V.len firsts))
 
@@ -442,19 +474,17 @@ fun isCall (toks : [Lexed]) (first : Int) (last : Int) : Bool =
      | (i, derives) ->
          derives
            or (match (tok i, tok (i + 1)) with
-               | (Token.LowerIdent _, Token.Bang) -> True
-               | (Token.LowerIdent _, Token.DeclBang) -> True
-               | (Token.UpperIdent _, Token.Bang) -> True
-               | (Token.UpperIdent _, Token.DeclBang) -> True
-               | _ -> False)
+            | (Token.LowerIdent _, Token.Bang) -> True
+            | (Token.LowerIdent _, Token.DeclBang) -> True
+            | (Token.UpperIdent _, Token.Bang) -> True
+            | (Token.UpperIdent _, Token.DeclBang) -> True
+            | _ -> False)
 
 -- The token after the bracket that closes the one at `i`.
 fun closing tok (i : Int) (last : Int) : Int =
   let rec go (j : Int) (depth : Int) =
     if j > last then j
-    else
-      (let d = depth + bracket (tok j) in
-       if d == 0 then j + 1 else go (j + 1) d)
+    else (let d = depth + bracket (tok j) in if d == 0 then j + 1 else go (j + 1) d)
   in go i 0
 
 -- --- places ------------------------------------------------------------------
@@ -492,8 +522,7 @@ fun pathNamed (v : View) (file : String) =
              (let p = Path.joinAll [home, "std", stdVersion, "Std", S.drop rest 4] in
               if exists p then Just p else None))
            (meadowHome ())
-       else
-         M.map (\x -> Path.join (snd x) rest) (V.find (\x -> fst x == pkg) v.study.homes))
+       else M.map (\x -> Path.join (snd x) rest) (V.find (\x -> fst x == pkg) v.study.homes))
 
 -- A path as a `file:` uri, as the Rust server writes one (`path_to_uri`):
 -- `/` between its parts, a drive's letter capital, and every byte that is
@@ -524,9 +553,9 @@ fun pathNamed (v : View) (file : String) =
             or b == 126
             or b == 47
             or b == 58
-        in
-        if keep then stringSlice p i (i + 1)
-        else "%" ++ stringSlice hex (b / 16) (b / 16 + 1) ++ stringSlice hex (b % 16) (b % 16 + 1))
+        in if keep then stringSlice p i (i + 1)
+           else
+             "%" ++ stringSlice hex (b / 16) (b / 16 + 1) ++ stringSlice hex (b % 16) (b % 16 + 1))
       (V.range 0 (stringByteLength p))
   in prefix ++ S.concatAll pieces
 
@@ -538,7 +567,9 @@ fun locationOf (ed : Editor) (v : View) (file : String) (from : Int) (to : Int) 
   else
     M.andThen
       (\path ->
-        (let open = V.find (\(d : Doc) -> keyOf d.known == keyOf path) (H.values (getRef ed.docs)) in
+        (let open =
+           V.find (\(d : Doc) -> keyOf d.known == keyOf path) (H.values (getRef ed.docs))
+         in
          let text =
            match open with
            | Just (d : Doc) -> Just d.text
@@ -625,13 +656,12 @@ fun studiedWrong (s : Study) (d : Doc) =
     V.concatMap
       (\x ->
         if keyOf (fst x) != keyOf d.known then []
-        else
-          V.map
-            (\e -> Diagnostic Severity.Error (snd e) (Meta (fst e) (fst e)) [] [])
-            (snd x))
+        else V.map (\e -> Diagnostic Severity.Error (snd e) (Meta (fst e) (fst e)) [] []) (snd x))
       s.parsed
   in
-  let grouped = V.concatMap (\x -> if keyOf (fst x) == keyOf d.known then snd x else []) s.grouped in
+  let grouped =
+    V.concatMap (\x -> if keyOf (fst x) == keyOf d.known then snd x else []) s.grouped
+  in
   let file =
     M.unwrapOr
       ""
@@ -678,7 +708,9 @@ fun valueAt (v : View) (o : Int) : Maybe Int =
      | None ->
          (let declared =
             V.filter
-              (\d -> match d with | (f, t, _) -> covers f t o and isWord v.text f t)
+              (\d ->
+                match d with
+                | (f, t, _) -> covers f t o and isWord v.text f t)
               v.defs
           in M.map
                (\d -> match d with | (_, _, id) -> id)
@@ -694,7 +726,10 @@ fun valueAt (v : View) (o : Int) : Maybe Int =
 fun isWord (text : String) (from : Int) (to : Int) : Bool =
   to > from
     and to <= stringByteLength text
-    and not (V.any (\c -> c == ' ' or c == '\n' or c == '\t' or c == '\r') (S.chars (stringSlice text from to)))
+    and not
+      (V.any
+         (\c -> c == ' ' or c == '\n' or c == '\t' or c == '\r')
+         (S.chars (stringSlice text from to)))
 
 -- The types, constructors and modules mentioned around `o`, innermost
 -- first.
@@ -723,8 +758,9 @@ fun binderOf (v : View) (id : Int) : Binder = V.getOr (emptyBinder ()) v.study.r
 fun declaredAt (v : View) (id : Int) : Maybe (String, Int, Int) =
   match siteOf (binderOf v id) with
   | Just (f, from, to) ->
-      if f == v.file or S.startsWith "Std/" f or V.any (\x -> srcFile (snd x) == f) v.study.sources then
-        Just (f, from, to)
+      if f == v.file
+        or S.startsWith "Std/" f
+        or V.any (\x -> srcFile (snd x) == f) v.study.sources then Just (f, from, to)
       else None
   | None -> None
 
@@ -773,9 +809,7 @@ fun definitionOf (ed : Editor) (a : Asked) =
               | None ->
                   M.unwrapOr
                     (J.jNull ())
-                    (M.andThen
-                       (fieldPlace ed v)
-                       (fieldDeclaredAt v a.offset)))
+                    (M.andThen (fieldPlace ed v) (fieldDeclaredAt v a.offset)))
 
 -- --- rename ------------------------------------------------------------------
 
@@ -793,10 +827,9 @@ fun renameTarget (v : View) (o : Int) : Result String (Int, Int, Int, Bool) =
             M.map
               (\d -> match d with | (f, t, _) -> (f, t))
               (V.find (\d -> match d with | (_, _, i) -> i == id) v.defs)
-      in
-      (match span with
-       | None -> Err "nothing to rename here"
-       | Just (f, t) -> targetIn v f t id True)
+      in (match span with
+          | None -> Err "nothing to rename here"
+          | Just (f, t) -> targetIn v f t id True)
   | None ->
       (match V.get (namesAt v o) 0 with
        | None -> Err "nothing to rename here"
@@ -873,7 +906,9 @@ fun renamed (ed : Editor) (v : View) (id : Int) (new : String) =
   -- package's as the renamer wrote them.
   let mine =
     V.concatMap
-      (\r -> match r with | (f, t, i) -> if i == id then [(v.file, f, t)] else [])
+      (\r ->
+        match r with
+        | (f, t, i) -> if i == id then [(v.file, f, t)] else [])
       (V.append v.refs (V.map (\n -> match n with | (f, t, i, _) -> (f, t, i)) v.names))
   in
   let theirs =
@@ -881,13 +916,18 @@ fun renamed (ed : Editor) (v : View) (id : Int) (new : String) =
       (\u ->
         match u with
         | (f, from, to) ->
-            v.package != "Std" and f != v.file and to > from and V.any (\x -> srcFile (snd x) == f) v.study.sources)
+            v.package != "Std"
+              and f != v.file
+              and to > from
+              and V.any (\x -> srcFile (snd x) == f) v.study.sources)
       b.uses
   in
   let every = V.concat [site, mine, theirs] in
   let files =
     V.foldl
-      (\acc x -> match x with | (f, _, _) -> if V.elem f acc then acc else V.pushBack acc f)
+      (\acc x ->
+        match x with
+        | (f, _, _) -> if V.elem f acc then acc else V.pushBack acc f)
       []
       every
   in
@@ -899,23 +939,24 @@ fun renamed (ed : Editor) (v : View) (id : Int) (new : String) =
             (sortOn
                (\x -> x)
                (V.concatMap
-                  (\x -> match x with | (g, from, to) -> if g == f then [(from, to)] else [])
+                  (\x ->
+                    match x with
+                    | (g, from, to) -> if g == f then [(from, to)] else [])
                   every))
-        in
-        match textAndUri ed v f with
-        | Just (uri, text) ->
-            [(
-              uri,
-              J.jArray
-                (V.map
-                   (\s ->
-                     J.jObject [
-                       ("range", rangeJson text (lineStarts text) (Meta (fst s) (snd s))),
-                       ("newText", J.jString new)
-                     ])
-                   spans)
-            )]
-        | None -> [])
+        in match textAndUri ed v f with
+           | Just (uri, text) ->
+               [(
+                 uri,
+                 J.jArray
+                   (V.map
+                      (\s ->
+                        J.jObject [
+                          ("range", rangeJson text (lineStarts text) (Meta (fst s) (snd s))),
+                          ("newText", J.jString new)
+                        ])
+                      spans)
+               )]
+           | None -> [])
       files
   in J.jObject [("changes", J.jObject changes)]
 
@@ -929,10 +970,11 @@ fun textAndUri (ed : Editor) (v : View) (file : String) =
   else
     M.andThen
       (\path ->
-        (let open = V.find (\(d : Doc) -> keyOf d.known == keyOf path) (H.values (getRef ed.docs)) in
-         match open with
-         | Just (d : Doc) -> Just (uriOfPath path, d.text)
-         | None -> M.map (\t -> (uriOfPath path, t)) (Res.toMaybe (readToString path))))
+        (let open =
+           V.find (\(d : Doc) -> keyOf d.known == keyOf path) (H.values (getRef ed.docs))
+         in match open with
+            | Just (d : Doc) -> Just (uriOfPath path, d.text)
+            | None -> M.map (\t -> (uriOfPath path, t)) (Res.toMaybe (readToString path))))
       (pathNamed v file)
 
 -- --- semantic tokens -----------------------------------------------------------
@@ -969,7 +1011,9 @@ fun tokensOf (ed : Editor) (a : Asked) =
       -- The last noted of those at one place: a `use`'s path is noted as
       -- modules first, and a type it reaches -- `use M.Ty.*` -- after.
       let named = V.foldl (\m n -> match n with | (f, _, _, k) -> H.insert f k m) H.empty v.names in
-      let moduled = V.foldl (\m x -> match x with | (f, _, _) -> H.insert f "m" m) H.empty v.modules in
+      let moduled =
+        V.foldl (\m x -> match x with | (f, _, _) -> H.insert f "m" m) H.empty v.modules
+      in
       let functions = functionsOf v in
       let scope = scopeOf v in
       let classified =
@@ -998,7 +1042,7 @@ fun tokensOf (ed : Editor) (a : Asked) =
                          -- qualifier's module after the name it qualifies, and a
                          -- `use`'s path before what it brings.
                          (match (if not inUse2 and H.member t.from moduled then Just "m"
-                                 else M.orElse (H.lookup t.from moduled) (H.lookup t.from named)) with
+                           else M.orElse (H.lookup t.from moduled) (H.lookup t.from named)) with
                           | Just k ->
                               Just
                                 (if k == "c" then "enumMember"
@@ -1013,10 +1057,9 @@ fun tokensOf (ed : Editor) (a : Asked) =
                    | Token.LowerIdent _ ->
                        Just (if H.member (t.from, t.to) functions then "function" else "variable")
                    | other -> fixedClass other
-                 in
-                 match kind with
-                 | Just k -> (inUse2, V.pushBack out (t.from, t.to, classIndex k))
-                 | None -> (inUse2, out)))
+                 in match kind with
+                    | Just k -> (inUse2, V.pushBack out (t.from, t.to, classIndex k))
+                    | None -> (inUse2, out)))
           (False, [])
           (V.range 0 (V.len toks))
       in
@@ -1110,7 +1153,9 @@ fun encoded (placed : [(Int, Int, Int, Int)]) : [Int] =
 fun functionsOf (v : View) : HashMap (Int, Int) Bool =
   let typed =
     V.foldl
-      (\h x -> match x with | (f, t, ty) -> if isFun ty then H.insert (f, t) True h else h)
+      (\h x ->
+        match x with
+        | (f, t, ty) -> if isFun ty then H.insert (f, t) True h else h)
       H.empty
       v.typing.nodes
   in
@@ -1207,8 +1252,6 @@ fun backToLine (s : String) (k : Int) : Int =
 
 -- --- not yet answered as the Rust server answers ------------------------------
 
-
-
 -- What the server read of the document asked about: MeadowBoot's own
 -- request, for finding out why it answers as it does.
 fun viewDump (ed : Editor) (a : Asked) =
@@ -1233,21 +1276,38 @@ fun viewDump (ed : Editor) (a : Asked) =
       let line = \i -> "${(binderOf v i).name} ${(binderOf v i).kind} ${(binderOf v i).site}" in
       J.jObject [
         ("file", J.jString v.file),
-        ("sources", J.jArray (V.map (\x -> J.jString "${fst x} = ${srcFile (snd x)}") v.study.sources)),
+        (
+          "sources",
+          J.jArray (V.map (\x -> J.jString "${fst x} = ${srcFile (snd x)}") v.study.sources)
+        ),
         ("homes", J.jArray (V.map (\x -> J.jString "${fst x} = ${snd x}") v.study.homes)),
         ("binders", J.jInt (V.len v.study.renamed.binders)),
         (
           "refs",
-          J.jArray (V.map (\r -> match r with | (f, t, i) -> J.jString "${show f} ${show t} ${line i}") v.refs)
+          J.jArray
+            (V.map
+               (\r ->
+                 match r with
+                 | (f, t, i) -> J.jString "${show f} ${show t} ${line i}")
+               v.refs)
         ),
         (
           "names",
           J.jArray
-            (V.map (\r -> match r with | (f, t, i, k) -> J.jString "${show f} ${show t} ${line i}") v.names)
+            (V.map
+               (\r ->
+                 match r with
+                 | (f, t, i, k) -> J.jString "${show f} ${show t} ${line i}")
+               v.names)
         ),
         (
           "defs",
-          J.jArray (V.map (\r -> match r with | (f, t, i) -> J.jString "${show f} ${show t} ${line i}") v.defs)
+          J.jArray
+            (V.map
+               (\r ->
+                 match r with
+                 | (f, t, i) -> J.jString "${show f} ${show t} ${line i}")
+               v.defs)
         ),
         ("calls", J.jArray (V.map (\c -> J.jString "${show (fst c)} ${show (snd c)}") v.calls)),
         ("said", J.jArray (V.map J.jString v.study.inferred.said)),
@@ -1255,7 +1315,9 @@ fun viewDump (ed : Editor) (a : Asked) =
           "vars",
           J.jArray
             (V.map
-               (\x -> match x with | (f, t, id, ty) -> J.jString "${show f} ${show t} ${show id} ${showType ty}")
+               (\x ->
+                 match x with
+                 | (f, t, id, ty) -> J.jString "${show f} ${show t} ${show id} ${showType ty}")
                v.typing.vars)
         )
       ]
@@ -1353,7 +1415,9 @@ fun moduleRefs (text : String) (pkg : String) (own : [[String]]) (calls : [(Int,
         let t = V.getOr noToken toks i in
         match t.token with
         | Token.UpperIdent n ->
-            if inside t.from or V.elem t.from inUse or not (isPeriod (V.getOr noToken toks (i + 1)).token) then []
+            if inside t.from
+              or V.elem t.from inUse
+              or not (isPeriod (V.getOr noToken toks (i + 1)).token) then []
             else
               (match H.lookup n aliases with
                | Just m -> [(t.from, t.to, m)]
@@ -1373,8 +1437,7 @@ fun moduleFile (v : View) (m : String) : Maybe String =
       (V.find (\(d : Declared) -> d.path == V.drop segs 1) v.study.renamed.modules)
   else if first == "Std" then
     Just
-      (if V.len segs == 1 then "Std/src/Prelude.mw"
-       else "Std/src/${S.join "/" (V.drop segs 1)}.mw")
+      (if V.len segs == 1 then "Std/src/Prelude.mw" else "Std/src/${S.join "/" (V.drop segs 1)}.mw")
   else None
 
 -- --- what is wrong, by name -------------------------------------------------------
@@ -1389,31 +1452,31 @@ fun undeclared (v : View) : [Diagnostic] =
         if S.startsWith "?" b.site and b.name != "?" then Just "undefined variable: "
         else if S.isEmpty b.name and b.site == "-" and b.kind == "t" and b.until < 0 then
           Just "unknown type "
-        else if S.isEmpty b.name and b.site == "-" and b.kind == "c" then Just "unknown constructor "
+        else if S.isEmpty b.name and b.site == "-" and b.kind == "c" then
+          Just "unknown constructor "
         else if S.isEmpty b.name and b.site == "-" and b.kind == "m" then Just "no module "
         else None
-      in
-      match says with
-      | None -> []
-      | Just what ->
-          V.concatMap
-            (\u ->
-              match u with
-              | (f, from, to) ->
-                  if f != v.file or to > stringByteLength v.text then []
-                  else
-                    (let written = stringSlice v.text from to in
-                     if S.isEmpty b.name
-                       and b.kind != "m"
-                       and (not (named written) or V.elem written builtinTyconNames) then []
+      in match says with
+         | None -> []
+         | Just what ->
+             V.concatMap
+               (\u ->
+                 match u with
+                 | (f, from, to) ->
+                     if f != v.file or to > stringByteLength v.text then []
                      else
-                       [Diagnostic
-                          Severity.Error
-                          (what ++ (if S.isEmpty b.name then "`${written}`" else b.name))
-                          (Meta from to)
-                          []
-                          []]))
-            b.uses)
+                       (let written = stringSlice v.text from to in
+                        if S.isEmpty b.name
+                          and b.kind != "m"
+                          and (not (named written) or V.elem written builtinTyconNames) then []
+                        else
+                          [Diagnostic
+                             Severity.Error
+                             (what ++ (if S.isEmpty b.name then "`${written}`" else b.name))
+                             (Meta from to)
+                             []
+                             []]))
+               b.uses)
     v.study.renamed.binders
 
 -- --- types, as inference left them ------------------------------------------------
@@ -1451,11 +1514,14 @@ def noTyping : Typing =
   }
 
 fun typingOf (s : Study) (file : String) : Typing =
-  match V.find (\k -> M.map fst (V.get s.renamed.programs k) == Just file) (V.range 0 (V.len s.renamed.programs)) with
+  match V.find
+    (\k -> M.map fst (V.get s.renamed.programs k) == Just file)
+    (V.range 0 (V.len s.renamed.programs)) with
   | None -> noTyping
   | Just k ->
       (match V.get s.inferred.typed k with
-       | Just (TypedProgram a root) -> V.foldl (\acc d -> typedDecl a d acc) noTyping (typedModuleDecls a root)
+       | Just (TypedProgram a root) ->
+           V.foldl (\acc d -> typedDecl a d acc) noTyping (typedModuleDecls a root)
        | None -> noTyping)
 
 fun typedDecl (a : TypedArena) (d : TypedDecl) (acc : Typing) : Typing =
@@ -1513,7 +1579,15 @@ fun typedPat (a : TypedArena) (p : TypedPat) (acc : Typing) : Typing =
   | TypedPatView.List r -> V.foldl (\x q -> typedPat a q x) here r.items
   | TypedPatView.Record r ->
       V.foldl
-        (\x f -> typedPat a (typedPatFieldPat a f) (fieldAt x (metaTypedName a (typedPatFieldName a f)) t (typedNameText a (typedPatFieldName a f))))
+        (\x f ->
+          typedPat
+            a
+            (typedPatFieldPat a f)
+            (fieldAt
+               x
+               (metaTypedName a (typedPatFieldName a f))
+               t
+               (typedNameText a (typedPatFieldName a f))))
         here
         r.fields
   | TypedPatView.View r -> typedPat a r.pat (typedExpr a r.fn here)
@@ -1554,13 +1628,16 @@ fun typedExpr (a : TypedArena) (e : TypedExpr) (acc : Typing) : Typing =
             typedExpr
               a
               (typedExprFieldValue a f)
-              (fieldAt t (metaTypedName a (typedExprFieldName a f)) ty (typedNameText a (typedExprFieldName a f))))
+              (fieldAt
+                 t
+                 (metaTypedName a (typedExprFieldName a f))
+                 ty
+                 (typedNameText a (typedExprFieldName a f))))
           here
           r.fields
-      in
-      (match r.base with
-       | Just b -> typedExpr a b fields
-       | None -> fields)
+      in (match r.base with
+          | Just b -> typedExpr a b fields
+          | None -> fields)
   | TypedExprView.Update r ->
       let ty = typTypedExpr a r.base in
       V.foldl
@@ -1568,11 +1645,18 @@ fun typedExpr (a : TypedArena) (e : TypedExpr) (acc : Typing) : Typing =
           typedExpr
             a
             (typedExprFieldValue a f)
-            (fieldAt t (metaTypedName a (typedExprFieldName a f)) ty (typedNameText a (typedExprFieldName a f))))
+            (fieldAt
+               t
+               (metaTypedName a (typedExprFieldName a f))
+               ty
+               (typedNameText a (typedExprFieldName a f))))
         (typedExpr a r.base here)
         r.fields
   | TypedExprView.Proj r ->
-      typedExpr a r.target (fieldAt here (metaTypedName a r.label) (typTypedExpr a r.target) (typedNameText a r.label))
+      typedExpr
+        a
+        r.target
+        (fieldAt here (metaTypedName a r.label) (typTypedExpr a r.target) (typedNameText a r.label))
   | TypedExprView.Handle r ->
       let body = typedExpr a r.body here in
       let arms =
@@ -1580,10 +1664,9 @@ fun typedExpr (a : TypedArena) (e : TypedExpr) (acc : Typing) : Typing =
           (\t h -> typedExpr a (typedHArmBody a h) (typedPat a (typedHArmParam a h) t))
           body
           r.arms
-      in
-      (match r.ret with
-       | Just x -> typedExpr a (typedRetBody a x) (typedPat a (typedRetPat a x) arms)
-       | None -> arms)
+      in (match r.ret with
+          | Just x -> typedExpr a (typedRetBody a x) (typedPat a (typedRetPat a x) arms)
+          | None -> arms)
   | _ -> here
 
 -- --- hover ---------------------------------------------------------------------
@@ -1599,7 +1682,8 @@ fun hoverOf (ed : Editor) (a : Asked) =
       (match hoverText v a.offset with
        | None -> J.jNull ()
        | Just md ->
-           J.jObject [("contents", J.jObject [("kind", J.jString "markdown"), ("value", J.jString md)])])
+           J.jObject
+             [("contents", J.jObject [("kind", J.jString "markdown"), ("value", J.jString md)])])
 
 fun hoverText (v : View) (o : Int) : Maybe String =
   let innermost = V.get (namesAt v o) 0 in
@@ -1615,21 +1699,19 @@ fun hoverText (v : View) (o : Int) : Maybe String =
              | Just n -> Just "${spellName n} : ${showScheme sc}"
              | None -> Just (showScheme sc))
         | _ -> M.map showType (typeAt v o)
-      in
-      M.map
-        (\sig ->
-          let doc =
-            M.andThen
-              (\id ->
-                M.andThen
-                  (\d -> match d with | (from, _, _) -> docAbove v.text from)
-                  (V.find (\d -> match d with | (_, _, i) -> i == id) v.defs))
-              var
-          in
-          match doc with
-          | Just text -> "```meadow\n${sig}\n```\n\n---\n\n${text}"
-          | None -> "```meadow\n${sig}\n```")
-        signature
+      in M.map
+           (\sig ->
+             let doc =
+               M.andThen
+                 (\id ->
+                   M.andThen
+                     (\d -> match d with | (from, _, _) -> docAbove v.text from)
+                     (V.find (\d -> match d with | (_, _, i) -> i == id) v.defs))
+                 var
+             in match doc with
+                | Just text -> "```meadow\n${sig}\n```\n\n---\n\n${text}"
+                | None -> "```meadow\n${sig}\n```")
+           signature
 
 -- What a binding of the package came to: generalized, or as the package
 -- exports it.
@@ -1662,7 +1744,8 @@ fun bindingName (v : View) (id : Int) : Maybe String =
       (match exported with
        | Just n -> Just n
        | None ->
-           if V.any (\d -> match d with | (_, _, i) -> i == id) v.defs then Just (binderOf v id).name
+           if V.any (\d -> match d with | (_, _, i) -> i == id) v.defs then
+             Just (binderOf v id).name
            else None)
 
 -- A name as a person writes it: an operator's in brackets, `(+)`.
@@ -1694,7 +1777,9 @@ fun ctorPath (v : View) (id : Int) : String =
   let b = binderOf v id in
   match (H.lookup id v.canons, siteOf b) with
   | (Just c, Just (f, _, _)) ->
-      S.join "." (V.concat [[M.unwrapOr "" (V.get (S.split "/" f) 0)], modulePathOf v f, [ctorSpelling c]])
+      S.join
+        "."
+        (V.concat [[M.unwrapOr "" (V.get (S.split "/" f) 0)], modulePathOf v f, [ctorSpelling c]])
   | (Just c, None) -> ctorSpelling c
   | _ ->
       if b.name == "True" or b.name == "False" then "Bool.${b.name}"
@@ -1768,32 +1853,31 @@ fun lensesOf (ed : Editor) (a : Asked) =
                        ]
                      )
                    ]
-                 in
-                 match test with
-                 | Just qualified ->
-                     [
-                       J.jObject [
-                         ("range", range),
-                         (
-                           "command",
-                           J.jObject [
-                             ("title", J.jString "▶ Test"),
-                             ("command", J.jString "meadow.testFunction"),
-                             (
-                               "arguments",
-                               J.jArray
-                                 [J.jObject [
-                                    ("uri", J.jString v.uri),
-                                    ("name", J.jString b.name),
-                                    ("test", J.jString qualified)
-                                  ]]
-                             )
-                           ]
-                         )
-                       ],
-                       debug
-                     ]
-                 | None -> [debug])
+                 in match test with
+                    | Just qualified ->
+                        [
+                          J.jObject [
+                            ("range", range),
+                            (
+                              "command",
+                              J.jObject [
+                                ("title", J.jString "▶ Test"),
+                                ("command", J.jString "meadow.testFunction"),
+                                (
+                                  "arguments",
+                                  J.jArray
+                                    [J.jObject [
+                                       ("uri", J.jString v.uri),
+                                       ("name", J.jString b.name),
+                                       ("test", J.jString qualified)
+                                     ]]
+                                )
+                              ]
+                            )
+                          ],
+                          debug
+                        ]
+                    | None -> [debug])
            (functionsIn v))
 
 -- The document's top-level definitions, each its binder, where its name is
@@ -1808,25 +1892,24 @@ fun functionsIn (v : View) : [(Int, Int, Int, Int, Maybe String)] =
       (M.map
          (\(d : Declared) -> d.path)
          (V.find (\(d : Declared) -> d.file == v.file) v.study.renamed.modules))
-  in
-  V.concatMap
-    (\top ->
-      match top with
-      | (id, params) ->
-          let b = binderOf v id in
-          (match siteOf b with
-           | Just (f, from, to) ->
-               if f != v.file or V.any (\c -> fst c <= from and from <= snd c) v.calls then []
-               else
-                 [(
-                   id,
-                   from,
-                   to,
-                   params,
-                   if V.elem b.name tests then Just (qualifiedTest v path b.name) else None
-                 )]
-           | None -> []))
-    v.typing.tops
+  in V.concatMap
+       (\top ->
+         match top with
+         | (id, params) ->
+             let b = binderOf v id in
+             (match siteOf b with
+              | Just (f, from, to) ->
+                  if f != v.file or V.any (\c -> fst c <= from and from <= snd c) v.calls then []
+                  else
+                    [(
+                      id,
+                      from,
+                      to,
+                      params,
+                      if V.elem b.name tests then Just (qualifiedTest v path b.name) else None
+                    )]
+              | None -> []))
+       v.typing.tops
 
 -- A test's name as `meadow test` prints and matches it.
 fun qualifiedTest (v : View) (path : [String]) (name : String) : String =
@@ -1845,7 +1928,9 @@ fun signatureOf (v : View) (id : Int) : String =
 -- The variables of the unit's types that are over numbers, by their kind.
 fun numberClasses (v : View) : HashMap Int VarKind =
   V.foldl
-    (\h n -> match n with | (id, frac) -> H.insert id (if frac then VarKind.Frac else VarKind.Num) h)
+    (\h n ->
+      match n with
+      | (id, frac) -> H.insert id (if frac then VarKind.Frac else VarKind.Num) h)
     H.empty
     v.study.inferred.numbers
 
@@ -1884,8 +1969,12 @@ fun withoutLoneEffect (t : String) : String =
       let cs = S.chars var in
       let small = M.unwrapOr False (M.map C.isLower (V.get cs 0)) in
       let plain = V.all (\c -> C.isAlphaNum c or c == '\'') cs in
-      let words = S.split " " (S.fromChars (V.map (\c -> if C.isAlphaNum c or c == '\'' then c else ' ') (S.chars body))) in
-      if small and plain and not (V.elem var words) then body else t
+      let words =
+        S.split
+          " "
+          (S.fromChars
+             (V.map (\c -> if C.isAlphaNum c or c == '\'' then c else ' ') (S.chars body)))
+      in if small and plain and not (V.elem var words) then body else t
 
 fun lastIndexOf (needle : String) (s : String) : Maybe Int =
   let n = stringByteLength needle in
@@ -1949,10 +2038,7 @@ fun classesOf (v : View) : HashMap Int VarKind =
       V.foldl
         (\h2 i ->
           match (V.get g.scheme.quant i, V.get g.vars i) with
-          | (Just k, Just var) ->
-              (match k with
-               | VarKind.Plain -> h2
-               | _ -> H.insert var k h2)
+          | (Just k, Just var) -> (match k with | VarKind.Plain -> h2 | _ -> H.insert var k h2)
           | _ -> h2)
         h
         (V.range 0 (V.len g.scheme.quant)))
@@ -2013,11 +2099,7 @@ fun overVars (vars : [Int]) (t : Type) : Type =
 fun resultOf (cx : HintCx) (id : Int) (arity : Int) : Maybe (Type, Type) =
   let whole = fnType cx id in
   let rec peel (t : Type) (n : Int) (eff : Type) =
-    if n == 0 then Just (t, eff)
-    else
-      match t with
-      | Fun _ ret e -> peel ret (n - 1) e
-      | _ -> None
+    if n == 0 then Just (t, eff) else match t with | Fun _ ret e -> peel ret (n - 1) e | _ -> None
   in match peel whole arity RowEmpty with
      | Just (ret, Var x) -> Just (ret, if occurrences whole x <= 1 then RowEmpty else Var x)
      | other -> other
@@ -2050,7 +2132,10 @@ fun appendAt (hints : [(Int, [(String, Bool)])]) (at : Int) (parts : [(String, B
 fun noteSpellings (h : Hinting) (t : Type) : Hinting =
   match t with
   | Con name args ->
-      V.foldl (\x a -> noteSpellings x a) (withSpelled h (H.insert (spelling name) name h.spelled)) args
+      V.foldl
+        (\x a -> noteSpellings x a)
+        (withSpelled h (H.insert (spelling name) name h.spelled))
+        args
   | Tuple ts -> V.foldl (\x a -> noteSpellings x a) h ts
   | Fun ps r e -> noteSpellings (noteSpellings (V.foldl (\x a -> noteSpellings x a) h ps) r) e
   | Record row -> noteSpellings h row
@@ -2071,14 +2156,16 @@ fun hintBinder (cx : HintCx) (from : Int) (to : Int) (t : Type) (h : Hinting) : 
         let h2 = noteSpellings (withNamer h nm) t in
         withHints
           h2
-          (V.append
-             h2.hints
-             [(from, [("(", False)]), (to, V.pushBack (V.pushFront (partsOf text) (" : ", False)) (")", False))])
+          (V.append h2.hints [
+             (from, [("(", False)]),
+             (to, V.pushBack (V.pushFront (partsOf text) (" : ", False)) (")", False))
+           ])
 
 fun hintPat (cx : HintCx) (p : TypedPat) (hint : Bool) (h : Hinting) : Hinting =
   let m = metaTypedPat cx.a p in
   match viewTypedPat cx.a p with
-  | TypedPatView.Var r -> if hint then hintBinder cx (metaStart m) (metaEnd m) (typTypedPat cx.a p) h else h
+  | TypedPatView.Var r ->
+      if hint then hintBinder cx (metaStart m) (metaEnd m) (typTypedPat cx.a p) h else h
   | TypedPatView.As r ->
       let named =
         match siteOf (binderOf cx.view r.id) with
@@ -2091,7 +2178,8 @@ fun hintPat (cx : HintCx) (p : TypedPat) (hint : Bool) (h : Hinting) : Hinting =
   | TypedPatView.Array r -> V.foldl (\x q -> hintPat cx q hint x) h r.items
   | TypedPatView.Vector r -> V.foldl (\x q -> hintPat cx q hint x) h r.items
   | TypedPatView.List r -> V.foldl (\x q -> hintPat cx q hint x) h r.items
-  | TypedPatView.Record r -> V.foldl (\x f -> hintPat cx (typedPatFieldPat cx.a f) hint x) h r.fields
+  | TypedPatView.Record r ->
+      V.foldl (\x f -> hintPat cx (typedPatFieldPat cx.a f) hint x) h r.fields
   | TypedPatView.View r -> hintPat cx r.pat hint (hintExpr cx r.fn h)
   | _ -> h
 
@@ -2134,16 +2222,18 @@ fun hintExpr (cx : HintCx) (e : TypedExpr) (h : Hinting) : Hinting =
             let withParam = hintPat cx (typedHArmParam a arm) True t in
             let resume = typedHArmResume a arm in
             let withResume =
-              match (siteOf (binderOf cx.view resume), H.lookup resume cx.view.study.inferred.monos) with
+              match (
+                siteOf (binderOf cx.view resume),
+                H.lookup resume cx.view.study.inferred.monos
+              ) with
               | (Just (_, from, to), Just ty) -> hintBinder cx from to ty withParam
               | _ -> withParam
             in hintExpr cx (typedHArmBody a arm) withResume)
           body
           r.arms
-      in
-      (match r.ret with
-       | Just x -> hintExpr cx (typedRetBody a x) (hintPat cx (typedRetPat a x) True arms)
-       | None -> arms)
+      in (match r.ret with
+          | Just x -> hintExpr cx (typedRetBody a x) (hintPat cx (typedRetPat a x) True arms)
+          | None -> arms)
   | _ -> h
 
 -- A rendered type in parts, each capitalised name -- a type's or an
@@ -2156,19 +2246,27 @@ fun partsOf (rendered : String) : [(String, Bool)] =
       | (parts, text, word) ->
           if S.isEmpty word then st
           else if M.unwrapOr False (M.map C.isUpper (V.get (S.chars word) 0)) then
-            (V.pushBack (if S.isEmpty text then parts else V.pushBack parts (text, False)) (word, True), "", "")
+            (
+              V.pushBack (if S.isEmpty text then parts else V.pushBack parts (text, False)) (
+                word,
+                True
+              ),
+              "",
+              ""
+            )
           else (parts, text ++ word, "")
   in
   let done =
     V.foldl
       (\st c ->
         if ident c then (match st with | (p, t, w) -> (p, t, w ++ S.fromChars [c]))
-        else (match flush st with | (p, t, w) -> (p, t ++ S.fromChars [c], w)))
+        else
+          (match flush st with
+           | (p, t, w) -> (p, t ++ S.fromChars [c], w)))
       ([], "", "")
       (S.chars rendered)
-  in
-  match flush done with
-  | (parts, text, _) -> if S.isEmpty text then parts else V.pushBack parts (text, False)
+  in match flush done with
+     | (parts, text, _) -> if S.isEmpty text then parts else V.pushBack parts (text, False)
 
 -- The document's hints between bytes `from` and `to`, as the protocol has
 -- them: each type name in a label linked to where the type is declared.
@@ -2197,30 +2295,45 @@ fun hintsOf (ed : Editor) (a : Asked) =
                     ]])
            hinted.hints)
 
-fun posJson (p : (Int, Int)) : Json = J.jObject [("line", J.jInt (fst p)), ("character", J.jInt (snd p))]
+fun posJson (p : (Int, Int)) : Json =
+  J.jObject [("line", J.jInt (fst p)), ("character", J.jInt (snd p))]
 
 -- Each type the package and what it depends on declare, by its canonical
 -- name: its binder.
 fun typeSites (v : View) : HashMap String Int =
   V.foldl
-    (\h (i : Item) -> if i.kind == "t" and not (S.isEmpty i.canon) then H.insert i.canon i.id h else h)
+    (\h (i : Item) ->
+      if i.kind == "t" and not (S.isEmpty i.canon) then H.insert i.canon i.id h else h)
     H.empty
-    (V.append (V.concatMap (\(d : Declared) -> d.items) v.study.renamed.modules) v.study.renamed.depItems)
+    (V.append
+       (V.concatMap (\(d : Declared) -> d.items) v.study.renamed.modules)
+       v.study.renamed.depItems)
 
-fun labelPart ed (v : View) (types : HashMap String Int) (spelled : HashMap String String) (part : (String, Bool)) =
+fun labelPart
+    ed
+    (v : View)
+    (types : HashMap String Int)
+    (spelled : HashMap String String)
+    (part : (String, Bool)) =
   match part with
   | (text, False) -> J.jObject [("value", J.jString text)]
   | (name, True) ->
       let canonical = M.unwrapOr name (H.lookup name spelled) in
       let place =
         M.andThen
-          (\id -> M.andThen (\d -> match d with | (f, from, to) -> locationOf ed v f from to) (declaredAt v id))
+          (\id ->
+            M.andThen
+              (\d -> match d with | (f, from, to) -> locationOf ed v f from to)
+              (declaredAt v id))
           (H.lookup canonical types)
-      in
-      (match place with
-       | Just loc ->
-           J.jObject [("value", J.jString name), ("location", loc), ("tooltip", J.jString "type `${name}`")]
-       | None -> J.jObject [("value", J.jString name)])
+      in (match place with
+          | Just loc ->
+              J.jObject [
+                ("value", J.jString name),
+                ("location", loc),
+                ("tooltip", J.jString "type `${name}`")
+              ]
+          | None -> J.jObject [("value", J.jString name)])
 
 -- What inference says of the document, with a type where the renamer has a
 -- name the typed tree does not span as the Rust compiler does: a value a
@@ -2242,10 +2355,14 @@ fun isWordByte (b : Int) : Bool =
 
 fun patched (s : Study) (file : String) (text : String) (refs : [(Int, Int, Int)]) (t : Typing)
     : Typing =
-  let exact = V.foldl (\h x -> match x with | (f, to, _) -> H.insert (f, to) True h) H.empty t.nodes in
+  let exact =
+    V.foldl (\h x -> match x with | (f, to, _) -> H.insert (f, to) True h) H.empty t.nodes
+  in
   let byBinder =
     V.foldl
-      (\h x -> match x with | (_, _, id, _) -> H.insert id (V.pushBack (H.getOr [] id h) x) h)
+      (\h x ->
+        match x with
+        | (_, _, id, _) -> H.insert id (V.pushBack (H.getOr [] id h) x) h)
       H.empty
       t.vars
   in
@@ -2306,7 +2423,8 @@ fun patched (s : Study) (file : String) (text : String) (refs : [(Int, Int, Int)
 fun named (s : String) : Bool =
   match V.get (S.chars s) 0 with
   | Just c ->
-      (C.isAlpha c or c == '_') and V.all (\x -> C.isAlphaNum x or x == '_' or x == '\'') (S.chars s)
+      (C.isAlpha c or c == '_')
+        and V.all (\x -> C.isAlphaNum x or x == '_' or x == '\'') (S.chars s)
   | None -> False
 
 -- The module a file a dump names is, by its path in its package: the
@@ -2319,8 +2437,11 @@ fun modulePathOf (v : View) (file : String) : [String] =
       (let parts = S.split "/" file in
        let inner = V.drop parts 2 in
        let last = V.getOr "" inner (V.len inner - 1) in
-       let bare = V.pushBack (V.take inner (V.len inner - 1)) (if S.endsWith ".mw" last then S.take last (stringByteLength last - 3) else last) in
-       if bare == ["Main"] or bare == ["Lib"] or bare == ["Prelude"] then [] else bare)
+       let bare =
+         V.pushBack
+           (V.take inner (V.len inner - 1))
+           (if S.endsWith ".mw" last then S.take last (stringByteLength last - 3) else last)
+       in if bare == ["Main"] or bare == ["Lib"] or bare == ["Prelude"] then [] else bare)
 
 -- A canonical constructor's last two segments: its type's name and its own.
 fun ctorSpelling (canon : String) : String =
@@ -2379,7 +2500,9 @@ fun askAt (text : String) (offset : Int) : Ask =
       else
         (let trimmed = S.trimEnd before in
          if S.endsWith "|>" trimmed then
-           Ask.Piped (stringByteLength (S.trimEnd (S.take trimmed (stringByteLength trimmed - 2)))) word
+           Ask.Piped
+             (stringByteLength (S.trimEnd (S.take trimmed (stringByteLength trimmed - 2))))
+             word
          else Ask.Name word)
 
 fun lineOfText (text : String) : String =
@@ -2392,25 +2515,31 @@ fun usedRest (line : String) : Maybe String =
   let l = S.trimStart line in
   let l2 =
     if S.startsWith "@" l then
-      (match V.find (\i -> C.isSpace (V.getOr ' ' (S.chars l) i)) (V.range 0 (V.len (S.chars l))) with
+      (match V.find
+         (\i -> C.isSpace (V.getOr ' ' (S.chars l) i))
+         (V.range 0 (V.len (S.chars l))) with
        | Just i -> S.fromChars (V.drop (S.chars l) (i + 1))
        | None -> "")
     else l
   in
   let l3 = S.trimStart l2 in
-  if S.startsWith "use" l3 and stringByteLength l3 > 3 and C.isSpace (V.getOr 'x' (S.chars (S.drop l3 3)) 0) then
-    Just (S.drop l3 3)
+  if S.startsWith "use" l3
+    and stringByteLength l3 > 3
+    and C.isSpace (V.getOr 'x' (S.chars (S.drop l3 3)) 0) then Just (S.drop l3 3)
   else None
 
 fun useAsk (rest : String) (word : String) : Ask =
   match lastIndexOf "(" rest with
   | Just open ->
-      if not (S.contains ")" (S.drop rest open)) then Ask.UseNames (pathOfText (S.take rest open)) word
+      if not (S.contains ")" (S.drop rest open)) then
+        Ask.UseNames (pathOfText (S.take rest open)) word
       else useNoParen rest word
   | None -> useNoParen rest word
 
 fun useNoParen (rest : String) (word : String) : Ask =
-  if V.elem "as" (V.filter (\w -> not (S.isEmpty w)) (S.split " " (S.join " " (S.split "\t" rest)))) then
+  if V.elem
+    "as"
+    (V.filter (\w -> not (S.isEmpty w)) (S.split " " (S.join " " (S.split "\t" rest)))) then
     Ask.Nothing word
   else
     Ask.UsePath
@@ -2441,14 +2570,15 @@ fun wordCounts (text : String) (into : HashMap String Int) : HashMap String Int 
       (\acc c ->
         match acc with
         | (h, w) ->
-            if C.isAlphaNum c or c == '_' or C.code c > 127 and isWordChar c then (h, V.pushBack w c)
+            if C.isAlphaNum c or c == '_' or C.code c > 127 and isWordChar c then
+              (h, V.pushBack w c)
             else if V.isEmpty w then acc
             else (H.insert (S.fromChars w) (H.getOr 0 (S.fromChars w) h + 1) h, []))
       (into, [])
       (S.chars text)
-  in
-  match done with
-  | (h, w) -> if V.isEmpty w then h else H.insert (S.fromChars w) (H.getOr 0 (S.fromChars w) h + 1) h
+  in match done with
+     | (h, w) ->
+         if V.isEmpty w then h else H.insert (S.fromChars w) (H.getOr 0 (S.fromChars w) h + 1) h
 
 -- How often each name is written in the standard library's sources, counted
 -- once: what idiomatic Meadow reaches for.
@@ -2496,7 +2626,14 @@ fun candidatesOf (ed : Editor) (v : View) =
     V.foldl
       (\h (i : Interface) ->
         if i.package != "Std" then h
-        else V.foldl (\h2 (e : Export) -> if V.isEmpty e.module and not (S.startsWith "op:" e.owner) then H.insert e.name True h2 else h2) h i.exports)
+        else
+          V.foldl
+            (\h2 (e : Export) ->
+              if V.isEmpty e.module and not (S.startsWith "op:" e.owner) then
+                H.insert e.name True h2
+              else h2)
+            h
+            i.exports)
       H.empty
       v.study.imported
   in
@@ -2507,7 +2644,10 @@ fun candidatesOf (ed : Editor) (v : View) =
         else
           V.concatMap
             (\(e : Export) ->
-              if e.kind != "v" or not (H.member e.name flat) or startsUpper e.name or not (shown True e) then []
+              if e.kind != "v"
+                or not (H.member e.name flat)
+                or startsUpper e.name
+                or not (shown True e) then []
               else
                 match e.scheme with
                 | Just sc ->
@@ -2525,16 +2665,17 @@ fun candidatesOf (ed : Editor) (v : View) =
   in
   let sorted =
     sortBy
-      (\(x : Candidate) (y : Candidate) -> compare (x.name, x.distance, x.shown) (y.name, y.distance, y.shown))
+      (\(x : Candidate) (y : Candidate) ->
+        compare (x.name, x.distance, x.shown) (y.name, y.distance, y.shown))
       (V.append own std)
-  in
-  V.foldl
-    (\acc (c : Candidate) ->
-      match V.last acc with
-      | Just (p : Candidate) -> if p.name == c.name and p.shown == c.shown then acc else V.pushBack acc c
-      | None -> V.pushBack acc c)
-    []
-    sorted
+  in V.foldl
+       (\acc (c : Candidate) ->
+         match V.last acc with
+         | Just (p : Candidate) ->
+             if p.name == c.name and p.shown == c.shown then acc else V.pushBack acc c
+         | None -> V.pushBack acc c)
+       []
+       sorted
 
 fun startsUpper (s : String) : Bool = M.unwrapOr False (M.map C.isUpper (V.get (S.chars s) 0))
 
@@ -2559,23 +2700,50 @@ fun pipesInto (scheme : Scheme) (subject : Type) : Maybe Fit =
     let params = paramsOf ty in
     if V.isEmpty params then None
     else
-      (let generic = \t -> match t with | Var _ -> True | Bound _ -> True | _ -> False in
+      (let generic =
+         \t ->
+           match t with
+           | Var _ -> True
+           | Bound _ -> True
+           | _ -> False
+       in
        let performs =
-         \at -> V.any (\p -> match snd p with | RowEmpty -> False | Var _ -> False | _ -> True) (V.drop params at)
+         \at ->
+           V.any
+             (\p ->
+               match snd p with
+               | RowEmpty -> False
+               | Var _ -> False
+               | _ -> True)
+             (V.drop params at)
        in
        let fits =
          \at ->
            (let snap = snapshot ar in
-            let ok = match unify ar (fst (V.getOr (Error, Error) params at)) s2 with | Ok _ -> True | Err _ -> False in
+            let ok =
+              match unify ar (fst (V.getOr (Error, Error) params at)) s2 with
+              | Ok _ -> True
+              | Err _ -> False
+            in
             let u = rollback ar snap in
             ok)
-       in
-       if fits 0 then Just (Fit { last = 0, generic = generic (fst (V.getOr (Error, Error) params 0)), effectful = performs 0 })
-       else
-         (let last = V.len params - 1 in
-          if last > 0 and fits last then
-            Just (Fit { last, generic = generic (fst (V.getOr (Error, Error) params last)), effectful = performs last })
-          else None)))
+       in if fits 0 then
+            Just
+              (Fit {
+                 last = 0,
+                 generic = generic (fst (V.getOr (Error, Error) params 0)),
+                 effectful = performs 0
+               })
+          else
+            (let last = V.len params - 1 in
+             if last > 0 and fits last then
+               Just
+                 (Fit {
+                    last,
+                    generic = generic (fst (V.getOr (Error, Error) params last)),
+                    effectful = performs last
+                  })
+             else None)))
 
 -- The parameters of a curried type, each with the effect of its arrow.
 fun paramsOf (t : Type) : [(Type, Type)] =
@@ -2588,9 +2756,13 @@ fun freshened (ar : Arena s) (seen : StRef s (HashMap Int Type)) (t : Type) : Ty
   | Var id ->
       (match H.lookup id (stGetRef seen) with
        | Just x -> x
-       | None -> (let x = fresh ar in let u = stSetRef seen (H.insert id x (stGetRef seen)) in x))
+       | None ->
+           (let x = fresh ar in
+            let u = stSetRef seen (H.insert id x (stGetRef seen)) in
+            x))
   | Con n args -> Con n (V.map (freshened ar seen) args)
-  | Fun args ret eff -> Fun (V.map (freshened ar seen) args) (freshened ar seen ret) (freshened ar seen eff)
+  | Fun args ret eff ->
+      Fun (V.map (freshened ar seen) args) (freshened ar seen ret) (freshened ar seen eff)
   | Tuple items -> Tuple (V.map (freshened ar seen) items)
   | Record row -> Record (freshened ar seen row)
   | RowExtend l f rest -> RowExtend l (freshened ar seen f) (freshened ar seen rest)
@@ -2647,34 +2819,37 @@ fun completionOf (ed : Editor) (a : Asked) =
           ("start", posJson (position v.text (lineStarts v.text) start)),
           ("end", M.unwrapOr (J.jNull ()) (J.get "position" a.params))
         ]
-      in
-      J.jObject [
-        ("isIncomplete", J.jBool True),
-        (
-          "items",
-          J.jArray
-            (V.map
-               (\i ->
-                 match V.get offers i with
-                 | Just (o : Offer) ->
-                     J.jObject [
-                       ("label", J.jString o.label),
-                       ("kind", J.jInt o.kind),
-                       ("detail", J.jString o.detail),
-                       ("labelDetails", J.jObject [("description", J.jString o.from)]),
-                       ("sortText", J.jString (padded i)),
-                       ("filterText", J.jString o.label),
-                       ("insertTextFormat", J.jInt (if o.snippet then 2 else 1)),
-                       ("textEdit", J.jObject [("range", range), ("newText", J.jString o.insert)])
-                     ]
-                 | None -> J.jNull ())
-               (V.range 0 (V.len offers)))
-        )
-      ]
+      in J.jObject [
+           ("isIncomplete", J.jBool True),
+           (
+             "items",
+             J.jArray
+               (V.map
+                  (\i ->
+                    match V.get offers i with
+                    | Just (o : Offer) ->
+                        J.jObject [
+                          ("label", J.jString o.label),
+                          ("kind", J.jInt o.kind),
+                          ("detail", J.jString o.detail),
+                          ("labelDetails", J.jObject [("description", J.jString o.from)]),
+                          ("sortText", J.jString (padded i)),
+                          ("filterText", J.jString o.label),
+                          ("insertTextFormat", J.jInt (if o.snippet then 2 else 1)),
+                          (
+                            "textEdit",
+                            J.jObject [("range", range), ("newText", J.jString o.insert)]
+                          )
+                        ]
+                    | None -> J.jNull ())
+                  (V.range 0 (V.len offers)))
+           )
+         ]
 
 fun padded (i : Int) : String =
   let s = show i in
-  if stringByteLength s >= 4 then s else S.concatAll (V.map (\k -> "0") (V.range 0 (4 - stringByteLength s))) ++ s
+  if stringByteLength s >= 4 then s
+  else S.concatAll (V.map (\k -> "0") (V.range 0 (4 - stringByteLength s))) ++ s
 
 -- Every name that starts with `word`, best first: what this file uses
 -- most, then what the library does, then what is nearest.
@@ -2687,7 +2862,14 @@ fun namesOffered (ed : Editor) (v : View) (word : String) =
         else
           [(
             [0, 0, 0 - H.getOr 0 c.name used, 0 - c.common, c.distance, 0, 0],
-            Offer { label = c.name, insert = c.name, snippet = False, detail = c.shown, from = c.from, kind = 3 }
+            Offer {
+              label = c.name,
+              insert = c.name,
+              snippet = False,
+              detail = c.shown,
+              from = c.from,
+              kind = 3
+            }
           )])
       (candidatesOf ed v)
   in V.map snd (stableSort byRank ranked)
@@ -2717,7 +2899,12 @@ fun pipedOffered (ed : Editor) (v : View) (subject : Type) (word : String) =
                   label = c.name,
                   insert =
                     if f.last == 0 then c.name
-                    else S.join " " (V.pushFront (V.map (\i -> "$" ++ "{${show (i + 1)}}") (V.range 0 f.last)) c.name),
+                    else
+                      S.join
+                        " "
+                        (V.pushFront
+                           (V.map (\i -> "$" ++ "{${show (i + 1)}}") (V.range 0 f.last))
+                           c.name),
                   snippet = f.last > 0,
                   detail = c.shown,
                   from = c.from,
@@ -2765,7 +2952,10 @@ fun pathIndex (v : View) =
         h
         (V.range 0 (V.len segs))
   in
-  let isType = \(owner : String) -> owner == "data" or owner == "record" or owner == "effect" or owner == "alias" in
+  let isType =
+    \(owner : String) ->
+      owner == "data" or owner == "record" or owner == "effect" or owner == "alias"
+  in
   -- The library's modules, as what it exports says them.
   let std =
     V.foldl
@@ -2780,7 +2970,8 @@ fun pathIndex (v : View) =
               let withModules = modulesTo acc here in
               if not (shown True e) or e.kind != "v" and not declaredHere then withModules
               else if e.kind == "t" and isType e.owner then add withModules at (e.name, 22, "")
-              else if e.kind == "c" then add withModules (at ++ "." ++ e.owner) (e.name, 20, e.owner)
+              else if e.kind == "c" then
+                add withModules (at ++ "." ++ e.owner) (e.name, 20, e.owner)
               else if e.kind == "v" then
                 add withModules at (e.name, 3, M.unwrapOr "" (M.map showScheme e.scheme))
               else withModules)
@@ -2801,7 +2992,11 @@ fun pathIndex (v : View) =
           else if it.kind == "v" then
             (match V.find (\(e : Export) -> e.binder == it.id) v.study.renamed.exports with
              | Just (e : Export) ->
-                 add acc at (it.name, 3, M.unwrapOr "" (M.map showScheme (H.lookup it.id v.study.inferred.schemes)))
+                 add acc at (
+                   it.name,
+                   3,
+                   M.unwrapOr "" (M.map showScheme (H.lookup it.id v.study.inferred.schemes))
+                 )
              | None -> acc)
           else acc)
         (modulesTo h here)
@@ -2821,7 +3016,8 @@ fun endingIn (index : HashMap String [(String, Int, String)]) (written : String)
       (H.keys index)
   in sortBy (\a b -> compare (stringByteLength a, a) (stringByteLength b, b)) found
 
-fun locatePath (index : HashMap String [(String, Int, String)]) (segments : [String]) : Maybe String =
+fun locatePath (index : HashMap String [(String, Int, String)]) (segments : [String])
+    : Maybe String =
   let written = S.join "." segments in
   if S.isEmpty written or not (V.isEmpty (H.getOr [] written index)) then Just written
   else V.get (endingIn index written) 0
@@ -2833,7 +3029,9 @@ fun entriesUnder index (path : String) (kinds : [Int]) (word : String) : [Offer]
     (\out e ->
       match e with
       | (n, k, detail) ->
-          if not (V.elem k kinds) or not (S.startsWith word n) or V.any (\(o : Offer) -> o.label == n) out then out
+          if not (V.elem k kinds)
+            or not (S.startsWith word n)
+            or V.any (\(o : Offer) -> o.label == n) out then out
           else
             V.pushBack
               out
@@ -2849,9 +3047,13 @@ fun entriesUnder index (path : String) (kinds : [Int]) (word : String) : [Offer]
     (H.getOr [] path index)
 
 fun describe (k : Int) : String =
-  if k == 9 then "module" else if k == 22 then "type" else if k == 20 then "constructor" else "value"
+  if k == 9 then "module"
+  else if k == 22 then "type"
+  else if k == 20 then "constructor"
+  else "value"
 
-fun byLabel (xs : [Offer]) : [Offer] = stableSort (\(a : Offer) (b : Offer) -> compare a.label b.label) xs
+fun byLabel (xs : [Offer]) : [Offer] =
+  stableSort (\(a : Offer) (b : Offer) -> compare a.label b.label) xs
 
 -- What follows `Q.` in an expression (`member`): under the module `Q` names,
 -- its values and its types' constructors; or, `Q` a type, its
@@ -2890,11 +3092,15 @@ fun underOffered (v : View) (segments : [String]) (kinds : [Int]) (word : String
 fun aliasesIn (text : String) : HashMap String String =
   V.foldl
     (\h line ->
-      (let words = V.filter (\w -> not (S.isEmpty w)) (S.split " " (S.join " " (S.split "\t" line))) in
-       let ws = if M.unwrapOr False (M.map (\w -> S.startsWith "@" w) (V.get words 0)) then V.drop words 1 else words in
-       match (V.get ws 0, V.get ws 1, V.get ws 2, V.get ws 3) with
-       | (Just "use", Just path, Just "as", Just alias) -> H.insert alias path h
-       | _ -> h))
+      (let words =
+         V.filter (\w -> not (S.isEmpty w)) (S.split " " (S.join " " (S.split "\t" line)))
+       in
+       let ws =
+         if M.unwrapOr False (M.map (\w -> S.startsWith "@" w) (V.get words 0)) then V.drop words 1
+         else words
+       in match (V.get ws 0, V.get ws 1, V.get ws 2, V.get ws 3) with
+          | (Just "use", Just path, Just "as", Just alias) -> H.insert alias path h
+          | _ -> h))
     H.empty
     (S.lines text)
 
@@ -2904,9 +3110,8 @@ fun fieldAt (acc : Typing) (m : Meta) (t : Type) (label : String) : Typing =
     match t with
     | Con rec0 _ -> "${rec0}.${label}"
     | _ -> "*.${label}"
-  in
-  match m with
-  | Meta from to -> { acc | fields = V.pushBack acc.fields (from, to, key) }
+  in match m with
+     | Meta from to -> { acc | fields = V.pushBack acc.fields (from, to, key) }
 
 -- Where each record field of the package is declared, by its record's
 -- canonical name and its own: each file a dump names, and where in it.
@@ -2915,10 +3120,7 @@ fun fieldSites (s : Study) : HashMap String (String, Int, Int) =
     (\h k ->
       match (V.get s.renamed.programs k, V.get s.inferred.typed k, V.get s.renamed.modules k) with
       | (Just (file, _), Just (TypedProgram a root), Just (d : Declared)) ->
-          V.foldl
-            (\h2 decl -> recordFields a decl file d h2)
-            h
-            (typedModuleDecls a root)
+          V.foldl (\h2 decl -> recordFields a decl file d h2) h (typedModuleDecls a root)
       | _ -> h)
     H.empty
     (V.range 0 (V.len s.renamed.programs))
@@ -2931,14 +3133,16 @@ fun recordFields (a : TypedArena) (decl : TypedDecl) (file : String) (d : Declar
       let canon =
         M.unwrapOr
           name
-          (M.map (\(i : Item) -> i.canon) (V.find (\(i : Item) -> i.kind == "t" and i.name == name) d.items))
-      in
-      V.foldl
-        (\h2 f ->
-          match metaTypedName a (typedFieldName a f) with
-          | Meta from to -> H.insert "${canon}.${typedNameText a (typedFieldName a f)}" (file, from, to) h2)
-        h
-        r.fields
+          (M.map
+             (\(i : Item) -> i.canon)
+             (V.find (\(i : Item) -> i.kind == "t" and i.name == name) d.items))
+      in V.foldl
+           (\h2 f ->
+             match metaTypedName a (typedFieldName a f) with
+             | Meta from to ->
+                 H.insert "${canon}.${typedNameText a (typedFieldName a f)}" (file, from, to) h2)
+           h
+           r.fields
   | _ -> h
 
 -- Where the field written around `o` is declared, if anywhere this
@@ -2949,30 +3153,26 @@ fun fieldDeclaredAt (v : View) (o : Int) : Maybe (String, Int, Int) =
     stableSortBy
       (\x -> match x with | (f, t, _) -> t - f)
       (V.filter (\x -> match x with | (f, t, _) -> covers f t o) v.typing.fields)
-  in
-  match V.get around 0 with
-  | None -> None
-  | Just (_, _, key) ->
-      let sites = fieldSites v.study in
-      if S.startsWith "*." key then
-        (let suffix = S.drop key 1 in
-         let keys = sortBy (\x y -> compare x y) (V.filter (\k -> S.endsWith suffix k) (H.keys sites)) in
-         M.andThen (\k -> H.lookup k sites) (V.get keys 0))
-      else H.lookup key sites
+  in match V.get around 0 with
+     | None -> None
+     | Just (_, _, key) ->
+         let sites = fieldSites v.study in
+         if S.startsWith "*." key then
+           (let suffix = S.drop key 1 in
+            let keys =
+              sortBy (\x y -> compare x y) (V.filter (\k -> S.endsWith suffix k) (H.keys sites))
+            in M.andThen (\k -> H.lookup k sites) (V.get keys 0))
+         else H.lookup key sites
 
 fun fieldPlace ed (v : View) (site : (String, Int, Int)) =
-  match site with
-  | (f, from, to) -> locationOf ed v f from to
+  match site with | (f, from, to) -> locationOf ed v f from to
 
 -- Whether a package that says what it exports -- `gated` -- shows `e` to
 -- the packages after it: what is `@pub`, and what is exported whatever is
 -- marked, an `impl`'s.
 fun shown (gated : Bool) (e : Export) : Bool =
   if not gated or S.startsWith "#" e.name then True
-  else
-    match e.vis with
-    | Vis.Exported -> True
-    | _ -> False
+  else match e.vis with | Vis.Exported -> True | _ -> False
 
 -- The module a site of the library is in, by its path: `Std/src/A/B.mw@9`
 -- is `[A, B]`, its prelude and root none.
