@@ -835,6 +835,66 @@ fn a_program_of_cut_runs_on_glade_and_as_an_executable_of_silos() {
     assert!(err.contains("`μ`"), "{err}");
 }
 
+/// A program of Cut that leaves its registers scattered where an instruction
+/// wants a run of them: three values computed per element, each element a
+/// tuple of its three, made at the array literal that is their one use. Each
+/// tuple lands in the register of its first value and frees the other two,
+/// so the 65 tuples sit in every third register with no run of 64 free
+/// anywhere -- and the array's first piece and an object's method handed
+/// them all want one each. MeadowBoot's own Cut has such an array, and Glade
+/// refused it: "no run of 64 free registers". Silo says what it answers.
+#[test]
+fn a_program_of_cut_whose_registers_are_scattered_runs_on_glade() {
+    const N: usize = 65;
+    let mut body = String::new();
+    for i in 0..N {
+        body.push_str(&format!("  t:Main/name({}; μ̃ r{i}: str.\n", i % 3));
+        for c in ["a", "b", "c"] {
+            body.push_str(&format!(
+                "  prim concatStrings([r{i}, \"{c}{i}\"]; μ̃ {c}{i}: str.\n"
+            ));
+        }
+    }
+    let closing = ")".repeat(4 * N);
+    let tuples: Vec<String> = (0..N)
+        .map(|i| format!("#tuple(a{i}, b{i}, c{i})"))
+        .collect();
+    let tuples = tuples.join(", ");
+    let params: Vec<String> = (0..N).map(|i| format!("y{i}: ptr")).collect();
+    let ys: Vec<String> = (0..N).map(|i| format!("y{i}")).collect();
+    let text = format!(
+        "cut 0\nentry t:Main/main\nanswer str\n\n\
+         def t:Main/name (i: i64; k: ptr) =\n  prim eq(i, 0;\n    \
+         μ̃ u: unit. prim sub(i, 1; μ̃ j: i64. t:Main/name(j; k)),\n    \
+         μ̃ u: unit. <\"x\" | k>)\n\n\
+         def t:Main/walk (t: ptr, i: i64, acc: str; k: ptr) =\n  \
+         prim arrayLen(t; μ̃ n: i64.\n  prim eq(i, n;\n    \
+         μ̃ u: unit. prim arrayGet(t, i; μ̃ e: ptr.\n      <e | case {{\n        \
+         #tuple(a: str, b: str, c: str) =>\n          \
+         prim concatStrings([acc, a, b, c]; μ̃ s: str.\n          \
+         prim add(i, 1; μ̃ j: i64. t:Main/walk(t, j, s; k)))\n      }}>),\n    \
+         μ̃ u: unit. <acc | k>))\n\n\
+         val t:Main/table : ptr =\n{body}  <[{tuples}] | halt>{closing}\n\n\
+         def t:Main/handed (g: ptr; k: ptr) =\n{body}  <g | apply({tuples}; k)>{closing}\n\n\
+         def t:Main/main (; k: ptr) =\n  \
+         t:Main/walk(t:Main/table, 0, \"\"; μ̃ s: str.\n  \
+         t:Main/handed(cocase {{ apply({}; j: ptr) => <[{}] | j> }}; μ̃ t: ptr.\n  \
+         t:Main/walk(t, 0, s; k)))\n",
+        params.join(", "),
+        ys.join(", "),
+    );
+    let dir = scratch("cut-scattered");
+    std::fs::write(dir.join("scattered.cut"), text).unwrap();
+    let once: String = (0..N).map(|i| format!("xa{i}xb{i}xc{i}")).collect();
+    for runtime in [&[][..], &["--runtime", "silo"]] {
+        let mut args = vec!["cut", "scattered.cut"];
+        args.extend_from_slice(runtime);
+        let (ok, out, err) = meadow(&dir, &args);
+        assert!(ok, "{runtime:?}: {err}");
+        assert_eq!(out, format!("{once}{once}"), "{runtime:?}");
+    }
+}
+
 /// Programs of an operation resumed twice, on Silo, where the code no such
 /// operation can reach keeps its continuations as frames (`meadow_cut::grade`):
 /// a helper of frames called between `choose` and its handler, a handler of
