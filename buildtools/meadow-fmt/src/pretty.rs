@@ -1103,8 +1103,12 @@ impl<'a> Printer<'a> {
             let j = self.i;
             let t = &self.toks[j];
             if t.kind == Kind::Open && t.mate != NONE && t.mate < self.end {
+                // A bracket with a comment before it is not hugged: the
+                // comment would end the line of what it is applied to, and
+                // read as about that.
+                let led = !self.toks[j].lead.is_empty();
                 let (d, h) = self.bracket(j);
-                hug = h && out.is_empty();
+                hug = h && out.is_empty() && !led;
                 out.push(d);
             } else {
                 hug = false;
@@ -1861,6 +1865,25 @@ fun declareOp (acc : HashMap String Fixity) (f : Fixity) (o : Syntax Surface) : 
 fun declareOp (acc : HashMap String Fixity) (f : Fixity) (o : Syntax Surface)
     : HashMap String Fixity ! { Report | e } =
   acc
+"#,
+        );
+    }
+
+    #[test]
+    fn a_comment_on_its_own_line_before_a_bracket_stays_there() {
+        check(
+            r#"fun main () =
+  runAll
+    -- about the list
+    [ one, two ]
+"#,
+            r#"fun main () =
+  runAll
+    -- about the list
+    [
+      one,
+      two
+    ]
 "#,
         );
     }

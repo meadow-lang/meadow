@@ -264,6 +264,9 @@ last release is under _Unreleased_.
   under its signature or its first clause. It used to read a clause's `|`
   as an operator after the signature, so a long one broke inside a clause
   and left its body to the left of its `|`.
+- `meadow fmt` leaves a comment on its own line before a bracketed argument
+  where it is. It put the bracket at the end of the line of what it is
+  applied to, and the comment with it, so that it read as about that.
 - MeadowBoot could not build Lingua: a value a package exports again from
   one of its own dependencies, as Doodle exports Bloom's styles, reached the
   packages after it with no type, so every use of it there shared one, and a
