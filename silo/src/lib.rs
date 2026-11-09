@@ -23,6 +23,7 @@ pub mod cycles;
 pub mod heap;
 pub mod memory;
 pub mod native;
+pub mod overflow;
 pub mod parcel;
 pub mod prims;
 pub mod profile;
@@ -369,6 +370,7 @@ pub unsafe extern "C" fn meadow_run(
         allocator();
         memory::start();
         heap::catch_faults();
+        overflow::catch();
         profile::start();
         let (mut main_ctx, v) = run_main(entry);
         profile::finish();

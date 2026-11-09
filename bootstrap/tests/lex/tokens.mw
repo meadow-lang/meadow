@@ -1,8 +1,8 @@
 -- Numbers, names, operators and punctuation, where logos decides by priority.
 def numbers = (0, 7, 007, 0x1F, 0XFF, 0b101, 0b2, 0o17, 0o8, 1.5, .5, 5., 1.2.3, 12e5)
 def big = (9223372036854775807, 9223372036854775808, 0xFFFFFFFFFFFFFFFF, 0x7FFFFFFFFFFFFFFF)
-def names = (x, x', x'', _x, _, __, _1, xY9_z, Upper, Up'per, A1, andy, or2, orr, iff, ending)
-def keywords = mod end use def fun let in match with if then else data record effect handle type trait impl where as macro infix infixl infixr and or
+def names = (x, x', x'', _x, _, __, _1, xY9_z, Upper, Up'per, A1, andy, or2, orr, iff, end, ending)
+def keywords = mod use def fun let in match with if then else data record effect handle type trait impl where as macro infix infixl infixr and or
 def ops = (+ - * / % ^ = == != < > <= >= ! -> <- => :: : ; , . .. ..= | <| |> @ ` $ \ #)
 def custom = (<> <$> >>= ::: :+ :> .* ** +++ !! ?? ~ ~> <=> ==> --> -- that was a comment
   )

@@ -16,8 +16,10 @@
 # `v0.3.0`, builds MeadowBoot too, and its archives go on the release
 # `release.yml` makes for it, once that exists. Each target is built on
 # a runner of its own system and processor, since `meadow` compiles MeadowBoot
-# natively for the machine it is on. A manual run builds everything and keeps
-# the archives as artifacts without publishing.
+# natively for the machine it is on. Each then has the MeadowBoot it built
+# build MeadowBoot, and that build it again, to the same Cut
+# (`scripts/meadowboot-selfbuild.sh`). A manual run builds everything and
+# keeps the archives as artifacts without publishing.
 
 name: meadowboot
 
@@ -146,7 +148,7 @@ jobs:
           work="$RUNNER_TEMP/smoke"
           mkdir -p "$work/Hello/src" "$work/Lib/src"
           printf '[package]\nname = "Hello"\nversion = "0.1.0"\n' > "$work/Hello/Meadow.toml"
-          printf 'use Std.Num.Float as F\n\nfun main () = println (show (F.round (F.sqrt 2.0 *. 100.0)))\n' > "$work/Hello/src/Main.mw"
+          printf 'use Std.Num.Float as F\n\nfun main () = println (show (F.round (F.sqrt 2.0 * 100.0)))\n' > "$work/Hello/src/Main.mw"
           printf '[package]\nname = "Lib"\nversion = "0.1.0"\n' > "$work/Lib/Meadow.toml"
           printf '@export\nfun twice (x : Int) : Int = x * 2\n' > "$work/Lib/src/Main.mw"
           cd "$work"
@@ -180,6 +182,20 @@ jobs:
         with:
           name: ${{ env.BUNDLE }}
           path: ${{ env.ARCHIVE }}
+
+      # MeadowBoot compiled by itself (stage 2), and stage 2 compiling
+      # MeadowBoot again to the very Cut it was made from: see the script.
+      # After the archive is kept, so that a failure here still leaves it to
+      # look at; a failure fails the target, as a broken archive would.
+      - name: Self-build
+        shell: bash
+        timeout-minutes: 60
+        run: |
+          exe=""
+          [ "$RUNNER_OS" = "Windows" ] && exe=".exe"
+          bash scripts/meadowboot-selfbuild.sh \
+            "bootstrap/target/release/native/silo/MeadowBoot$exe" \
+            "buildtools/target/release/meadow$exe"
 
   publish:
     needs: build

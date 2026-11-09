@@ -292,8 +292,6 @@ pub enum Token {
     // Keywords
     #[token("mod")]
     Mod,
-    #[token("end")]
-    End,
     #[token("use")]
     Use,
     #[token("def")]
@@ -468,7 +466,6 @@ impl Token {
             Backtick => owned("`"),
             Dollar => owned("$"),
             Mod => owned("mod"),
-            End => owned("end"),
             Use => owned("use"),
             Def => owned("def"),
             Fun => owned("fun"),
@@ -559,7 +556,6 @@ impl<'a> Display for Token {
             Dollar => write!(f, "Dollar"),
 
             Mod => write!(f, "Mod"),
-            End => write!(f, "End"),
             Use => write!(f, "Use"),
             Def => write!(f, "Def"),
             Fun => write!(f, "Fun"),
@@ -927,6 +923,22 @@ mod tests {
         assert_eq!(
             kinds("fun map xs"),
             vec![Fun, LowerIdent("map".into()), LowerIdent("xs".into())]
+        );
+    }
+
+    #[test]
+    fn end_is_an_identifier() {
+        use Token::*;
+        assert_eq!(
+            kinds("let end = 3 in end"),
+            vec![
+                Let,
+                LowerIdent("end".into()),
+                Eq,
+                Int(3),
+                In,
+                LowerIdent("end".into())
+            ]
         );
     }
 

@@ -55,6 +55,10 @@ last release is under _Unreleased_.
   (3d2afe126)`). A dependency held back by a newer release that breaks its
   `version` is named, with that release. It used to say every dependency was
   current, as if there were nothing newer.
+- `end` is no longer reserved and may be a name: a function, a parameter, a
+  local, a field or a pattern variable may be called `end`. It was a keyword
+  that no form used, so writing it anywhere was a syntax error. The language
+  server, the REPL and the VS Code grammar no longer colour it as a keyword.
 
 ### Added
 
@@ -68,6 +72,19 @@ last release is under _Unreleased_.
   session and says by kind of request how far they agree; it is ignored until
   they do. Workspace symbols and `meadow/ir` are not answered yet, and
   `lsp --check` is still `meadow`'s.
+- A Silo program that runs out of stack on Windows says so: how deep it got,
+  in a stack of what size -- the main thread's gigabyte, or a green thread's
+  or a handler's 256 MiB -- and where in the executable. It used to end with
+  status `0xC00000FD` and not a word, since Rust's report of an overflow
+  comes with a Rust `main` and a Silo program's is C. With
+  `MEADOW_SILO_OVERFLOW_TRACE` set it goes on with the words on the stack
+  that point into the executable, and reports an access violation the same
+  way; `scripts/silo-map-names.py` names them from the linker's map
+  (`docs/RUNTIME.md`, "A native program that dies on Windows").
+- The MeadowBoot workflow builds MeadowBoot with itself on each of its five
+  targets, after the archive is kept: MeadowBoot compiled by itself must
+  compile `bootstrap/` to the very Cut it was made from, and then run a
+  program and build a library (`scripts/meadowboot-selfbuild.sh`).
 - `meadow new MyApp` makes a package in a new directory, as `cargo new` does:
   named after the directory (`my-app` makes `MyApp`), and a git repository
   of its own unless it is inside one already or joins a workspace.
@@ -240,6 +257,14 @@ last release is under _Unreleased_.
   one. Lingua's finder came out performing `Console`, which its pure tests
   were then refused for. Such an export now has the type its own package
   gave it. MeadowBoot is built with Lingua and Cut at their current `master`.
+- Glade compiles MeadowBoot's own Cut. It used to refuse it with "no run of
+  64 free registers": an array literal of tuples, each made where the array
+  is from values computed before it, left a value in every third register, so
+  the array had no run of free registers to be read from although most of the
+  file was free. Where an instruction wants a run of registers -- an array, a
+  record, a constructor's fields in a match -- the values in the way are now
+  moved aside first, and a call through an object that finds no run for its
+  arguments puts them at the bottom of the file, as a jump does.
 - A Cut program that both handles an operation and exports a definition to C
   was lowered with its `perform`s jumping to the wrong definition: the
   search they share was numbered as if there were no exports.
@@ -251,6 +276,13 @@ last release is under _Unreleased_.
   is handed to the search instead, and stays a frame. And a clause that
   resumes as its last act left a frame of the runtime's on the handler's stack
   for every operation: its handler now resumes the continuation itself.
+  MeadowBoot compiled by itself was such a program, twice over. On Windows
+  it overflowed a handler's 256 MiB segment compiling its own sources, with
+  one of those frames for each operation resumed. And compiling the
+  standard library and a small program, about one run in fifteen it crashed
+  or said every thread was waiting (on Linux it hung instead): the same
+  stage 2, built with the lowering of Cut's `perform` alone fixed, or with
+  trial deletion in place of concurrent tracing, failed no run in a hundred.
 - `Std.Json` read an integer too long for an `Int` as whatever it wrapped round
   to. It now reads as the nearest `Float`, the one number that is close.
 - MeadowBoot compiled a float literal of more than about 18 digits to the
