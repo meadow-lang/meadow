@@ -110,7 +110,6 @@ use Std.Result.Result.*
     "`" = Backtick,
     "$" = Dollar,
     "mod" = Mod,
-    "end" = End,
     "use" = Use,
     "def" = Def,
     "fun" = Fun,
@@ -266,7 +265,6 @@ use Std.Result.Result.*
          | "`"
          | "$"
          | "mod"
-         | "end"
          | "use"
          | "def"
          | "fun"

@@ -164,7 +164,6 @@ pub fn classified(text: &str, scope: &Scope<'_>) -> Vec<(usize, usize, u32)> {
             | Token::Infix
             | Token::Infixl
             | Token::Infixr
-            | Token::End
             | Token::As
             | Token::And
             | Token::Or => "keyword",

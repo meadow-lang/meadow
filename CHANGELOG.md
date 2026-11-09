@@ -55,6 +55,10 @@ last release is under _Unreleased_.
   (3d2afe126)`). A dependency held back by a newer release that breaks its
   `version` is named, with that release. It used to say every dependency was
   current, as if there were nothing newer.
+- `end` is no longer reserved and may be a name: a function, a parameter, a
+  local, a field or a pattern variable may be called `end`. It was a keyword
+  that no form used, so writing it anywhere was a syntax error. The language
+  server, the REPL and the VS Code grammar no longer colour it as a keyword.
 
 ### Added
 
@@ -234,6 +238,14 @@ last release is under _Unreleased_.
 
 ### Fixed
 
+- Glade compiles MeadowBoot's own Cut. It used to refuse it with "no run of
+  64 free registers": an array literal of tuples, each made where the array
+  is from values computed before it, left a value in every third register, so
+  the array had no run of free registers to be read from although most of the
+  file was free. Where an instruction wants a run of registers -- an array, a
+  record, a constructor's fields in a match -- the values in the way are now
+  moved aside first, and a call through an object that finds no run for its
+  arguments puts them at the bottom of the file, as a jump does.
 - A Cut program that both handles an operation and exports a definition to C
   was lowered with its `perform`s jumping to the wrong definition: the
   search they share was numbered as if there were no exports.

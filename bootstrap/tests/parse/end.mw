@@ -1,0 +1,18 @@
+-- `end` is an ordinary name: a function, a parameter, a local, a field, a
+-- pattern variable and an imported name may all be called it.
+
+use M (end)
+
+fun end x = x
+
+fun span start end = { start = start, end = end }
+
+def ends = (end 1, (span 1 5).end, { r | end = 2 }, \end -> end)
+
+def local = let end = 3 in end
+
+def matched = match pair with | (start, end) -> end - start
+
+def piped = 5 |> end
+
+def fields = end.end
