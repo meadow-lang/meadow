@@ -335,7 +335,7 @@ fun viewIn (uri : String) (path : String) (text : String) (file : String) (s : S
            (M.unwrapOr "" (V.get (S.split "/" file) 0))
            (V.map (\(d : Declared) -> d.path) s.renamed.modules)
            calls,
-       typing = patched s file (V.concatMap (\x -> match x with | (f, t, id, k) -> if k == "v" then [(f, t, id)] else []) uses) (typingOf s file),
+       typing = patched s file text (V.concatMap (\x -> match x with | (f, t, id, k) -> if k == "v" then [(f, t, id)] else []) uses) (typingOf s file),
        canons =
          V.foldl
            (\h (i : Item) ->
@@ -749,7 +749,16 @@ fun definitionOf (ed : Editor) (a : Asked) =
                               (declaredAt v id))
                   None
                   (namesAt v a.offset)
-              in M.unwrapOr (J.jNull ()) found)
+              in
+              -- And a record's field, by the record it is of.
+              match found with
+              | Just loc -> loc
+              | None ->
+                  M.unwrapOr
+                    (J.jNull ())
+                    (M.andThen
+                       (fieldPlace ed v)
+                       (fieldDeclaredAt v a.offset)))
 
 -- --- rename ------------------------------------------------------------------
 
@@ -942,12 +951,8 @@ fun tokensOf (ed : Editor) (a : Asked) =
       let toks = (lex v.text).tokens in
       -- The last noted of those at one place: a `use`'s path is noted as
       -- modules first, and a type it reaches -- `use M.Ty.*` -- after.
-      let resolved =
-        V.foldl
-          (\m n -> match n with | (f, _, _, k) -> H.insert f k m)
-          (V.foldl (\m x -> match x with | (f, _, _) -> H.insert f "m" m) H.empty v.modules)
-          v.names
-      in
+      let named = V.foldl (\m n -> match n with | (f, _, _, k) -> H.insert f k m) H.empty v.names in
+      let moduled = V.foldl (\m x -> match x with | (f, _, _) -> H.insert f "m" m) H.empty v.modules in
       let functions = functionsOf v in
       let scope = scopeOf v in
       let classified =
@@ -972,7 +977,11 @@ fun tokensOf (ed : Editor) (a : Asked) =
                    | Token.UpperIdent n ->
                        if declaresModule then Just "namespace"
                        else
-                         (match H.lookup t.from resolved with
+                         -- What resolved there, as the Rust server notes it: a
+                         -- qualifier's module after the name it qualifies, and a
+                         -- `use`'s path before what it brings.
+                         (match (if not inUse2 and H.member t.from moduled then Just "m"
+                                 else M.orElse (H.lookup t.from moduled) (H.lookup t.from named)) with
                           | Just k ->
                               Just
                                 (if k == "c" then "enumMember"
@@ -1229,7 +1238,7 @@ fun viewDump (ed : Editor) (a : Asked) =
           "vars",
           J.jArray
             (V.map
-               (\x -> match x with | (f, t, ty) -> J.jString "${show f} ${show t} ${showType ty}")
+               (\x -> match x with | (f, t, id, ty) -> J.jString "${show f} ${show t} ${show id} ${showType ty}")
                v.typing.vars)
         )
       ]
@@ -1401,7 +1410,10 @@ record Typing = {
   binders : HashMap Int Type,
   funs : HashMap Int Int,
   -- Each mention of a value: where inference has it, and its type.
-  vars : [(Int, Int, Type)],
+  vars : [(Int, Int, Int, Type)],
+  -- Each record field written, where, by its record's canonical name and
+  -- its own -- `*.x` where the record is not known (`Namespace::Field`).
+  fields : [(Int, Int, String)],
   -- Each `impl`'s method, by its binder: `#impl.Trait.method`.
   methods : HashMap Int String,
   -- The module's top-level definitions that something could be started at:
@@ -1411,7 +1423,15 @@ record Typing = {
 }
 
 def noTyping : Typing =
-  Typing { nodes = [], binders = H.empty, funs = H.empty, vars = [], methods = H.empty, tops = [] }
+  Typing {
+    nodes = [],
+    binders = H.empty,
+    funs = H.empty,
+    vars = [],
+    fields = [],
+    methods = H.empty,
+    tops = []
+  }
 
 fun typingOf (s : Study) (file : String) : Typing =
   match V.find (\k -> M.map fst (V.get s.renamed.programs k) == Just file) (V.range 0 (V.len s.renamed.programs)) with
@@ -1474,7 +1494,11 @@ fun typedPat (a : TypedArena) (p : TypedPat) (acc : Typing) : Typing =
   | TypedPatView.Array r -> V.foldl (\x q -> typedPat a q x) here r.items
   | TypedPatView.Vector r -> V.foldl (\x q -> typedPat a q x) here r.items
   | TypedPatView.List r -> V.foldl (\x q -> typedPat a q x) here r.items
-  | TypedPatView.Record r -> V.foldl (\x f -> typedPat a (typedPatFieldPat a f) x) here r.fields
+  | TypedPatView.Record r ->
+      V.foldl
+        (\x f -> typedPat a (typedPatFieldPat a f) (fieldAt x (metaTypedName a (typedPatFieldName a f)) t (typedNameText a (typedPatFieldName a f))))
+        here
+        r.fields
   | TypedPatView.View r -> typedPat a r.pat (typedExpr a r.fn here)
   | _ -> here
 
@@ -1484,7 +1508,8 @@ fun typedExpr (a : TypedArena) (e : TypedExpr) (acc : Typing) : Typing =
   match viewTypedExpr a e with
   | TypedExprView.Var r ->
       (match metaTypedExpr a e with
-       | Meta from to -> { here | vars = V.pushBack here.vars (from, to, typTypedExpr a e) })
+       | Meta from to ->
+           { here | vars = V.pushBack here.vars (from, to, typedRefId a r.ref, typTypedExpr a e) })
   | TypedExprView.Lam r -> typedExpr a r.body (V.foldl (\t p -> typedPat a p t) here r.params)
   | TypedExprView.App r -> each (typedExpr a r.func here) r.args
   | TypedExprView.Let r -> typedExpr a r.body (V.foldl (\t b -> typedBind a b t) here r.binds)
@@ -1505,13 +1530,32 @@ fun typedExpr (a : TypedArena) (e : TypedExpr) (acc : Typing) : Typing =
   | TypedExprView.List r -> each here r.items
   | TypedExprView.Cons r -> each here r.args
   | TypedExprView.Record r ->
-      let fields = V.foldl (\t f -> typedExpr a (typedExprFieldValue a f) t) here r.fields in
+      let ty = typTypedExpr a e in
+      let fields =
+        V.foldl
+          (\t f ->
+            typedExpr
+              a
+              (typedExprFieldValue a f)
+              (fieldAt t (metaTypedName a (typedExprFieldName a f)) ty (typedNameText a (typedExprFieldName a f))))
+          here
+          r.fields
+      in
       (match r.base with
        | Just b -> typedExpr a b fields
        | None -> fields)
   | TypedExprView.Update r ->
-      V.foldl (\t f -> typedExpr a (typedExprFieldValue a f) t) (typedExpr a r.base here) r.fields
-  | TypedExprView.Proj r -> typedExpr a r.target here
+      let ty = typTypedExpr a r.base in
+      V.foldl
+        (\t f ->
+          typedExpr
+            a
+            (typedExprFieldValue a f)
+            (fieldAt t (metaTypedName a (typedExprFieldName a f)) ty (typedNameText a (typedExprFieldName a f))))
+        (typedExpr a r.base here)
+        r.fields
+  | TypedExprView.Proj r ->
+      typedExpr a r.target (fieldAt here (metaTypedName a r.label) (typTypedExpr a r.target) (typedNameText a r.label))
   | TypedExprView.Handle r ->
       let body = typedExpr a r.body here in
       let arms =
@@ -2165,33 +2209,56 @@ fun labelPart ed (v : View) (types : HashMap String Int) (spelled : HashMap Stri
 -- name the typed tree does not span as the Rust compiler does: a value a
 -- qualifier reaches, `V.map`, whose mention the tree has at the qualifier
 -- alone; and a handler's continuation, which no node is.
-fun patched (s : Study) (file : String) (refs : [(Int, Int, Int)]) (t : Typing) : Typing =
+-- Where the qualifier of a name at `f` starts -- `V` of `V.map` -- if it
+-- has one.
+fun qualifierBefore (text : String) (f : Int) : Maybe Int =
+  if f < 2 or stringSlice text (f - 1) f != "." then None
+  else
+    let rec back (i : Int) =
+      if i > 0 and isWordByte (byteOf text (i - 1)) then back (i - 1) else i
+    in
+    let q = back (f - 1) in
+    if q < f - 1 and byteOf text q >= 65 and byteOf text q <= 90 then Just q else None
+
+fun isWordByte (b : Int) : Bool =
+  (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or (b >= 48 and b <= 57) or b == 95
+
+fun patched (s : Study) (file : String) (text : String) (refs : [(Int, Int, Int)]) (t : Typing)
+    : Typing =
   let exact = V.foldl (\h x -> match x with | (f, to, _) -> H.insert (f, to) True h) H.empty t.nodes in
-  -- The smallest mention around a name: a function's, in a call, is as
-  -- wide as the call.
-  let around =
-    \f to ->
+  let byBinder =
+    V.foldl
+      (\h x -> match x with | (_, _, id, _) -> H.insert id (V.pushBack (H.getOr [] id h) x) h)
+      H.empty
+      t.vars
+  in
+  -- The mention of the same binder the typed tree has for a name: the
+  -- smallest around it, or else the one that starts nearest it.
+  let mentionOf =
+    \f to id ->
       V.foldl
         (\acc x ->
           match x with
-          | (a, b, ty) ->
-              if a <= f and to <= b then
-                (match acc with
-                 | Just (a0, b0, _) -> if b - a < b0 - a0 then Just x else acc
-                 | None -> Just x)
-              else acc)
+          | (a, b, _, ty) ->
+              (let near = if a > f then a - f else f - a in
+               let key = if a <= f and to <= b then (0, b - a) else (1, near) in
+               if key >= (1, 64) then acc
+               else
+                 match acc with
+                 | Just (k, _) -> if key < k then Just (key, ty) else acc
+                 | None -> Just (key, ty)))
         None
-        t.vars
+        (H.getOr [] id byBinder)
   in
   let mentions =
     V.concatMap
       (\r ->
         match r with
-        | (f, to, _) ->
+        | (f, to, id) ->
             if H.member (f, to) exact then []
             else
-              (match around f to with
-               | Just (_, _, ty) -> [(f, to, ty)]
+              (match mentionOf f to id with
+               | Just (_, ty) -> if inUse text f then [] else [(f, to, ty)]
                | None -> []))
       refs
   in
@@ -2213,6 +2280,7 @@ fun patched (s : Study) (file : String) (refs : [(Int, Int, Int)]) (t : Typing) 
        binders = t.binders,
        funs = t.funs,
        vars = t.vars,
+       fields = t.fields,
        methods = t.methods,
        tops = t.tops
      }
@@ -2390,7 +2458,7 @@ fun candidatesOf (ed : Editor) (v : View) =
   let own =
     V.concatMap
       (\(e : Export) ->
-        if e.kind != "v" or startsUpper e.name then []
+        if e.kind != "v" or startsUpper e.name or not (shown v.study.renamed.anyVis e) then []
         else
           match H.lookup e.binder v.study.inferred.schemes with
           | Just sc ->
@@ -2411,7 +2479,7 @@ fun candidatesOf (ed : Editor) (v : View) =
     V.foldl
       (\h (i : Interface) ->
         if i.package != "Std" then h
-        else V.foldl (\h2 (e : Export) -> if e.kind == "v" and e.flat then H.insert e.name True h2 else h2) h i.exports)
+        else V.foldl (\h2 (e : Export) -> if V.isEmpty e.module then H.insert e.name True h2 else h2) h i.exports)
       H.empty
       v.study.imported
   in
@@ -2422,7 +2490,7 @@ fun candidatesOf (ed : Editor) (v : View) =
         else
           V.concatMap
             (\(e : Export) ->
-              if e.kind != "v" or not (H.member e.name flat) or startsUpper e.name then []
+              if e.kind != "v" or not (H.member e.name flat) or startsUpper e.name or not (shown True e) then []
               else
                 match e.scheme with
                 | Just sc ->
@@ -2664,7 +2732,7 @@ fun byRank (x : ([Int], Offer)) (y : ([Int], Offer)) : Ordering =
 -- its constructors. Each entry is a name, what it is -- the protocol's
 -- kind of completion item: 9 a module, 22 a type, 20 a constructor, 3 a
 -- value -- and its detail: a value's scheme, the type a constructor builds.
-fun pathIndex (v : View) : HashMap String [(String, Int, String)] =
+fun pathIndex (v : View) =
   let add =
     \h path e ->
       (let under = H.getOr [] path h in
@@ -2689,17 +2757,19 @@ fun pathIndex (v : View) : HashMap String [(String, Int, String)] =
         else
           V.foldl
             (\acc (e : Export) ->
+              let declaredHere = siteModule e.site == Just e.module in
               let here = V.pushFront e.module "Std" in
               let at = S.join "." here in
               let withModules = modulesTo acc here in
-              if e.kind == "t" and isType e.owner then add withModules at (e.name, 22, "")
+              if not (shown True e) or e.kind != "v" and not declaredHere then withModules
+              else if e.kind == "t" and isType e.owner then add withModules at (e.name, 22, "")
               else if e.kind == "c" then add withModules (at ++ "." ++ e.owner) (e.name, 20, e.owner)
               else if e.kind == "v" then
                 add withModules at (e.name, 3, M.unwrapOr "" (M.map showScheme e.scheme))
               else withModules)
             h
             i.exports)
-      H.empty
+      (stdModules ())
       v.study.imported
   in
   -- And the package's own, by its name.
@@ -2769,7 +2839,7 @@ fun byLabel (xs : [Offer]) : [Offer] = stableSort (\(a : Offer) (b : Offer) -> c
 -- What follows `Q.` in an expression (`member`): under the module `Q` names,
 -- its values and its types' constructors; or, `Q` a type, its
 -- constructors.
-fun memberOffered (v : View) (q : String) (word : String) : [Offer] =
+fun memberOffered (v : View) (q : String) (word : String) =
   let index = pathIndex v in
   match H.lookup q (aliasesIn v.text) with
   | Just written ->
@@ -2792,7 +2862,7 @@ fun memberOffered (v : View) (q : String) (word : String) : [Offer] =
        | Just path -> byLabel (entriesUnder index path [20] word)
        | None -> [])
 
-fun underOffered (v : View) (segments : [String]) (kinds : [Int]) (word : String) : [Offer] =
+fun underOffered (v : View) (segments : [String]) (kinds : [Int]) (word : String) =
   let index = pathIndex v in
   match locatePath index segments with
   | Just path -> byLabel (entriesUnder index path kinds word)
@@ -2810,3 +2880,140 @@ fun aliasesIn (text : String) : HashMap String String =
        | _ -> h))
     H.empty
     (S.lines text)
+
+-- A field `label` of a record of type `t`, written at `m`.
+fun fieldAt (acc : Typing) (m : Meta) (t : Type) (label : String) : Typing =
+  let key =
+    match t with
+    | Con rec0 _ -> "${rec0}.${label}"
+    | _ -> "*.${label}"
+  in
+  match m with
+  | Meta from to -> { acc | fields = V.pushBack acc.fields (from, to, key) }
+
+-- Where each record field of the package is declared, by its record's
+-- canonical name and its own: each file a dump names, and where in it.
+fun fieldSites (s : Study) : HashMap String (String, Int, Int) =
+  V.foldl
+    (\h k ->
+      match (V.get s.renamed.programs k, V.get s.inferred.typed k, V.get s.renamed.modules k) with
+      | (Just (file, _), Just (TypedProgram a root), Just (d : Declared)) ->
+          V.foldl
+            (\h2 decl -> recordFields a decl file d h2)
+            h
+            (typedModuleDecls a root)
+      | _ -> h)
+    H.empty
+    (V.range 0 (V.len s.renamed.programs))
+
+fun recordFields (a : TypedArena) (decl : TypedDecl) (file : String) (d : Declared) h =
+  match viewTypedDecl a decl with
+  | TypedDeclView.Attributed r -> recordFields a r.decl file d h
+  | TypedDeclView.Record r ->
+      let name = typedNameText a r.name in
+      let canon =
+        M.unwrapOr
+          name
+          (M.map (\(i : Item) -> i.canon) (V.find (\(i : Item) -> i.kind == "t" and i.name == name) d.items))
+      in
+      V.foldl
+        (\h2 f ->
+          match metaTypedName a (typedFieldName a f) with
+          | Meta from to -> H.insert "${canon}.${typedNameText a (typedFieldName a f)}" (file, from, to) h2)
+        h
+        r.fields
+  | _ -> h
+
+-- Where the field written around `o` is declared, if anywhere this
+-- server goes: by its record, or -- the record not known -- the first by
+-- name of the records with a field so called.
+fun fieldDeclaredAt (v : View) (o : Int) : Maybe (String, Int, Int) =
+  let around =
+    stableSortBy
+      (\x -> match x with | (f, t, _) -> t - f)
+      (V.filter (\x -> match x with | (f, t, _) -> covers f t o) v.typing.fields)
+  in
+  match V.get around 0 with
+  | None -> None
+  | Just (_, _, key) ->
+      let sites = fieldSites v.study in
+      if S.startsWith "*." key then
+        (let suffix = S.drop key 1 in
+         let keys = sortBy (\x y -> compare x y) (V.filter (\k -> S.endsWith suffix k) (H.keys sites)) in
+         M.andThen (\k -> H.lookup k sites) (V.get keys 0))
+      else H.lookup key sites
+
+fun fieldPlace ed (v : View) (site : (String, Int, Int)) =
+  match site with
+  | (f, from, to) -> locationOf ed v f from to
+
+-- Whether a package that says what it exports -- `gated` -- shows `e` to
+-- the packages after it: what is `@pub`, and what is exported whatever is
+-- marked, an `impl`'s.
+fun shown (gated : Bool) (e : Export) : Bool =
+  if not gated or S.startsWith "#" e.name then True
+  else
+    match e.vis with
+    | Vis.Exported -> True
+    | _ -> False
+
+-- The module a site of the library is in, by its path: `Std/src/A/B.mw@9`
+-- is `[A, B]`, its prelude and root none.
+fun siteModule (site : String) : Maybe [String] =
+  match S.indexOf "@" site with
+  | None -> None
+  | Just at ->
+      (let file = S.take site at in
+       if not (S.startsWith "Std/src/" file) then None
+       else
+         (let rel = S.drop file 8 in
+          let bare = if S.endsWith ".mw" rel then S.take rel (stringByteLength rel - 3) else rel in
+          let path = S.split "/" bare in
+          Just (if path == ["Prelude"] or path == ["Lib"] then [] else path)))
+
+-- Every module of the library, under `Std` and each module on the way:
+-- what a path completes to before anything in it is.
+fun stdModules () =
+  match stdDir () with
+  | None -> H.empty
+  | Just dir ->
+      (let src = Path.join dir "src" in
+       V.foldl
+         (\h f ->
+           let rel = S.drop (keyOf f) (stringByteLength (keyOf src) + 1) in
+           let bare = if S.endsWith ".mw" rel then S.take rel (stringByteLength rel - 3) else rel in
+           let segs = V.pushFront (S.split "/" (realCase f src bare)) "Std" in
+           if segs == ["Std", "Prelude"] or segs == ["Std", "Lib"] then h
+           else
+             V.foldl
+               (\h2 i ->
+                 (let at = S.join "." (V.take segs i) in
+                  let e = (V.getOr "" segs i, 9, "") in
+                  let under = H.getOr [] at h2 in
+                  if V.any (\x -> match x with | (n, k, _) -> n == fst3 e and k == 9) under then h2
+                  else H.insert at (V.pushBack under e) h2))
+               h
+               (V.range 1 (V.len segs)))
+         H.empty
+         (sourcesOf dir))
+
+fun fst3 (t : (a, b, c)) : a = match t with | (x, _, _) -> x
+
+-- `bare`, a file's path under `src` as `keyOf` lowered it, as the file
+-- spells it.
+fun realCase (f : String) (src : String) (bare : String) : String =
+  let plain = S.join "/" (S.split "\\" f) in
+  let start = stringByteLength plain - stringByteLength bare - 3 in
+  if start < 0 then bare else stringSlice plain start (start + stringByteLength bare)
+
+-- Whether byte `f` of `text` is on a line that is a `use`: what a `use`
+-- names is no expression, and has no type.
+fun inUse (text : String) (f : Int) : Bool =
+  let line = S.trimStart (lineOfText (stringSlice text 0 f)) in
+  let bare =
+    if S.startsWith "@" line then
+      (match S.indexOf " " line with
+       | Just i -> S.trimStart (S.drop line i)
+       | None -> line)
+    else line
+  in S.startsWith "use " bare
