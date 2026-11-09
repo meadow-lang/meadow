@@ -83,6 +83,17 @@ last release is under _Unreleased_.
   it, where, and whether it gets a repository, and shows what it will make
   before it makes it. `meadow init --lib` makes a library too: a
   `src/Lib.mw` with a function and a test of it.
+- MeadowBoot runs the Rust back end in its own process: `meadow-host`, the
+  `meadow` command line built as a library, is loaded through `Std.Ffi` and
+  called for what MeadowBoot does not do itself -- building and running its
+  Cut, and the commands it has no code for yet. It used to start the Rust
+  `meadow` as a second program for each, so a MeadowBoot could not be
+  `meadow` without one beside it. MeadowBoot's archives carry the library,
+  and `MEADOW_HOST` names another. `MEADOW_BOOTSTRAP=1` lets a stable
+  `meadow` take unstable features, as `RUSTC_BOOTSTRAP` does rustc, for
+  building MeadowBoot, which uses `Std.Ffi` to do this. MeadowBoot reads a
+  module's own attributes, `@!feature(ffi)`, as the Rust compiler does; it
+  could not parse a file that began with one.
 - `meadow update --breaking` moves a dependency past a release that breaks
   the `version` it asks for: the `version` in `Meadow.toml` is raised to the
   newest release, and the lockfile follows. With `--dry-run` it says what it

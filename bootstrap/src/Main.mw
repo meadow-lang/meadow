@@ -3,6 +3,11 @@
 -- Each pass is checked against the Rust compiler's, input by input: see
 -- `README.md` and `buildtools/meadow/tests/bootstrap.rs`. What each command
 -- prints is what that test compares.
+--
+-- What MeadowBoot does not do itself is the Rust `meadow`'s, called in this
+-- process through `Std.Ffi`: see `hosted`.
+
+@!feature(ffi)
 
 mod Lex
 mod Derive
@@ -64,6 +69,9 @@ use Std.Exn (catch)
 use Lingua.Query (QueryError)
 use Std.Process (exit, getEnv)
 use Std.Process as Proc
+use Std.Ffi as Ffi
+use Std.Ffi (Arg)
+use Std.Json as J
 use Std.Time (monotonic)
 use Std.Thread (parMap)
 use MeadowBoot.Macros as Mc
@@ -475,11 +483,54 @@ fun meadow () =
            (let beside = Path.join dir named in if exists beside then beside else "meadow")
        | None -> "meadow")
 
+-- The Rust `meadow` as a library to load into this process, `meadow-host`:
+-- where `MEADOW_HOST` says, or beside this program, as a release has it.
+-- `MEADOW` naming a program asks for that program instead.
+fun hostLibrary () =
+  match getEnv "MEADOW_HOST" with
+  | Just h -> Just h
+  | None ->
+      if M.isSome (getEnv "MEADOW") then None
+      else
+        (let named =
+           if hostOs == "windows" then "meadow_host.dll"
+           else if hostOs == "macos" then "libmeadow_host.dylib"
+           else "libmeadow_host.so"
+         in match Path.parent (Proc.currentExe ()) with
+            | Just dir ->
+                (let beside = Path.join dir named in if exists beside then Just beside else None)
+            | None -> None)
+
+-- `args` run by the Rust `meadow`: in this process, through its library,
+-- where there is one, and as a program of its own where not. What it ends
+-- with is the answer, unless it ends this process itself, as a command that
+-- fails does.
+fun backEnd (args : [String]) =
+  match hostLibrary () with
+  | Just lib -> hosted lib args
+  | None -> Proc.runInherit (meadow ()) args
+
+-- What is run for `args` where their output is to be kept rather than shown:
+-- a program of its own, so this one, which calls the library, where there is
+-- a library.
+fun backEndProgram () = if M.isSome (hostLibrary ()) then Proc.currentExe () else meadow ()
+
+fun hosted (lib : String) (args : [String]) =
+  -- Standard output is buffered on each side of the call, so what this
+  -- program wrote goes out first: writing to standard error sends it.
+  let sent = writeError "" in
+  match Ffi.open lib with
+  | Err why -> Err why
+  | Ok loaded ->
+      match Ffi.function loaded "meadow_main" with
+      | Err why -> Err why
+      | Ok main -> Ffi.callInt main [Arg.String (J.render (J.jArray (V.map J.jString args)))]
+
 -- This command line as it was written, given to `meadow`, and its answer
 -- this program's: the tools MeadowBoot does not have yet, behind the command
 -- line it will have them at.
 fun handedOn () =
-  match Proc.runInherit (meadow ()) (Proc.argv ()) with
+  match backEnd (Proc.argv ()) with
   | Ok code -> exit code
   | Err why -> (let u = writeError "meadowboot: `meadow` could not be run: ${why}\n" in exit 1)
 
@@ -560,7 +611,7 @@ fun driven (path : Maybe String) (b : CliBuild) (args : Maybe [String]) =
                      aimed,
                      (if M.isNone args then ["--no-run"] else V.pushFront theirs "--")
                    ]
-               in match Proc.runInherit (meadow ()) back with
+               in match backEnd back with
                   | Ok 0 ->
                       if not library then exit 0
                       else
@@ -1173,7 +1224,7 @@ fun gladeRound
                     in
                     let w = writeString (given, text) in
                     let x = writeString (said, "") in
-                    (match Proc.run (meadow ()) ["cut", program, "--", given, said] with
+                    (match Proc.run (backEndProgram ()) ["cut", program, "--", given, said] with
                      | Err why -> failing "the back end could not be run: ${why}"
                      | Ok (code, out, err) ->
                          let m2 = stamp "wave ${show wave} ran ${show (V.len theirs)} calls" in

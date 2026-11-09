@@ -14,10 +14,10 @@
 //! tables -- is kept in a [`Prefix`], built for `Std` once and added to as
 //! entries join.
 
+use crate::runtime;
+use crate::tour;
+use crate::{complete, finder, ir, stdlib, viewer};
 use itertools::Either;
-use meadow::runtime;
-use meadow::tour;
-use meadow::{complete, finder, ir, stdlib, viewer};
 use meadow_compiler::{
     AstModule, CompiledPackage, Options, ast, compile_unit, core, diagnostics, hir,
     intern::InternedString,
@@ -964,7 +964,7 @@ pub struct Session {
     uses: Vec<ast::LDecl>,
     /// Which machine evaluates a line. `:cek` and `:vm` switch it, which is the
     /// quickest way to decide whether something odd is the language or the VM.
-    engine: meadow::Engine,
+    engine: crate::Engine,
     /// Report how long every entry took -- `:time` turns it on and off.
     timing: bool,
     /// Which step of the tour is showing, if any. The tour is not a mode: the
@@ -982,7 +982,7 @@ pub struct Session {
     /// The same for `Std` alone, which `:reset` goes back to.
     std_cache: Prefix,
     /// What `Ctrl-F` searches, shared with the key binding that shows it and
-    /// brought up to date after every entry. See [`meadow::finder`].
+    /// brought up to date after every entry. See [`crate::finder`].
     finder: Arc<RwLock<finder::Catalog>>,
     /// The library's declarations, collected once: `Std` does not change
     /// under a session.
@@ -1045,7 +1045,7 @@ impl Session {
             std_len,
             uses: Vec::new(),
             // What a debug build runs on.
-            engine: meadow::Engine::Jit,
+            engine: crate::Engine::Jit,
             timing: false,
             tour: None,
             pending: None,
@@ -1188,7 +1188,7 @@ impl Session {
         }));
 
         // `Ctrl-F`: find a declaration, by name or by type, and put it on the
-        // prompt. See `meadow::finder`.
+        // prompt. See `crate::finder`.
         rl.bind_sequence(
             KeyEvent::ctrl('F'),
             EventHandler::Conditional(Box::new(FindKey {
@@ -1274,9 +1274,9 @@ impl Session {
                         ":module" => self.list_module(),
                         ":vm" | ":cek" | ":jit" => {
                             self.engine = match trimmed {
-                                ":cek" => meadow::Engine::Cek,
-                                ":jit" => meadow::Engine::Jit,
-                                _ => meadow::Engine::Vm,
+                                ":cek" => crate::Engine::Cek,
+                                ":jit" => crate::Engine::Jit,
+                                _ => crate::Engine::Vm,
                             };
                             println!("(evaluating with the {})", self.engine);
                         }
@@ -1534,9 +1534,9 @@ impl Session {
                 entry_is_expression: label.is_some(),
                 cfg: meadow_compiler::Cfg {
                     backend: match self.engine {
-                        meadow::Engine::Vm => "vm",
-                        meadow::Engine::Cek => "cek",
-                        meadow::Engine::Jit => "jit",
+                        crate::Engine::Vm => "vm",
+                        crate::Engine::Cek => "cek",
+                        crate::Engine::Jit => "jit",
                     },
                     ..self.opts.cfg
                 },

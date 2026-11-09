@@ -122,10 +122,9 @@ fn prune(dir: &Path) {
         }
         done.push(dir.to_path_buf());
     }
-    let Some(built) = std::env::current_exe()
-        .and_then(std::fs::metadata)
-        .and_then(|m| m.modified())
-        .ok()
+    let Some(built) = crate::host::this_build()
+        .and_then(|e| std::fs::metadata(e).ok())
+        .and_then(|m| m.modified().ok())
     else {
         return;
     };
@@ -267,7 +266,9 @@ fn compiler() -> u64 {
     *ID.get_or_init(|| {
         let mut h = hasher();
         text(&mut h, env!("CARGO_PKG_VERSION"));
-        let exe = std::env::current_exe().and_then(std::fs::metadata);
+        let exe = crate::host::this_build()
+            .ok_or_else(|| std::io::Error::other("no build"))
+            .and_then(std::fs::metadata);
         match exe {
             Ok(meta) => {
                 h.write_u64(meta.len());

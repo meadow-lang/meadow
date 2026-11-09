@@ -3284,6 +3284,93 @@ fn a_package_s_tests_are_run_by_meadowboot_as_meadow_test_runs_them() {
     assert_eq!(code, Some(0), "{said}");
 }
 
+/// `meadow-host`, the Rust `meadow` as a library, built beside the `meadow`
+/// this test runs -- or the one `MEADOWBOOT_HOST` names.
+fn meadow_host() -> PathBuf {
+    if let Some(given) = std::env::var_os("MEADOWBOOT_HOST") {
+        return PathBuf::from(given);
+    }
+    static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            let dir = meadow().parent().expect("meadow's directory").to_path_buf();
+            let mut c = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+            c.args(["build", "-q", "-p", "meadow-host", "--manifest-path"])
+                .arg(repo().join("buildtools").join("Cargo.toml"));
+            if dir.file_name().is_some_and(|n| n == "release") {
+                c.arg("--release");
+            }
+            let out = c.output().expect("cargo runs");
+            assert!(
+                out.status.success(),
+                "meadow-host did not build:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            dir.join(format!(
+                "{}meadow_host{}",
+                std::env::consts::DLL_PREFIX,
+                std::env::consts::DLL_SUFFIX
+            ))
+        })
+        .clone()
+}
+
+/// MeadowBoot with the Rust `meadow` loaded into its own process rather than
+/// run as a program: `MEADOW_HOST` names the library and nothing names a
+/// `meadow` to run. A package is built and run -- its output and its exit
+/// status MeadowBoot's -- and commands MeadowBoot does not have, `fmt` and
+/// `fmt --check`, are answered by the library: a file set out badly is said
+/// to be, is set out, and then is not.
+#[test]
+fn meadowboot_calls_the_back_end_in_its_own_process() {
+    let dir = meadow_scratch::scratch!("meadowboot-host-{}", std::process::id());
+    std::fs::create_dir_all(dir.join("src")).expect("a package directory");
+    std::fs::write(
+        dir.join("Meadow.toml"),
+        "[package]\nname = \"Hosted\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("a manifest");
+    std::fs::write(
+        dir.join("src").join("Main.mw"),
+        "use Std.Process (exit)\n\nfun main () =\n  let u = println \"from the program\" in\n  exit 3\n",
+    )
+    .expect("the root module");
+    let host = meadow_host();
+    let run = |args: &[&std::ffi::OsStr]| {
+        let out = Command::new(meadowboot_exe())
+            .args(args)
+            .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+            .env("MEADOW_HOST", &host)
+            .env_remove("MEADOW")
+            .env_remove("MEADOWBOOT_EXPANSIONS")
+            .output()
+            .expect("MeadowBoot runs");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (code, out, err) = run(&["run".as_ref(), "--offline".as_ref(), dir.as_os_str()]);
+    // After what the build says it compiled, which is on standard output.
+    assert!(out.ends_with("\nfrom the program\n"), "{out}{err}");
+    assert_eq!(code, Some(3), "{out}{err}");
+
+    let main = dir.join("src").join("Main.mw");
+    std::fs::write(&main, "fun main ()   =   println \"x\"\n").expect("a file set out badly");
+    let check = || run(&["fmt".as_ref(), "--check".as_ref(), main.as_os_str()]);
+    let (code, out, err) = check();
+    assert_eq!(code, Some(1), "{out}{err}");
+    assert!(format!("{out}{err}").contains("Main.mw"), "{out}{err}");
+    let (code, out, err) = run(&["fmt".as_ref(), main.as_os_str()]);
+    assert_eq!(code, Some(0), "{out}{err}");
+    let set_out = std::fs::read_to_string(&main).unwrap_or_default();
+    let (code, out, err) = check();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(set_out, "fun main () = println \"x\"\n");
+    assert_eq!(code, Some(0), "{out}{err}");
+}
+
 /// A constructor written through the module a `use … as` names, as MeadowBoot
 /// builds it: `A.App` where one of the module's types has that constructor,
 /// and `A.Term.Var` where two do -- in a pattern and in an expression -- with

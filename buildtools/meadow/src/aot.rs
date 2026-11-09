@@ -1323,10 +1323,7 @@ pub fn runtimes(target: Target) -> Result<Vec<PathBuf>, String> {
     if host && let Some(path) = embedded(target.runtime, lib) {
         candidates.push(path);
     }
-    if let Some(dir) = std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(Path::to_path_buf))
-    {
+    if let Some(dir) = crate::host::this_build().and_then(|e| e.parent().map(Path::to_path_buf)) {
         candidates.push(dir.join("lib").join(target.triple()).join(lib));
         if host {
             candidates.push(dir.join(lib));

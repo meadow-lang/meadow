@@ -1138,6 +1138,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "meadow-host"
+version = "0.5.0"
+dependencies = [
+ "meadow",
+ "serde_json",
+]
+
+[[package]]
 name = "meadow-infer"
 version = "0.5.0"
 dependencies = [

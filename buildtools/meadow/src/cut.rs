@@ -129,7 +129,7 @@ fn image(path: &Path) -> Result<meadow_bytecode::Program, String> {
 fn image_key(path: &Path) -> Option<(PathBuf, String, u64)> {
     use std::hash::{Hash, Hasher};
     let text = std::fs::read(path).ok()?;
-    let exe = std::fs::metadata(std::env::current_exe().ok()?).ok()?;
+    let exe = std::fs::metadata(crate::host::this_build()?).ok()?;
     let mut h = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut h);
     exe.len().hash(&mut h);
