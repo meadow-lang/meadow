@@ -203,6 +203,49 @@ and so does a missing library.
 `RUSTC_BOOTSTRAP` does rustc. A build from a checkout, or a nightly, needs
 nothing.
 
+## The prompt
+
+`meadow` with no command is the prompt, and MeadowBoot's is its own
+(`src/Repl.mw`), declared with Lingua's `repl!`. Retiring the Rust front end
+means every tool built on it has to be written again over MeadowBoot's
+passes, and a tool declared in Lingua is one whose line editing, history,
+colour, completion and `:` commands come from the same place as every other
+Lingua language's: what is left to write is what is Meadow's own.
+
+It answers what `meadow repl` answers, line for line. Each entry is a unit
+of its own, named `repl:N` as the Rust prompt names them, compiled against
+the standard library and every entry before it (`Compiler.enteredUnit`).
+What those define is in scope bare, the newest of a name over an older one
+(`Scopes.isEntry`), so a name defined again is a new definition and what was
+compiled against the old one goes on using it. An expression is the entry
+`def it = …`. The `use`s typed so far are written ahead of each entry, so a
+qualifier lasts for the session. When an entry is finished is the Rust
+prompt's rule, ported (`needsContinuation`): `repl!` reads another line while
+every error its `errors` reports is at the end, and the prompt reports one
+there exactly when the Rust prompt would read on.
+
+An entry is run by MeadowBoot's CEK machine: the standard library's core,
+each entry's and its own, linked into one program (`Core.linkedUnits`), and
+the last value it defines asked for. The standard library is built once, in
+`meadowboot-repl` in the scratch directory, by another run of MeadowBoot, so
+that nothing a build prints reaches the prompt. `:tour` takes the Rust
+prompt's tour, which `src/Tour.mw` is written out from (see its header).
+
+What it does not do yet: `:ir` shows none of the compiler's IRs; the CEK
+machine has no threads, and computes far more slowly than the JIT the Rust
+prompt runs on, so `fib 30` takes minutes rather than milliseconds; and Tab
+completes from the session's names, not from the compiler's scope at the
+cursor.
+
+`buildtools/meadow/tests/repl_differential.rs` types the same sessions into
+both prompts and compares what they print, entry by entry, and reports how
+far they agree by kind of entry. Its doc comment has the numbers.
+
+```sh
+MEADOWBOOT_EXE=bootstrap/target/release/native/silo/MeadowBoot.exe \
+  cargo test --release -p meadow --test repl_differential -- --ignored
+```
+
 ## What the Rust compiler learned
 
 Writing a second compiler finds what the first one does that nothing else

@@ -1,0 +1,1064 @@
+-- The prompt: `meadow repl`, MeadowBoot's, declared with Lingua's `repl!`
+-- over what the compiler already works out.
+--
+-- It answers what the Rust compiler's prompt answers
+-- (`buildtools/meadow/src/cli/repl.rs`), line for line: the banner, an
+-- entry's type -- `name : scheme` -- and its value, `= 42`, what is wrong
+-- with it, and the `:` commands. `buildtools/meadow/tests/repl_differential.rs`
+-- types the same sessions into both and compares what they print; where the
+-- two still differ, that test says how far.
+--
+-- Each entry is a unit of its own, as it is for the Rust prompt: a package
+-- named `repl:3`, of one module, compiled against the standard library and
+-- every entry before it (`Compiler.enteredUnit`). What those define is in
+-- scope bare (`Scopes.isEntry`), the newest of a name over an older one, so
+-- a name defined again is a new definition, and what was compiled against
+-- the old one goes on using it. An expression is the entry `def it = …`, and
+-- in it `it` means the entry before. The `use`s typed so far are written
+-- ahead of each entry, so that a qualifier lasts for the session.
+--
+-- An entry is run by the CEK machine (`Cek`): the standard library's core,
+-- every entry's and its own, made one program (`Core.linkedUnits`), and the
+-- last value it defines asked for. `:jit`, `:vm` and `:cek` choose what
+-- `@cfg(backend = …)` answers, which is all of the Rust prompt's choice of
+-- machine that this one has.
+--
+-- When an entry is finished is the Rust prompt's rule (`needsContinuation`):
+-- `repl!` takes an entry as unfinished when every error `errors` says it has
+-- is at its end, and this prompt says there is one there exactly when the
+-- Rust prompt would read another line.
+
+use Lingua (repl!)
+use Lingua.Repl (Reply)
+use Lingua.Green (Green)
+use Lingua.Make (Given, unitImports)
+use Lingua.Lang (Meta)
+use Lingua.Lang.Meta.*
+use Lingua.Diagnostic (errorAt, renderAll)
+use MeadowBoot.Syntax (Surface, parseSurface)
+use MeadowBoot.Parse (checkedTree)
+use MeadowBoot.Compiler (
+  Interface, Entered, enteredUnit, givenUnits, unitDatabase, compilerWhole, hostOs, hostArch
+)
+use MeadowBoot.Lower (Cfg)
+use MeadowBoot.Scopes (Export)
+use MeadowBoot.Types (Scheme, showScheme)
+use MeadowBoot.Core (CoreProgram, linkedUnits)
+use MeadowBoot.Cek as Cek
+use MeadowBoot.Unit (stdDir)
+use MeadowBoot.Tour (Step, steps)
+use Std.Collections.Vector as V
+use Std.Collections.HashMap as H
+use Std.String as S
+use Std.Char as C
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+use Std.Result.Result.*
+use Std.Path as Path
+use Std.Fs (writeString, createDirAll, exists)
+use Std.Console (writeOutput, writeError)
+use Std.Process (getEnv)
+use Std.Process as Proc
+use Std.Time (monotonic)
+use Std.Result as Res
+
+repl! {
+  pub Prompt "meadow" for Session
+    | text = typedIn
+    | eval = evaluated
+    | tree = treeOf
+    | errors = unfinishedAt
+    | completion = completionAt
+    | commands = sessionCommands
+    | prompt = "> "
+    | history = ".repl_history"
+}
+
+-- --- what the prompt keeps ----------------------------------------------------
+
+-- An entry that was run: the unit it was compiled to -- its package's name,
+-- what it exports and its interface -- and its core, for the CEK machine;
+-- and whether it was a `use`, which is written ahead of every entry after.
+record Kept = {
+  pkg : String,
+  text : String,
+  exports : [Export],
+  interface : Interface,
+  core : Maybe CoreProgram
+}
+
+-- What the prompt keeps between lines: the entry being typed; where it
+-- builds, and the standard library's interface and, once something has
+-- been run, its core; the entries run so far, oldest first; the `use`s
+-- typed; how to evaluate; whether to time every entry; where the tour is
+-- and how many of a step's lines `:try` has handed over; the last entry
+-- with code of its own, for `:ir`; and the number the next entry's unit
+-- takes.
+@pub record Session = {
+  typed : Ref String,
+  home : String,
+  std : Maybe Interface,
+  stdCore : Ref (Maybe CoreProgram),
+  kept : Ref [Kept],
+  uses : Ref [String],
+  engine : Ref String,
+  timing : Ref Bool,
+  tour : Ref (Maybe Int),
+  tried : Ref Int,
+  last : Ref (Maybe (String, Int)),
+  line : Ref Int
+}
+
+-- A session: the standard library built where the prompt's entries are
+-- made, and its interface read back. Then the banner.
+@pub fun newSession () =
+  let home = homeDir () in
+  let std = loadStd home in
+  let said =
+    (match std with
+     | Err why -> writeError "meadowboot: the standard library could not be loaded: ${why}\n"
+     | Ok _ -> ())
+  in
+  let shown = writeOutput banner in
+  Session {
+    typed = newRef "",
+    home,
+    std = Res.toMaybe std,
+    stdCore = newRef None,
+    kept = newRef [],
+    uses = newRef [],
+    engine = newRef "jit",
+    timing = newRef False,
+    tour = newRef None,
+    tried = newRef 0,
+    last = newRef None,
+    line = newRef 1
+  }
+
+-- Where the prompt's units are made: a package of its own in the scratch
+-- directory, which the standard library is built for once and then kept.
+fun homeDir () =
+  let tmp =
+    match getEnv "TEMP" with
+    | Just t -> t
+    | None -> M.unwrapOr "/tmp" (getEnv "TMPDIR")
+  in Path.join tmp "meadowboot-repl"
+
+-- The standard library, built for the package at `home` by another run of
+-- this program -- so that what a build says does not reach the prompt --
+-- and its interface read back.
+fun loadStd (home : String) =
+  let main = Path.joinAll [home, "src", "Main.mw"] in
+  let made =
+    if exists main then ()
+    else
+      (let a = createDirAll (Path.join home "src") in
+       let b =
+         writeString (
+           Path.join home "Meadow.toml",
+           "[package]\nname = \"repl\"\nversion = \"0.1.0\"\n"
+         )
+       in
+       let c = writeString (main, "def result = ()\n") in
+       ())
+  in
+  let built = Proc.run (Proc.currentExe ()) ["infer", main] in
+  match givenUnits "debug" home home with
+  | Err why -> Err why
+  | Ok g ->
+      (match stdOf (unitImports g) with
+       | Just (_, i) -> Ok i
+       | None -> Err "the build has no standard library")
+
+-- The standard library among what a unit imports: where it is, and its
+-- interface.
+fun stdOf (imports : [(String, Interface)]) : Maybe (String, Interface) =
+  V.find (\(x : (String, Interface)) -> (snd x).package == "Std") imports
+
+-- The standard library's core, made the first time something is run.
+fun stdCoreOf (s : Session) =
+  match getRef s.stdCore with
+  | Just c -> Just c
+  | None ->
+      let made =
+        (match givenUnits "debug" s.home s.home with
+         | Ok g ->
+             (match stdOf (unitImports g) with
+              | Just (dir, _) ->
+                  (match givenUnits "debug" s.home dir with
+                   | Ok u -> compilerWhole (unitDatabase u) 0
+                   | Err _ -> None)
+              | None -> None)
+         | Err _ -> None)
+      in
+      let u = setRef s.stdCore made in
+      made
+
+-- --- what is typed --------------------------------------------------------------
+
+fun typedIn (s : Session) (file : Int) (t : String) = setRef s.typed t
+
+-- The entry's tree, for the line to colour.
+fun treeOf (s : Session) (file : Int) = fst (parseSurface (getRef s.typed))
+
+-- What Tab offers at byte `at` of the entry, each with what it is (the
+-- prompt keeps those that start as the name before the cursor does): after
+-- `S.`, what the module a `use … as S` names exports; anywhere else, a value
+-- or a type in scope -- an entry's, or the standard library's root's. As the
+-- Rust prompt's (`complete::Names::candidates`), though by the session's
+-- names rather than its compiler's scopes.
+fun completionAt (s : Session) (file : Int) (at : Int) =
+  let t = getRef s.typed in
+  let cs = S.chars (stringSlice t 0 (min at (stringByteLength t))) in
+  let rec back i = if i > 0 and isWordChar (V.getOr ' ' cs (i - 1)) then back (i - 1) else i in
+  let start = back (V.len cs) in
+  let qualified = start > 0 and V.getOr ' ' cs (start - 1) == '.' in
+  let stdExports =
+    (match s.std with
+     | Just (i : Interface) -> i.exports
+     | None -> [])
+  in if qualified then
+       (let qualStart = back (start - 1) in
+        let alias = S.fromChars (V.drop (V.take cs (start - 1)) qualStart) in
+        match aliasPath (getRef s.uses) alias with
+        | Just path ->
+            V.map
+              (\(e : Export) -> (e.name, "value"))
+              (V.filter (\(e : Export) -> e.kind == "v" and e.module == path) stdExports)
+        | None -> [])
+     else
+       V.concat [
+         V.concatMap
+           (\(k : Kept) ->
+             V.map (\(e : Export) -> (e.name, if e.kind == "t" then "type" else "value")) k.exports)
+           (getRef s.kept),
+         V.concatMap
+           (\(e : Export) ->
+             if V.isEmpty e.module and (e.kind == "v" or e.kind == "t") then
+               [(e.name, if e.kind == "t" then "type" else "value")]
+             else [])
+           stdExports
+       ]
+
+-- An error at the entry's end where the Rust prompt reads another line for
+-- it, and none where it enters it.
+fun unfinishedAt (s : Session) (file : Int) =
+  let t = getRef s.typed in
+  if needsContinuation t then [stringByteLength t] else []
+
+-- Whether the Rust prompt reads another line for `input` before entering it
+-- (`needs_continuation`): a `:` line never does and a trailing `\` always
+-- does. A first line is entered once it parses. Once there are several, a
+-- blank line enters them; a signature waiting for its clauses, an arm (`|`),
+-- an open bracket or an operator or keyword at the end reads on; and
+-- otherwise they are entered once they parse.
+@pub fun needsContinuation (input : String) : Bool =
+  if S.startsWith ":" (S.trimStart input) then False
+  else if S.endsWith "\\" (trimSpaces input) then True
+  else
+    let code = withoutLiterals input in
+    let multiline = S.contains "\n" input in
+    let lines = S.split "\n" input in
+    if multiline and S.isEmpty (S.trim (V.getOr "" lines (V.len lines - 1))) then False
+    else if opensASignature (lastCodeLine code) then True
+    else if not multiline then not (parsesOk input)
+    else if S.startsWith "|" (S.trimStart (lastCodeLine input)) then True
+    else if bracketDepth code > 0 then True
+    else if V.elem (lastWord code) dangling then True
+    else not (parsesOk input)
+
+-- What an entry may end with and still be going on.
+def dangling : [String] =
+  [
+    "->", "=", "==", "!=", "<=", ">=", "&&", "||", "let", "in", "if", "then", "else", "match",
+    "with", "fun", "def", "|", "\\", "+", "-", "*", "/", "%", "^", "<", ">", ".", ","
+  ]
+
+-- `s` without the spaces and tabs at its end.
+fun trimSpaces (s : String) : String =
+  let cs = S.chars s in
+  let rec back i =
+    if i > 0 and (V.getOr ' ' cs (i - 1) == ' ' or C.code (V.getOr ' ' cs (i - 1)) == 9) then
+      back (i - 1)
+    else i
+  in S.fromChars (V.take cs (back (V.len cs)))
+
+-- The last line of `code` with anything on it.
+fun lastCodeLine (code : String) : String =
+  M.unwrapOr "" (V.find (\l -> not (S.isEmpty (S.trim l))) (V.reverse (S.split "\n" code)))
+
+-- The last word of `code`, between white space.
+fun lastWord (code : String) : String =
+  let ws = V.filter (\w -> not (S.isEmpty w)) (S.split " " (spacedOut code)) in
+  V.getOr "" ws (V.len ws - 1)
+
+-- Every white space character a space.
+fun spacedOut (s : String) : String =
+  S.fromChars (V.map (\c -> if C.isSpace c then ' ' else c) (S.chars s))
+
+-- Whether `line` is a signature with nothing defined yet: `fun f : T` or
+-- `def x : T`, with no `=` of its own (`=>` is none).
+fun opensASignature (line : String) : Bool =
+  let first = V.getOr "" (V.filter (\w -> not (S.isEmpty w)) (S.split " " (spacedOut line))) 0 in
+  (first == "fun" or first == "def")
+    and S.contains ":" line
+    and not (S.contains "=" (S.join "" (S.split "=>" line)))
+
+-- How many brackets of `code` are open at its end.
+fun bracketDepth (code : String) : Int =
+  V.foldl
+    (\d c ->
+      if c == '(' or c == '[' or c == '{' then d + 1
+      else if c == ')' or c == ']' or c == '}' then d - 1
+      else d)
+    0
+    (S.chars code)
+
+-- Whether `input` parses as one declaration or one expression.
+fun parsesOk (input : String) : Bool =
+  match entryOf input with
+  | Parsed.Decls -> True
+  | Parsed.Expr -> True
+  | Parsed.Wrong _ -> False
+
+-- What an entry is: declarations, an expression, or neither -- with what is
+-- wrong with it, each at its byte.
+data Parsed = Decls | Expr | Wrong [(Int, String)]
+
+-- What `input` is. An expression is read as the declaration `def it = …`
+-- would be, the bytes of what is wrong with it counted from its own start.
+fun entryOf (input : String) : Parsed =
+  if V.all (\l -> S.isEmpty (S.trim l) or S.startsWith "--" (S.trim l)) (S.split "\n" input) then
+    Parsed.Wrong [(0, "nothing to enter")]
+  else
+    match checkedTree input with
+    | Ok _ -> Parsed.Decls
+    | Err asDecls ->
+        match checkedTree (itPrefix ++ input) with
+        | Ok _ -> Parsed.Expr
+        | Err asExpr ->
+            if startsADecl input then Parsed.Wrong asDecls
+            else
+              Parsed.Wrong (V.map (\e -> (max 0 (fst e - stringByteLength itPrefix), snd e)) asExpr)
+
+-- What an expression entry is written after.
+def itPrefix : String = "def it = "
+
+-- Whether `input` starts as a declaration does.
+fun startsADecl (input : String) : Bool =
+  let first = V.getOr "" (V.filter (\w -> not (S.isEmpty w)) (S.split " " (spacedOut input))) 0 in
+  S.startsWith "@" first
+    or V.elem first [
+      "use", "def", "fun", "data", "record", "effect", "type", "trait", "impl", "macro", "mod",
+      "infix", "infixl", "infixr", "pattern"
+    ]
+
+-- What a string literal being skipped is in the middle of: its text; a
+-- `${…}` hole of one, so many braces deep; or a raw string, `r#"…"#`, closed
+-- by a quote and so many `#`s.
+data Lit = InText | InHole Int | InRaw Int
+
+-- `input` with each string literal a space either side of nothing, and its
+-- comments gone: what the brackets and the last word are counted in
+-- (`strip_strings_and_comments`).
+fun withoutLiterals (input : String) : String = S.fromChars (stripped (S.chars input) 0 [])
+
+fun stripped (cs : [Char]) (i : Int) (out : [Char]) : [Char] =
+  match V.get cs i with
+  | None -> out
+  | Just c ->
+      let opened =
+        if c == '"' then Just (Lit.InText, 1)
+        else if c == 'r' then M.map (\h -> (Lit.InRaw h, 2 + h)) (opensRaw cs i)
+        else None
+      in match opened with
+         | Just (first, skip) ->
+             stripped cs (skipped cs (i + skip) [first]) (V.pushBack (V.pushBack out ' ') ' ')
+         | None ->
+             if c == '-' and V.get cs (i + 1) == Just '-' then stripped cs (lineEnd cs i) out
+             else stripped cs (i + 1) (V.pushBack out c)
+
+-- Where the line `i` is on ends: at its newline, which is kept.
+fun lineEnd (cs : [Char]) (i : Int) : Int =
+  match V.get cs i with
+  | Just c -> if c == '\n' then i else lineEnd cs (i + 1)
+  | None -> i
+
+fun isWordChar (c : Char) : Bool = C.isAlphaNum c or c == '_' or C.code c == 39
+
+-- How many `#`s the raw string starting at `i` opens with, if one does.
+fun opensRaw (cs : [Char]) (i : Int) : Maybe Int =
+  if V.get cs i != Just 'r' or (i > 0 and isWordChar (V.getOr ' ' cs (i - 1))) then None
+  else
+    (let hashes = runOf cs (i + 1) '#' in
+     if V.get cs (i + 1 + hashes) == Just '"' then Just hashes else None)
+
+fun runOf (cs : [Char]) (at : Int) (c : Char) : Int =
+  if V.get cs at == Just c then 1 + runOf cs (at + 1) c else 0
+
+-- Past the literal whose insides start at `i`, `nest` being what it is in
+-- the middle of, innermost last.
+fun skipped (cs : [Char]) (i : Int) (nest : [Lit]) : Int =
+  match (V.get nest (V.len nest - 1), V.get cs i) with
+  | (Just top, Just d) ->
+      let j = i + 1 in
+      let popped = V.take nest (V.len nest - 1) in
+      (match top with
+       | Lit.InRaw h ->
+           if d == '"' and runOf cs j '#' >= h then skipped cs (j + h) popped else skipped cs j nest
+       | Lit.InText ->
+           if d == '\\' then skipped cs (j + 1) nest
+           else if d == '"' then skipped cs j popped
+           else if d == '$' and V.get cs j == Just '{' then
+             skipped cs (j + 1) (V.pushBack nest (Lit.InHole 0))
+           else skipped cs j nest
+       | Lit.InHole depth ->
+           if d == '"' then skipped cs j (V.pushBack nest Lit.InText)
+           else if d == 'r' and M.isSome (opensRaw cs (j - 1)) then
+             (let h = M.unwrapOr 0 (opensRaw cs (j - 1)) in
+              skipped cs (j + 1 + h) (V.pushBack nest (Lit.InRaw h)))
+           else if d == '{' then skipped cs j (V.pushBack popped (Lit.InHole (depth + 1)))
+           else if d == '}' then
+             (if depth == 0 then skipped cs j popped
+              else skipped cs j (V.pushBack popped (Lit.InHole (depth - 1))))
+           else skipped cs j nest)
+  | _ -> i
+
+-- `foo \` and a newline as the newline alone: a `\` that continues a line
+-- is not part of the entry (`join_continuations`).
+fun joinedLines (input : String) : String =
+  S.join
+    "\n"
+    (V.map
+       (\l ->
+         let t = trimSpaces l in
+         if S.endsWith "\\" t then stringSlice t 0 (stringByteLength t - 1) else l)
+       (S.split "\n" input))
+
+-- --- an entry ------------------------------------------------------------------
+
+-- Whether an entry is run, or only its type said (`:t`).
+data Mode = Run | TypeOnly
+
+-- What entering what was typed prints: what `handled` writes, and its last
+-- line, which is the prompt's to write.
+fun evaluated (s : Session) (file : Int) =
+  let entry = S.trim (joinedLines (getRef s.typed)) in
+  handled s entry Mode.Run (getRef s.timing)
+
+-- One entry checked, compiled and -- if it is to be `Run` -- run: what is
+-- wrong with it written to standard error, what it binds, each `name :
+-- scheme`, and its value, `= 42`, or what went wrong running it. And with
+-- `timed`, how long each part took. The last line is answered rather than
+-- written.
+fun handled (s : Session) (input : String) (mode : Mode) (timed : Bool) =
+  let started = monotonic () in
+  match entryOf input with
+  -- The first thing wrong, as the Rust parser stops at it.
+  | Parsed.Wrong errs ->
+      (let u =
+         writeError
+           (renderAll
+              "repl"
+              input
+              (V.map (\e -> errorAt (Meta (fst e) (fst e + 1)) (snd e)) (V.take errs 1)))
+       in "")
+  | parsed ->
+      match s.std with
+      | None ->
+          (let u = writeError "meadowboot: there is no standard library to compile against\n" in "")
+      | Just std ->
+          let isExpr = (match parsed with | Parsed.Expr -> True | _ -> False) in
+          let n = getRef s.line in
+          let pkg = "repl:${show n}" in
+          let dir = Path.join s.home "entry${show n}" in
+          let uses = getRef s.uses in
+          let ahead = S.join "" (V.map (\u -> u ++ "\n") uses) in
+          let module = ahead ++ (if isExpr then itPrefix ++ input else input) ++ "\n" in
+          let files =
+            [
+              (Path.join dir "Meadow.toml", "[package]\nname = \"${pkg}\"\nversion = \"0.1.0\"\n"),
+              (Path.joinAll [dir, "src", "Main.mw"], module)
+            ]
+          in
+          let before = V.map (\(k : Kept) -> k.interface) (getRef s.kept) in
+          let done = enteredUnit (cfgFor s) dir (V.pushFront before std) files in
+          let shift = if isExpr then stringByteLength itPrefix else 0 in
+          let wrong =
+            V.map (\w -> placedIn input (V.len uses) (stringByteLength ahead) shift w) done.wrong
+          in
+          let u = if V.isEmpty wrong then () else writeError (renderAll "repl" input wrong) in
+          let values = V.filter isBinding done.exports in
+          let label = if isExpr then Just (labelOf input) else None in
+          -- A name the entry says nothing binds names no binding: its type
+          -- is the error's.
+          let unbound = \l -> V.any (\w -> S.endsWith ": undefined variable: ${l}" w) done.wrong in
+          let named = M.andThen (\l -> if unbound l then None else namedScheme s std l) label in
+          let w =
+            V.foldl
+              (\acc (e : Export) ->
+                writeOutput
+                  ("${match label with | Just l -> l | None -> e.name} : ${match (named, label) with | (Just sc, _) -> sc | _ -> schemeOf e}\n"))
+              ()
+              values
+          in
+          let hadError = not (V.isEmpty wrong) in
+          let types =
+            if V.isEmpty values and not hadError then
+              V.foldl
+                (\acc (e : Export) ->
+                  if e.kind == "t" and isDeclaredType e then
+                    writeOutput "defined type ${pkg}.${e.name}\n"
+                  else acc)
+                ()
+                done.exports
+            else ()
+          in
+          let running = (match mode with | Mode.Run -> True | Mode.TypeOnly -> False) in
+          if hadError or not running then ""
+          else
+            let checked = monotonic () - started in
+            let kept =
+              Kept {
+                pkg,
+                text = input,
+                exports = done.exports,
+                interface = done.interface,
+                core = done.core
+              }
+            in
+            -- What is run is the last value it defines; an effect's
+            -- operation is no definition to run.
+            let runnable = V.filter (\(e : Export) -> S.isEmpty e.owner) values in
+            let answer =
+              (match V.get runnable (V.len runnable - 1) with
+               | Just (e : Export) -> ran s kept e checked timed
+               | None -> "")
+            in
+            let x = keep s kept input in
+            answer
+
+-- Whether an export is a binding the prompt shows: a value, or an effect's
+-- operation, but nothing a derive or the compiler made (`$…`).
+fun isBinding (e : Export) : Bool =
+  e.kind == "v"
+    and (S.isEmpty e.owner or S.startsWith "op:" e.owner)
+    and not (S.startsWith "$" e.name)
+
+-- `name : scheme` of what an export is: its scheme, written as the Rust
+-- compiler writes one.
+fun schemeOf (e : Export) : String =
+  match e.scheme with
+  | Just sc -> showScheme sc
+  | None -> "{error}"
+
+-- Whether a type export is a type a declaration made -- `data`, `record`,
+-- `type` -- rather than a trait, an effect or a trait's associated type.
+fun isDeclaredType (e : Export) : Bool =
+  not (e.owner == "trait" or e.owner == "effect" or S.startsWith "assoc" e.owner)
+
+-- An entry that ran kept: the units after it are compiled against it, and a
+-- `use` is written ahead of each.
+fun keep (s : Session) (k : Kept) (input : String) =
+  let a = setRef s.kept (V.pushBack (getRef s.kept) k) in
+  let b = setRef s.line (getRef s.line + 1) in
+  let c =
+    if M.isSome k.core and V.any (\(e : Export) -> e.kind == "v") k.exports then
+      setRef s.last (Just (input, V.len (getRef s.kept) - 1))
+    else ()
+  in if isUse input then
+       setRef s.uses (V.pushBack (V.filter (\u -> u != input) (getRef s.uses)) input)
+     else ()
+
+fun isUse (input : String) : Bool =
+  let first = V.getOr "" (V.filter (\w -> not (S.isEmpty w)) (S.split " " (spacedOut input))) 0 in
+  first == "use" or (S.startsWith "@" first and S.contains " use " (spacedOut input))
+
+-- What a problem the compiler found is, placed in the entry as typed: a
+-- parse error at its byte, `@12: why`, or anything else at its line and
+-- column, `file:2:5: why`, the lines of the `use`s written ahead of it and
+-- the `def it = ` an expression is written after taken off.
+fun placedIn (input : String) (ahead : Int) (aheadBytes : Int) (shift : Int) (w : String) =
+  let atByte =
+    if S.startsWith "@" w then
+      (match S.indexOf ": " w with
+       | Just k -> M.map (\b -> (b, S.drop w (k + 2))) (S.toInt (stringSlice w 1 k))
+       | None -> None)
+    else None
+  in match atByte with
+     | Just (b, why) ->
+         (let at = min (stringByteLength input) (max 0 (b - aheadBytes - shift)) in
+          errorAt (Meta at (at + 1)) why)
+     | None ->
+         match lineColumn w with
+         | Just (line, column, why) ->
+             (let l = line - ahead in
+              let col = if l == 1 then column - shift else column in
+              let at = byteOfPlace input l col in
+              errorAt (Meta at (at + 1)) why)
+         | None -> errorAt (Meta 0 0) w
+
+-- `file:2:5: why` read as its line, column and why.
+fun lineColumn (w : String) : Maybe (Int, Int, String) =
+  let parts = S.split ": " w in
+  match V.get parts 0 with
+  | None -> None
+  | Just place ->
+      let bits = S.split ":" place in
+      let n = V.len bits in
+      match (M.andThen S.toInt (V.get bits (n - 2)), M.andThen S.toInt (V.get bits (n - 1))) with
+      | (Just line, Just column) -> Just (line, column, S.join ": " (V.drop parts 1))
+      | _ -> None
+
+-- The byte line `line`, column `column` of `text` is at, each from one.
+fun byteOfPlace (text : String) (line : Int) (column : Int) : Int =
+  let ls = S.split "\n" text in
+  let before = V.foldl (\acc l -> acc + stringByteLength l + 1) 0 (V.take ls (max 0 (line - 1))) in
+  min (stringByteLength text) (max 0 (before + column - 1))
+
+-- What an expression is reported under: the name it is, when it is only a
+-- name -- `x`, `S.length`, `None` -- and `_` when it is computed.
+fun labelOf (input : String) : String =
+  let t = S.trim input in
+  if isName t then t
+  else
+    let parts = S.split "." t in
+    let m = V.getOr "" parts 0 in
+    if V.len parts == 2
+      and isName m
+      and C.isUpper (V.getOr ' ' (S.chars m) 0)
+      and isName (V.getOr "" parts 1) then t
+    else "_"
+
+fun isName (t : String) : Bool =
+  let cs = S.chars t in
+  match V.get cs 0 with
+  | Just first -> (C.isAlpha first or first == '_') and V.all isWordChar cs
+  | None -> False
+
+-- The scheme of the binding an entry names, when it is only a name of a
+-- value: what the newest entry of that name, or the standard library's
+-- root, binds -- which says more than what running it settled.
+fun namedScheme (s : Session) (std : Interface) (label : String) =
+  if label == "_" or C.isUpper (V.getOr ' ' (S.chars label) 0) and not (S.contains "." label) then
+    None
+  else if S.contains "." label then
+    let parts = S.split "." label in
+    let x = V.getOr "" parts 1 in
+    M.andThen
+      (\path ->
+        M.map
+          schemeOf
+          (V.find
+             (\(e : Export) -> e.kind == "v" and e.name == x and e.module == path)
+             std.exports))
+      (aliasPath (getRef s.uses) (V.getOr "" parts 0))
+  else
+    let own =
+      V.find
+        (\(e : Export) -> e.kind == "v" and S.isEmpty e.owner and e.name == label)
+        (V.concatMap (\(k : Kept) -> V.reverse k.exports) (V.reverse (getRef s.kept)))
+    in match own with
+       | Just e -> Just (schemeOf e)
+       | None ->
+           M.map
+             schemeOf
+             (V.find
+                (\(e : Export) -> e.kind == "v" and e.name == label and V.isEmpty e.module)
+                std.exports)
+
+-- The module of the standard library a `use … as alias` typed so far names.
+fun aliasPath (uses : [String]) (alias : String) : Maybe [String] =
+  V.foldl
+    (\acc u ->
+      let ws = V.filter (\w -> not (S.isEmpty w)) (S.split " " (spacedOut u)) in
+      let path = S.split "." (V.getOr "" ws 1) in
+      if V.len ws == 4
+        and V.getOr "" ws 0 == "use"
+        and V.getOr "" ws 2 == "as"
+        and V.getOr "" ws 3 == alias
+        and V.getOr "" path 0 == "Std" then Just (V.drop path 1)
+      else acc)
+    None
+    uses
+
+-- What `@cfg` answers for an entry: this machine, the debug profile, and
+-- the machine chosen to evaluate with.
+fun cfgFor (s : Session) =
+  Cfg {
+    os = hostOs,
+    arch = hostArch,
+    profile = "debug",
+    backend = getRef s.engine,
+    opt = "1",
+    test = False,
+    flags = []
+  }
+
+-- Export `e` of the entry `k` run on the CEK machine with the standard
+-- library and every entry before it: `= value`, or nothing where it went
+-- wrong, which is said on standard error. With `timed`, how long it took.
+fun ran (s : Session) (k : Kept) (e : Export) (checked : Int) (timed : Bool) =
+  let t0 = monotonic () in
+  let units =
+    V.concat [
+      (match stdCoreOf s with | Just c -> [c] | None -> []),
+      V.concatMap (\(x : Kept) -> M.unwrapOr [] (M.map (\c -> [c]) x.core)) (getRef s.kept),
+      M.unwrapOr [] (M.map (\c -> [c]) k.core)
+    ]
+  in match linkedUnits units with
+     | (whole, table) ->
+         let m = Cek.machine whole in
+         let t1 = monotonic () in
+         let result =
+           (match H.lookup "meadow:${k.pkg}/d${show e.binder}" table with
+            | Just id -> Cek.call m id []
+            | None -> Err "`${e.name}` was not compiled")
+         in
+         let said =
+           (match result with
+            | Ok v -> "= ${Cek.display v}"
+            | Err why -> (let u = writeError (why ++ "\n") in ""))
+         in
+         let t2 = monotonic () in
+         if not timed then said
+         else
+           let line =
+             "time: ${duration (checked + t2 - t0)} (check ${duration checked}${if getRef s.engine == "cek" then "" else ", compile ${duration (t1 - t0)}"}, run ${duration (t2 - t1)})"
+           in if S.isEmpty said then line else "${said}\n${line}"
+
+-- A time in nanoseconds as the Rust prompt writes one: three figures and
+-- its unit, `3.36ms`, `268µs` (`runtime::format_duration`).
+@pub fun duration (ns : Int) : String =
+  let three =
+    \unit ->
+      (let hundredths = (ns * 100 + unit / 2) / unit in
+       if hundredths < 1000 then "${show (hundredths / 100)}.${twoDigits (hundredths % 100)}"
+       else
+         (let tenths = (ns * 10 + unit / 2) / unit in
+          if tenths < 1000 then "${show (tenths / 10)}.${show (tenths % 10)}"
+          else show ((ns + unit / 2) / unit)))
+  in if ns < 1000 then "${show ns}ns"
+     else if ns < 999500 then "${three 1000}µs"
+     else if ns < 999500000 then "${three 1000000}ms"
+     else if ns < 59950000000 then "${three 1000000000}s"
+     else
+       (let tenths = (ns + 50000000) / 100000000 in
+        "${show (tenths / 600)}m ${twoDigits (tenths % 600 / 10)}.${show (tenths % 10)}s")
+
+fun twoDigits (n : Int) : String = if n < 10 then "0${show n}" else show n
+
+-- --- the banner and `:help` ----------------------------------------------------
+
+def logo : String =
+  "      __  ___               __\n     /  |/  /__  ____ _____/ /___ _      __\n    / /|_/ / _ \\/ __ `/ __  / __ \\ | /| / /\n   / /  / /  __/ /_/ / /_/ / /_/ / |/ |/ /\n  /_/  /_/\\___/\\__,_/\\__,_/\\____/|__/|__/"
+
+-- What the prompt says when it starts: short, so that the name is still on
+-- the screen when the prompt is. Everything else is `:help`'s.
+def banner : String =
+  S.join "\n" [
+    "", logo, "", "  Welcome to the Meadow interactive environment!", "",
+    "  :help commands and keys   :tour a tour   :q quit",
+    "  Tab completes   Ctrl+F finds a declaration   Ctrl+J starts a new line", "", ""
+  ]
+
+-- The `:` commands, each as it is written and what it does.
+def commandList : [(String, String)] =
+  [
+    (":q", "quit"),
+    (":t <expr>", "type-check without evaluating"),
+    (":module", "list what is defined, and what a later definition shadowed"),
+    (":ir", "the last entry in every IR the compiler puts it in, a page each; Tab turns the page"),
+    (":ir <name>", "a definition, the same way"),
+    (
+      ":ir <which> <name>",
+      "one of them, printed as it is: core, cut, axcut, bytecode, native or llvm (with no name, the last entry's)"
+    ),
+    (":reset", "forget everything defined so far"),
+    (":jit / :vm / :cek", "switch machines (the JIT is the default)"),
+    (":time", "time every entry from now on, or stop"),
+    (":time <expr>", "time just this entry"),
+    (":tour", "a guided tour of the language, one step at a time"),
+    (":next / :back", "move through it; `:try` puts its example on the prompt")
+  ]
+
+fun padded (s : String) (width : Int) : String = s ++ S.repeat " " (max 0 (width - S.charLength s))
+
+-- `:help`: every command, and the keys, at the length the banner is not.
+def helpText : String =
+  S.join
+    "\n"
+    (V.concat [
+       ["", "  ${padded ":help" 17}  this"],
+       V.map (\c -> "  ${padded (fst c) 17}  ${snd c}") commandList,
+       [
+         "", "  Tab completes names — values, types, constructors and `use` paths,",
+         "  each in the namespace the cursor is actually in.",
+         "  Ctrl+F finds a declaration — by name, or by a type like [a] -> Int.",
+         "  Multi-line: Alt+Enter / Ctrl+J insert a newline; an unfinished line (open bracket,",
+         "  dangling operator, trailing `\\`, a signature, `| ...` arms) keeps reading.",
+         "  End a multi-line entry with a blank line."
+       ],
+       (if hostOs == "macos" then
+          [
+            "  On macOS: Ctrl+J always works. Option+Return (Alt+Enter) does once the terminal",
+            "  sends Option as Meta: Terminal > Settings > Profiles > Keyboard >",
+            "  \"Use Option as Meta key\"; in iTerm2, Profiles > Keys > Left Option: Esc+;",
+            "  in VS Code's terminal, the setting `terminal.integrated.macOptionIsMeta`.",
+            "  Until then Option+Return is an ordinary Return, and enters what is typed."
+          ]
+        else []),
+       [""]
+     ])
+
+-- --- the commands ----------------------------------------------------------------
+
+-- The prompt's `:` lines, as the Rust prompt has them.
+def sessionCommands =
+  [
+    ("help", "", "this", \s rest -> Reply.Said helpText),
+    ("h", "", "this", \s rest -> Reply.Said helpText),
+    ("?", "", "this", \s rest -> Reply.Said helpText),
+    ("q", "", "quit", \s rest -> Reply.Leave ""),
+    ("quit", "", "quit", \s rest -> Reply.Leave ""),
+    (
+      "t",
+      "<expr>",
+      "type-check without evaluating",
+      \s rest -> Reply.Said (handled s rest Mode.TypeOnly False)
+    ),
+    (
+      "module",
+      "",
+      "list what is defined, and what a later definition shadowed",
+      \s rest -> Reply.Said (listed s)
+    ),
+    ("reset", "", "forget everything defined so far", \s rest -> Reply.Said (reset s)),
+    ("jit", "", "switch machines", \s rest -> Reply.Said (switched s "jit")),
+    ("vm", "", "switch machines", \s rest -> Reply.Said (switched s "vm")),
+    ("cek", "", "switch machines", \s rest -> Reply.Said (switched s "cek")),
+    (
+      "time",
+      "[<expr>]",
+      "time every entry from now on, or stop; or just this entry",
+      \s rest -> Reply.Said (timeCommand s rest)
+    ),
+    (
+      "tour",
+      "[<step>]",
+      "a guided tour of the language, one step at a time",
+      \s rest -> Reply.Said (tourCommand s rest)
+    ),
+    ("next", "", "the tour's next step", \s rest -> Reply.Said (nextStep s)),
+    ("n", "", "the tour's next step", \s rest -> Reply.Said (nextStep s)),
+    ("back", "", "the tour's step before", \s rest -> Reply.Said (backStep s)),
+    ("b", "", "the tour's step before", \s rest -> Reply.Said (backStep s)),
+    ("try", "", "put the step's next example on the prompt", \s rest -> tryStep s),
+    (
+      "ir",
+      "[<which>] [<name>]",
+      "an entry in the compiler's IRs",
+      \s rest -> Reply.Said (shownIr s rest)
+    )
+  ]
+
+fun switched (s : Session) (engine : String) =
+  let u = setRef s.engine engine in
+  "(evaluating with the ${engine})"
+
+fun timeCommand (s : Session) (rest : String) =
+  if S.isEmpty rest then
+    (let u = setRef s.timing (not (getRef s.timing)) in
+     "(timing every entry: ${if getRef s.timing then "on" else "off"})")
+  else handled s (S.trim (joinedLines rest)) Mode.Run True
+
+fun reset (s : Session) =
+  let a = setRef s.kept [] in
+  let b = setRef s.uses [] in
+  let c = setRef s.line 1 in
+  let d = setRef s.last None in
+  "(reset)"
+
+-- `:module`: everything defined so far, with its type, and those a later
+-- definition of the same name shadowed.
+fun listed (s : Session) =
+  let all =
+    V.concatMap
+      (\(k : Kept) -> V.map (\(e : Export) -> (e.name, schemeOf e)) (V.filter isBinding k.exports))
+      (getRef s.kept)
+  in if V.isEmpty all then "(no bindings yet)"
+     else
+       let marked =
+         V.map
+           (\i ->
+             match V.get all i with
+             | Just (name, scheme) ->
+                 (name, scheme, V.any (\x -> fst x == name) (V.drop all (i + 1)))
+             | None -> ("", "", False))
+           (V.range 0 (V.len all))
+       in
+       let shadowed = V.len (V.filter (\x -> match x with | (_, _, sh) -> sh) marked) in
+       let lines =
+         V.map
+           (\x ->
+             match x with
+             | (name, scheme, sh) ->
+                 if sh then "${name} : ${scheme}  (shadowed)" else "${name} : ${scheme}")
+           marked
+       in S.join
+            "\n"
+            (if shadowed == 0 then lines
+             else
+               V.append lines [
+                 "",
+                 "(${show shadowed} definition${if shadowed == 1 then " is" else "s are"} shadowed: a name defined again is a new one, and what was written before it goes on using the old)"
+               ])
+
+-- --- the tour ----------------------------------------------------------------------
+
+fun sectionTitle (section : Int) : String = if section == 0 then "the basics" else "going further"
+
+fun sectionNamed (word : String) : Maybe Int =
+  if V.elem word ["basics", "basic", "1"] then Just 0
+  else if V.elem word ["advanced", "more", "2"] then Just 1
+  else None
+
+fun sectionFirst (section : Int) : Maybe Int =
+  V.find
+    (\i -> M.map (\(st : Step) -> st.section) (V.get steps i) == Just section)
+    (V.range 0 (V.len steps))
+
+fun heading (at : Int) : String =
+  "Step ${show (at + 1)} of ${show (V.len steps)} — ${M.unwrapOr "" (M.map (\(st : Step) -> st.title) (V.get steps at))}"
+
+-- What the tour has to offer: its sections, and where each begins.
+fun tourContents () : String =
+  let parts =
+    V.concatMap
+      (\section ->
+        let these =
+          V.filter
+            (\i -> M.map (\(st : Step) -> st.section) (V.get steps i) == Just section)
+            (V.range 0 (V.len steps))
+        in match V.get these 0 with
+           | None -> []
+           | Just first ->
+               V.concat [
+                 ["  ${padded (sectionTitle section) 14} ${show (V.len these)} steps, from :tour ${show (first + 1)}"],
+                 V.map
+                   (\i ->
+                     "    ${padLeft (show (i + 1)) 3}. ${M.unwrapOr "" (M.map (\(st : Step) -> st.title) (V.get steps i))}")
+                   these,
+                 [""]
+               ])
+      [0, 1]
+  in S.join
+       "\n"
+       (V.concat [
+          ["", "  A tour of the language", ""],
+          parts,
+          ["  :next starts at the beginning; :tour advanced goes straight to the second part.", ""]
+        ])
+
+fun padLeft (s : String) (width : Int) : String = S.repeat " " (max 0 (width - S.charLength s)) ++ s
+
+-- Step `at`, shown, and remembered as where the tour is.
+fun showTour (s : Session) (at : Int) =
+  match V.get steps at with
+  | None -> ""
+  | Just (step : Step) ->
+      let a = setRef s.tour (Just at) in
+      let b = setRef s.tried 0 in
+      S.join
+        "\n"
+        (V.concat [
+           ["", "  ${heading at}  (${sectionTitle step.section})", ""],
+           V.map (\l -> if S.isEmpty l then "" else "  ${l}") step.text,
+           [""],
+           V.map
+             (\i -> "  ${show (i + 1)}. ${V.getOr "" step.code i}")
+             (V.range 0 (V.len step.code)),
+           ["", "  :try puts the next of those on the prompt, :next moves on, :back goes back.", ""]
+         ])
+
+fun tourCommand (s : Session) (rest : String) =
+  if S.isEmpty rest then
+    (match getRef s.tour with
+     | Just at -> showTour s at
+     | None -> tourContents ())
+  else if rest == "off" or rest == "end" then
+    (let u = setRef s.tour None in "(the tour is over; everything you defined is still here)")
+  else
+    match (sectionNamed rest, S.toInt rest) with
+    | (Just section, _) ->
+        (match sectionFirst section with
+         | Just at -> showTour s at
+         | None -> "(that section has no steps)")
+    | (_, Just n) -> if n >= 1 and n <= V.len steps then showTour s (n - 1) else tourContents ()
+    | _ -> tourContents ()
+
+fun sectionOf (at : Int) : Int = M.unwrapOr 0 (M.map (\(st : Step) -> st.section) (V.get steps at))
+
+fun nextStep (s : Session) =
+  match getRef s.tour with
+  | Just at ->
+      if at + 1 < V.len steps and sectionOf (at + 1) != sectionOf at then
+        (let u = setRef s.tour None in
+         "(that is ${sectionTitle (sectionOf at)}. `:tour advanced` carries on with ${sectionTitle (sectionOf (at + 1))}, and everything you defined is still here)")
+      else if at + 1 < V.len steps then showTour s (at + 1)
+      else (let u = setRef s.tour None in "(that was the last step; the tour is over)")
+  | None -> showTour s 0
+
+fun backStep (s : Session) =
+  match getRef s.tour with
+  | Just at -> if at > 0 then showTour s (at - 1) else showTour s 0
+  | None -> showTour s 0
+
+-- `:try`: the step's next example on the prompt, to be read, changed and
+-- run -- round again after the last.
+fun tryStep (s : Session) =
+  match getRef s.tour with
+  | None -> Reply.Said "(`:tour` first, and `:try` will offer what to type)"
+  | Just at ->
+      let code = M.unwrapOr [] (M.map (\(st : Step) -> st.code) (V.get steps at)) in
+      match V.get code (getRef s.tried) with
+      | Just line -> (let u = setRef s.tried (getRef s.tried + 1) in Reply.Edit line)
+      | None ->
+          (let u = setRef s.tried 1 in
+           match V.get code 0 with
+           | Just line -> Reply.Edit line
+           | None -> Reply.Said "")
+
+-- --- :ir --------------------------------------------------------------------------
+
+-- `:ir`: what this prompt has of an entry's IRs. It has none of them yet:
+-- the Rust prompt's pages are its own compiler's.
+fun shownIr (s : Session) (rest : String) =
+  let words = V.filter (\w -> not (S.isEmpty w)) (S.split " " (spacedOut rest)) in
+  let first = V.getOr "" words 0 in
+  -- `:ir which name`, or `:ir which` for the last entry's -- unless `which`
+  -- is the name of something defined, which is what it then means.
+  let name =
+    if V.len words > 1 and V.elem first irForms then S.join " " (V.drop words 1)
+    else if V.elem first irForms and not (isDefined s first) then ""
+    else S.trim rest
+  in if S.isEmpty name then
+       (match getRef s.last with
+        | None -> "(nothing to show yet: enter an expression or a definition, and `:ir` shows it)"
+        | Just _ -> irNotYet)
+     else if isDefined s name then irNotYet
+     else "(nothing called `${name}` is defined)"
+
+def irForms : [String] = ["core", "cut", "axcut", "bytecode", "native", "llvm"]
+
+def irNotYet : String = "(MeadowBoot's prompt does not show IRs yet)"
+
+-- Whether a value called `name` is defined: by an entry, or by the
+-- standard library.
+fun isDefined (s : Session) (name : String) =
+  V.any
+    (\(k : Kept) -> V.any (\(e : Export) -> e.kind == "v" and e.name == name) k.exports)
+    (getRef s.kept)
+    or (match s.std with
+     | Just (i : Interface) -> V.any (\(e : Export) -> e.kind == "v" and e.name == name) i.exports
+     | None -> False)

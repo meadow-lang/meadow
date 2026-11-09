@@ -29,7 +29,7 @@ use Lingua (lang!, pass!)
 use Lingua.Lang (Meta, metaStart)
 use MeadowBoot.Groups (Binding, Group, bindingsOf, boundBy, groupModule, moduleOrder, unitGroups)
 use MeadowBoot.Prims (primScheme)
-use MeadowBoot.Scopes (Renamed, Declared, Item, DepExports, Export)
+use MeadowBoot.Scopes (Renamed, Declared, Item, DepExports, Export, isEntry)
 use Lingua.Buf as B
 use Std.Collections.Vector as V
 use Std.Collections.HashMap as H
@@ -956,7 +956,7 @@ fun varType (cx : Cx s) out (ref : InferringRef) : Type ! { St s | e } =
               else ()
             in openArrows i (instantiateAt i key sc)))
     | None ->
-        (let t = freshGlobal i.ar in
+        (let t = if M.isSome (H.lookup id i.unbound) then Error else freshGlobal i.ar in
          let u = setScheme i id (mono t) in
          t)
 
@@ -2966,7 +2966,16 @@ fun newInf (r : Renamed) : Inf s ! { St s | e } =
     group = stNewRef [],
     member = stNewRef None,
     methodSigs = stNewRef H.empty,
-    names = V.map (\(b : Binder) -> b.name) r.binders
+    names = V.map (\(b : Binder) -> b.name) r.binders,
+    unbound =
+      V.foldl
+        (\h k ->
+          match V.get r.binders k with
+          | Just (b : Binder) ->
+              if b.kind == "v" and S.startsWith "?" b.site then H.insert k True h else h
+          | None -> h)
+        H.empty
+        (V.range 0 (V.len r.binders))
   }
 
 -- Every declared binder's canonical name -- an operation's is `op:` and its
@@ -2993,13 +3002,18 @@ fun canonTable (r : Renamed) : HashMap Int String =
     (V.append own r.depItems)
 
 -- The root module's `main`: the definition that is run rather than defined.
+-- And in an entry of the prompt, `it`, which the prompt runs and shows, as
+-- the Rust compiler's `Options::entry_name` has it.
 fun entriesOf (r : Renamed) : [Int] =
   V.concatMap
     (\(d : Declared) ->
       if V.isEmpty d.path then
         V.concatMap
           (\(it : Item) ->
-            if it.kind == "v" and it.name == "main" and S.isEmpty it.owner then [it.id] else [])
+            if it.kind == "v"
+              and S.isEmpty it.owner
+              and (it.name == "main" or it.name == "it" and isEntry d.file) then [it.id]
+            else [])
           d.items
       else [])
     r.modules

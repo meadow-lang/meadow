@@ -292,7 +292,10 @@ use Sol.*
   group : StRef s [Int],
   member : StRef s (Maybe Int),
   methodSigs : StRef s (HashMap Int Scheme),
-  names : [String]
+  names : [String],
+  -- The binders of names nothing binds: each is of the error type, which
+  -- agrees with anything, as the Rust compiler types one.
+  unbound : HashMap Int Bool
 }
 
 -- A signature, where it was written: its module, its type, the bounds its

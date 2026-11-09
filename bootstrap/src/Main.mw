@@ -32,9 +32,12 @@ mod Ast
 mod Lower
 mod Rename
 mod Scopes
+mod Tour
+mod Repl
 
 use Lingua (cli!)
 use MeadowBoot.Lex (lex, dump)
+use MeadowBoot.Repl (runPrompt)
 use MeadowBoot.Core (program, erase, linkedUnits, CoreProgram, coreFilePackage)
 use MeadowBoot.Expand (Call, readRound, writeAnswers, callText, seenAfter)
 use MeadowBoot.Scopes (Export)
@@ -468,6 +471,8 @@ fun run (every : CliOptions) (cli : Cli) =
               (if V.isEmpty r.cfg then None else Just (S.join "," r.cfg)))
            r.files)
   | Cli.Expand r -> finish (expandRound r.files)
+  -- The prompt is MeadowBoot's (`Repl`).
+  | Cli.Repl -> runPrompt ()
   -- What is not MeadowBoot's yet is `meadow`'s, asked the same way.
   | _ -> handedOn ()
 
