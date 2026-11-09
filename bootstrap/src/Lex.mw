@@ -31,7 +31,6 @@ use Std.Result.Result.*
   = @regex("[ \t\n\r]+") @skip Whitespace
   | @regex("--[^\n]*") @skip Comment
   | @token("mod") Mod
-  | @token("end") End
   | @token("use") Use
   | @token("def") Def
   | @token("fun") Fun
@@ -187,7 +186,6 @@ use Std.Result.Result.*
   | Backtick
   | Dollar
   | Mod
-  | End
   | Use
   | Def
   | Fun
@@ -327,7 +325,6 @@ fun converted (input : String) (t : Code) (from : Int) (to : Int) : Result Strin
 fun fixed (t : Code) : Token =
   match t with
   | Code.Mod -> Token.Mod
-  | Code.End -> Token.End
   | Code.Use -> Token.Use
   | Code.Def -> Token.Def
   | Code.Fun -> Token.Fun
