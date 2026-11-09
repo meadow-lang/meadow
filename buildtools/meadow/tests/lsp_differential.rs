@@ -943,17 +943,26 @@ fn progress(line: &str) {
 ///
 /// Not yet, so it is ignored: run it with `--ignored` to see how far. On
 /// 2026-11-09, over `examples`, `benches` and `glade` at every name, the two
-/// agreed on 15336 of 16331 answers:
+/// agreed on 15345 of 16331 answers:
 ///
 /// ```text
-/// completion       712 / 1013    hover           4608 / 4624
-/// definition      4614 / 4624    initialize         0 / 13
+/// completion       712 / 1013    hover           4610 / 4624
+/// definition      4620 / 4624    initialize         0 / 13
 /// diagnostics       32 / 45      ir                 0 / 47
 /// formatting        19 / 19      lenses            19 / 19
 /// hints             18 / 19      prepareRename   4624 / 4624
 /// protocol          26 / 52      rename           648 / 1148 (500 refusals)
-/// symbols            0 / 65      tokens            16 / 19
+/// symbols            0 / 65      tokens            17 / 19
 /// ```
+///
+/// and over `lib` and `bootstrap` at every tenth name, completing at every
+/// fifth place (`MEADOW_LSP_EVERY=10 MEADOW_LSP_COMPLETE=5`), on 49700 of
+/// 54979: definition 14955 / 15528, hover 14267 / 15528, prepareRename
+/// 15424 / 15528, rename 4096 / 6747 (2551 refusals), tokens 78 / 130, hints
+/// 101 / 130, lenses 128 / 130, formatting 130 / 130, completion 363 / 660,
+/// diagnostics 113 / 148. Most of the difference there is inside macro calls
+/// -- `lang!`, `database!` -- whose expansions the two compilers type and
+/// place differently.
 ///
 /// What is left is of three kinds. MeadowBoot does not answer workspace
 /// symbols (`meadow_find`'s search) or `meadow/ir` yet, and its completion
