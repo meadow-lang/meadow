@@ -12,9 +12,9 @@ tree = "344ca224a72f8d22632104c46f238d134138b8d9"
 
 [[package]]
 name = "Cut"
-source = "git+https://github.com/meadow-lang/Cut.git?rev=f8c20aab31bc56c9bbf93b7446a1542bb0421131"
-rev = "f8c20aab31bc56c9bbf93b7446a1542bb0421131"
-tree = "4dfb336435116e03d3697825b592f02fc07380b5"
+source = "git+https://github.com/meadow-lang/Cut.git?rev=9f2b6fd6685306cfc488137e7f03e8521505eb07"
+rev = "9f2b6fd6685306cfc488137e7f03e8521505eb07"
+tree = "4299e6ca4fd438c0b7f7f3f4f27120552c0afd02"
 
 [[package]]
 name = "Doodle"
@@ -32,16 +32,16 @@ tree = "809c6aa34620f8b8270c7811bb4b54e56719cbfe"
 
 [[package]]
 name = "LineEditor"
-source = "git+https://github.com/meadow-lang/LineEditor?version=0.2.0"
-version = "0.2.1"
-rev = "89225cde596daadc4138905fa17d0efccebc43ab"
-tree = "8f685240f4d853d8a0db9e04a30ca408d925d62c"
+source = "git+https://github.com/meadow-lang/LineEditor?version=0.2.2"
+version = "0.2.2"
+rev = "2c4b99ff3d5af18cd5cb65d33c8f61a53f7edd99"
+tree = "94081a99b15d97885e9752fca248decf47b8c951"
 
 [[package]]
 name = "Lingua"
-source = "git+https://github.com/meadow-lang/Lingua.git?rev=03d1178b3fd8bb4d6a417266cad6615e87e330f7"
-rev = "03d1178b3fd8bb4d6a417266cad6615e87e330f7"
-tree = "1e40cb862351b783230e90e3e51eae44c3f197a3"
+source = "git+https://github.com/meadow-lang/Lingua.git?rev=07cbed85b864c24441dd1fd45f6afdc49a24f440"
+rev = "07cbed85b864c24441dd1fd45f6afdc49a24f440"
+tree = "ab95423deb83693519c30aa00188cdb50002b394"
 
 [[package]]
 name = "Nettle"
