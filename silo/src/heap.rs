@@ -923,14 +923,16 @@ pub fn catch_faults() {
             record: *mut Record,
             context: *mut std::ffi::c_void,
         }
+        // Declared as `crate::overflow` declares them.
         unsafe extern "system" {
             fn AddVectoredExceptionHandler(
                 first: u32,
-                handler: extern "system" fn(*mut Pointers) -> i32,
+                handler: extern "system" fn(*mut std::ffi::c_void) -> i32,
             ) -> *mut std::ffi::c_void;
-            fn GetModuleHandleW(name: *const u16) -> *mut std::ffi::c_void;
+            fn GetModuleHandleW(name: *const u16) -> *mut u8;
         }
-        extern "system" fn said(p: *mut Pointers) -> i32 {
+        extern "system" fn said(p: *mut std::ffi::c_void) -> i32 {
+            let p = p as *mut Pointers;
             // Safety: what Windows hands a vectored handler.
             let r = unsafe { &*(*p).record };
             if r.code == 0xc000_0005 {

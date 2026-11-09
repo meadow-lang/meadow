@@ -10,3 +10,8 @@
 # Meadow source is written with `\n` everywhere. A checkout on Windows that
 # turned them into `\r\n` is a file `meadow fmt --check` calls unformatted.
 *.mw text eol=lf
+
+# A shell script with `\r\n` is one bash cannot run: each line ends in a `\r`
+# it takes for part of the command. The release workflows run them on
+# Windows too, from a checkout that would otherwise have them.
+*.sh text eol=lf

@@ -1330,6 +1330,40 @@ sampler above counts instructions; and it is for a machine where nothing
 outside the process may look -- a container allows neither `perf` nor
 `ptrace`. On macOS `sample <pid>` does as much unasked.
 
+### A native program that dies on Windows
+
+A Silo program that runs out of stack on Windows says so, how deep it got
+and in a stack of what size -- which tells the main thread's gigabyte from a
+green thread's or a handler segment's 256 MiB -- and where in the executable
+it was:
+
+```text
+silo: the program overflowed its stack: 255 MiB deep in a stack of 256 MiB, at offset 0x445226c in the executable
+```
+
+Rust's own report of an overflow is installed by a Rust `main`, and a Silo
+program's `main` is C, so without this the process ended with `0xC00000FD`
+and nothing else; and a debugger is often not to be had there. With
+`MEADOW_SILO_OVERFLOW_TRACE` set, the report goes on with every word on the
+stack that points into the executable, from the top frame down, and then the
+outermost frames: return addresses among them, so a runaway recursion shows
+as a cycle of the same few. An access violation is reported the same way.
+The executable has no symbols, but the linker writes a map of them when
+asked, through a `MEADOW_CLANG` that adds `-Wl,/MAP` to clang's arguments --
+a `clangmap.cmd` holding the one line
+`@"C:\Program Files\LLVM\bin\clang.exe" -Wno-unused-command-line-argument -Wl,/MAP %*`:
+
+```sh
+MEADOW_CLANG=clangmap.cmd meadow build --release --runtime silo .
+MEADOW_SILO_OVERFLOW_TRACE=1 ./target/release/native/silo/MyProgram 2> report.txt
+python scripts/silo-map-names.py target/release/native/silo/MyProgram.map < report.txt
+```
+
+That is how MeadowBoot compiled by itself was seen overflowing a handler's
+256 MiB segment with one runtime `drive` frame for every operation resumed,
+which `silo/src/segments.rs` no longer makes: a clause's last resumption
+goes back to its handler's `drive`, which resumes it there.
+
 ### What a native program made and let go of
 
 ```sh

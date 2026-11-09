@@ -292,4 +292,5 @@ other and the program does not link, which is the check working.
 | `MEADOW_SILO_PRIMS`  | count the primitives a run called, and report them        |
 | `MEADOW_SILO_CYCLES` | the cycle collector's runs or traces, what they freed, and pauses |
 | `MEADOW_CYCLES`      | at build time: `tracing` (the default) or `trial`         |
+| `MEADOW_SILO_OVERFLOW_TRACE` | on Windows, at a stack overflow or an access violation, the words on the stack that point into the executable (`docs/RUNTIME.md`) |
 | `MEADOW_CLANG`       | the clang to compile and link with                        |
