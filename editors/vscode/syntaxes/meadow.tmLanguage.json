@@ -96,7 +96,7 @@
         },
         {
           "name": "keyword.other.meadow",
-          "match": "\\b(mod|use|def|fun|let|rec|in|data|record|effect|type|trait|impl|where|infix|infixl|infixr|end|as)\\b"
+          "match": "\\b(mod|use|def|fun|let|rec|in|data|record|effect|type|trait|impl|where|infix|infixl|infixr|as)\\b"
         },
         {
           "name": "keyword.operator.logical.meadow",

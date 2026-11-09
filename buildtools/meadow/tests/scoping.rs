@@ -106,3 +106,29 @@ fn a_lambda_parameter_shadows_a_top_level_binding() {
         "11"
     );
 }
+
+// --- `end` is a name ---------------------------------------------------------
+
+// The lexer once reserved `end` though no form used it, so it could name
+// nothing. It is an ordinary lower-case name now.
+
+#[test]
+fn a_let_may_bind_end() {
+    assert_eq!(eval_main("def result = let end = 3 in end\n"), "3");
+}
+
+#[test]
+fn a_function_may_be_named_end() {
+    assert_eq!(eval_main("fun end x = x\ndef result = end 4\n"), "4");
+}
+
+#[test]
+fn a_parameter_and_a_field_may_be_named_end() {
+    assert_eq!(
+        eval_main(
+            "fun span start end = { start = start, end = end }\n\
+             def result = let r = span 1 5 in r.end - r.start\n"
+        ),
+        "4"
+    );
+}

@@ -55,6 +55,10 @@ last release is under _Unreleased_.
   (3d2afe126)`). A dependency held back by a newer release that breaks its
   `version` is named, with that release. It used to say every dependency was
   current, as if there were nothing newer.
+- `end` is no longer reserved and may be a name: a function, a parameter, a
+  local, a field or a pattern variable may be called `end`. It was a keyword
+  that no form used, so writing it anywhere was a syntax error. The language
+  server, the REPL and the VS Code grammar no longer colour it as a keyword.
 
 ### Added
 
