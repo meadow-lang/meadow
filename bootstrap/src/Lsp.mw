@@ -339,8 +339,9 @@ fun viewIn (uri : String) (path : String) (text : String) (file : String) (s : S
                 -- derive mentions stands at the trait it is named for.
                 if f == file
                   and kept from to
-                  and (b.kind != "v" or not (inside from) or stringSlice text from to == b.name) then
-                  [(from, to, id, b.kind)]
+                  and (b.kind != "v"
+                     or not (inside from)
+                     or stringSlice text from to == b.name) then [(from, to, id, b.kind)]
                 else [])
           b.uses)
       (V.range 0 (V.len binders))
@@ -439,19 +440,43 @@ fun macroCalls (text : String) : [(Int, Int)] =
       (0, [])
       (V.range 0 (V.len toks))
   in
-  let firsts = snd opens in
-  V.concatMap
-    (\k ->
-      let first = V.getOr 0 firsts k in
-      let last = V.getOr (V.len toks) firsts (k + 1) - 1 in
-      if last < first then []
-      else if isCall toks first last then
-        [(
-          (V.getOr (Lexed { token = Token.Error, from = 0, to = 0 }) toks first).from,
-          (V.getOr (Lexed { token = Token.Error, from = 0, to = 0 }) toks last).to
-        )]
-      else [])
-    (V.range 0 (V.len firsts))
+  -- Attributes on lines of their own are the declaration's below them.
+  let firsts =
+    V.foldl
+      (\acc i ->
+        match V.last acc with
+        | Just prev ->
+            if onlyAttributes toks prev (i - 1) then V.pushBack (V.take acc (V.len acc - 1)) prev
+            else V.pushBack acc i
+        | None -> V.pushBack acc i)
+      []
+      (snd opens)
+  in V.concatMap
+       (\k ->
+         let first = V.getOr 0 firsts k in
+         let last = V.getOr (V.len toks) firsts (k + 1) - 1 in
+         if last < first then []
+         else if isCall toks first last then
+           [(
+             (V.getOr (Lexed { token = Token.Error, from = 0, to = 0 }) toks first).from,
+             (V.getOr (Lexed { token = Token.Error, from = 0, to = 0 }) toks last).to
+           )]
+         else [])
+       (V.range 0 (V.len firsts))
+
+-- Whether tokens `first` to `last` are attributes and nothing else.
+fun onlyAttributes (toks : [Lexed]) (first : Int) (last : Int) : Bool =
+  let tok = \i -> (V.getOr noToken toks i).token in
+  let rec go (i : Int) =
+    if i > last then True
+    else
+      match (tok i, tok (i + 1)) with
+      | (Token.At, Token.LowerIdent _) ->
+          (match tok (i + 2) with
+           | Token.LParen -> go (closing tok (i + 2) last)
+           | _ -> go (i + 2))
+      | _ -> False
+  in last >= first and go first
 
 fun bracket (t : Token) : Int =
   match t with
@@ -1018,74 +1043,74 @@ fun srcFile (s : Source) : String = s.file
 -- function's type.
 fun tokensOf (ed : Editor) (a : Asked) =
   match viewOf ed a with
-  | None -> J.jNull ()
-  | Just v ->
-      let toks = (lex v.text).tokens in
-      -- The last noted of those at one place: a `use`'s path is noted as
-      -- modules first, and a type it reaches -- `use M.Ty.*` -- after.
-      let named = V.foldl (\m n -> match n with | (f, _, _, k) -> H.insert f k m) H.empty v.names in
-      let moduled =
-        V.foldl (\m x -> match x with | (f, _, _) -> H.insert f "m" m) H.empty v.modules
-      in
-      let functions = functionsOf v in
-      let scope = scopeOf v in
-      let classified =
-        V.foldl
-          (\acc i ->
-            match acc with
-            | (inUse, out) ->
-                (let t = V.getOr noToken toks i in
-                 let inUse2 =
-                   match t.token with
-                   | Token.Use -> True
-                   | Token.UpperIdent _ -> inUse
-                   | Token.LowerIdent _ -> inUse
-                   | Token.Period -> inUse
-                   | Token.As -> inUse
-                   | _ -> False
-                 in
-                 let nextIsPeriod = isPeriod (V.getOr noToken toks (i + 1)).token in
-                 let declaresModule = i > 0 and isMod (V.getOr noToken toks (i - 1)).token in
-                 let kind =
-                   match t.token with
-                   | Token.UpperIdent n ->
-                       if declaresModule then Just "namespace"
-                       else
-                         -- What resolved there, as the Rust server notes it: a
-                         -- qualifier's module after the name it qualifies, and a
-                         -- `use`'s path before what it brings.
-                         (match (if not inUse2 and H.member t.from moduled then Just "m"
-                           else M.orElse (H.lookup t.from moduled) (H.lookup t.from named)) with
-                          | Just k ->
-                              Just
-                                (if k == "c" then "enumMember"
-                                 else if k == "t" then "type"
-                                 else "namespace")
-                          | None ->
-                              if inUse2 then Just "namespace"
-                              else if nextIsPeriod then Just "namespace"
-                              else if V.elem n (fst scope) then Just "enumMember"
-                              else if V.elem n (snd scope) then Just "type"
-                              else Just "namespace")
-                   | Token.LowerIdent _ ->
-                       Just (if H.member (t.from, t.to) functions then "function" else "variable")
-                   | other -> fixedClass other
-                 in match kind with
-                    | Just k -> (inUse2, V.pushBack out (t.from, t.to, classIndex k))
-                    | None -> (inUse2, out)))
-          (False, [])
-          (V.range 0 (V.len toks))
-      in
-      let starts = lineStarts v.text in
-      let placed =
-        V.concatMap
-          (\x ->
-            match x with
-            | (from, to, k) ->
-                (match (position v.text starts from, position v.text starts to) with
-                 | ((l1, c1), (l2, c2)) -> if l1 != l2 then [] else [(l1, c1, c2 - c1, k)]))
-          (snd classified)
-      in J.jObject [("data", J.jArray (V.map J.jInt (encoded placed)))]
+  -- A document whose package could not be studied is coloured by its
+  -- tokens alone, as the Rust server colours a file it could not compile.
+  | None -> if a.file < 0 then J.jNull () else tokensIn a.text [] [] H.empty ([], [])
+  | Just v -> tokensIn v.text v.names v.modules (functionsOf v) (scopeOf v)
+
+fun tokensIn (text : String) names modules functions scope =
+  let toks = (lex text).tokens in
+  -- The last noted of those at one place: a `use`'s path is noted as
+  -- modules first, and a type it reaches -- `use M.Ty.*` -- after.
+  let named = V.foldl (\m n -> match n with | (f, _, _, k) -> H.insert f k m) H.empty names in
+  let moduled = V.foldl (\m x -> match x with | (f, _, _) -> H.insert f "m" m) H.empty modules in
+  let classified =
+    V.foldl
+      (\acc i ->
+        match acc with
+        | (inUse, out) ->
+            (let t = V.getOr noToken toks i in
+             let inUse2 =
+               match t.token with
+               | Token.Use -> True
+               | Token.UpperIdent _ -> inUse
+               | Token.LowerIdent _ -> inUse
+               | Token.Period -> inUse
+               | Token.As -> inUse
+               | _ -> False
+             in
+             let nextIsPeriod = isPeriod (V.getOr noToken toks (i + 1)).token in
+             let declaresModule = i > 0 and isMod (V.getOr noToken toks (i - 1)).token in
+             let kind =
+               match t.token with
+               | Token.UpperIdent n ->
+                   if declaresModule then Just "namespace"
+                   else
+                     -- What resolved there, as the Rust server notes it: a
+                     -- qualifier's module after the name it qualifies, and a
+                     -- `use`'s path before what it brings.
+                     (match (if not inUse2 and H.member t.from moduled then Just "m"
+                       else M.orElse (H.lookup t.from moduled) (H.lookup t.from named)) with
+                      | Just k ->
+                          Just
+                            (if k == "c" then "enumMember"
+                             else if k == "t" then "type"
+                             else "namespace")
+                      | None ->
+                          if inUse2 then Just "namespace"
+                          else if nextIsPeriod then Just "namespace"
+                          else if V.elem n (fst scope) then Just "enumMember"
+                          else if V.elem n (snd scope) then Just "type"
+                          else Just "namespace")
+               | Token.LowerIdent _ ->
+                   Just (if H.member (t.from, t.to) functions then "function" else "variable")
+               | other -> fixedClass other
+             in match kind with
+                | Just k -> (inUse2, V.pushBack out (t.from, t.to, classIndex k))
+                | None -> (inUse2, out)))
+      (False, [])
+      (V.range 0 (V.len toks))
+  in
+  let starts = lineStarts text in
+  let placed =
+    V.concatMap
+      (\x ->
+        match x with
+        | (from, to, k) ->
+            (match (position text starts from, position text starts to) with
+             | ((l1, c1), (l2, c2)) -> if l1 != l2 then [] else [(l1, c1, c2 - c1, k)]))
+      (snd classified)
+  in J.jObject [("data", J.jArray (V.map J.jInt (encoded placed)))]
 
 -- A token's class by its kind alone, for every kind but a word.
 fun fixedClass (t : Token) : Maybe String =
@@ -1428,9 +1453,7 @@ fun moduleRefs (text : String) (pkg : String) (own : [[String]]) (calls : [(Int,
         let t = V.getOr noToken toks i in
         match t.token with
         | Token.UpperIdent n ->
-            if inside t.from
-              or V.elem t.from inUse
-              or not (isPeriod (V.getOr noToken toks (i + 1)).token) then []
+            if V.elem t.from inUse or not (isPeriod (V.getOr noToken toks (i + 1)).token) then []
             else
               (match H.lookup n aliases with
                | Just m -> [(t.from, t.to, m)]
@@ -1794,14 +1817,13 @@ fun ctorPath (v : View) (id : Int) : String =
       -- constructors are shown from the module down.
       (let alone =
          f == v.file and V.any (\x -> S.contains "meadowboot-lsp" (fst x)) v.study.sources
-       in
-       S.join
-         "."
-         (V.concat [
-            if alone then [] else [M.unwrapOr "" (V.get (S.split "/" f) 0)],
-            modulePathOf v f,
-            [ctorSpelling c]
-          ]))
+       in S.join
+            "."
+            (V.concat [
+               if alone then [] else [M.unwrapOr "" (V.get (S.split "/" f) 0)],
+               modulePathOf v f,
+               [ctorSpelling c]
+             ]))
   | (Just c, None) -> ctorSpelling c
   | _ ->
       if b.name == "True" or b.name == "False" then "Bool.${b.name}"
@@ -1842,7 +1864,7 @@ fun docAbove (text : String) (at : Int) : Maybe String =
 -- before it above each `@test` (`CodeLensRequest`).
 fun lensesOf (ed : Editor) (a : Asked) =
   match viewOf ed a with
-  | None -> J.jNull ()
+  | None -> if a.file < 0 then J.jNull () else J.jArray []
   | Just v ->
       J.jArray
         (V.concatMap
@@ -2294,7 +2316,7 @@ fun partsOf (rendered : String) : [(String, Bool)] =
 -- them: each type name in a label linked to where the type is declared.
 fun hintsOf (ed : Editor) (a : Asked) =
   match viewOf ed a with
-  | None -> J.jNull ()
+  | None -> if a.file < 0 then J.jNull () else J.jArray []
   | Just v ->
       let from = byteIn a ["range", "start"] in
       let to = byteIn a ["range", "end"] in
@@ -2437,7 +2459,9 @@ fun patched (s : Study) (file : String) (text : String) (refs : [(Int, Int, Int)
   let derives = deriveAttrs text in
   let written =
     V.filter
-      (\x -> match x with | (f, _, _) -> not (V.any (\d -> fst d <= f and f < snd d) derives))
+      (\x ->
+        match x with
+        | (f, _, _) -> not (V.any (\d -> fst d <= f and f < snd d) derives))
       t.nodes
   in Typing {
        nodes = V.concat [written, mentions, continuations],
@@ -3182,13 +3206,17 @@ fun fieldDeclaredAt (v : View) (o : Int) : Maybe (String, Int, Int) =
   -- A field's declaration is a mention of it too.
   let declared =
     V.concatMap
-      (\kv -> match kv with | (k, (f, a, b)) -> if f == v.file then [(a, b, k)] else [])
+      (\kv ->
+        match kv with
+        | (k, (f, a, b)) -> if f == v.file then [(a, b, k)] else [])
       (H.toVec (fieldSites v.study))
   in
   let around =
     stableSortBy
       (\x -> match x with | (f, t, _) -> t - f)
-      (V.filter (\x -> match x with | (f, t, _) -> covers f t o) (V.append v.typing.fields declared))
+      (V.filter
+         (\x -> match x with | (f, t, _) -> covers f t o)
+         (V.append v.typing.fields declared))
   in match V.get around 0 with
      | None -> None
      | Just (_, _, key) ->
