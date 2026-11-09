@@ -1,0 +1,15 @@
+-- What a package exports of another's has that package's scheme here: each
+-- use of `R.dim` is an instance of it. With no scheme, every use would share
+-- one type, so `drawn` would not be generalized, and the effect a use of it
+-- performs below -- `Console` -- would reach the pure `plainly`.
+use Std.Console (Console, writeOutput)
+use ReExporter as R
+
+@pub data Finder e = Finder (Int -> Int ! e)
+
+@pub fun drawn (f : Finder e) : Int ! e = match f with | Finder look -> look (R.dim 2)
+
+@pub fun plainly (level : Int) : Int = drawn (Finder (\x -> R.dim x)) + level
+
+@pub fun loudly (level : Int) : () ! { Console | e } =
+  writeOutput (show (drawn (Finder (\x -> (let u = writeOutput "dim" in R.dim x)))))

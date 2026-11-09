@@ -240,6 +240,13 @@ last release is under _Unreleased_.
 
 ### Fixed
 
+- MeadowBoot could not build Lingua: a value a package exports again from
+  one of its own dependencies, as Doodle exports Bloom's styles, reached the
+  packages after it with no type, so every use of it there shared one, and a
+  function generic in what it performs was not generalized when it called
+  one. Lingua's finder came out performing `Console`, which its pure tests
+  were then refused for. Such an export now has the type its own package
+  gave it. MeadowBoot is built with Lingua and Cut at their current `master`.
 - Glade compiles MeadowBoot's own Cut. It used to refuse it with "no run of
   64 free registers": an array literal of tuples, each made where the array
   is from values computed before it, left a value in every third register, so

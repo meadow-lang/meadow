@@ -2610,7 +2610,7 @@ fun inferImpl
            (\kv -> (fst kv, normalizeScheme i (genScheme (snd kv))))
            (H.toVec (stGetRef i.generalized)))
     in
-    let exported =
+    let own =
       V.foldl
         (\h id ->
           match schemeOf i id with
@@ -2618,6 +2618,23 @@ fun inferImpl
           | None -> h)
         H.empty
         (stGetRef i.exports)
+    in
+    -- And what the unit exports of a dependency's -- a `@pub use` of
+    -- another package's value -- with the scheme that package gave it, as
+    -- it is: it was settled in that package's arena, not this one. Without
+    -- it, a unit after this one has no scheme for the name, and every use
+    -- of it there shares one type, as a name mentioned before its
+    -- definition does.
+    let exported =
+      V.foldl
+        (\h (ex : Export) ->
+          if ex.kind != "v" or M.isSome (H.lookup ex.binder h) then h
+          else
+            (match schemeOf i ex.binder with
+             | Just sc -> H.insert ex.binder sc h
+             | None -> h))
+        own
+        r.exports
     in
     let dumps = V.map (\k -> dumpModule i r k general texts) (V.range 0 (V.len r.modules)) in
     let evidence = evidenceOfUnit i in
