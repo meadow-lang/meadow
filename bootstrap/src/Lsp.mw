@@ -328,7 +328,14 @@ fun viewIn (uri : String) (path : String) (text : String) (file : String) (s : S
         V.concatMap
           (\u ->
             match u with
-            | (f, from, to) -> if f == file and kept from to then [(from, to, id, b.kind)] else [])
+            | (f, from, to) ->
+                -- In a macro call, only a value's name as written: what a
+                -- derive mentions stands at the trait it is named for.
+                if f == file
+                  and kept from to
+                  and (b.kind != "v" or not (inside from) or stringSlice text from to == b.name) then
+                  [(from, to, id, b.kind)]
+                else [])
           b.uses)
       (V.range 0 (V.len binders))
   in
@@ -1777,9 +1784,18 @@ fun ctorPath (v : View) (id : Int) : String =
   let b = binderOf v id in
   match (H.lookup id v.canons, siteOf b) with
   | (Just c, Just (f, _, _)) ->
-      S.join
-        "."
-        (V.concat [[M.unwrapOr "" (V.get (S.split "/" f) 0)], modulePathOf v f, [ctorSpelling c]])
+      -- A document alone is no package anyone can name: its own
+      -- constructors are shown from the module down.
+      (let alone =
+         f == v.file and V.any (\x -> S.contains "meadowboot-lsp" (fst x)) v.study.sources
+       in
+       S.join
+         "."
+         (V.concat [
+            if alone then [] else [M.unwrapOr "" (V.get (S.split "/" f) 0)],
+            modulePathOf v f,
+            [ctorSpelling c]
+          ]))
   | (Just c, None) -> ctorSpelling c
   | _ ->
       if b.name == "True" or b.name == "False" then "Bool.${b.name}"
@@ -3149,10 +3165,16 @@ fun recordFields (a : TypedArena) (decl : TypedDecl) (file : String) (d : Declar
 -- server goes: by its record, or -- the record not known -- the first by
 -- name of the records with a field so called.
 fun fieldDeclaredAt (v : View) (o : Int) : Maybe (String, Int, Int) =
+  -- A field's declaration is a mention of it too.
+  let declared =
+    V.concatMap
+      (\kv -> match kv with | (k, (f, a, b)) -> if f == v.file then [(a, b, k)] else [])
+      (H.toVec (fieldSites v.study))
+  in
   let around =
     stableSortBy
       (\x -> match x with | (f, t, _) -> t - f)
-      (V.filter (\x -> match x with | (f, t, _) -> covers f t o) v.typing.fields)
+      (V.filter (\x -> match x with | (f, t, _) -> covers f t o) (V.append v.typing.fields declared))
   in match V.get around 0 with
      | None -> None
      | Just (_, _, key) ->
