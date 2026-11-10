@@ -195,10 +195,12 @@ tokens, inlay hints, code lenses, formatting, completion after each `|>` and
 and a close. It reports agreement by kind of request, and is ignored until
 the two agree. Where they cannot yet, the reason is one of three: MeadowBoot
 has not ported it (workspace symbols, `meadow/ir`); Lingua's `lsp!` cannot say
-it (a refusal as an error, diagnostics without `relatedInformation`,
-`initialize` without `positionEncoding` and `serverInfo`, notifications other
-than opening, changing and closing, a close that forgets the document); or
-the two compilers' answers differ, which is what the test is for.
+it (diagnostics without `relatedInformation`, `initialize` without
+`positionEncoding` and `serverInfo`); or the two compilers' answers differ,
+which is what the test is for. A refusal, a file changed on the disk and a
+document closed, which it once could not say either, it now does: a closed
+document's text stops standing for its file (`closed`), and the package goes
+back to what is on the disk.
 
 ## Running
 

@@ -13,8 +13,9 @@
 -- (`requests`), so that each answer is written in the shape the Rust server
 -- writes it, and what the server says it can do is the Rust server's
 -- (`capabilities`). A rename that cannot be done is refused with the Rust
--- server's error and its reason (`refuse`), and a file changed on the disk
--- is heard of (`notifications`).
+-- server's error and its reason (`refuse`), a file changed on the disk is
+-- heard of (`notifications`), and a document closed stands for its file no
+-- more (`closed`).
 --
 -- A document belongs to its package, as it does for the Rust server: when
 -- one is opened, the package around it is built as `meadow build` would --
@@ -75,6 +76,7 @@ lsp! {
   pub Server "meadow" for Editor
     | opened = openedAt
     | text = textAt
+    | closed = closedAt
     | diagnostics = diagnosticsOf
     | requests = editorRequests
     | refuse = refusalOf
@@ -210,10 +212,32 @@ fun textAt (ed : Editor) (file : Int) (t : String) =
       -- the disk changes nothing, and a package opened whole is studied
       -- once, not once a file.
       let before = if S.isEmpty d.text then builtText ed d else Just d.text in
-      if before == Just t then ()
+      if before == Just t then () else changed ed d.root
+
+-- One more change to the package at `root`: it is studied again when next
+-- asked about.
+fun changed (ed : Editor) (root : String) =
+  let k = keyOf root in
+  setRef ed.edits (H.insert k (H.getOr 0 k (getRef ed.edits) + 1) (getRef ed.edits))
+
+-- A document the editor closed: its text no longer stands for its file, and
+-- the package goes back to what is on the disk, as the Rust server drops its
+-- copy. Lingua then looks at every document still open again. When the disk
+-- holds what the package was built with, only the closed text has to go;
+-- when it does not -- the document was saved since, which is no news while
+-- it is open -- the package is built and read back again.
+fun closedAt (ed : Editor) (file : Int) =
+  match H.lookup file (getRef ed.docs) with
+  | None -> ()
+  | Just (d : Doc) ->
+      let a = setRef ed.docs (H.delete file (getRef ed.docs)) in
+      let b = setRef ed.views (H.delete file (getRef ed.views)) in
+      if isAlone d.root then ()
       else
-        (let k = keyOf d.root in
-         setRef ed.edits (H.insert k (H.getOr 0 k (getRef ed.edits) + 1) (getRef ed.edits)))
+        let built = builtText ed d in
+        if Res.toMaybe (readToString d.path) != built then reload ed d.root
+        else if Just d.text == built then ()
+        else changed ed d.root
 
 -- The text a document's package was built with for its file, if it has
 -- been loaded.
@@ -260,7 +284,7 @@ fun reload (ed : Editor) (root : String) =
   let k = keyOf root in
   let a = setRef ed.loaded (H.delete k (getRef ed.loaded)) in
   let b = load ed root in
-  setRef ed.edits (H.insert k (H.getOr 0 k (getRef ed.edits) + 1) (getRef ed.edits))
+  changed ed root
 
 -- The package at `root` studied, with each open document of it as the
 -- editor holds it: the last study, if nothing has changed since.

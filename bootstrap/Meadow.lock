@@ -12,9 +12,9 @@ tree = "344ca224a72f8d22632104c46f238d134138b8d9"
 
 [[package]]
 name = "Cut"
-source = "git+https://github.com/meadow-lang/Cut.git?rev=18a5602312633e009825783001050fbafdf0e11a"
-rev = "18a5602312633e009825783001050fbafdf0e11a"
-tree = "ee214734d87991c2f3d5e5fa64ecee9095b8717c"
+source = "git+https://github.com/meadow-lang/Cut.git?rev=a82dc40a8c25509d6740277b44dfe68ea6cfb009"
+rev = "a82dc40a8c25509d6740277b44dfe68ea6cfb009"
+tree = "f91e84860a9e22baf3b777590c83e9b7c3972d52"
 
 [[package]]
 name = "Doodle"
@@ -39,9 +39,9 @@ tree = "94081a99b15d97885e9752fca248decf47b8c951"
 
 [[package]]
 name = "Lingua"
-source = "git+https://github.com/meadow-lang/Lingua.git?rev=92955a573a7ecd6b39c10080b41f8ff6ea272317"
-rev = "92955a573a7ecd6b39c10080b41f8ff6ea272317"
-tree = "b51c75447cd65249bf66114d5d70caa3eaf0b31c"
+source = "git+https://github.com/meadow-lang/Lingua.git?rev=d40e7af39121cb089ed7997e09d17de1328550a3"
+rev = "d40e7af39121cb089ed7997e09d17de1328550a3"
+tree = "6bea22914e65e97e68cd2d360155fb8a07a35bb3"
 
 [[package]]
 name = "Nettle"
