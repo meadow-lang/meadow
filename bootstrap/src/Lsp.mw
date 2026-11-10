@@ -12,7 +12,9 @@
 -- Lingua speaks the protocol. Every request is one of the language's own
 -- (`requests`), so that each answer is written in the shape the Rust server
 -- writes it, and what the server says it can do is the Rust server's
--- (`capabilities`).
+-- (`capabilities`). A rename that cannot be done is refused with the Rust
+-- server's error and its reason (`refuse`), and a file changed on the disk
+-- is heard of (`notifications`).
 --
 -- A document belongs to its package, as it does for the Rust server: when
 -- one is opened, the package around it is built as `meadow build` would --
@@ -23,7 +25,7 @@
 -- has changed since it last was.
 
 use Lingua (lsp!)
-use Lingua.Lsp (Asked, pathOf, rangeJson, lineStarts, position, uriOf)
+use Lingua.Lsp (Asked, pathOf, rangeJson, lineStarts, position, uriOf, newName, requestFailed)
 use Lingua.Lang (Meta)
 use Lingua.Lang.Meta.*
 use Lingua.Diagnostic (Diagnostic, Severity)
@@ -75,6 +77,8 @@ lsp! {
     | text = textAt
     | diagnostics = diagnosticsOf
     | requests = editorRequests
+    | refuse = refusalOf
+    | notifications = editorNotifications
     | capabilities = editorCapabilities
 }
 
@@ -220,6 +224,43 @@ fun builtText (ed : Editor) (d : Doc) =
        | Ok g -> M.map snd (V.find (\x -> keyOf (fst x) == keyOf d.known) (unitSources g))
        | Err _ -> None)
   | None -> None
+
+-- --- files changed on the disk -----------------------------------------------
+
+-- What the server hears of its own: files changed on the disk.
+def editorNotifications =
+  [("workspace/didChangeWatchedFiles", \ed (a : Asked) -> changedOnDisk ed a.params)]
+
+-- A file changed on the disk -- a module of a package that is not open, a
+-- manifest, the lockfile a build wrote -- can change what an open document
+-- means, so every package a document is open in is built and read back
+-- again, and every open document looked at again, as the Rust server
+-- analyses each one again. Except a save: an open document written to the
+-- disk as the editor holds it says nothing the editor has not.
+fun changedOnDisk (ed : Editor) (params : Json) =
+  let changes = M.unwrapOr [] (M.andThen J.asArray (J.get "changes" params)) in
+  let news =
+    V.any (\c -> isNews ed (M.unwrapOr "" (M.andThen J.asString (J.get "uri" c)))) changes
+  in if not news then False
+     else
+       (let roots = V.map (\(l : Loaded) -> l.root) (H.values (getRef ed.loaded)) in
+        let u = V.foldl (\acc root -> if isAlone root then acc else reload ed root) () roots in
+        True)
+
+-- Whether a change to the file at `uri` is news: it is no open document, or
+-- the disk does not hold what the editor does.
+fun isNews (ed : Editor) (uri : String) =
+  let path = absolute (pathOf uri) in
+  match V.find (\(d : Doc) -> keyOf d.path == keyOf path) (H.values (getRef ed.docs)) with
+  | None -> True
+  | Just (d : Doc) -> Res.toMaybe (readToString path) != Just d.text
+
+-- The package at `root` built and read back again, and studied again.
+fun reload (ed : Editor) (root : String) =
+  let k = keyOf root in
+  let a = setRef ed.loaded (H.delete k (getRef ed.loaded)) in
+  let b = load ed root in
+  setRef ed.edits (H.insert k (H.getOr 0 k (getRef ed.edits) + 1) (getRef ed.edits))
 
 -- The package at `root` studied, with each open document of it as the
 -- editor holds it: the last study, if nothing has changed since.
@@ -870,7 +911,9 @@ fun renameTarget (v : View) (o : Int) : Result String (Int, Int, Int, Bool) =
           | Just (f, t) -> targetIn v f t id True)
   | None ->
       (match V.get (namesAt v o) 0 with
-       | None -> Err "nothing to rename here"
+       | None ->
+           if V.isEmpty (fieldsAround v o) then Err "nothing to rename here"
+           else Err "renaming a field is not supported yet"
        | Just (f, t, id, kind) ->
            if kind == "m" then Err "a module is named by its file: rename the file"
            else targetIn v f t id False)
@@ -917,21 +960,37 @@ fun prepareRenameOf (ed : Editor) (a : Asked) =
        | Ok (f, t, _, _) -> rangeJson v.text (lineStarts v.text) (Meta f t)
        | Err _ -> J.jNull ())
 
+-- A request this server will not answer, and why: a rename that cannot be
+-- done, refused as the Rust server refuses it, with `requestFailed` and the
+-- reason -- what is at the position is not the package's to rename, or the
+-- new name is not one it could be.
+fun refusalOf (ed : Editor) (a : Asked) =
+  if a.method != "textDocument/rename" then None
+  else M.map (\why -> (requestFailed, why)) (renameRefused ed a)
+
+fun renameRefused (ed : Editor) (a : Asked) =
+  if a.file < 0 then Just "that file is not open"
+  else
+    match viewOf ed a with
+    | None -> Just "nothing to rename here"
+    | Just v ->
+        match renameTarget v a.offset with
+        | Err why -> Just why
+        | Ok (_, _, _, value) ->
+            (match newNameOk value (newName a.params) with
+             | Err why -> Just why
+             | Ok _ -> None)
+
 -- Every place the name at the position is written, made the new name: its
--- declaration, and each mention of it in the package, file by file. A
--- refusal is the Rust server's error; Lingua's requests answer only with a
--- result, so it is answered with nothing.
+-- declaration, and each mention of it in the package, file by file. What
+-- cannot be renamed was refused before this is asked (`refusalOf`).
 fun renameOf (ed : Editor) (a : Asked) =
   match viewOf ed a with
   | None -> J.jNull ()
   | Just v ->
-      let new = M.unwrapOr "" (M.andThen J.asString (J.get "newName" a.params)) in
       (match renameTarget v a.offset with
        | Err _ -> J.jNull ()
-       | Ok (_, _, id, value) ->
-           (match newNameOk value new with
-            | Err _ -> J.jNull ()
-            | Ok _ -> renamed ed v id new))
+       | Ok (_, _, id, _) -> renamed ed v id (newName a.params))
 
 fun renamed (ed : Editor) (v : View) (id : Int) (new : String) =
   let b = binderOf v id in
@@ -3202,6 +3261,20 @@ fun recordFields (a : TypedArena) (decl : TypedDecl) (file : String) (d : Declar
 -- server goes: by its record, or -- the record not known -- the first by
 -- name of the records with a field so called.
 fun fieldDeclaredAt (v : View) (o : Int) : Maybe (String, Int, Int) =
+  match V.get (fieldsAround v o) 0 with
+  | None -> None
+  | Just (_, _, key) ->
+      let sites = fieldSites v.study in
+      if S.startsWith "*." key then
+        (let suffix = S.drop key 1 in
+         let keys =
+           sortBy (\x y -> compare x y) (V.filter (\k -> S.endsWith suffix k) (H.keys sites))
+         in M.andThen (\k -> H.lookup k sites) (V.get keys 0))
+      else H.lookup key sites
+
+-- The fields written around `o`, innermost first: where each is written,
+-- and its record's canonical name and its own.
+fun fieldsAround (v : View) (o : Int) : [(Int, Int, String)] =
   -- A field's declaration is a mention of it too.
   let declared =
     V.concatMap
@@ -3209,23 +3282,11 @@ fun fieldDeclaredAt (v : View) (o : Int) : Maybe (String, Int, Int) =
         match kv with
         | (k, (f, a, b)) -> if f == v.file then [(a, b, k)] else [])
       (H.toVec (fieldSites v.study))
-  in
-  let around =
-    stableSortBy
-      (\x -> match x with | (f, t, _) -> t - f)
-      (V.filter
-         (\x -> match x with | (f, t, _) -> covers f t o)
-         (V.append v.typing.fields declared))
-  in match V.get around 0 with
-     | None -> None
-     | Just (_, _, key) ->
-         let sites = fieldSites v.study in
-         if S.startsWith "*." key then
-           (let suffix = S.drop key 1 in
-            let keys =
-              sortBy (\x y -> compare x y) (V.filter (\k -> S.endsWith suffix k) (H.keys sites))
-            in M.andThen (\k -> H.lookup k sites) (V.get keys 0))
-         else H.lookup key sites
+  in stableSortBy
+       (\x -> match x with | (f, t, _) -> t - f)
+       (V.filter
+          (\x -> match x with | (f, t, _) -> covers f t o)
+          (V.append v.typing.fields declared))
 
 fun fieldPlace ed (v : View) (site : (String, Int, Int)) =
   match site with | (f, from, to) -> locationOf ed v f from to

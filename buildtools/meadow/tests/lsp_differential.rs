@@ -470,8 +470,8 @@ impl Tally {
             entry.1 += 1;
             return;
         }
-        // A refusal the Rust server answers with an error, which Lingua's
-        // `requests` cannot: counted as a difference, and said apart.
+        // A refusal the Rust server answers with an error and MeadowBoot's
+        // with nothing: counted as a difference, and said apart.
         if r.as_ref().is_some_and(|v| v.get("error").is_some()) && b == Some(Value::Null) {
             *self.refused.entry(kind.to_string()).or_default() += 1;
         }
@@ -886,10 +886,21 @@ fn session(t: &mut Tally, root: &Path, files: &[PathBuf], exe: &Path, every: usi
             "textDocument/hover",
             here,
         );
+        // Lingua publishes an empty list for a document closed, since it
+        // will not look at it again to say otherwise; the Rust server
+        // publishes nothing. Both leave the editor showing nothing wrong in
+        // it, so that one is not counted.
         let said = |s: &Server| {
             json!(
                 s.notes
                     .iter()
+                    .filter(|n| {
+                        !(n["method"] == "textDocument/publishDiagnostics"
+                            && n["params"]["uri"] == uri.as_str()
+                            && n["params"]["diagnostics"]
+                                .as_array()
+                                .is_some_and(Vec::is_empty))
+                    })
                     .map(|n| n["method"].clone())
                     .collect::<Vec<_>>()
             )
@@ -943,20 +954,22 @@ fn progress(line: &str) {
 ///
 /// Not yet, so it is ignored: run it with `--ignored` to see how far. On
 /// 2026-11-09, over `examples`, `benches` and `glade` at every name, the two
-/// agreed on 15345 of 16331 answers:
+/// agreed on 15897 of 16331 answers:
 ///
 /// ```text
 /// completion       712 / 1013    hover           4610 / 4624
-/// definition      4620 / 4624    initialize         0 / 13
-/// diagnostics       32 / 45      ir                 0 / 47
+/// definition      4620 / 4624    initialize        13 / 13
+/// diagnostics       45 / 45      ir                 0 / 47
 /// formatting        19 / 19      lenses            19 / 19
 /// hints             18 / 19      prepareRename   4624 / 4624
-/// protocol          26 / 52      rename           648 / 1148 (500 refusals)
+/// protocol          52 / 52      rename          1148 / 1148
 /// symbols            0 / 65      tokens            17 / 19
 /// ```
 ///
-/// and over `lib` and `bootstrap` at every tenth name, completing at every
-/// fifth place (`MEADOW_LSP_EVERY=10 MEADOW_LSP_COMPLETE=5`), on 49700 of
+/// and, the same day but before MeadowBoot's server refused a rename with an
+/// error (so with each refusal a difference), over `lib` and `bootstrap` at
+/// every tenth name, completing at every fifth place
+/// (`MEADOW_LSP_EVERY=10 MEADOW_LSP_COMPLETE=5`), on 49700 of
 /// 54979: definition 14955 / 15528, hover 14267 / 15528, prepareRename
 /// 15424 / 15528, rename 4096 / 6747 (2551 refusals), tokens 78 / 130, hints
 /// 101 / 130, lenses 128 / 130, formatting 130 / 130, completion 363 / 660,
@@ -964,15 +977,11 @@ fn progress(line: &str) {
 /// -- `lang!`, `database!` -- whose expansions the two compilers type and
 /// place differently.
 ///
-/// What is left is of three kinds. MeadowBoot does not answer workspace
+/// What is left is of two kinds. MeadowBoot does not answer workspace
 /// symbols (`meadow_find`'s search) or `meadow/ir` yet, and its completion
-/// lacks what an `impl` and a default method export (`#impl.Trait`). Lingua's
-/// `lsp!` cannot answer a request with an error -- the Rust server refuses a
-/// rename with one, and answers a method it does not know with its own -- nor
-/// publish a diagnostic without `relatedInformation`, nor leave
-/// `positionEncoding` and `serverInfo` out of `initialize`, nor forget a
-/// closed document without publishing for it. And the two compilers differ in
-/// a few answers: a `runSt`'s type at a use, what a derive mentions.
+/// lacks what an `impl` and a default method export (`#impl.Trait`). And the
+/// two compilers differ in a few answers: a `runSt`'s type at a use, what a
+/// derive mentions.
 #[test]
 #[ignore = "MeadowBoot's server does not agree with meadow lsp yet: see the doc comment"]
 fn meadowboot_s_language_server_answers_as_meadow_lsp_answers() {
