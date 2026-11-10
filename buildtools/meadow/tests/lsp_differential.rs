@@ -966,22 +966,22 @@ fn progress(line: &str) {
 /// symbols            0 / 65      tokens            17 / 19
 /// ```
 ///
-/// and, the same day but before MeadowBoot's server refused a rename with an
-/// error (so with each refusal a difference), over `lib` and `bootstrap` at
-/// every tenth name, completing at every fifth place
-/// (`MEADOW_LSP_EVERY=10 MEADOW_LSP_COMPLETE=5`), on 49700 of
-/// 54979: definition 14955 / 15528, hover 14267 / 15528, prepareRename
-/// 15424 / 15528, rename 4096 / 6747 (2551 refusals), tokens 78 / 130, hints
-/// 101 / 130, lenses 128 / 130, formatting 130 / 130, completion 363 / 660,
-/// diagnostics 113 / 148. Most of the difference there is inside macro calls
-/// -- `lang!`, `database!` -- whose expansions the two compilers type and
-/// place differently.
+/// and over `lib` and `bootstrap` at every tenth name, completing at every
+/// fifth place (`MEADOW_LSP_EVERY=10 MEADOW_LSP_COMPLETE=5`), on 53792 of
+/// 56548: definition 15423 / 15995, hover 14740 / 15995, prepareRename
+/// 15897 / 15995, rename 6713 / 6878, tokens 81 / 133, hints 105 / 133,
+/// lenses 132 / 133, formatting 133 / 133, completion 371 / 676, diagnostics
+/// 124 / 151. Most of the difference there is inside macro calls -- `lang!`,
+/// `database!` -- whose expansions the two compilers type and place
+/// differently.
 ///
 /// What is left is of two kinds. MeadowBoot does not answer workspace
 /// symbols (`meadow_find`'s search) or `meadow/ir` yet, and its completion
 /// lacks what an `impl` and a default method export (`#impl.Trait`). And the
 /// two compilers differ in a few answers: a `runSt`'s type at a use, what a
-/// derive mentions.
+/// derive mentions, and, of a rename, which names a field is read through
+/// (MeadowBoot tells a field from its syntax, the Rust server by its
+/// namespace).
 #[test]
 #[ignore = "MeadowBoot's server does not agree with meadow lsp yet: see the doc comment"]
 fn meadowboot_s_language_server_answers_as_meadow_lsp_answers() {

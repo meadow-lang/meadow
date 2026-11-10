@@ -894,8 +894,16 @@ fun definitionOf (ed : Editor) (a : Asked) =
 
 -- What a rename at `o` renames, as the Rust server decides it
 -- (`rename_target`): the span the cursor is on, the binder, and whether it
--- is a value; or why it cannot be renamed.
+-- is a value; or why it cannot be renamed. Where there is nothing to rename
+-- but a field, it is the field that cannot be.
 fun renameTarget (v : View) (o : Int) : Result String (Int, Int, Int, Bool) =
+  match targetAt v o with
+  | Err why ->
+      if why == outside False and isOnAField v o then Err "renaming a field is not supported yet"
+      else Err why
+  | found -> found
+
+fun targetAt (v : View) (o : Int) : Result String (Int, Int, Int, Bool) =
   match valueAt v o with
   | Just id ->
       let mine = V.filter (\r -> match r with | (f, t, i) -> i == id and covers f t o) v.refs in
@@ -911,9 +919,7 @@ fun renameTarget (v : View) (o : Int) : Result String (Int, Int, Int, Bool) =
           | Just (f, t) -> targetIn v f t id True)
   | None ->
       (match V.get (namesAt v o) 0 with
-       | None ->
-           if V.isEmpty (fieldsAround v o) then Err "nothing to rename here"
-           else Err "renaming a field is not supported yet"
+       | None -> Err "nothing to rename here"
        | Just (f, t, id, kind) ->
            if kind == "m" then Err "a module is named by its file: rename the file"
            else targetIn v f t id False)
@@ -3276,17 +3282,103 @@ fun fieldDeclaredAt (v : View) (o : Int) : Maybe (String, Int, Int) =
 -- and its record's canonical name and its own.
 fun fieldsAround (v : View) (o : Int) : [(Int, Int, String)] =
   -- A field's declaration is a mention of it too.
-  let declared =
-    V.concatMap
-      (\kv ->
-        match kv with
-        | (k, (f, a, b)) -> if f == v.file then [(a, b, k)] else [])
-      (H.toVec (fieldSites v.study))
-  in stableSortBy
-       (\x -> match x with | (f, t, _) -> t - f)
-       (V.filter
-          (\x -> match x with | (f, t, _) -> covers f t o)
-          (V.append v.typing.fields declared))
+  stableSortBy
+    (\x -> match x with | (f, t, _) -> t - f)
+    (V.filter
+       (\x -> match x with | (f, t, _) -> covers f t o)
+       (V.append v.typing.fields (fieldsDeclared v)))
+
+-- The fields the document declares: where each is written, and its
+-- record's canonical name and its own.
+fun fieldsDeclared (v : View) : [(Int, Int, String)] =
+  V.concatMap
+    (\kv ->
+      match kv with
+      | (k, (f, a, b)) -> if f == v.file then [(a, b, k)] else [])
+    (H.toVec (fieldSites v.study))
+
+-- Whether `o` is on a field's name: where a record declares it, derived or
+-- not, or, outside any macro call, where it is read (`r.x`) or updated
+-- (`{ r | x = 1 }`). That is where the Rust server says it cannot rename a
+-- field. A field named in a record built (`R { x = 1 }`), and in a macro's
+-- own syntax, it says nothing is there to rename.
+fun isOnAField (v : View) (o : Int) : Bool =
+  let t = v.text in
+  let named =
+    \f to ->
+      to > f
+        and V.all (\c -> C.isAlphaNum c or c == '_' or c == '\'') (S.chars (stringSlice t f to))
+  in
+  let used =
+    \x ->
+      match x with
+      | (f, to, _) ->
+          covers f to o and named f to and (byteNear t (spaceBefore t f) == 46 or not (isBuilt t f))
+  in isFieldDeclaration t o
+       or (not (V.any (\c -> fst c <= o and o <= snd c) v.calls)
+          and (V.any (\x -> match x with | (f, to, _) -> covers f to o) (fieldsDeclared v)
+             or V.any used v.typing.fields))
+
+-- The byte at `i` of `t`, or 0 outside it.
+fun byteNear (t : String) (i : Int) : Int =
+  if i < 0 or i >= stringByteLength t then 0 else toInt (stringByteAt t i)
+
+-- Whether a byte may be part of a name.
+fun isNameByte (b : Int) : Bool =
+  (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 95 or b == 39
+
+-- Where the last byte before `i` that is not blank space is, or -1.
+fun spaceBefore (t : String) (i : Int) : Int =
+  let rec back j =
+    if j < 0 then -1
+    else
+      (let b = byteNear t j in if b == 32 or b == 9 or b == 10 or b == 13 then back (j - 1) else j)
+  in back (i - 1)
+
+-- Where the first byte from `i` on that is not blank space is.
+fun spaceAfter (t : String) (i : Int) : Int =
+  let b = byteNear t i in
+  if i < stringByteLength t and (b == 32 or b == 9 or b == 10 or b == 13) then spaceAfter t (i + 1)
+  else i
+
+-- Where the brace that `i` is inside opens, or -1.
+fun braceBefore (t : String) (i : Int) : Int =
+  let rec opening j depth =
+    if j < 0 then -1
+    else
+      (let b = byteNear t j in
+       if b == 125 then opening (j - 1) (depth + 1)
+       else if b == 123 then (if depth == 0 then j else opening (j - 1) (depth - 1))
+       else opening (j - 1) depth)
+  in opening (i - 1) 0
+
+-- Where the name that ends at `last` starts.
+fun nameStart (t : String) (last : Int) : Int =
+  if last < 0 or not (isNameByte (byteNear t last)) then last + 1 else nameStart t (last - 1)
+
+-- Whether the label at `i` is one of a record being built: the brace it is
+-- inside follows a capitalised name, `Key { code = … }`.
+fun isBuilt (t : String) (i : Int) : Bool =
+  let brace = braceBefore t i in
+  if brace < 0 then False
+  else
+    let last = spaceBefore t brace in
+    let first = byteNear t (nameStart t last) in
+    last >= 0 and first >= 65 and first <= 90
+
+-- Whether the name at `o` is a field a record declares: `name : Type` in
+-- braces that follow an `=`, `record R = { … }`.
+fun isFieldDeclaration (t : String) (o : Int) : Bool =
+  if not (isNameByte (byteNear t o)) then False
+  else
+    let rec ending j = if isNameByte (byteNear t j) then ending (j + 1) else j in
+    let from = nameStart t o in
+    let colon = spaceAfter t (ending o) in
+    let brace = braceBefore t from in
+    byteNear t colon == 58
+      and byteNear t (colon + 1) != 58
+      and brace >= 0
+      and byteNear t (spaceBefore t brace) == 61
 
 fun fieldPlace ed (v : View) (site : (String, Int, Int)) =
   match site with | (f, from, to) -> locationOf ed v f from to
