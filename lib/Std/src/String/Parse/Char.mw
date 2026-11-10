@@ -32,8 +32,8 @@ use Std.Bool (not)
 @pub fun crlf : (Stream s, PartialEq s) => Parser s s | crlf = string "\r\n"
 
 -- The end of a line: `\n` or `\r\n`.
-@pub fun eol : (Stream s, PartialEq s) => Parser s s | eol =
-  P.label "end of line" (P.alt (P.map P.tokenToChunk newline) crlf)
+@pub fun eol : (Stream s, PartialEq s) => Parser s s
+  | eol = P.label "end of line" (P.alt (P.map P.tokenToChunk newline) crlf)
 
 -- A tab, `\t`.
 @pub fun tab : Stream s => Parser s Char | tab = P.label "tab" (char '\t')
@@ -71,54 +71,55 @@ fun isHorizontal c = c == ' ' or c == '\t'
 @pub fun hspace : Stream s => Parser s () | hspace = P.void (P.takeWhileP isHorizontal)
 
 -- One or more spaces and tabs.
-@pub fun hspace1 : Stream s => Parser s () | hspace1 =
-  P.void (P.takeWhile1P "white space" isHorizontal)
+@pub fun hspace1 : Stream s => Parser s ()
+  | hspace1 = P.void (P.takeWhile1P "white space" isHorizontal)
 
 -- --- classes -----------------------------------------------------------------
 
 -- A white-space character.
-@pub fun spaceChar : Stream s => Parser s Char | spaceChar =
-  P.label "white space" (P.satisfy Ch.isSpace)
+@pub fun spaceChar : Stream s => Parser s Char
+  | spaceChar = P.label "white space" (P.satisfy Ch.isSpace)
 
 -- An upper-case ASCII letter.
-@pub fun upperChar : Stream s => Parser s Char | upperChar =
-  P.label "an uppercase letter" (P.satisfy Ch.isUpper)
+@pub fun upperChar : Stream s => Parser s Char
+  | upperChar = P.label "an uppercase letter" (P.satisfy Ch.isUpper)
 
 -- A lower-case ASCII letter.
-@pub fun lowerChar : Stream s => Parser s Char | lowerChar =
-  P.label "a lowercase letter" (P.satisfy Ch.isLower)
+@pub fun lowerChar : Stream s => Parser s Char
+  | lowerChar = P.label "a lowercase letter" (P.satisfy Ch.isLower)
 
 -- An ASCII letter.
-@pub fun letterChar : Stream s => Parser s Char | letterChar =
-  P.label "a letter" (P.satisfy Ch.isAlpha)
+@pub fun letterChar : Stream s => Parser s Char
+  | letterChar = P.label "a letter" (P.satisfy Ch.isAlpha)
 
 -- An ASCII letter or digit.
-@pub fun alphaNumChar : Stream s => Parser s Char | alphaNumChar =
-  P.label "a letter or digit" (P.satisfy Ch.isAlphaNum)
+@pub fun alphaNumChar : Stream s => Parser s Char
+  | alphaNumChar = P.label "a letter or digit" (P.satisfy Ch.isAlphaNum)
 
 -- A decimal digit.
-@pub fun digitChar : Stream s => Parser s Char | digitChar =
-  P.label "a digit" (P.satisfy Ch.isDigit)
+@pub fun digitChar : Stream s => Parser s Char
+  | digitChar = P.label "a digit" (P.satisfy Ch.isDigit)
 
 -- `0` or `1`.
-@pub fun binDigitChar : Stream s => Parser s Char | binDigitChar =
-  P.label "a binary digit" (P.satisfy (\c -> c == '0' or c == '1'))
+@pub fun binDigitChar : Stream s => Parser s Char
+  | binDigitChar = P.label "a binary digit" (P.satisfy (\c -> c == '0' or c == '1'))
 
 -- `0` to `7`.
-@pub fun octDigitChar : Stream s => Parser s Char | octDigitChar =
-  P.label "an octal digit" (P.satisfy (Ch.isBetween '0' '7'))
+@pub fun octDigitChar : Stream s => Parser s Char
+  | octDigitChar = P.label "an octal digit" (P.satisfy (Ch.isBetween '0' '7'))
 
 -- A hexadecimal digit, in either case.
-@pub fun hexDigitChar : Stream s => Parser s Char | hexDigitChar =
-  P.label "a hexadecimal digit" (P.satisfy Ch.isHexDigit)
+@pub fun hexDigitChar : Stream s => Parser s Char
+  | hexDigitChar = P.label "a hexadecimal digit" (P.satisfy Ch.isHexDigit)
 
 -- A character below 128.
-@pub fun asciiChar : Stream s => Parser s Char | asciiChar =
-  P.label "an ASCII character" (P.satisfy Ch.isAscii)
+@pub fun asciiChar : Stream s => Parser s Char
+  | asciiChar = P.label "an ASCII character" (P.satisfy Ch.isAscii)
 
 -- A character that is not a control character.
-@pub fun printChar : Stream s => Parser s Char | printChar =
-  P.label "a printable character" (P.satisfy (\c -> Ch.code c >= 32 and Ch.code c != 127))
+@pub fun printChar : Stream s => Parser s Char
+  | printChar =
+    P.label "a printable character" (P.satisfy (\c -> Ch.code c >= 32 and Ch.code c != 127))
 
 -- --- tests -------------------------------------------------------------------
 

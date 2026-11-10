@@ -35,22 +35,25 @@ use Std.Ordering.Ordering.*
 
   fun (<) : a -> a -> Bool | (<) x y = match partialCmp x y with | Just Less -> True | _ -> False
 
-  fun (>) : a -> a -> Bool | (>) x y =
-    match partialCmp x y with
-    | Just Greater -> True
-    | _ -> False
+  fun (>) : a -> a -> Bool
+    | (>) x y =
+      match partialCmp x y with
+      | Just Greater -> True
+      | _ -> False
 
-  fun (<=) : a -> a -> Bool | (<=) x y =
-    match partialCmp x y with
-    | Just Less -> True
-    | Just Equal -> True
-    | _ -> False
+  fun (<=) : a -> a -> Bool
+    | (<=) x y =
+      match partialCmp x y with
+      | Just Less -> True
+      | Just Equal -> True
+      | _ -> False
 
-  fun (>=) : a -> a -> Bool | (>=) x y =
-    match partialCmp x y with
-    | Just Greater -> True
-    | Just Equal -> True
-    | _ -> False
+  fun (>=) : a -> a -> Bool
+    | (>=) x y =
+      match partialCmp x y with
+      | Just Greater -> True
+      | Just Equal -> True
+      | _ -> False
 }
 
 @pub trait Ord a <: Eq a, PartialOrd a {
@@ -64,77 +67,62 @@ use Std.Ordering.Ordering.*
 -- equal, so that the next field decides.
 @pub fun isEqualPartial (c : Maybe Ordering) : Bool = match c with | Just Equal -> True | _ -> False
 
-@pub fun isEqualOrdering (c : Ordering) : Bool =
-  match c with
-  | Equal -> True
-  | _ ->
-      False
-        -- --- the integer types -----------------------------------------------------
-        --
-        -- Every comparison is its primitive, so that `x < y` on two `Int`s is the one
-        -- instruction it would be if `<` were built in.
+@pub fun isEqualOrdering (c : Ordering) : Bool = match c with | Equal -> True | _ -> False
 
-        macro
-        comparable
-  | ($($t : ident), *) ->
-      {
-        $(impl
-           PartialEq
-           $t
-           { fun (==) x y = _primEq x y fun (!=) x y = _primNe x y }
-           impl
-           Eq
-           $t
-           {}
-           impl
-           PartialOrd
-           $t
-           {
-             fun partialCmp x y =
-               Just
-                 (if _primLt x y then Less else if _primEq x y then Equal else Greater)
-                 fun
-                 (<)
-                 x
-                 y =
-               _primLt x y fun (>) x y =
-               _primGt x y fun (<=) x y =
-               _primLe x y fun (>=) x y =
-               _primGe x y
-           }
-           impl
-           Ord
-           $t
-           {
-             fun compare x y = if _primLt x y then Less else if _primEq x y then Equal else Greater
-           })*
-      }
-        comparable!
-        { Int, BigInt, Int8, Int16, Int32, UInt8, UInt16, UInt32, UInt64 }
-        -- --- floats: partial -------------------------------------------------------
-        --
-        -- IEEE 754: `NaN` equals nothing, itself included, and is ordered against
-        -- nothing; `-0.0` equals `0.0`.
+-- --- the integer types -----------------------------------------------------
+--
+-- Every comparison is its primitive, so that `x < y` on two `Int`s is the one
+-- instruction it would be if `<` were built in.
 
-        macro
-        floating
-  | ($($t : ident), *) ->
-      {
-        $(impl PartialEq $t { fun (==) x y = _primLeF x y and _primGeF x y } impl PartialOrd $t {
-           fun partialCmp x y =
-             if _primLtF x y then Just Less
-             else if _primGtF x y then Just Greater
-             else if _primLeF x y then Just Equal
-             else
-               None fun (<) x y =
-                 _primLtF x y fun (>) x y =
-                 _primGtF x y fun (<=) x y =
-                 _primLeF x y fun (>=) x y =
-                 _primGeF x y
-         })*
+macro comparable
+  | ($( $t : ident ),*) -> {
+    $(
+      impl PartialEq $t {
+        fun (==) x y = _primEq x y
+        fun (!=) x y = _primNe x y
       }
-        floating!
-        { Float, Float32 }
+      impl Eq $t {
+      }
+      impl PartialOrd $t {
+        fun partialCmp x y =
+          Just (if _primLt x y then Less else if _primEq x y then Equal else Greater)
+          fun (<) x y = _primLt x y
+          fun (>) x y = _primGt x y
+          fun (<=) x y = _primLe x y
+          fun (>=) x y = _primGe x y
+      }
+      impl Ord $t {
+        fun compare x y = if _primLt x y then Less else if _primEq x y then Equal else Greater
+      }
+    )*
+  }
+
+comparable! { Int, BigInt, Int8, Int16, Int32, UInt8, UInt16, UInt32, UInt64 }
+
+-- --- floats: partial -------------------------------------------------------
+--
+-- IEEE 754: `NaN` equals nothing, itself included, and is ordered against
+-- nothing; `-0.0` equals `0.0`.
+
+macro floating
+  | ($( $t : ident ),*) -> {
+    $(
+      impl PartialEq $t {
+        fun (==) x y = _primLeF x y and _primGeF x y
+      }
+      impl PartialOrd $t {
+        fun partialCmp x y =
+          if _primLtF x y then Just Less
+          else if _primGtF x y then Just Greater else if _primLeF x y then Just Equal else None
+          fun (<) x y = _primLtF x y
+          fun (>) x y = _primGtF x y
+          fun (<=) x y = _primLeF x y
+          fun (>=) x y = _primGeF x y
+      }
+    )*
+  }
+
+floating! { Float, Float32 }
 
 -- --- characters and strings --------------------------------------------------
 
