@@ -123,8 +123,8 @@ use Std.Result.Result.*
 
   -- Several, as a message names them: by default, each as `showToken` says,
   -- with spaces between.
-  fun showTokens : s -> [Token s] -> String | showTokens input ts =
-    S.join " " (V.map (showToken input) ts)
+  fun showTokens : s -> [Token s] -> String
+    | showTokens input ts = S.join " " (V.map (showToken input) ts)
 }
 
 -- A span of the source: from an offset up to, not including, another.
@@ -446,10 +446,10 @@ fun andThen c off2 hs reply =
 -- is about and what went wrong there, as lines of text.
 @pub fun parse
     : (VisualStream s, TraversableStream s) => Parser s a -> s -> Result ((Int, Int), String) a
-    | parse p input =
-  match runParser p input with
-  | Ok a -> Ok a
-  | Err e -> Err (pair (errorSpan input e) (parseErrorTextPretty e))
+  | parse p input =
+    match runParser p input with
+    | Ok a -> Ok a
+    | Err e -> Err (pair (errorSpan input e) (parseErrorTextPretty e))
 
 -- ---------------------------------------------------------------------------
 -- Choice and backtracking
@@ -494,11 +494,12 @@ fun found input off =
   | None -> EndOfInput
 
 -- Succeed only if `p` does *not* match here. Consumes nothing.
-@pub fun notFollowedBy : Stream s => Parser s a -> Parser s () | notFollowedBy p =
-  Parser (\input off ->
-    match runP p input off with
-    | Done _ _ _ _ -> Failed False (Trivial off (Just (found input off)) [])
-    | Failed _ _ -> Done False () off [])
+@pub fun notFollowedBy : Stream s => Parser s a -> Parser s ()
+  | notFollowedBy p =
+    Parser (\input off ->
+      match runP p input off with
+      | Done _ _ _ _ -> Failed False (Trivial off (Just (found input off)) [])
+      | Failed _ _ -> Done False () off [])
 
 -- Replace what `p` says it wanted, for errors raised before it consumed
 -- anything, and what it hints: the way to turn "'x' or 'y' or …" into "an
@@ -542,84 +543,88 @@ fun found input off =
 -- The next token, if `f` makes something of it. `expected` is what to say was
 -- wanted when it does not.
 @pub fun token : Stream s => (Token s -> Maybe a) -> [ErrorItem s] -> Parser s a
-    | token f expected =
-  Parser (\input off ->
-    match take1 input off with
-    | None -> Failed False (Trivial off (Just EndOfInput) expected)
-    | Just (t, next) ->
-        (match f t with
-         | Just a -> Done True a next []
-         | None -> Failed False (Trivial off (Just (Tokens (tokenToChunk t))) expected)))
+  | token f expected =
+    Parser (\input off ->
+      match take1 input off with
+      | None -> Failed False (Trivial off (Just EndOfInput) expected)
+      | Just (t, next) ->
+          (match f t with
+           | Just a -> Done True a next []
+           | None -> Failed False (Trivial off (Just (Tokens (tokenToChunk t))) expected)))
 
 -- Any single token; fails only at the end of input.
 @pub fun anySingle : Stream s => Parser s (Token s) | anySingle = token (\t -> Just t) []
 
 -- A token satisfying `f`.
-@pub fun satisfy : Stream s => (Token s -> Bool) -> Parser s (Token s) | satisfy f =
-  token (\t -> if f t then Just t else None) []
+@pub fun satisfy : Stream s => (Token s -> Bool) -> Parser s (Token s)
+  | satisfy f = token (\t -> if f t then Just t else None) []
 
 -- Exactly this token.
-@pub fun single : (Stream s, PartialEq (Token s)) => Token s -> Parser s (Token s) | single x =
-  token (\t -> if t == x then Just t else None) [Tokens (tokenToChunk x)]
+@pub fun single : (Stream s, PartialEq (Token s)) => Token s -> Parser s (Token s)
+  | single x = token (\t -> if t == x then Just t else None) [Tokens (tokenToChunk x)]
 
 -- Any token except this one.
 @pub fun anySingleBut : (Stream s, PartialEq (Token s)) => Token s -> Parser s (Token s)
-    | anySingleBut x =
-  satisfy (\t -> not (t == x))
+  | anySingleBut x = satisfy (\t -> not (t == x))
 
 -- Any one of `xs`.
-@pub fun oneOf : (Stream s, PartialEq (Token s)) => [Token s] -> Parser s (Token s) | oneOf xs =
-  satisfy (\t -> V.elem t xs)
+@pub fun oneOf : (Stream s, PartialEq (Token s)) => [Token s] -> Parser s (Token s)
+  | oneOf xs = satisfy (\t -> V.elem t xs)
 
 -- Any token not in `xs`.
-@pub fun noneOf : (Stream s, PartialEq (Token s)) => [Token s] -> Parser s (Token s) | noneOf xs =
-  satisfy (\t -> V.notElem t xs)
+@pub fun noneOf : (Stream s, PartialEq (Token s)) => [Token s] -> Parser s (Token s)
+  | noneOf xs = satisfy (\t -> V.notElem t xs)
 
 fun rest input off = fst (takeWhile input (\t -> True) off)
 
 -- Exactly this run of tokens, or nothing consumed.
-@pub fun chunk : (Stream s, PartialEq s) => s -> Parser s s | chunk want =
-  Parser (\input off ->
-    match takeN input (chunkLength want) off with
-    | Just (got, next) ->
-        if got == want then Done (next > off) got next []
-        else Failed False (Trivial off (Just (Tokens got)) [Tokens want])
-    | None ->
-        let left = rest input off in
-        let unexpected = if chunkEmpty left then EndOfInput else Tokens left in
-        Failed False (Trivial off (Just unexpected) [Tokens want]))
+@pub fun chunk : (Stream s, PartialEq s) => s -> Parser s s
+  | chunk want =
+    Parser (\input off ->
+      match takeN input (chunkLength want) off with
+      | Just (got, next) ->
+          if got == want then Done (next > off) got next []
+          else Failed False (Trivial off (Just (Tokens got)) [Tokens want])
+      | None ->
+          let left = rest input off in
+          let unexpected = if chunkEmpty left then EndOfInput else Tokens left in
+          Failed False (Trivial off (Just unexpected) [Tokens want]))
 
 -- The end of the input.
-@pub fun eof : Stream s => Parser s () | eof =
-  Parser (\input off ->
-    match take1 input off with
-    | None -> Done False () off []
-    | Just (t, _) -> Failed False (Trivial off (Just (Tokens (tokenToChunk t))) [EndOfInput]))
+@pub fun eof : Stream s => Parser s ()
+  | eof =
+    Parser (\input off ->
+      match take1 input off with
+      | None -> Done False () off []
+      | Just (t, _) -> Failed False (Trivial off (Just (Tokens (tokenToChunk t))) [EndOfInput]))
 
 -- The longest run of tokens satisfying `f`, possibly empty. Never fails.
 --
 -- Prefer this to `many (satisfy f)`: it takes the run as one chunk rather
 -- than accumulating a token at a time.
-@pub fun takeWhileP : Stream s => (Token s -> Bool) -> Parser s s | takeWhileP f =
-  Parser (\input off ->
-    match takeWhile input f off with
-    | (got, next) -> Done (next > off) got next [])
+@pub fun takeWhileP : Stream s => (Token s -> Bool) -> Parser s s
+  | takeWhileP f =
+    Parser (\input off ->
+      match takeWhile input f off with
+      | (got, next) -> Done (next > off) got next [])
 
 -- As `takeWhileP`, but demanding at least one token, described by `what`.
 -- What follows the run is hinted to have been `what` as well.
-@pub fun takeWhile1P : Stream s => String -> (Token s -> Bool) -> Parser s s | takeWhile1P what f =
-  Parser (\input off ->
-    match takeWhile input f off with
-    | (got, next) ->
-        if next > off then Done True got next [Label what]
-        else Failed False (Trivial off (Just (found input off)) [Label what]))
+@pub fun takeWhile1P : Stream s => String -> (Token s -> Bool) -> Parser s s
+  | takeWhile1P what f =
+    Parser (\input off ->
+      match takeWhile input f off with
+      | (got, next) ->
+          if next > off then Done True got next [Label what]
+          else Failed False (Trivial off (Just (found input off)) [Label what]))
 
 -- Exactly `n` tokens, described by `what`.
-@pub fun takeP : Stream s => String -> Int -> Parser s s | takeP what n =
-  Parser (\input off ->
-    match takeN input n off with
-    | Just (got, next) -> Done (next > off) got next []
-    | None -> Failed False (Trivial off (Just EndOfInput) [Label what]))
+@pub fun takeP : Stream s => String -> Int -> Parser s s
+  | takeP what n =
+    Parser (\input off ->
+      match takeN input n off with
+      | Just (got, next) -> Done (next > off) got next []
+      | None -> Failed False (Trivial off (Just EndOfInput) [Label what]))
 
 -- ---------------------------------------------------------------------------
 -- Position
@@ -637,13 +642,14 @@ fun rest input off = fst (takeWhile input (\t -> True) off)
 
 -- `p`'s result, with the span of the source it read: what a syntax tree's
 -- nodes want to carry.
-@pub fun withSpan : TraversableStream s => Parser s a -> Parser s (a, (Int, Int)) | withSpan p =
-  bind getInput (\input ->
-    map
-      (\t ->
-        match t with
-        | (a, from, to) -> (a, sourceSpan input from to))
-      (withOffsets p))
+@pub fun withSpan : TraversableStream s => Parser s a -> Parser s (a, (Int, Int))
+  | withSpan p =
+    bind getInput (\input ->
+      map
+        (\t ->
+          match t with
+          | (a, from, to) -> (a, sourceSpan input from to))
+        (withOffsets p))
 
 -- ---------------------------------------------------------------------------
 -- Repetition
@@ -732,11 +738,12 @@ fun restL p op acc = alt (bind op (\f -> bind p (\y -> restL p op (f acc y)))) (
 -- ---------------------------------------------------------------------------
 
 -- An item as a message names it. A chunk of tokens stands for its own stream.
-@pub fun showItem : VisualStream s => ErrorItem s -> String | showItem item =
-  match item with
-  | Tokens c -> showTokens c (chunkToTokens c)
-  | Label l -> l
-  | EndOfInput -> "end of input"
+@pub fun showItem : VisualStream s => ErrorItem s -> String
+  | showItem item =
+    match item with
+    | Tokens c -> showTokens c (chunkToTokens c)
+    | Label l -> l
+    | EndOfInput -> "end of input"
 
 fun dedupe xs = V.foldl (\acc x -> if V.elem x acc then acc else V.pushBack acc x) V.empty xs
 
@@ -750,43 +757,46 @@ fun orList xs =
 
 -- What went wrong, as lines of text: `unexpected 'x'` and `expecting …`, or
 -- the program's own messages.
-@pub fun parseErrorTextPretty : VisualStream s => ParseError s -> String | parseErrorTextPretty e =
-  match e with
-  | Fancy _ messages -> S.concat (S.join "\n" (dedupe messages)) "\n"
-  | Trivial _ unexpected expected ->
-      let u =
-        match unexpected with
-        | Just item -> S.concatAll ["unexpected ", showItem item, "\n"]
-        | None -> ""
-      in
-      let wants = expected |> V.map showItem |> dedupe in
-      let x = if V.isEmpty wants then "" else S.concatAll ["expecting ", orList wants, "\n"] in
-      let text = S.concat u x in
-      if S.isEmpty text then "unknown parse error\n" else text
+@pub fun parseErrorTextPretty : VisualStream s => ParseError s -> String
+  | parseErrorTextPretty e =
+    match e with
+    | Fancy _ messages -> S.concat (S.join "\n" (dedupe messages)) "\n"
+    | Trivial _ unexpected expected ->
+        let u =
+          match unexpected with
+          | Just item -> S.concatAll ["unexpected ", showItem item, "\n"]
+          | None -> ""
+        in
+        let wants = expected |> V.map showItem |> dedupe in
+        let x = if V.isEmpty wants then "" else S.concatAll ["expecting ", orList wants, "\n"] in
+        let text = S.concat u x in
+        if S.isEmpty text then "unknown parse error\n" else text
 
 -- A one-line description: the offset, and what went wrong there.
-@pub fun showError : VisualStream s => ParseError s -> String | showError e =
-  S.concatAll [
-    "at offset ",
-    S.fromInt (errorOffset e),
-    ": ",
-    e |> parseErrorTextPretty |> S.trimEnd |> S.lines |> S.join "; ",
-  ]
+@pub fun showError : VisualStream s => ParseError s -> String
+  | showError e =
+    S.concatAll [
+      "at offset ",
+      S.fromInt (errorOffset e),
+      ": ",
+      e |> parseErrorTextPretty |> S.trimEnd |> S.lines |> S.join "; ",
+    ]
 
 -- The span of the source an error is about: the tokens it found there, or
 -- the place it stopped if it found none.
-@pub fun errorSpan : TraversableStream s => s -> ParseError s -> (Int, Int) | errorSpan input e =
-  let off = errorOffset e in
-  let width =
-    match e with
-    | Trivial _ (Just (Tokens c)) _ -> chunkLength c
-    | _ -> 0
-  in
-  let stop =
-    match takeN input width off with
-    | Just (_, next) -> next
-    | None -> off
-  in sourceSpan input off stop
+@pub fun errorSpan : TraversableStream s => s -> ParseError s -> (Int, Int)
+  | errorSpan input e =
+    let off = errorOffset e in
+    let width =
+      match e with
+      | Trivial _ (Just (Tokens c)) _ -> chunkLength c
+      | _ -> 0
+    in
+    let stop =
+      match takeN input width off with
+      | Just (_, next) -> next
+      | None -> off
+    in sourceSpan input off stop
 
 -- --- tests -------------------------------------------------------------------
 

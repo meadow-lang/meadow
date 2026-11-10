@@ -65,6 +65,16 @@ fn how_far_in_a_line_was_typed_does_not_decide_where_it_goes() {
                 held.insert(first + extra);
             }
         }
+        // So are a `macro`'s, which is kept as it is written: from its line
+        // to the next that starts at the margin.
+        let mut in_macro = false;
+        for (n, line) in src.lines().enumerate() {
+            if !line.is_empty() && !line.starts_with(' ') {
+                in_macro = line.starts_with("macro ");
+            } else if in_macro {
+                held.insert(n);
+            }
+        }
         // Every other line three times as far in as it was.
         let moved: String = src
             .lines()
