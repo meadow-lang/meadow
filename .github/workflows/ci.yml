@@ -86,6 +86,34 @@ jobs:
             buildtools
             installer
 
+      # MeadowBoot's objects, as the last run on `master` left them.
+      # `tests/bootstrap.rs` builds MeadowBoot as `meadow build --release`
+      # does, and most of that build is clang compiling five hundred LLVM
+      # modules at -O2: over ten minutes on a runner's four cores, every run. A
+      # module whose text is the one an object beside it was compiled from is
+      # not compiled again (`clang_link` in `buildtools/meadow/src/aot.rs`
+      # says so by a hash of the text), so with the last build's objects only
+      # the modules a change touched are compiled, and nothing is taken on
+      # trust that the build does not check. Keyed by the runner's image,
+      # since the image is what says which clang made them. A run reads what
+      # its own ref saved last, or else `master`'s; a merge queue's ref is
+      # gone once its run is, so a queue run saves nothing.
+      - name: Which runner image
+        id: image
+        if: steps.checked.outputs.skip != 'true'
+        shell: bash
+        run: echo "version=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore MeadowBoot's objects
+        if: steps.checked.outputs.skip != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            bootstrap/target/release/native/silo/*.o
+            bootstrap/target/release/native/silo/MeadowBoot.units
+          key: meadowboot-objects-${{ steps.image.outputs.version }}-${{ github.sha }}
+          restore-keys: meadowboot-objects-${{ steps.image.outputs.version }}-
+
       # Invoked through `bash` rather than executed: the tree is developed on
       # Windows, where `core.filemode` is off, so a script's executable bit is
       # easy to lose and the failure only shows up here.
@@ -93,3 +121,12 @@ jobs:
         if: steps.checked.outputs.skip != 'true'
         shell: bash
         run: bash scripts/check.sh
+
+      - name: Save MeadowBoot's objects
+        if: steps.checked.outputs.skip != 'true' && github.event_name != 'merge_group'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            bootstrap/target/release/native/silo/*.o
+            bootstrap/target/release/native/silo/MeadowBoot.units
+          key: meadowboot-objects-${{ steps.image.outputs.version }}-${{ github.sha }}
