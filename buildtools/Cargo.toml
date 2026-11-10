@@ -35,16 +35,17 @@ codegen-units = 1
 # machines are some thirty times slower, and `tests/vm.rs` alone took eleven
 # minutes on a fast machine -- and past CI's 45-minute limit on a Windows
 # runner, which looked like a hang and was not one. So the crates that execute
-# programs are optimized in every profile; debug assertions stay on, and
-# everything else -- the compiler, the tools, the tests -- stays quick to build.
-[profile.dev.package.meadow-glade]
-opt-level = 2
-
-[profile.dev.package.meadow-eval]
-opt-level = 2
-
-[profile.dev.package.meadow-seq]
-opt-level = 2
-
-[profile.dev.package.meadow-core]
+# programs are optimized in every profile.
+#
+# So is the compiler, and everything else the members depend on: a debug
+# `meadow` compiles programs too, and the tests have it compile a great deal.
+# `tests/bootstrap.rs` has it build MeadowBoot, which unoptimized spent eight
+# minutes in the front end and the emitter on one core, and under two
+# optimized; the differentials run the front end over every package in the
+# tree, and `meadow lsp --check` runs it over every source. Compiling all of
+# it optimized added twenty seconds to a cold build of the tests on four
+# cores, and took ten minutes off the bootstrap tests. Debug assertions and
+# overflow checks stay on everywhere, and the workspace's own crates -- the
+# tools, and the ninety test crates -- stay unoptimized and quick to build.
+[profile.dev.package."*"]
 opt-level = 2
