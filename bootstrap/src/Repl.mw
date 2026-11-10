@@ -56,7 +56,7 @@ use Std.Maybe.Maybe.*
 use Std.Result.Result.*
 use Std.Path as Path
 use Std.Fs (writeString, createDirAll, exists)
-use Std.Console (writeOutput, writeError)
+use Std.Console (writeError)
 use Std.Process (getEnv)
 use Std.Process as Proc
 use Std.Time (monotonic)
@@ -69,7 +69,7 @@ use Std.Result as Res
 repl! {
   pub Prompt "meadow" for Session
     | text = typedIn
-    | answer = answered
+    | speak = speaking
     | tree = treeOf
     | errors = unfinishedAt
     | completion = completionAt
@@ -448,17 +448,18 @@ fun joinedLines (input : String) : String =
 -- Whether an entry is run, or only its type said (`:t`).
 data Mode = Run | TypeOnly
 
--- What entering what was typed answers. `:t` and `:time` given an entry
--- reach the prompt as that line entered (`Reply.Entry`), and say only the
--- entry's type, or time its run; anything else is an entry.
-fun answered (s : Session) (file : Int) =
+-- What entering what was typed says, each part handed to `say` as it
+-- comes. `:t` and `:time` given an entry reach the prompt as that line
+-- entered (`Reply.Entry`), and say only the entry's type, or time its run;
+-- anything else is an entry.
+fun speaking (s : Session) (file : Int) say =
   let entry = S.trim (joinedLines (getRef s.typed)) in
   match afterCommand "t" entry with
-  | Just rest -> handled s rest Mode.TypeOnly False
+  | Just rest -> handled s rest Mode.TypeOnly False say
   | None ->
       match afterCommand "time" entry with
-      | Just rest -> handled s rest Mode.Run True
-      | None -> handled s entry Mode.Run (getRef s.timing)
+      | Just rest -> handled s rest Mode.Run True say
+      | None -> handled s entry Mode.Run (getRef s.timing) say
 
 -- What follows `:name` and blank space at the start of `entry`, if it
 -- starts so.
@@ -480,33 +481,29 @@ fun wrongPart (drawn : String) : Spoken =
   Spoken.ToErr
     (if S.endsWith "\n" drawn then stringSlice drawn 0 (stringByteLength drawn - 1) else drawn)
 
--- A part written now, as the prompt writes one: on a line of its own, where
--- it goes, and nothing at all if it is empty. What an entry's run writes
--- comes after what was said of the entry before it ran, as it does for the
--- Rust prompt; the prompt writes an answer only once all of it is made.
-fun spoken (part : Spoken) =
-  match part with
-  | Spoken.ToOut t -> if S.isEmpty t then () else writeOutput (t ++ "\n")
-  | Spoken.ToErr t -> if S.isEmpty t then () else writeError (t ++ "\n")
+-- Each of `parts` handed to `say`, in order.
+fun sayAll say (parts : [Spoken]) = V.foldl (\u part -> say part) () parts
 
 -- One entry checked, compiled and -- if it is to be `Run` -- run: what is
 -- wrong with it, for standard error; what it binds, each `name : scheme`;
 -- and its value, `= 42`, or what went wrong running it. And with `timed`,
--- how long each part took. What is said before an entry runs is written
--- before it runs (`spoken`), and the rest answered.
-fun handled (s : Session) (input : String) (mode : Mode) (timed : Bool) =
+-- how long each part took. Each part is handed to `say` when it is known,
+-- and the prompt writes it then: what is said of the entry before it runs
+-- comes before what its run writes, as it does for the Rust prompt.
+fun handled (s : Session) (input : String) (mode : Mode) (timed : Bool) say =
   let started = monotonic () in
   match entryOf input with
   -- The first thing wrong, as the Rust parser stops at it.
   | Parsed.Wrong errs ->
-      [wrongPart
-         (renderAll
-            "repl"
-            input
-            (V.map (\e -> errorAt (Meta (fst e) (fst e + 1)) (snd e)) (V.take errs 1)))]
+      say
+        (wrongPart
+           (renderAll
+              "repl"
+              input
+              (V.map (\e -> errorAt (Meta (fst e) (fst e + 1)) (snd e)) (V.take errs 1))))
   | parsed ->
       match s.std with
-      | None -> [Spoken.ToErr "meadowboot: there is no standard library to compile against"]
+      | None -> say (Spoken.ToErr "meadowboot: there is no standard library to compile against")
       | Just std ->
           let isExpr = (match parsed with | Parsed.Expr -> True | _ -> False) in
           let n = getRef s.line in
@@ -554,11 +551,10 @@ fun handled (s : Session) (input : String) (mode : Mode) (timed : Bool) =
                 done.exports
             else []
           in
-          let said = V.concat [wrongly, bound, types] in
+          let w = sayAll say (V.concat [wrongly, bound, types]) in
           let running = (match mode with | Mode.Run -> True | Mode.TypeOnly -> False) in
-          if hadError or not running then said
+          if hadError or not running then ()
           else
-            let w = V.foldl (\u part -> spoken part) () said in
             let checked = monotonic () - started in
             let kept =
               Kept {
@@ -572,13 +568,11 @@ fun handled (s : Session) (input : String) (mode : Mode) (timed : Bool) =
             -- What is run is the last value it defines; an effect's
             -- operation is no definition to run.
             let runnable = V.filter (\(e : Export) -> S.isEmpty e.owner) values in
-            let answer =
+            let r =
               (match V.get runnable (V.len runnable - 1) with
-               | Just (e : Export) -> ran s kept e checked timed
-               | None -> [])
-            in
-            let x = keep s kept input in
-            answer
+               | Just (e : Export) -> sayAll say (ran s kept e checked timed)
+               | None -> ())
+            in keep s kept input
 
 -- Whether an export is a binding the prompt shows: a value, or an effect's
 -- operation, but nothing a derive or the compiler made (`$…`).
@@ -910,7 +904,7 @@ fun switched (s : Session) (engine : String) =
   "(evaluating with the ${engine})"
 
 -- `:time`: timing every entry turned on or off; or, given an entry, that
--- entry timed (`answered`).
+-- entry timed (`speaking`).
 fun timeCommand (s : Session) (rest : String) =
   if S.isEmpty rest then
     (let u = setRef s.timing (not (getRef s.timing)) in

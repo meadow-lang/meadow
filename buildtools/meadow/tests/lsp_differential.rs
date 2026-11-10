@@ -103,6 +103,9 @@ struct Server {
     inbox: Receiver<Value>,
     next: i64,
     notes: Vec<Value>,
+    /// Each file's diagnostics as last published, however long ago: `notes`
+    /// is cleared between steps, and this is not.
+    published: HashMap<String, Value>,
     /// Whether it has stopped answering: died, or took longer than anyone
     /// would wait.
     gone: bool,
@@ -157,6 +160,7 @@ impl Server {
             inbox,
             next: 1,
             notes: Vec::new(),
+            published: HashMap::new(),
             gone: false,
         }
     }
@@ -197,6 +201,11 @@ impl Server {
                         });
                     }
                     if v.get("method").is_some() {
+                        if v["method"] == "textDocument/publishDiagnostics" {
+                            let uri = v["params"]["uri"].as_str().unwrap_or("").to_string();
+                            self.published
+                                .insert(uri, v["params"]["diagnostics"].clone());
+                        }
                         self.notes.push(v);
                     }
                 }
@@ -875,6 +884,7 @@ fn session(t: &mut Tally, root: &Path, files: &[PathBuf], exe: &Path, every: usi
         );
         servers.0.notes.clear();
         servers.1.notes.clear();
+        let before = (servers.0.published.clone(), servers.1.published.clone());
         let close = json!({"textDocument": {"uri": uri}});
         servers.0.notify("textDocument/didClose", close.clone());
         servers.1.notify("textDocument/didClose", close);
@@ -889,17 +899,26 @@ fn session(t: &mut Tally, root: &Path, files: &[PathBuf], exe: &Path, every: usi
         // Lingua publishes an empty list for a document closed, since it
         // will not look at it again to say otherwise; the Rust server
         // publishes nothing. Both leave the editor showing nothing wrong in
-        // it, so that one is not counted.
-        let said = |s: &Server| {
+        // it, so that one is not counted. Lingua then looks at the files
+        // still open again, since a language that kept the closed text goes
+        // back to the disk, and publishes what it finds; the Rust server
+        // does not. When that is what the file showed before, the editor
+        // shows the same, so that is not counted either -- but a file whose
+        // diagnostics the close changed is, since here the closed text is
+        // what is on the disk.
+        let said = |s: &Server, before: &HashMap<String, Value>| {
             json!(
                 s.notes
                     .iter()
                     .filter(|n| {
+                        let diagnostics = &n["params"]["diagnostics"];
+                        let file = n["params"]["uri"].as_str().unwrap_or("");
                         !(n["method"] == "textDocument/publishDiagnostics"
-                            && n["params"]["uri"] == uri.as_str()
-                            && n["params"]["diagnostics"]
-                                .as_array()
-                                .is_some_and(Vec::is_empty))
+                            && if file == uri.as_str() {
+                                diagnostics.as_array().is_some_and(Vec::is_empty)
+                            } else {
+                                before.get(file).unwrap_or(&json!([])) == diagnostics
+                            })
                     })
                     .map(|n| n["method"].clone())
                     .collect::<Vec<_>>()
@@ -908,8 +927,8 @@ fn session(t: &mut Tally, root: &Path, files: &[PathBuf], exe: &Path, every: usi
         t.add(
             "protocol",
             &format!("{name} what closing it published"),
-            Some(said(&servers.0)),
-            Some(said(&servers.1)),
+            Some(said(&servers.0, &before.0)),
+            Some(said(&servers.1, &before.1)),
         );
     }
     servers.0.stop();
