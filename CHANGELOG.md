@@ -293,6 +293,19 @@ last release is under _Unreleased_.
 
 ### Fixed
 
+- MeadowBoot's language server forgets a document the editor closes. It
+  went on compiling the document's package with the closed document's last
+  text, saved or not, so the files still open kept the errors of an edit that
+  was never saved. Now the package goes back to what is on the disk, as with
+  `meadow lsp`, and the documents still open are looked at again: a sibling
+  broken only in the editor and then closed leaves no error behind, and one
+  saved broken and mended in the editor before closing shows the disk's
+  error again. MeadowBoot's prompt keeps a `:t`, `:time` or unknown `:` line
+  in its history once, where it kept it twice. It still writes what it says
+  of an entry before the entry runs (what is wrong, `name : scheme`) ahead of
+  what the run prints, now through `repl!`'s `speak`. MeadowBoot and Cut are
+  built on Lingua d40e7af, which gives `lsp!` its `closed` and `repl!`
+  its `speak`.
 - MeadowBoot could not build Lingua: a value a package exports again from
   one of its own dependencies, as Doodle exports Bloom's styles, reached the
   packages after it with no type, so every use of it there shared one, and a
