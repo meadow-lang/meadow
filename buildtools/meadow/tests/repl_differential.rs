@@ -19,9 +19,7 @@
 //! message, the line that starts `Error:`, and not by the drawing of the
 //! source under it, whose labels each compiler words its own way; a time
 //! is any time; and white space at the end of a line or of the output is
-//! none. MeadowBoot's ends every entry with a line, even one that printed
-//! nothing (`repl!` writes what an entry answers and a newline), which the
-//! last rule takes away.
+//! none.
 //!
 //! Agreement is reported by kind of entry. The test passes only when every
 //! entry agrees, and it does not yet: see the numbers on
@@ -785,9 +783,8 @@ fn progress(line: &str) {
 /// What is left is of four kinds. MeadowBoot's CEK machine has no threads
 /// (`ThreadSpawn`), which ten lines of the tour's second part need, and
 /// `:ir` shows none of the compiler's IRs (two). A parse error is worded by
-/// each parser its own way (two), and Lingua's `repl!` answers a `:` line it
-/// does not know itself, where the Rust prompt hands it to the parser (one).
-/// And the Rust prompt does what is better not copied: `:try` with no
+/// each parser its own way (three, one of them a `:` line that is no
+/// command, which both prompts hand to the parser). And the Rust prompt does what is better not copied: `:try` with no
 /// terminal does nothing, since rustyline takes no initial text then (four);
 /// an `effect` entry shows its operations and then runs one, `program has no
 /// entry point` (three); `@derive(Debug) data` shows the derived `impl`'s

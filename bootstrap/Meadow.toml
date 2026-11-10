@@ -3,8 +3,8 @@ name = "MeadowBoot"
 version = "0.1.0"
 
 [dependencies]
-Lingua = { git = "https://github.com/meadow-lang/Lingua.git", rev = "07cbed85b864c24441dd1fd45f6afdc49a24f440" }
-Cut = { git = "https://github.com/meadow-lang/Cut.git", rev = "9f2b6fd6685306cfc488137e7f03e8521505eb07" }
+Lingua = { git = "https://github.com/meadow-lang/Lingua.git", rev = "92955a573a7ecd6b39c10080b41f8ff6ea272317" }
+Cut = { git = "https://github.com/meadow-lang/Cut.git", rev = "18a5602312633e009825783001050fbafdf0e11a" }
 Scythe = { git = "https://github.com/meadow-lang/Scythe.git", branch = "master" }
 
 # Bytecode, on the JIT: a build with no LLVM in it, which is a third of the

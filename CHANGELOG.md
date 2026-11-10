@@ -59,6 +59,20 @@ last release is under _Unreleased_.
   local, a field or a pattern variable may be called `end`. It was a keyword
   that no form used, so writing it anywhere was a syntax error. The language
   server, the REPL and the VS Code grammar no longer colour it as a keyword.
+- MeadowBoot's language server and prompt are built on Lingua 92955a5, and
+  Cut moves to it too. The server refuses a rename it cannot do as
+  `meadow lsp` does, with the error `-32803` and the reason
+  (`` `2x` is not a name ``, `a module is named by its file: rename the
+  file`), where it answered nothing. It hears `workspace/didChangeWatchedFiles`:
+  when a file changed on the disk is not an open document as the editor
+  holds it, the packages that documents are open in are built again and
+  every open document is looked at again. A method it does not know, a
+  request before `initialized` and one after `shutdown` get the protocol's
+  errors, and closing a document publishes an empty list of diagnostics for
+  it. The prompt, like `meadow repl`, keeps every line in its history,
+  including `:` lines. Ctrl-C ends it, and a `:` line that is no command goes
+  to the parser. It has no `:theme`, and an entry that answers nothing
+  writes nothing, where it used to write an empty line.
 
 ### Added
 
