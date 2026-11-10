@@ -62,6 +62,24 @@ last release is under _Unreleased_.
 
 ### Added
 
+- MeadowBoot has a prompt of its own: `meadowboot` with no command, as
+  `meadow` with none, is now MeadowBoot's REPL (`bootstrap/src/Repl.mw`),
+  declared with Lingua's `repl!` rather than handed to the Rust `meadow`. It
+  is a step in retiring the Rust front end: each tool is written again over
+  MeadowBoot's passes, in Lingua, and checked against the Rust one. Each entry
+  is compiled by MeadowBoot as a unit of its own after the ones before it, as
+  the Rust prompt compiles them, and run on MeadowBoot's CEK machine; the
+  banner, an entry's type and value, its errors, when an entry of several
+  lines is finished, and the `:` commands are the Rust prompt's.
+  `buildtools/meadow/tests/repl_differential.rs` types the same sessions into
+  both and reports how far they agree, by kind of entry; `:ir` is not
+  MeadowBoot's yet, and neither are threads on its CEK machine. Along the
+  way MeadowBoot came to agree with the Rust compiler in more places: its CEK
+  machine prints a `Vector` as its elements, `[1, 2, 3]`, and writes and
+  reads for a `Console` operation nothing handles; a name nothing binds has
+  the error's type, so what is wrong with it is said once; and a name
+  written through a qualifier nothing names is refused, as `module `Nope`
+  is not in scope here`.
 - MeadowBoot has a language server of its own: `lsp` in MeadowBoot
   (`bootstrap/src/Lsp.mw`), declared with Lingua's `lsp!`, answers hover, go
   to definition, completion, inlay hints, code lenses, semantic tokens,

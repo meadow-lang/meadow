@@ -673,7 +673,11 @@ fun applyUse (cx : UnitCx) (m : ModFrame) (acc : Layers) (one : (AstDecl, Vis)) 
                   -- One name with something asked of it may be a type in
                   -- sight already; anything else names no module.
                   | None ->
-                      if V.len segs == 1 and (glob or not (V.isEmpty names)) then acc else missing
+                      (match (if V.len segs == 1 then entryType cx last else None) with
+                       | Just (items, t) -> useType acc vis items t lastAt written glob True
+                       | None ->
+                           if V.len segs == 1 and (glob or not (V.isEmpty names)) then acc
+                           else missing)
                   | Just d ->
                       let path = V.drop segs 1 in
                       if depHas d path then moduleUse (depItems d path)
@@ -686,7 +690,8 @@ fun applyUse (cx : UnitCx) (m : ModFrame) (acc : Layers) (one : (AstDecl, Vis)) 
 -- The base every module of the unit shares: the primitives, then the
 -- prelude. For a module of the standard library, the modules before it whose
 -- names are every later one's (`flatModules`); for any other unit, what the
--- standard library exports at its root.
+-- standard library exports at its root, and then, for an entry of the prompt,
+-- what the entries before it define.
 fun baseOf (cx : UnitCx) (prims : [(String, Int)]) (m : ModFrame) : Layers =
   let start = { noLayers | values = prims } in
   if cx.isStd then
@@ -704,9 +709,37 @@ fun baseOf (cx : UnitCx) (prims : [(String, Int)]) (m : ModFrame) : Layers =
       start
       flatModules
   else
-    match V.find (\(d : Dep) -> d.name == "Std") cx.deps with
-    | Just std -> bring start Private (bareUse (depItems std []) True)
-    | None -> start
+    let prelude =
+      (match V.find (\(d : Dep) -> d.name == "Std") cx.deps with
+       | Just std -> bring start Private (bareUse (depItems std []) True)
+       | None -> start)
+    in V.foldl
+         (\acc (d : Dep) ->
+           if isEntry d.name then bring acc Private (bareUse (depItems d []) False) else acc)
+         prelude
+         cx.deps
+
+-- Whether a unit is an entry of the prompt (`Repl`): `repl:3`, as `meadow
+-- repl` names its entries. What an entry defines is in scope bare in every
+-- entry after it -- a value, and a type with the constructor named like it,
+-- its other constructors under it -- and the newest of a name is the one
+-- meant, as `meadow repl` has it: no package can be named so.
+@pub fun isEntry (pkg : String) : Bool = S.startsWith "repl:" pkg
+
+-- The type named `name` that the newest entry of the prompt declaring one
+-- declares, with what that entry declares: what `use Colour.*` names in a
+-- later entry.
+fun entryType (cx : UnitCx) (name : String) : Maybe ([Item], Item) =
+  V.foldl
+    (\found (d : Dep) ->
+      if not (isEntry d.name) then found
+      else
+        (let items = depItems d [] in
+         match V.find (\(i : Item) -> i.kind == "t" and i.name == name) items with
+         | Just t -> Just (items, t)
+         | None -> found))
+    None
+    cx.deps
 
 -- A module of the standard library by the name `stdOrder` has it.
 fun moduleName (m : ModFrame) : String =

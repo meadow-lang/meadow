@@ -22,7 +22,8 @@ use Std.Process (getEnv)
 use MeadowBoot.Types.Type.*
 use Lingua.Green (Green)
 use Lingua.Red as R
-use Lingua.Diagnostic (Diagnostic, collect, renderAll)
+use Lingua.Diagnostic (Diagnostic, collect, renderAll, whereAt, message)
+use Lingua.Lang (metaStart)
 use MeadowBoot.Syntax
 use MeadowBoot.Parse (checkedTree)
 use MeadowBoot.Fixity (Fixity, Grouped, declare, grouped)
@@ -485,6 +486,28 @@ fun checkedOf
                         b.uses))
             r.binders
       in
+      -- A name written through a qualifier nothing names is a use of the one
+      -- binder that stands for every unknown value (`?`): said as the Rust
+      -- renamer says it, naming the qualifier.
+      let unqualified =
+        if not checked then []
+        else
+          V.concatMap
+            (\(b : Binder) ->
+              if b.name != "?" or not (S.startsWith "?" b.site) then []
+              else
+                V.concatMap
+                  (\used ->
+                    match used with
+                    | (file, start, stop) ->
+                        (let text = M.unwrapOr "" (H.lookup file texts) in
+                         match qualifierAt text start stop with
+                         | Just q ->
+                             ["${file}:${placeIn text start}: module `${q}` is not in scope here (add `use <path> as ${q}`)"]
+                         | None -> []))
+                  b.uses)
+            r.binders
+      in
       let pkg =
         M.unwrapOr
           ""
@@ -620,7 +643,8 @@ fun checkedOf
             r.exports
       in
       let problems =
-        if checked then V.concat [undefined, twice, placedSaid, unmatched] else done.problems
+        if checked then V.concat [undefined, unqualified, twice, placedSaid, unmatched]
+        else done.problems
       in
       let program = isProgram r.exports in
       -- What C may call: each function an `@export` is written on, with the
@@ -1059,6 +1083,35 @@ fun named (text : String) : Bool =
   | Just first -> capital first and V.all rest codes
   | None -> False
 
+-- The qualifier of the name written at `start` to `stop` of `text`: what
+-- comes before its last `.`, when it is written `Q.name` -- or, when only
+-- the name is, the word before the `.` in front of it.
+fun qualifierAt (text : String) (start : Int) (stop : Int) : Maybe String =
+  if stop > stringByteLength text or start < 0 then None
+  else
+    (let written = stringSlice text start stop in
+     match lastDot written 0 (0 - 1) with
+     | Just k -> Just (stringSlice written 0 k)
+     | None ->
+         if start > 0 and stringSlice text (start - 1) start == "." then
+           (let rec back i =
+              if i > 0 and wordByte (stringSlice text (i - 1) i) then back (i - 1) else i
+            in
+            let word = stringSlice text (back (start - 1)) (start - 1) in
+            if named word then Just word else None)
+         else None)
+
+-- Whether a one-byte text is a letter, a digit or `_`.
+fun wordByte (b : String) : Bool =
+  match V.get (V.map charCode (S.chars b)) 0 with
+  | Just c -> (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or (c >= 48 and c <= 57) or c == 95
+  | None -> False
+
+fun lastDot (s : String) (from : Int) (found : Int) : Maybe Int =
+  match S.indexOfFrom "." s from with
+  | Just i -> lastDot s (i + 1) i
+  | None -> if found < 0 then None else Just found
+
 -- Where byte `offset` of `text` is, as a line and a column, each from one.
 fun placeIn (text : String) (offset : Int) : String =
   if offset > stringByteLength text then "@${show offset}"
@@ -1451,6 +1504,135 @@ fun answeredIn (file : String) (kept : [(String, String, Int, Int, String)])
             | _ -> h)
     H.empty
     kept
+
+-- --- an entry of the prompt -----------------------------------------------------
+
+-- An entry of the prompt (`Repl`), compiled as a unit of its own after the
+-- ones before it: what is wrong with it, each where it is -- a parse error
+-- at its byte, `@12: why`, anything else at its line and column,
+-- `file:1:5: why` -- what it exports, each with its scheme, its interface
+-- for the entries after it, and its core, to be run.
+@pub record Entered = {
+  wrong : [String],
+  exports : [Export],
+  interface : Interface,
+  core : Maybe CoreProgram
+}
+
+-- The entry whose files are `files` -- a manifest naming it and one module
+-- -- in directory `dir`, against `imported`: the standard library, then the
+-- entries before it, oldest first. Its core keeps every definition as it
+-- was written, and has no entry: what runs it asks for a definition by its
+-- symbol.
+@pub fun enteredUnit
+    (cfg : Cfg)
+    (dir : String)
+    (imported : [Interface])
+    (files : [(String, String)]) =
+  let db = newCompiler () in
+  let a = setCompilerFiles db 0 (V.map fst files) in
+  let b = setCompilerImported db 0 imported in
+  let h = setCompilerHome db 0 dir in
+  let k = setCompilerAnswers db 0 [] in
+  let g = setCompilerCfg db 0 cfg in
+  let c = V.foldl (\acc s -> setCompilerSource db (fst s) (snd s)) () files in
+  let modules = V.filter (\s -> S.endsWith ".mw" (fst s)) files in
+  let pkg =
+    M.unwrapOr
+      ""
+      (M.map (\s -> packageName (snd s)) (V.find (\s -> S.endsWith "Meadow.toml" (fst s)) files))
+  in
+  let unparsed =
+    V.concatMap
+      (\s ->
+        match compilerParsed db (fst s) with
+        | Err errs -> V.map (\e -> "@${show (fst e)}: ${snd e}") errs
+        | Ok _ -> [])
+      modules
+  in if not (V.isEmpty unparsed) then nothingEntered pkg unparsed
+     else
+       let ungrouped =
+         V.concatMap
+           (\s ->
+             match compilerGrouped db (fst s) with
+             | Just (_, ds) ->
+                 V.map
+                   (\d -> "${fst s}:${placeIn (snd s) (metaStart (whereAt d))}: ${message d}")
+                   ds
+             | None -> [])
+           modules
+       in if not (V.isEmpty ungrouped) then nothingEntered pkg ungrouped
+          else enteredChecked cfg dir imported files db pkg
+
+-- An entry that did not get as far as its names: what is wrong with it.
+fun nothingEntered (pkg : String) (wrong : [String]) : Entered =
+  Entered { wrong, exports = [], interface = { emptyInterface () | package = pkg }, core = None }
+
+-- An entry whose files parsed and grouped, its names resolved, its types
+-- inferred and its core made.
+fun enteredChecked cfg (dir : String) (imported : [Interface]) (files : [(String, String)]) db pkg =
+  let modules = V.filter (\s -> S.endsWith ".mw" (fst s)) files in
+  let lowerings = V.map (\s -> (fst s, compilerLowered db (fst s))) modules in
+  let misread =
+    V.concatMap
+      (\x ->
+        match x with
+        | (f, Just (_, _, wrongs)) ->
+            V.map (\w -> match w with | (why, from, _) -> "@${show from}: ${why}") wrongs
+        | _ -> [])
+      lowerings
+  in
+  let asts =
+    V.concatMap (\x -> match x with | (f, Just (ast, _, _)) -> [(f, ast)] | _ -> []) lowerings
+  in
+  let fixities = compilerFixities db 0 in
+  let trees =
+    V.map
+      (\s -> (fst s, snd s, if S.endsWith ".mw" (fst s) then compilerGrouped db (fst s) else None))
+      files
+  in match checkedOf
+       cfg
+       dir
+       imported
+       (tableOf fixities)
+       trees
+       asts
+       None
+       True
+       False
+       False
+       False
+       False
+       True
+       False
+       (\x -> ()) with
+     | (exports, anyVis, types, made, problems) ->
+         Entered {
+           wrong = V.append misread problems,
+           exports,
+           interface =
+             Interface {
+               fixities,
+               package = pkg,
+               exports,
+               anyVis,
+               types,
+               linked =
+                 (match made with
+                  | Just (_, l, _) -> ownNamed imported l
+                  | None -> emptyLinked ()),
+               macros = [],
+               bindings = []
+             },
+           core = M.map fst3 made
+         }
+
+-- What a unit links with, but of the labels of records only its own: those
+-- of every unit it imports come first in `named`, and every entry after it
+-- imports those units too. Kept, they would be in each entry's interface
+-- once for each entry before it, twice as many with every entry.
+fun ownNamed (imported : [Interface]) (l : Linked) : Linked =
+  { l | named = V.drop l.named (V.len (V.concatMap (\(i : Interface) -> i.linked.named) imported)) }
 
 -- --- the build ---------------------------------------------------------------
 

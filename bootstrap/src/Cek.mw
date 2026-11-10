@@ -35,6 +35,7 @@ use Std.Sort (sortOn)
 use Std.Maybe as Mb
 use Std.Maybe.Maybe.*
 use Std.Result.Result.*
+use Std.Console (writeOutput, writeError, readLine)
 use Value.*
 use Frame.*
 use Control.*
@@ -463,13 +464,39 @@ fun apply (m : Machine) (f : Value) (arg : Value) (k : List Frame) =
        | None -> Err "continuation resumed more than once")
   | other -> Err "${display other} is not a function"
 
+-- What the machine does for an operation of `Console` that nothing handles,
+-- as `meadow_eval`'s `native_console` does: write the text, to standard
+-- output or -- after what went there -- to standard error, or read a line.
+-- `None` for any other operation, which is unhandled.
+fun console (eff : String) (op : String) (arg : Value) =
+  if eff != "Console" then None
+  else if op == "writeOutput" then
+    (match arg with
+     | Str s -> Just (Ok (let u = writeOutput s in Unit))
+     | other -> Just (Err "Console.writeOutput: expected a String, got ${display other}"))
+  else if op == "writeError" then
+    (match arg with
+     | Str s -> Just (Ok (let u = writeError s in Unit))
+     | other -> Just (Err "Console.writeError: expected a String, got ${display other}"))
+  else if op == "readLine" then
+    Just
+      (Ok
+         (match readLine () with
+          | Just line -> Ctor "Maybe.Just" [Str line]
+          | None -> Ctor "Maybe.None" []))
+  else None
+
 -- A `perform`: the continuation split at the nearest handler with a clause for
 -- the operation -- the handler's frame and everything above it taken, to be
 -- the resumption -- and the clause run.
 fun perform (m : Machine) (e : String) (o : String) (arg : Value) (k : List Frame) =
   let a = m.arena in
   match handlerIn a e o k [;] with
-  | None -> Err "unhandled effect ${afterLast "." e}.${o}"
+  | None ->
+      (match console (afterLast "/" (afterLast "." e)) o arg with
+       | Just (Ok v) -> go m (Ret v) k
+       | Just (Err why) -> Err why
+       | None -> Err "unhandled effect ${afterLast "." e}.${o}")
   | Just (taken, outer, clause, henv) ->
       let cont = Cont (newRef (Just taken)) in
       let scope =
@@ -1103,6 +1130,12 @@ fun displayed (v : Value) = match v with | Str s -> s | other -> display other
         (match listItems v [] with
          | Just items -> "[" ++ joined "; " items ++ "]"
          | None -> "${bare name}(..)")
+      -- A vector prints as its elements, `[1, 2, 3]`, whatever shape its
+      -- tree has.
+      else if name == "Vector.Empty" or name == "Vector.Single" or name == "Vector.Full" then
+        (match vectorItems v with
+         | Just items -> "[" ++ joined ", " items ++ "]"
+         | None -> "${bare name}(..)")
       else if V.isEmpty xs then bare name
       else "${bare name}(" ++ joined ", " xs ++ ")"
   | Closure _ _ _ -> "<closure>"
@@ -1113,6 +1146,44 @@ fun displayed (v : Value) = match v with | Str s -> s | other -> display other
   | Lazy _ -> "<unevaluated>"
 
 fun joined (sep : String) (xs : [Value]) = S.join sep (V.map display xs)
+
+-- A vector's elements, in order, when it is one: its side buffers and its
+-- tree's leaves (`meadow_eval`'s `vector_elems`).
+fun vectorItems (v : Value) : Maybe [Value] =
+  match v with
+  | Ctor "Vector.Empty" xs -> if V.isEmpty xs then Just [] else None
+  | Ctor "Vector.Single" xs -> onlyArray xs
+  | Ctor "Vector.Full" xs ->
+      if V.len xs != 7 then None
+      else
+        (match (V.get xs 2, V.get xs 3, V.get xs 4, V.get xs 5, V.get xs 6) with
+         | (Just (Array a), Just (Array b), Just tree, Just (Array c), Just (Array d)) ->
+             Mb.map (\mid -> V.concat [a, b, mid, c, d]) (nodeItems tree)
+         | _ -> None)
+  | _ -> None
+
+-- The elements of the one array `xs` holds, if it holds one and nothing else.
+fun onlyArray (xs : [Value]) : Maybe [Value] =
+  match V.get xs 0 with
+  | Just (Array items) -> if V.len xs == 1 then Just items else None
+  | _ -> None
+
+-- The elements under a node of a vector's tree, in order.
+fun nodeItems (n : Value) : Maybe [Value] =
+  match n with
+  | Ctor "VNode.Leaf" xs -> onlyArray xs
+  | Ctor "VNode.Branch" xs ->
+      (match V.get xs 1 with
+       | Just (Array kids) ->
+           V.foldl
+             (\acc k ->
+               match (acc, nodeItems k) with
+               | (Just sofar, Just more) -> Just (V.append sofar more)
+               | _ -> None)
+             (Just [])
+             kids
+       | _ -> None)
+  | _ -> None
 
 -- A list's elements, when it is one.
 fun listItems (v : Value) (sofar : [Value]) : Maybe [Value] =
