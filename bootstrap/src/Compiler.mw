@@ -50,6 +50,7 @@ use MeadowBoot.Scopes (
 use MeadowBoot.Infer (inferUnit, Inferred)
 use MeadowBoot.Elab (unitCore, defSymbol, Linked, Numbers, DataSig, DefaultSig, Imported, CExport)
 use MeadowBoot.Seq as Seq
+use MeadowBoot.Shown as Shown
 use MeadowBoot.Lint (lint)
 use MeadowBoot.Dictionaries as Dictionaries
 use MeadowBoot.Inline as Inline
@@ -186,6 +187,7 @@ database! {
              False
              False
              False
+             False
              (\x -> ()))
     -- The same with no entry: every definition of the unit, for whoever runs
     -- one of them -- a macro -- rather than the unit.
@@ -207,6 +209,7 @@ database! {
                 (modulesOf (queryFiles unit)))
              None
              True
+             False
              False
              False
              False
@@ -418,6 +421,7 @@ fun checkedOf
     (naming : Bool)
     (checked : Bool)
     (strict : Bool)
+    (positions : Bool)
     (mark : String -> () ! e)
     : ([Export], Bool, TypeEnv, Maybe (CoreProgram, Linked, Object), [String]) ! e =
   let m0 = mark "start" in
@@ -554,6 +558,14 @@ fun checkedOf
         V.map (\(e : Export) -> { e | scheme = H.lookup e.binder done.schemes }) r.exports
       in
       let cored = unitCore pkg r done theirs entry in
+      -- What a debugger is told of the unit, where it is built for one: the
+      -- files it was written in, which each binder was declared in, and
+      -- what the source calls each name a person wrote, and its type.
+      let shown =
+        if positions then
+          Shown.shownOf pkg dir (V.map (\s -> (fileOf (snd s), fst s)) sources) r.binders done
+        else Shown.nothing ()
+      in
       let m3 = mark "core" in
       -- `MEADOWBOOT_NAMES`: each definition's symbol beside the name it was
       -- written with, for whoever reads a profile of what this compiles.
@@ -794,6 +806,10 @@ fun checkedOf
                         (sigsOf known)
                         (V.map (\(e : Entry [String]) -> (e.key, e.value)) labelled)
                         (V.filter (\p -> p != "Std") (V.pushBack packages pkg))
+                        -- A definition copied for a number type, or for
+                        -- dictionaries, is shown as what it is a copy of.
+                        (if positions then Shown.withCopies (Shown.originsOf written core) shown
+                         else shown)
                     )))
           cored,
         problems
@@ -1070,7 +1086,12 @@ fun wholeObject
         (o.opt == UnitsOpt.O3)
   in (
        M.unwrapOr entry (H.lookup (defSymbol root.package entry) table),
-       Seq.declarations core [] [] (V.filter (\p -> p != "Std") root.linked.packages)
+       Seq.declarations
+         core
+         []
+         []
+         (V.filter (\p -> p != "Std") root.linked.packages)
+         (Shown.nothing ())
      )
 
 -- Whether `text` is one name of a type or a constructor: a capital, then
@@ -1631,6 +1652,7 @@ fun enteredChecked cfg (dir : String) (imported : [Interface]) (files : [(String
        False
        True
        False
+       False
        (\x -> ()) with
      | (exports, anyVis, types, made, problems) ->
          Entered {
@@ -1698,6 +1720,9 @@ make! {
       strict : Bool =
         False
           "stop a build at a `match` that misses a value, as the release profile does: what `--strict` and `--lenient` say"
+      positions : Bool =
+        False
+          "write into the program where each term a debugger stops at was written, and what the source calls each name, for a debugger to step and show it by: what the debug profile does"
       checked : Bool =
         True
           "stop a build at whatever is wrong with a unit -- a name nothing binds, types that do not agree -- where it otherwise stops only at a `main` that is not one"
@@ -1707,7 +1732,7 @@ make! {
           for
           link
     }
-    | profile debug {}
+    | profile debug { positions = True }
     | profile release { opt = O2, kind = Release, strict = True }
     | pinned = pinnedOf
 }
@@ -1922,6 +1947,7 @@ fun compiling (o : UnitsOptions) (u : Given Interface) =
               (M.isSome (getEnv "MEADOWBOOT_NAMES"))
               o.checked
               (o.checked and o.strict)
+              o.positions
               mark with
             | _ if not (V.isEmpty misread and V.isEmpty unexpanded) ->
                 Err (S.join "" (V.append misread unexpanded))

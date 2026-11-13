@@ -26,6 +26,20 @@ last release is under _Unreleased_.
 
 ### Changed
 
+- MeadowBoot's debug adapter debugs on Glade, through `meadow-host`, where it
+  ran programs on MeadowBoot's CEK machine: the session is `meadow dap`'s own,
+  so it steps, stops and shows the stack, scopes (registers, handlers and the
+  heap among them) and values as `meadow dap` does, at Glade's speed. A debug
+  build of MeadowBoot's says where it was written for it to: its Cut has a
+  `source` for each file, a position on each term a step may stop before, and
+  what the source calls each binder and definition, the debug profile's new
+  `positions` option. A definition copied for a number type or for
+  dictionaries is shown as the one it was copied from. A debug build of the
+  standard library has them too, so a step goes into it. `meadow cut` takes
+  them off before it builds or runs a program. The CEK machine is still what a session runs on where the library
+  cannot be loaded, or where `MEADOWBOOT_DAP=cek` asks for it. The two
+  adapters agree on 957 of the differential test's 1220 answers, where they
+  agreed on 894 of 1235.
 - MeadowBoot's prompt runs each entry where `meadow repl` runs one: on
   Glade, with the JIT, in its own process through `meadow-host`, where it
   used to run them on MeadowBoot's CEK machine. `fib 30` takes under a

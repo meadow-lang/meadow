@@ -1,14 +1,27 @@
 -- The debug adapter: `meadow dap`, MeadowBoot's, declared with Lingua's
--- `dap!` over the CEK machine (`Cek`).
+-- `dap!`.
 --
 -- It answers what the Rust compiler's adapter answers
 -- (`buildtools/meadow/src/dap/`), in the same shapes, and
 -- `buildtools/meadow/tests/dap_differential.rs` drives both through the same
 -- sessions and says how far they agree.
 --
--- Lingua speaks the protocol. What is Meadow's own is the machine: a program
--- built by MeadowBoot, made one program of core with every unit it depends
--- on (`Core.linkedUnits`), and run by the CEK machine a boundary at a time.
+-- Lingua speaks the protocol. What is Meadow's own is the machine, of which
+-- there are two:
+--
+-- **The back end's.** The program is built for debugging, as `meadow build`
+-- builds it: its Cut says where each term a step may stop before was
+-- written, and what the source calls each name (`Shown`; `docs/CUT.md` in
+-- meadow, "Positions and names"). `meadow-host` runs it on Glade, a step at
+-- a time, in this process (`meadow_debug`), with the Rust adapter's own
+-- session: so it steps, stops and shows the stack and values as `meadow dap`
+-- does, at Glade's speed. This is what a session runs on wherever the library
+-- is found.
+--
+-- **The CEK machine's** (`Cek`), where there is no library to load, or
+-- `MEADOWBOOT_DAP=cek` asks for it: the program built by MeadowBoot, made one
+-- program of core with every unit it depends on (`Core.linkedUnits`), and run
+-- a boundary at a time. The rest of this note is of that machine.
 --
 -- **Boundaries.** The Rust adapter steps Glade's bytecode, and stops at the
 -- first instruction of a source position: a call, a branch, a body, a `let`
@@ -33,11 +46,17 @@
 -- the Glade machine's (`Cek.preview`).
 --
 -- What it does not do yet: the launch's `entry` -- an expression to start at
--- instead of `main` -- and the raw machine's scopes the Rust adapter has
--- beside a frame's locals (registers, handlers, the heap).
+-- instead of `main` -- and, on the CEK machine, the raw machine's scopes the
+-- Rust adapter has beside a frame's locals (registers, handlers, the heap).
 
 use Lingua (dap!)
 use Lingua.Dap (Frame, Scope, Variable, Mode, Stop)
+use Lingua.Make (linkDirIn)
+use MeadowBoot.Repl (hostLibrary)
+use Std.Ffi as Ffi
+use Std.Ffi (Arg, Function)
+use Std.Json as J
+use Std.Result as Res
 use Lingua.Lang (Meta, metaStart, metaEnd)
 use Lingua.Lang.Meta.*
 use Lingua.Make (Given, unitImports, unitSources)
@@ -50,9 +69,7 @@ use MeadowBoot.Compiler (
 )
 use MeadowBoot.Rename (Binder)
 use MeadowBoot.Scopes (Source, Export)
-use MeadowBoot.Infer
-use MeadowBoot.Types (Type, VarKind, namerOf, renderIn)
-use MeadowBoot.Solve (Generalized)
+use MeadowBoot.Shown (typesIn, classesIn, typeText, isTypeVariable)
 use MeadowBoot.Unit (packageOf, absolute)
 use Std.Collections.Vector as V
 use Std.Collections.HashMap as H
@@ -72,16 +89,228 @@ use Std.Sort (sortOn)
 
 dap! {
   pub Adapter "meadow"
-    | launch = launched
-    | resume = resumed
-    | run = ran
-    | breakpoints = placed
-    | frames = framesOf
-    | scopes = scopesOf
-    | variables = variablesOf
-    | evaluate = evaluated
-    | output = outputOf
+    | launch = launchedOn
+    | resume = resumedOn
+    | run = ranOn
+    | breakpoints = placedOn
+    | frames = framesOn
+    | scopes = scopesOn
+    | variables = variablesOn
+    | evaluate = evaluatedOn
+    | output = outputOn
 }
+
+-- --- which machine -----------------------------------------------------------------
+
+-- What a session runs on: the back end, through `meadow-host`; or the CEK
+-- machine, where there is no library to load.
+data Engine = Back Hosted | Own Debugging
+
+-- A session the back end holds: `meadow_debug`, which takes each request;
+-- the file a package made for a file of no package stands for, as in
+-- `rootOf`; and what the program wrote that has not been asked for.
+record Hosted = {
+  debug : Function,
+  alias : Maybe (String, String),
+  out : String
+}
+
+-- `meadow_debug`, where `meadow-host` can be loaded and has it -- unless
+-- `MEADOWBOOT_DAP=cek` asks for the CEK machine.
+fun backEnd () : Maybe Function ! { Process | e } =
+  if getEnv "MEADOWBOOT_DAP" == Just "cek" then None
+  else
+    match hostLibrary () with
+    | None -> None
+    | Just lib ->
+        (match Ffi.open lib with
+         | Err _ -> None
+         | Ok loaded -> Res.toMaybe (Ffi.function loaded "meadow_debug"))
+
+fun launchedOn (path : String) (args : Json) =
+  match backEnd () with
+  | Just debug -> launchedBack debug path args
+  | None -> Res.map (\d -> Engine.Own d) (launched path args)
+
+fun resumedOn (e : Engine) (mode : Mode) =
+  match e with
+  | Engine.Back h ->
+      (let u = asked h [("do", J.jString "resume"), ("mode", J.jString (modeName mode))] in e)
+  | Engine.Own m -> Engine.Own (resumed m mode)
+
+fun ranOn (e : Engine) (steps : Int) =
+  match e with
+  | Engine.Back h ->
+      (match asked h [("do", J.jString "run"), ("budget", J.jInt steps)] with
+       | Err why -> (e, Just (Stop.Failed why))
+       | Ok answer ->
+           (
+             Engine.Back { h | out = h.out ++ M.unwrapOr "" (textIn "output" answer) },
+             M.andThen stopOf (J.get "stop" answer)
+           ))
+  | Engine.Own m -> (match ran m steps with | (m2, stop) -> (Engine.Own m2, stop))
+
+fun placedOn (e : Engine) (path : String) (lines : [Int]) =
+  match e with
+  | Engine.Back h ->
+      (match asked h [
+         ("do", J.jString "breakpoints"),
+         ("path", J.jString (madeFor h.alias (absolute path))),
+         ("lines", J.jArray (V.map J.jInt lines))
+       ] with
+       | Err _ -> (e, V.map (\l -> None) lines)
+       | Ok answer -> (e, V.map J.asInt (listIn "lines" answer)))
+  | Engine.Own m ->
+      (match placed m path lines with
+       | (m2, landed) -> (Engine.Own m2, landed))
+
+-- Where the program is, innermost first. A frame of no position -- the code
+-- the back end runs a program's `main` from, a function of the standard
+-- library, which is built with none -- is not one a person wrote, and is
+-- left out, as the CEK machine leaves it out.
+fun framesOn (e : Engine) =
+  match e with
+  | Engine.Back h ->
+      (match asked h [("do", J.jString "frames"), ("max", J.jInt 1000)] with
+       | Err _ -> []
+       | Ok answer ->
+           V.concatMap
+             (\f ->
+               let line = M.unwrapOr 0 (M.andThen J.asInt (J.get "line" f)) in
+               if line <= 0 then []
+               else
+                 [Frame {
+                    name = M.unwrapOr "?" (textIn "name" f),
+                    path = shownPath (theirs h.alias (M.unwrapOr "" (textIn "path" f))),
+                    line,
+                    column = M.unwrapOr 0 (M.andThen J.asInt (J.get "column" f))
+                  }])
+             (listIn "frames" answer))
+  | Engine.Own m -> framesOf m
+
+fun scopesOn (e : Engine) (frame : Int) =
+  match e with
+  | Engine.Back h ->
+      (match asked h [("do", J.jString "scopes"), ("frame", J.jInt frame)] with
+       | Err _ -> []
+       | Ok answer ->
+           V.map
+             (\s ->
+               Scope {
+                 name = M.unwrapOr "" (textIn "name" s),
+                 reference = M.unwrapOr 0 (M.andThen J.asInt (J.get "reference" s)),
+                 expensive = M.unwrapOr False (M.andThen J.asBool (J.get "expensive" s))
+               })
+             (listIn "scopes" answer))
+  | Engine.Own m -> scopesOf m frame
+
+fun variablesOn (e : Engine) (reference : Int) =
+  match e with
+  | Engine.Back h ->
+      (match asked h [("do", J.jString "variables"), ("reference", J.jInt reference)] with
+       | Err _ -> []
+       | Ok answer -> V.map variableOf (listIn "variables" answer))
+  | Engine.Own m -> variablesOf m reference
+
+fun evaluatedOn (e : Engine) (frame : Int) (expr : String) =
+  match e with
+  | Engine.Back h ->
+      (match asked h [
+         ("do", J.jString "evaluate"),
+         ("frame", J.jInt frame),
+         ("expression", J.jString expr)
+       ] with
+       | Err _ -> None
+       | Ok answer ->
+           (match J.get "variable" answer with
+            | Just v -> if M.isSome (J.asObject v) then Just (variableOf v) else None
+            | None -> None))
+  | Engine.Own m -> evaluated m frame expr
+
+fun outputOn (e : Engine) =
+  match e with
+  | Engine.Back h -> (Engine.Back { h | out = "" }, h.out)
+  | Engine.Own m -> (match outputOf m with | (m2, text) -> (Engine.Own m2, text))
+
+-- --- the back end ------------------------------------------------------------------
+
+-- The program at `path` built for debugging, as `launched` builds it for the
+-- CEK machine, and handed to the back end at its first boundary: the program
+-- of Cut the build linked, which says where each of its terms was written.
+fun launchedBack (debug : Function) (path : String) (args : Json) =
+  let given = absolute path in
+  if not (exists given) then Err "cannot open ${path}: there is no such file or directory"
+  else
+    match rootOf given with
+    | Err why -> Err why
+    | Ok (root, alias) ->
+        (match Proc.run (Proc.currentExe ()) ["units", root] with
+         | Err why -> Err "the build could not be run: ${why}"
+         | Ok (code, out, err) ->
+             if code != 0 then Err "${path} did not compile:\n${S.trim (out ++ err)}"
+             else
+               (let program = Path.join (linkDirIn root "debug") "program.cut" in
+                let h = Hosted { debug, alias, out = "" } in
+                if not (exists program) then Err "${path} has no `main` to run"
+                else
+                  match asked h [("do", J.jString "launch"), ("program", J.jString program)] with
+                  | Err why -> Err why
+                  | Ok _ -> Ok (Engine.Back h)))
+
+-- What the back end answers `request`, or why it would not.
+fun asked (h : Hosted) (request : [(String, Json)]) : Result String Json ! { Process | e } =
+  match Res.andThen
+    J.parse
+    (Ffi.callString h.debug [Arg.String (J.render (J.jObject request))]) with
+  | Err why -> Err "the back end could not be asked: ${why}"
+  | Ok answer ->
+      (match textIn "error" answer with
+       | Just why -> Err why
+       | None -> Ok answer)
+
+fun textIn (field : String) (j : Json) : Maybe String = M.andThen J.asString (J.get field j)
+
+fun listIn (field : String) (j : Json) : [Json] =
+  M.unwrapOr [] (M.andThen J.asArray (J.get field j))
+
+fun modeName (mode : Mode) : String =
+  match mode with
+  | Mode.Continue -> "continue"
+  | Mode.StepIn -> "stepIn"
+  | Mode.StepOver -> "stepOver"
+  | Mode.StepOut -> "stepOut"
+
+-- Why the back end stopped, as it says it.
+fun stopOf (j : Json) : Maybe Stop =
+  let text = M.unwrapOr "" (textIn "text" j) in
+  match textIn "reason" j with
+  | None -> None
+  | Just reason ->
+      if reason == "breakpoint" then Just Stop.Breakpoint
+      else if reason == "step" then Just Stop.Step
+      else if reason == "entry" then Just Stop.Entry
+      else if reason == "pause" then Just Stop.Pause
+      else if reason == "exception" then Just (Stop.Exception text)
+      else if reason == "exited" then Just (Stop.Exited text)
+      else Just (Stop.Failed text)
+
+fun variableOf (v : Json) : Variable =
+  Variable {
+    name = M.unwrapOr "" (textIn "name" v),
+    value = M.unwrapOr "" (textIn "value" v),
+    kind = M.unwrapOr "" (textIn "type" v),
+    reference = M.unwrapOr 0 (M.andThen J.asInt (J.get "reference" v))
+  }
+
+-- A file the editor names, as the build knows it: the one made for a file
+-- of no package, for that file.
+fun madeFor (alias : Maybe (String, String)) (p : String) : String =
+  match alias with
+  | Just (made, theirs) -> if keyOf theirs == keyOf p then made else p
+  | None -> p
+
+-- And the other way: a file the build knows, as the editor does.
+fun theirs (alias : Maybe (String, String)) (p : String) : String = realPath alias p
 
 -- --- what the adapter knows of the program --------------------------------------
 
@@ -338,8 +567,8 @@ fun sourcesOf
   in
   let binders = study.renamed.binders in
   let global = \id -> id * many + own in
-  let typing = typesOf study in
-  let classes = classesOf study in
+  let typing = typesIn study.inferred in
+  let classes = classesIn study.inferred in
   let names =
     V.foldl
       (\h id ->
@@ -677,123 +906,6 @@ fun walk
            (getRef w.mentions))
   | _ -> ()
 
--- --- types -----------------------------------------------------------------------
-
--- The kind of each type variable inference made that is not a plain one: a
--- number's, or a fraction's, which the Rust compiler names `n` and `f`.
-fun classesOf (s : Study) : HashMap Int VarKind =
-  V.foldl
-    (\h (g : Generalized) ->
-      V.foldl
-        (\h2 i ->
-          match (V.get g.scheme.quant i, V.get g.vars i) with
-          | (Just k, Just var) -> (match k with | VarKind.Plain -> h2 | _ -> H.insert var k h2)
-          | _ -> h2)
-        h
-        (V.range 0 (V.len g.scheme.quant)))
-    (V.foldl
-       (\h n ->
-         match n with
-         | (id, frac) -> H.insert id (if frac then VarKind.Frac else VarKind.Num) h)
-       H.empty
-       s.inferred.numbers)
-    (H.values s.inferred.generics)
-
--- A type as the Rust compiler writes it, each variable named by its kind.
-fun typeText (classes : HashMap Int VarKind) (t : Type) : String =
-  withoutLoneEffect (fst (renderIn (namerOf classes) t))
-
--- `Int -> Int ! e` as the Rust adapter writes it, `Int -> Int`: an effect that
--- is only a variable says nothing.
-fun withoutLoneEffect (ty : String) : String =
-  match lastBang ty 0 (0 - 1) with
-  | k -> if k < 0 then ty else if isTypeVariable (S.drop ty (k + 3)) then S.take ty k else ty
-
-fun lastBang (ty : String) (from : Int) (found : Int) : Int =
-  match S.indexOfFrom " ! " ty from with
-  | Just i -> lastBang ty (i + 1) i
-  | None -> found
-
--- The type inference gave each name the package's modules bind, by binder.
-fun typesOf (s : Study) : HashMap Int Type =
-  V.foldl
-    (\h p ->
-      match p with
-      | TypedProgram a root -> V.foldl (\acc d -> typedDecl a d acc) h (typedModuleDecls a root))
-    H.empty
-    s.inferred.typed
-
-fun typedDecl (a : TypedArena) (d : TypedDecl) (acc : HashMap Int Type) : HashMap Int Type =
-  match viewTypedDecl a d with
-  | TypedDeclView.Bind r -> typedBind a r.bind acc
-  | TypedDeclView.Attributed r -> typedDecl a r.decl acc
-  | TypedDeclView.Trait r -> V.foldl (\t b -> typedBind a b t) acc r.defaults
-  | TypedDeclView.Impl r -> V.foldl (\t b -> typedBind a b t) acc r.methods
-  | _ -> acc
-
-fun typedBind (a : TypedArena) (b : TypedBind) (acc : HashMap Int Type) : HashMap Int Type =
-  match viewTypedBind a b with
-  | TypedBindView.Fun r -> typedExpr a r.body (V.foldl (\t p -> typedPat a p t) acc r.params)
-  | TypedBindView.Pat r -> typedExpr a r.value (typedPat a r.pat acc)
-
-fun typedPat (a : TypedArena) (p : TypedPat) (acc : HashMap Int Type) : HashMap Int Type =
-  let t = typTypedPat a p in
-  let each = \x qs -> V.foldl (\h q -> typedPat a q h) x qs in
-  match viewTypedPat a p with
-  | TypedPatView.Var r -> H.insert r.id t acc
-  | TypedPatView.As r -> typedPat a r.pat (H.insert r.id t acc)
-  | TypedPatView.Ann r -> typedPat a r.pat acc
-  | TypedPatView.Cons r -> each acc r.args
-  | TypedPatView.Tuple r -> each acc r.items
-  | TypedPatView.Array r -> each acc r.items
-  | TypedPatView.Vector r -> each acc r.items
-  | TypedPatView.List r -> each acc r.items
-  | TypedPatView.Record r -> V.foldl (\h f -> typedPat a (typedPatFieldPat a f) h) acc r.fields
-  | TypedPatView.View r -> typedPat a r.pat (typedExpr a r.fn acc)
-  | _ -> acc
-
-fun typedExpr (a : TypedArena) (e : TypedExpr) (acc : HashMap Int Type) : HashMap Int Type =
-  let each = \x es -> V.foldl (\t c -> typedExpr a c t) x es in
-  match viewTypedExpr a e with
-  | TypedExprView.Lam r -> typedExpr a r.body (V.foldl (\t p -> typedPat a p t) acc r.params)
-  | TypedExprView.App r -> each (typedExpr a r.func acc) r.args
-  | TypedExprView.Let r -> typedExpr a r.body (V.foldl (\t b -> typedBind a b t) acc r.binds)
-  | TypedExprView.If r -> typedExpr a r.no (typedExpr a r.yes (typedExpr a r.cond acc))
-  | TypedExprView.Match r ->
-      V.foldl
-        (\t arm ->
-          let withPat = typedPat a (typedArmPat a arm) t in
-          let withGuard =
-            match typedArmGuard a arm with
-            | Just g -> typedExpr a g withPat
-            | None -> withPat
-          in typedExpr a (typedArmBody a arm) withGuard)
-        (typedExpr a r.scrutinee acc)
-        r.arms
-  | TypedExprView.Tuple r -> each acc r.items
-  | TypedExprView.Array r -> each acc r.items
-  | TypedExprView.List r -> each acc r.items
-  | TypedExprView.Cons r -> each acc r.args
-  | TypedExprView.Record r ->
-      let fields = V.foldl (\t f -> typedExpr a (typedExprFieldValue a f) t) acc r.fields in
-      (match r.base with
-       | Just b -> typedExpr a b fields
-       | None -> fields)
-  | TypedExprView.Update r ->
-      V.foldl (\t f -> typedExpr a (typedExprFieldValue a f) t) (typedExpr a r.base acc) r.fields
-  | TypedExprView.Proj r -> typedExpr a r.target acc
-  | TypedExprView.Handle r ->
-      let body = typedExpr a r.body acc in
-      let arms =
-        V.foldl
-          (\t h -> typedExpr a (typedHArmBody a h) (typedPat a (typedHArmParam a h) t))
-          body
-          r.arms
-      in (match r.ret with
-          | Just x -> typedExpr a (typedRetBody a x) (typedPat a (typedRetPat a x) arms)
-          | None -> arms)
-  | _ -> acc
-
 -- --- running ---------------------------------------------------------------------
 
 -- How it is to run, from where it is now.
@@ -1002,12 +1114,6 @@ fun row (m : Debugging) (name : String) (v : Value) (ty : String) =
        kind,
        reference = if Cek.opens v then refer m (Target.Parts v) else 0
      }
-
--- `a`, `n1`: a type that is only a variable.
-fun isTypeVariable (ty : String) : Bool =
-  match V.get (S.chars ty) 0 with
-  | Just c -> C.isLower c and V.all (\x -> C.isAlphaNum x) (S.chars ty)
-  | None -> False
 
 -- A name, looked up in a frame, as a hover or a watch asks.
 fun evaluated (m : Debugging) (frame : Int) (expr : String) =

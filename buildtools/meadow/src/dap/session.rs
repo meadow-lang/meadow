@@ -181,6 +181,9 @@ pub struct Session {
     /// definitions by symbols (`meadow:App/d12f`), which a stack shows by
     /// what their source called them.
     titles: HashMap<InternedString, String>,
+    /// Whether locals are shown in the order their names were bound, rather
+    /// than the order the registers hold them: for a program of Cut.
+    bound_order: bool,
     /// `boundary[pc]`: the first instruction of a source position.
     boundary: Vec<bool>,
     /// `breakpoint[pc]`: stop before running it.
@@ -359,7 +362,9 @@ impl Session {
             .iter()
             .filter_map(|d| Some((d.name, lowered.map.titles.get(&d.label)?.clone())))
             .collect();
-        Session::from_parts(image, files, vars, titles)
+        let mut session = Session::from_parts(image, files, vars, titles)?;
+        session.bound_order = true;
+        Ok(session)
     }
 
     /// Stand at the first boundary, as a launch for a debugger that stops
@@ -464,6 +469,7 @@ impl Session {
             vm,
             files,
             vars,
+            bound_order: false,
             titles,
             boundary,
             breakpoint: vec![false; n],
@@ -917,17 +923,27 @@ impl Session {
                 };
                 let mut seen = HashSet::new();
                 let mut rows = Vec::new();
+                let mut vars = f.vars;
+                // A program of Cut is lowered with its environment in another
+                // order than the Rust core's: its names are taken newest
+                // first by when they were bound, and shown in that order.
+                if self.bound_order {
+                    vars.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
+                }
                 // Newest first, so a shadowed name shows its current binding.
-                for (name, value) in f.vars {
+                for (name, value) in vars {
                     let Some(info) = self.vars.get(&name).cloned() else {
                         continue;
                     };
                     if !seen.insert(info.name.clone()) {
                         continue;
                     }
-                    rows.push(self.row(info.name, value, Some(info.ty)));
+                    rows.push((name, self.row(info.name, value, Some(info.ty))));
                 }
-                rows
+                if self.bound_order {
+                    rows.sort_by_key(|(n, _)| *n);
+                }
+                rows.into_iter().map(|(_, row)| row).collect()
             }
             Target::Registers => {
                 let pc = self.here();

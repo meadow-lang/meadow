@@ -317,18 +317,43 @@ sent to the editor's console -- and what is Meadow's own is the machine: a
 program that runs a little at a time and can say where it is and what it
 holds.
 
-That machine is MeadowBoot's CEK machine, as the prompt's is. A launch builds
-the package as `meadow build` would, by a run of this program (`units`), so
-that nothing the build prints reaches the editor; makes each unit's core
-(`compilerWhole`) and links them into one program (`Core.linkedUnits`); and
-runs `main` to its first boundary. The Rust adapter steps Glade's bytecode,
-whose debug information Glade's code generator writes from the Rust core's
-positions; a program MeadowBoot builds reaches Glade as Cut, which carries
-none. So the front end does the whole of debugging here, and the back end
-none of it. For the back end to step MeadowBoot's programs, Cut would have
-to carry positions to AxCut and Glade's debug information, and `meadow-host`
-would need entry points for a session the adapter holds open: launch, step,
-frames and values.
+That machine is the back end's: the program runs on Glade, as `meadow dap`
+runs one. A launch builds the package as `meadow build` would, by a run of
+this program (`units`), so that nothing the build prints reaches the editor,
+and hands the program the build linked to `meadow-host`, which holds the
+session open in this process (`meadow_debug`, JSON in and out) and runs it
+to its first boundary. The session is the Rust adapter's own
+(`buildtools/meadow/src/dap/session.rs`), so stepping, the stack, scopes and
+values are what `meadow dap` makes of Glade's bytecode, at Glade's speed.
+
+What makes that possible is that a debug build says where it was written.
+The debug profile has `positions` set, and a unit built with it writes into
+its Cut (`src/Shown.mw`, `Seq.lowerAt`; `docs/CUT.md`, "Positions and
+names"):
+
+- a `source` for each file it was written in, named by a symbol of the
+  package's -- `meadow:App/"src/Main.mw"` -- so that the units' objects,
+  linked text by text, name their files apart;
+- a position on each term a step may stop before, at the terms below, by the
+  term's span in the file its definition was written in;
+- what the source calls each binder and its type, `v12: i64 @"count"
+  "Int"`, and what it calls each definition, `def S @"double"`, which the
+  stack and the locals are shown by. A definition copied for a number type,
+  or for the dictionaries it is given, is shown as the one it is a copy of:
+  `Shown.originsOf` finds that by where the copy's terms were written.
+
+The standard library is built with them too in a debug build, as the Rust
+compiler's debug information covers it, so a step goes into it as
+`meadow dap`'s does. They cost little: a debug build of the library is a fifth
+larger as Cut and takes as long. `meadow cut` takes them off before it builds
+or runs a program, so a debug build runs as it did, and compiles to the same
+bytecode and LLVM IR.
+
+Where `meadow-host` cannot be loaded, or `MEADOWBOOT_DAP=cek` asks, the
+machine is MeadowBoot's CEK machine, as the prompt's can be. A launch then
+makes each unit's core (`compilerWhole`), links them into one program
+(`Core.linkedUnits`), and runs `main` to its first boundary. The rest of this
+section is of how that machine does what Glade's debug information does.
 
 - **Where a step may stop.** The terms that stand where the Rust core has a
   position (`meadow_core::Term::Loc`) are the machine's boundaries: the head
@@ -353,11 +378,11 @@ frames and values.
   Glade's (`Cek.preview`). Evaluating looks a name up in a frame.
 
 What it does not do yet: a launch's `entry`, which starts at an expression
-rather than at `main`; the raw machine's scopes (registers, handlers, the
-heap) beside a frame's locals; and stopping in the standard library, which
-the Rust adapter shows from the library's extracted sources. A frame below
-the top shows everything its scope holds, where the Rust adapter shows what
-its continuation captured. And the CEK machine has no threads.
+rather than at `main`. On the CEK machine, the raw machine's scopes
+(registers, handlers, the heap) are not beside a frame's locals, a frame
+below the top shows everything its scope holds, where the Rust adapter shows
+what its continuation captured, the standard library is not stepped into,
+and there are no threads.
 
 `buildtools/meadow/tests/dap_differential.rs` drives both adapters through
 the same sessions -- each program stepped in, over and out from its entry,
