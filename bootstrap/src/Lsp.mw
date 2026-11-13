@@ -33,7 +33,7 @@ use Lingua.Diagnostic (Diagnostic, Severity)
 use Lingua.Diagnostic.Diagnostic.*
 use Lingua.Make (Given, unitImports, unitDir, unitSources)
 use MeadowBoot.Compiler (
-  Interface, Study, studyUnit, unitDatabase, givenUnits, compilerFiles, setCompilerSource
+  Interface, Study, studyUnitOf, studyDatabase, givenUnits, compilerFiles, setCompilerSource
 )
 use MeadowBoot.Unit (packageOf, absolute)
 use MeadowBoot.Rename (Binder)
@@ -307,7 +307,7 @@ fun studyOf (ed : Editor) (root : String) =
        | None -> None)
 
 fun studied (ed : Editor) (g : Given Interface) =
-  let db = unitDatabase g in
+  let db = studyDatabase g in
   let files = compilerFiles db 0 in
   let u =
     V.foldl
@@ -317,7 +317,7 @@ fun studied (ed : Editor) (g : Given Interface) =
         | None -> ())
       ()
       (H.values (getRef ed.docs))
-  in studyUnit db (V.map fst (unitImports g))
+  in studyUnitOf db (V.map snd (unitImports g)) (V.map fst (unitImports g))
 
 -- --- one document, as the requests read it -----------------------------------
 

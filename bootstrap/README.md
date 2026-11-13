@@ -259,8 +259,8 @@ What it said on one Windows desktop (28 cores), in milliseconds:
 | `examples/MiniML`, after edit |      218 |               1966 |            874 |
 | a prompt entry, checked       |        4 |                179 |             42 |
 | the prompt, started and quit  |      131 |               1336 |            554 |
-| a file opened, to diagnostics |      225 |                911 |            500 |
-| an edit, to its diagnostics   |       16 |                300 |            265 |
+| a file opened, to diagnostics |      225 |                911 |            344 |
+| an edit, to its diagnostics   |       16 |                300 |            117 |
 
 A cold `meadow` build has the standard library compiled into the binary; a
 cold MeadowBoot build compiles it, about 2.5 s of the time. Most of a build
@@ -293,6 +293,11 @@ What was slow, and is not now:
   a letter and what it holds, each string written once and then named by
   its number. The standard library's is 4.5 MB, read in about 200 ms and
   written in about 500.
+- The language server studied a package with a database made as a build's
+  was, holding every interface the package imports, and asked it for one
+  file after another. It is given the fixities alone, as a build's is, and
+  parses, groups and lowers the package's files side by side: a study of
+  `examples/MiniML` takes 100 ms where it took 300.
 
 ## The back end, in the same process
 

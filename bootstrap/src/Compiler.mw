@@ -373,23 +373,46 @@ fun inferredOf
 
 -- The unit `db` holds, studied: as `inferredOf` infers it, keeping all of
 -- it. `homes` are the directories of the units it imports, in their order.
-@pub fun studyUnit db (homes : [String]) =
+@pub fun studyUnit db (homes : [String]) = studyUnitOf db (compilerImported db 0) homes
+
+-- The same, for a database made by `studyDatabase`, which holds no more of
+-- the interfaces it imports than their fixities: `imported` are the whole.
+@pub fun studyUnitOf db (imported : [Interface]) (homes : [String]) =
   -- `MEADOWBOOT_TIMINGS`: how long each part of the study took.
   let clk = T.clock "study ${compilerHome db 0}" in
-  let study = studying db homes clk in
+  let study = studying db imported homes clk in
   let said = T.report clk in
   study
 
-fun studying db (homes : [String]) (clk : Clock) =
+-- A database for studying unit `u` (`studyUnitOf`), as `unitDatabase`
+-- makes one, but given only the fixities of what it imports -- all that the
+-- queries a study asks of it read; copying the rest into it took longer
+-- than the study -- and asked several files at once.
+@pub fun studyDatabase (u : Given Interface) =
+  parallelCompiler
+    (unitDatabaseWith
+       u
+       shownCfg
+       (readKept (M.unwrapOr "" (Res.toMaybe (readToString (Path.join (unitOut u) "macros.kept")))))
+       (fixitiesOnly (V.map snd (unitImports u))))
+
+fun studying db (imported : [Interface]) (homes : [String]) (clk : Clock) =
   let files = compilerFiles db 0 in
   let modules = modulesOf files in
-  let imported = compilerImported db 0 in
+  -- Every module parsed and grouped, and then lowered, each on a thread of
+  -- its own where the database is parallel.
+  let each = compilerGroupedEach db modules in
   let triples =
     V.map
       (\f -> (f, compilerSource db f, if S.endsWith ".mw" f then compilerGrouped db f else None))
       files
   in
   let groupedAt = T.lap clk "parse+fixity" in
+  -- What every file's lowering reads, asked first, so no thread waits on
+  -- another's answer to it.
+  let pkg = compilerPackage db 0 in
+  let expanded = compilerExpansions db 0 in
+  let lowerings = compilerLoweredEach db modules in
   let asts =
     V.concatMap
       (\f ->
