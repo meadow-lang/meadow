@@ -56,6 +56,8 @@ use MeadowBoot.Inline as Inline
 use MeadowBoot.Eta as Eta
 use MeadowBoot.Exhaust as Exhaust
 use MeadowBoot.Tests as Tests
+use MeadowBoot.Timings as T
+use MeadowBoot.Timings (Clock)
 use MeadowBoot.Dictionaries (emptySummary)
 use MeadowBoot.Types
 use MeadowBoot.Core (CoreProgram, joinedUnits)
@@ -323,6 +325,13 @@ fun inferredOf
 -- The unit `db` holds, studied: as `inferredOf` infers it, keeping all of
 -- it. `homes` are the directories of the units it imports, in their order.
 @pub fun studyUnit db (homes : [String]) =
+  -- `MEADOWBOOT_TIMINGS`: how long each part of the study took.
+  let clk = T.clock "study ${compilerHome db 0}" in
+  let study = studying db homes clk in
+  let said = T.report clk in
+  study
+
+fun studying db (homes : [String]) (clk : Clock) =
   let files = compilerFiles db 0 in
   let modules = modulesOf files in
   let imported = compilerImported db 0 in
@@ -331,6 +340,7 @@ fun inferredOf
       (\f -> (f, compilerSource db f, if S.endsWith ".mw" f then compilerGrouped db f else None))
       files
   in
+  let groupedAt = T.lap clk "parse+fixity" in
   let asts =
     V.concatMap
       (\f ->
@@ -339,6 +349,7 @@ fun inferredOf
         | None -> [])
       modules
   in
+  let loweredAt = T.lap clk "lower" in
   let parsed =
     V.map
       (\f ->
@@ -362,6 +373,7 @@ fun inferredOf
        triples
        asts with
      | (sources, r) ->
+         let renamedAt = T.lap clk "rename" in
          let deps =
            V.map
              (\x ->
@@ -382,6 +394,7 @@ fun inferredOf
                 triples)
          in
          let done = inferUnit r deps (V.map (\(i : Interface) -> i.types) imported) texts in
+         let inferredAt = T.lap clk "infer" in
          Study {
            sources,
            renamed = r,
@@ -612,6 +625,25 @@ fun checkedOf
                  (Exhaust.check written (V.append (sigsOf known) (Seq.datasOf written)))
            | None -> [])
       in
+      -- The first binder of each value by its module and name: a value is
+      -- defined twice when it is not the first. (Asking every export of
+      -- every other was as many questions as the square of what the unit
+      -- exports, which for the standard library is thousands.)
+      let valueKey = \(e : Export) -> "${S.join "." e.module} ${e.name}" in
+      let firstOf =
+        if not checked then H.empty
+        else
+          V.foldl
+            (\h (x : Export) ->
+              if x.kind != "v" or not (S.isEmpty x.owner) then h
+              else
+                (let k = valueKey x in
+                 match H.lookup k h with
+                 | Just b -> if b <= x.binder then h else H.insert k x.binder h
+                 | None -> H.insert k x.binder h))
+            H.empty
+            r.exports
+      in
       -- A value a module defines twice, at the second: where the Rust
       -- renamer refuses it, which would otherwise be taken for an overload
       -- of the first and fail as one.
@@ -621,14 +653,7 @@ fun checkedOf
           V.concatMap
             (\(e : Export) ->
               if e.kind != "v" or not (S.isEmpty e.owner) or S.startsWith "$" e.name then []
-              else if V.any
-                (\(x : Export) ->
-                  x.kind == "v"
-                    and S.isEmpty x.owner
-                    and x.name == e.name
-                    and x.module == e.module
-                    and x.binder < e.binder)
-                r.exports then
+              else if M.unwrapOr e.binder (H.lookup (valueKey e) firstOf) < e.binder then
                 (match M.andThen
                    (\(b : Binder) ->
                      match S.indexOf "@" b.site with
@@ -671,6 +696,7 @@ fun checkedOf
           cExported
       in
       let problems = V.append problems refused in
+      let m3c = mark "checked" in
       (
         exports,
         anyVis,
@@ -705,11 +731,13 @@ fun checkedOf
                      (V.map (\(n : Numbers) -> (n.program, V.zip n.vars n.fracs)) theirNumbers)
                      done.numbers
                  in
+                 let m3n = mark "numbered" in
                  -- And a definition that is a function is written with all
                  -- its parameters before anything asks how many it has
                  -- (`Eta`): what is optimised, lowered and told the units
                  -- that import this one is its arity as it is used.
                  let plain = if keep and not inlines then numbered else Eta.expanded numbered in
+                 let m3e = mark "eta" in
                  let traits =
                    Inline.traitsOf
                      (V.append
@@ -744,57 +772,60 @@ fun checkedOf
                                 ctors = V.map (\c -> Entry { key = fst c, value = snd c }) ctors
                               }])
                      (Seq.datasOf core)
-                 in (
-                      core,
-                      Linked {
-                        package = pkg,
-                        packages = V.pushBack packages pkg,
-                        datas = V.append known ownDatas,
-                        named =
-                          V.append
-                            labelled
-                            (V.map (\n -> Entry { key = fst n, value = snd n }) (Seq.namedOf core)),
-                        dicts,
-                        defaults,
-                        aliases,
-                        arities =
-                          V.append
-                            (V.map
-                               (\x -> Entry { key = fst x, value = snd x })
-                               (Seq.aritiesOf core))
-                            (V.concatMap
-                               (\(al : Entry String) ->
-                                 V.concatMap
-                                   (\(l : Linked) ->
-                                     V.filter (\(x : Entry Int) -> x.key == al.value) l.arities)
-                                   linked)
-                               aliases),
-                        summary = Dictionaries.summary plain labelled,
-                        -- Kept for the units that import this one,
-                        -- and nothing imports a program: its bodies were
-                        -- most of what was written of it.
-                        bodies =
-                          if (keep and not inlines) or program then Inline.nothing ()
-                          else Inline.exports core traits inlines generous,
-                        numbers =
-                          if Inline.keepsAny ownNumbers then
-                            V.pushFront
-                              theirNumbers
-                              (Numbers {
-                                 program = ownNumbers,
-                                 vars = V.map fst done.numbers,
-                                 fracs = V.map snd done.numbers
-                               })
-                          else theirNumbers,
-                        whole = if wholly then plain else Inline.nothing (),
-                        cExports = cExported
-                      },
-                      Seq.declarations
-                        core
-                        (sigsOf known)
-                        (V.map (\(e : Entry [String]) -> (e.key, e.value)) labelled)
-                        (V.filter (\p -> p != "Std") (V.pushBack packages pkg))
-                    )))
+                 in
+                 let kept =
+                   Linked {
+                     package = pkg,
+                     packages = V.pushBack packages pkg,
+                     datas = V.append known ownDatas,
+                     named =
+                       V.append
+                         labelled
+                         (V.map (\n -> Entry { key = fst n, value = snd n }) (Seq.namedOf core)),
+                     dicts,
+                     defaults,
+                     aliases,
+                     arities =
+                       V.append
+                         (V.map (\x -> Entry { key = fst x, value = snd x }) (Seq.aritiesOf core))
+                         (V.concatMap
+                            (\(al : Entry String) ->
+                              V.concatMap
+                                (\(l : Linked) ->
+                                  V.filter (\(x : Entry Int) -> x.key == al.value) l.arities)
+                                linked)
+                            aliases),
+                     summary = Dictionaries.summary plain labelled,
+                     -- Kept for the units that import this one,
+                     -- and nothing imports a program: its bodies were
+                     -- most of what was written of it.
+                     bodies =
+                       if (keep and not inlines) or program then Inline.nothing ()
+                       else Inline.exports core traits inlines generous,
+                     numbers =
+                       if Inline.keepsAny ownNumbers then
+                         V.pushFront
+                           theirNumbers
+                           (Numbers {
+                              program = ownNumbers,
+                              vars = V.map fst done.numbers,
+                              fracs = V.map snd done.numbers
+                            })
+                       else theirNumbers,
+                     whole = if wholly then plain else Inline.nothing (),
+                     cExports = cExported
+                   }
+                 in
+                 let m5 = mark "kept" in
+                 (
+                   core,
+                   kept,
+                   Seq.declarations
+                     core
+                     (sigsOf known)
+                     (V.map (\(e : Entry [String]) -> (e.key, e.value)) labelled)
+                     (V.filter (\p -> p != "Std") (V.pushBack packages pkg))
+                 )))
           cored,
         problems
       )
@@ -1430,21 +1461,37 @@ fun modulePath (isStd : Bool) (src : String) (path : String) : [String] =
     u
     shownCfg
     (readKept (M.unwrapOr "" (Res.toMaybe (readToString (Path.join (unitOut u) "macros.kept")))))
+    (V.map snd (unitImports u))
 
--- The same, with `kept` for what its macros answered.
+-- The same, with `kept` for what its macros answered, and `imported` for
+-- the interfaces of the units it depends on.
 fun unitDatabaseWith
     (u : Given Interface)
     (cfg : Cfg)
-    (kept : [(String, String, Int, Int, String)]) =
+    (kept : [(String, String, Int, Int, String)])
+    (imported : [Interface]) =
   let db = newCompiler () in
   let sources = testedSources cfg.test u in
   let a = setCompilerFiles db 0 (V.map fst sources) in
-  let b = setCompilerImported db 0 (V.map snd (unitImports u)) in
+  let b = setCompilerImported db 0 imported in
   let h = setCompilerHome db 0 (unitDir u) in
   let k = setCompilerAnswers db 0 kept in
   let g = setCompilerCfg db 0 cfg in
   let c = V.foldl (\acc s -> setCompilerSource db (fst s) (snd s)) () sources in
   db
+
+-- Of each interface, only what a unit's database is asked of it when the
+-- unit is built or an entry checked -- its fixities, for `fixities` -- which
+-- is what such a database is given in place of the whole. Whatever a
+-- database holds is copied into a region where any thread can read it, and
+-- the rest of an interface -- the standard library's most of all, with its
+-- types and what is inlined from it -- is many times what the unit's own
+-- sources are: copying it was most of what checking a small unit took.
+-- What the passes after it need of an interface they are handed directly.
+fun fixitiesOnly (imported : [Interface]) : [Interface] =
+  V.map
+    (\(i : Interface) -> { emptyInterface () | fixities = i.fixities, package = i.package })
+    imported
 
 -- A unit's sources, and where it is being tested -- only the package asked
 -- for ever is -- each module with its tests listed at its end and the root
@@ -1529,13 +1576,28 @@ fun answeredIn (file : String) (kept : [(String, String, Int, Int, String)])
     (dir : String)
     (imported : [Interface])
     (files : [(String, String)]) =
+  -- `MEADOWBOOT_TIMINGS`: how long each pass took, the entry named by its
+  -- package.
+  let named = V.find (\s -> S.endsWith "Meadow.toml" (fst s)) files in
+  let clk = T.clock (M.unwrapOr dir (M.map (\s -> packageName (snd s)) named)) in
+  let done = entering cfg dir imported files clk in
+  let said = T.report clk in
+  done
+
+fun entering
+    (cfg : Cfg)
+    (dir : String)
+    (imported : [Interface])
+    (files : [(String, String)])
+    (clk : Clock) =
   let db = newCompiler () in
   let a = setCompilerFiles db 0 (V.map fst files) in
-  let b = setCompilerImported db 0 imported in
+  let b = setCompilerImported db 0 (fixitiesOnly imported) in
   let h = setCompilerHome db 0 dir in
   let k = setCompilerAnswers db 0 [] in
   let g = setCompilerCfg db 0 cfg in
   let c = V.foldl (\acc s -> setCompilerSource db (fst s) (snd s)) () files in
+  let given = T.lap clk "given" in
   let modules = V.filter (\s -> S.endsWith ".mw" (fst s)) files in
   let pkg =
     M.unwrapOr
@@ -1549,20 +1611,22 @@ fun answeredIn (file : String) (kept : [(String, String, Int, Int, String)])
         | Err errs -> V.map (\e -> "@${show (fst e)}: ${snd e}") errs
         | Ok _ -> [])
       modules
-  in if not (V.isEmpty unparsed) then nothingEntered pkg unparsed
-     else
-       let ungrouped =
-         V.concatMap
-           (\s ->
-             match compilerGrouped db (fst s) with
-             | Just (_, ds) ->
-                 V.map
-                   (\d -> "${fst s}:${placeIn (snd s) (metaStart (whereAt d))}: ${message d}")
-                   ds
-             | None -> [])
-           modules
-       in if not (V.isEmpty ungrouped) then nothingEntered pkg ungrouped
-          else enteredChecked cfg dir imported files db pkg
+  in
+  let parsedAt = T.lap clk "parse" in
+  if not (V.isEmpty unparsed) then nothingEntered pkg unparsed
+  else
+    let ungrouped =
+      V.concatMap
+        (\s ->
+          match compilerGrouped db (fst s) with
+          | Just (_, ds) ->
+              V.map (\d -> "${fst s}:${placeIn (snd s) (metaStart (whereAt d))}: ${message d}") ds
+          | None -> [])
+        modules
+    in
+    let groupedAt = T.lap clk "fixity" in
+    if not (V.isEmpty ungrouped) then nothingEntered pkg ungrouped
+    else enteredChecked cfg dir imported files db pkg clk
 
 -- An entry that did not get as far as its names: what is wrong with it.
 fun nothingEntered (pkg : String) (wrong : [String]) : Entered =
@@ -1570,9 +1634,17 @@ fun nothingEntered (pkg : String) (wrong : [String]) : Entered =
 
 -- An entry whose files parsed and grouped, its names resolved, its types
 -- inferred and its core made.
-fun enteredChecked cfg (dir : String) (imported : [Interface]) (files : [(String, String)]) db pkg =
+fun enteredChecked
+    cfg
+    (dir : String)
+    (imported : [Interface])
+    (files : [(String, String)])
+    db
+    pkg
+    (clk : Clock) =
   let modules = V.filter (\s -> S.endsWith ".mw" (fst s)) files in
   let lowerings = V.map (\s -> (fst s, compilerLowered db (fst s))) modules in
+  let loweredAt = T.lap clk "lower" in
   let misread =
     V.concatMap
       (\x ->
@@ -1605,7 +1677,7 @@ fun enteredChecked cfg (dir : String) (imported : [Interface]) (files : [(String
        False
        True
        False
-       (\x -> ()) with
+       (\x -> T.lap clk (T.passOf x)) with
      | (exports, anyVis, types, made, problems) ->
          Entered {
            wrong = V.append misread problems,
@@ -1750,19 +1822,37 @@ fun resolving (o : UnitsOptions) : Bool = o.dictionaries and o.opt != UnitsOpt.O
 -- Compile unit `u`: every file parsed and grouped by the unit's fixities, and
 -- its interface -- or what is wrong, drawn.
 fun compileUnit (o : UnitsOptions) (u : Given Interface) =
-  match toResult (\() -> compiling o u) with
-  | Ok r -> r
-  | Err why -> Err "${show why}\n"
+  -- `MEADOWBOOT_TIMINGS`: how long each pass took, the unit named by its
+  -- package.
+  let clk = T.clock (unitName u) in
+  let r =
+    match toResult (\() -> compiling o u clk) with
+    | Ok r -> r
+    | Err why -> Err "${show why}\n"
+  in
+  let said = T.report clk in
+  r
 
-fun compiling (o : UnitsOptions) (u : Given Interface) =
+-- A unit as a person would name it: its package's name, or where it is.
+fun unitName (u : Given Interface) : String =
+  match V.find (\s -> S.endsWith "Meadow.toml" (fst s)) (unitSources u) with
+  | Just (_, text) -> (let n = packageName text in if S.isEmpty n then unitDir u else n)
+  | None -> unitDir u
+
+fun compiling (o : UnitsOptions) (u : Given Interface) (clk : Clock) =
   let timed = M.isSome (getEnv "MEADOWBOOT_TIMES") or M.isSome (getEnv "MEADOWBOOT_NAMES") in
   let mark =
-    \what -> if timed then writeError "${show (monotonic ())} ${unitDir u} ${what}\n" else ()
+    \what ->
+      (let said =
+         (if timed then writeError "${show (monotonic ())} ${unitDir u} ${what}\n" else ())
+       in T.lap clk (T.passOf what))
   in
   let m0 = mark "given" in
   -- A unit's files are parsed, and their operators grouped, each on a thread
   -- of its own: neither needs what another file's comes to.
-  let db = parallelCompiler (unitDatabaseWith u (cfgOf o) []) in
+  let db =
+    parallelCompiler (unitDatabaseWith u (cfgOf o) [] (fixitiesOnly (V.map snd (unitImports u))))
+  in
   let sources = V.filter (\s -> S.endsWith ".mw" (fst s)) (testedSources o.test u) in
   let files = V.map fst sources in
   let parsed = compilerParsedEach db files in
