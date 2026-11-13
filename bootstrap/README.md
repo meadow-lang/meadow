@@ -222,6 +222,68 @@ MEADOWBOOT_MEADOW=target/release/meadow cargo test -p meadow --test bootstrap
 `MEADOWBOOT_MEADOW` names the `meadow` that builds and runs MeadowBoot; the
 debug one the test is built with works too, slowly.
 
+## How fast it is
+
+MeadowBoot is to replace the Rust front end, so it has to be about as quick
+to use: a build, an entry at the prompt and an edit in the editor should not
+be noticeably slower. Two tools say how far off it is.
+
+`MEADOWBOOT_TIMINGS=1` has MeadowBoot say how long each pass of each unit
+took, as the unit finishes -- a build's, a prompt entry's, and each time the
+language server studies a package:
+
+```text
+timings Std:   2561.8 ms
+  parse            77.2 ms
+  fixity          101.1 ms
+  lower           188.4 ms
+  rename          124.4 ms
+  infer           706.7 ms
+  elaborate       241.4 ms
+  ...
+```
+
+`scripts/bench-meadowboot.py` runs the same work through MeadowBoot and the
+Rust `meadow`, both release builds, and prints the two side by side: builds
+of `examples/` cold and after an edit, the standard library from its
+sources, MeadowBoot itself, sixty prompt entries, and edits in the language
+server. `--passes` adds the timings above, summed over each case's units.
+
+What it said on one Windows desktop (28 cores), in milliseconds:
+
+| case                          | `meadow` | MeadowBoot before | MeadowBoot now |
+| ----------------------------- | -------: | ----------------: | -------------: |
+| `examples/Euler`, cold build  |      150 |              3469 |           3294 |
+| `examples/Euler`, after edit  |      153 |              1744 |           1626 |
+| `examples/MiniML`, cold build |      217 |              3564 |           3388 |
+| `examples/MiniML`, after edit |      218 |              1966 |           1700 |
+| a prompt entry, checked       |        4 |               179 |             44 |
+| an edit, to its diagnostics   |       16 |               300 |            299 |
+
+A cold `meadow` build has the standard library compiled into the binary; a
+cold MeadowBoot build compiles it, about 2.5 s of the time. Of what is left,
+most of a build after an edit is reading the standard library's interface,
+twice -- once for the unit and once for the link. A unit's own passes take
+70-90 ms of a small package's build.
+
+What was slow, and is not now:
+
+- A unit's database held the interfaces of every unit it imports, as an
+  input, though only their fixities are asked of it there; a database keeps
+  an input where any thread can read it, which copied the standard library's
+  interface for every unit and every prompt entry -- 90-115 ms each. It is
+  given their fixities alone.
+- Renaming found each dependency's type's constructors by reading every
+  constructor the dependency has, for each of its types; with the standard
+  library that was a few hundred thousand comparisons per unit. They are
+  grouped by their type once.
+- The check for a value a module defines twice compared every export with
+  every other: 150 ms of compiling the standard library. It keeps the first
+  of each name.
+- The walk that copies definitions for number types (`Inline.numbered`) also
+  worked out which definitions could be inlined and what each dictionary
+  holds, which only the walks that inline or read dictionaries ask.
+
 ## The back end, in the same process
 
 What MeadowBoot does not do itself -- building its Cut into a program, and

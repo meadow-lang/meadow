@@ -117,6 +117,18 @@ last release is under _Unreleased_.
   `meadow-host`'s `meadow_debug`, a session another program holds open --
   launch, breakpoints, run and step, the stack, scopes, locals and values,
   JSON in and out. See `docs/CUT.md`, "Positions and names".
+- `MEADOWBOOT_TIMINGS=1` has MeadowBoot say how long each pass of each unit
+  took -- parse, fixity, lower, rename, infer, elaborate, optimise, cut --
+  for a build, a prompt entry and the language server's study of a package;
+  and `scripts/bench-meadowboot.py` runs the same builds, prompt entries and
+  editor edits through MeadowBoot and the Rust `meadow` and prints both.
+  MeadowBoot is to replace the Rust front end, so how much slower it is has
+  to be measurable, and a regression visible. The numbers are in
+  `bootstrap/README.md`. Checking an entry at MeadowBoot's prompt went from
+  about 180 ms to about 45 ms: a unit's database no longer copies every
+  interface it imports, renaming no longer reads every constructor of a
+  dependency for each of its types, and compiling the standard library lost
+  a check that compared every export with every other.
 - MeadowBoot has a prompt of its own: `meadowboot` with no command, as
   `meadow` with none, is now MeadowBoot's REPL (`bootstrap/src/Repl.mw`),
   declared with Lingua's `repl!` rather than handed to the Rust `meadow`. It

@@ -483,6 +483,13 @@ fun owned (items : [Item]) : HashMap String [Item] =
     H.empty
     items
 
+-- `items` by their owner, each kept in the order it is among them.
+fun ownedBy (items : [Item]) : HashMap String [Item] =
+  V.foldl
+    (\h (i : Item) -> H.insert i.owner (V.pushBack (M.unwrapOr [] (H.lookup i.owner h)) i) h)
+    H.empty
+    items
+
 -- `withType`, of a module whose items are `by` kind and owner.
 fun withTypeIn (by : HashMap String [Item]) (t : Item) : [Item] =
   let of = \key -> M.unwrapOr [] (H.lookup key by) in
@@ -919,6 +926,11 @@ fun renaming (pkg : String) (isStd : Bool) (sources : [Source]) (deps : [DepExpo
       (V.concatMap (\(d : Dep) -> V.map (\x -> [snd x]) d.items) depCx)
   in
   let depCtors = V.concatMap (\(d : Dep) -> V.map snd d.items) depCx in
+  -- The dependencies' constructors by their type, each kept in the order it
+  -- is among them: a dependency's type finds its own here, where reading
+  -- every constructor for each type was as many reads as the standard
+  -- library has types times what it exports.
+  let depCtorsOf = ownedBy (V.filter (\(i : Item) -> i.kind == "c") depCtors) in
   let typeCtors =
     V.foldl
       (\h (items : [Item]) ->
@@ -926,14 +938,10 @@ fun renaming (pkg : String) (isStd : Bool) (sources : [Source]) (deps : [DepExpo
           (\g (t : Item) ->
             if t.kind != "t" then g
             else
-              let pool = if V.len items == 1 then depCtors else items in
-              H.insert
-                t.id
-                (V.foldl
-                   (\c (k : Item) -> H.insert k.name k.id c)
-                   H.empty
-                   (ctorsOfType pool t.name))
-                g)
+              let mine =
+                if V.len items == 1 then M.unwrapOr [] (H.lookup t.name depCtorsOf)
+                else ctorsOfType items t.name
+              in H.insert t.id (V.foldl (\c (k : Item) -> H.insert k.name k.id c) H.empty mine) g)
           h
           items)
       H.empty
@@ -1003,6 +1011,7 @@ fun renaming (pkg : String) (isStd : Bool) (sources : [Source]) (deps : [DepExpo
   in
   -- Every trait's associated types, by the trait: what an `impl`'s `type`
   -- is, whatever is in scope.
+  let typesOf = ownedBy (V.filter (\(i : Item) -> i.kind == "t") allItems) in
   let traitAssocs =
     V.foldl
       (\h (t : Item) ->
@@ -1010,11 +1019,9 @@ fun renaming (pkg : String) (isStd : Bool) (sources : [Source]) (deps : [DepExpo
           H.insert
             t.id
             (V.foldl
-               (\g (x : Item) ->
-                 if x.kind == "t" and x.owner == "assoc:" ++ t.name then H.insert x.name x.id g
-                 else g)
+               (\g (x : Item) -> H.insert x.name x.id g)
                H.empty
-               allItems)
+               (M.unwrapOr [] (H.lookup ("assoc:" ++ t.name) typesOf)))
             h
         else h)
       H.empty
