@@ -83,6 +83,18 @@ fn every_module_groups_by_bracket_and_comes_back_unchanged() {
 }
 
 #[test]
+fn an_empty_module_parses_to_no_declarations() {
+    for text in ["", "\n", "-- only a comment\n", "@!feature(ffi)\n"] {
+        let src = Source::new(SourceKind::Interactive, text.into());
+        let tokens = lex(text);
+        let (module, errs) = parse("M".into(), src, &tokens);
+        assert!(errs.is_empty(), "{text:?}: {errs:?}");
+        let module = module.expect("a module");
+        assert!(module.value.decls.is_empty(), "{text:?}");
+    }
+}
+
+#[test]
 fn every_module_renders_back_to_the_tokens_it_came_from() {
     // `stringify!` writes token trees back as text. A token tree does not
     // remember its whitespace, so the text is not the file -- but lexing it must
