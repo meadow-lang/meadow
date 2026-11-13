@@ -250,24 +250,32 @@ of `examples/` cold and after an edit, the standard library from its
 sources, MeadowBoot itself, sixty prompt entries, and edits in the language
 server. `--passes` adds the timings above, summed over each case's units.
 
-What it said on one Windows desktop (28 cores), in milliseconds:
+What it said on one Windows desktop (28 cores), in milliseconds, before this
+work began (master at `dd9e15e`) and after it:
 
-| case                          | `meadow` | MeadowBoot, Nov 13 | MeadowBoot now |
-| ----------------------------- | -------: | -----------------: | -------------: |
-| `examples/Euler`, cold build  |      150 |               3469 |           3378 |
-| `examples/Euler`, after edit  |      153 |               1744 |            758 |
-| `examples/MiniML`, cold build |      217 |               3564 |           3396 |
-| `examples/MiniML`, after edit |      218 |               1966 |            874 |
-| a prompt entry, checked       |        4 |                179 |             42 |
-| the prompt, started and quit  |      131 |               1336 |            554 |
-| a file opened, to diagnostics |      225 |                911 |            344 |
-| an edit, to its diagnostics   |       16 |                300 |            117 |
+| case                              | `meadow` | MeadowBoot before | MeadowBoot now |
+| --------------------------------- | -------: | ----------------: | -------------: |
+| `examples/Euler`, cold build      |      149 |              3469 |           2916 |
+| `examples/Euler`, after an edit   |      151 |              1744 |            706 |
+| `examples/MiniML`, cold build     |      231 |              3564 |           3057 |
+| `examples/MiniML`, after edit     |      223 |              1966 |            826 |
+| the standard library, from source |  593-817 |              3877 |           2932 |
+| MeadowBoot itself, cold build     |  39-43 s |           82-91 s |       78-119 s |
+| a prompt entry, checked           |        5 |               179 |             42 |
+| the prompt, started and quit      |      131 |              1336 |            641 |
+| a file opened, to diagnostics     |      217 |               911 |            348 |
+| an edit, to its diagnostics       |       17 |               300 |            118 |
+
+The machine is shared, so a number moves by a tenth between runs, and the
+build of MeadowBoot itself -- which builds the servers of its procedural
+macros too -- by a third.
 
 A cold `meadow` build has the standard library compiled into the binary; a
-cold MeadowBoot build compiles it, about 2.5 s of the time. Most of a build
-after an edit is reading the standard library's interface, which Lingua's
-build does twice -- once for the unit and once for the link -- at about
-300 ms each. A unit's own passes take 70-90 ms of a small package's build.
+cold MeadowBoot build compiles it, which is most of the time, until it reads
+a precompiled one (`Std.mwstd`). What is left of a build after an edit is
+mostly the standard library's interface read twice: Lingua's build reads it
+for the unit compiled, and again from the disk for the link, at about 235 ms
+each. A unit's own passes take 70-90 ms of a small package's build.
 
 What was slow, and is not now:
 
