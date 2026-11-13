@@ -90,7 +90,7 @@ pub fn parse_pat<'src>(
 }
 
 /// Parse a run of declarations -- what a module body is, without the module.
-/// Unlike [`parse`] this accepts none, since a macro may expand to nothing. See
+/// Like [`parse`] this accepts none, since a macro may expand to nothing. See
 /// [`parse_expr`].
 pub fn parse_decls<'src>(
     tokens: &'src [LToken],
@@ -118,9 +118,9 @@ where
         .collect::<Vec<_>>();
     inner
         .then(
+            // A module may be empty: a file just made, or only comments.
             decl()
                 .repeated()
-                .at_least(1)
                 .collect::<Vec<_>>()
                 .validate(|groups, _, emitter| joined(groups, emitter)),
         )
