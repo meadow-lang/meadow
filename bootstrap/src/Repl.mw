@@ -83,6 +83,7 @@ use Std.Process (getEnv)
 use Std.Process as Proc
 use Std.Time (monotonic)
 use Std.Result as Res
+use Std.Test (assertEq)
 
 -- As the Rust prompt does, every line is kept in the history, `:` lines
 -- too; Ctrl-C ends the prompt; and a `:` line that is no command is an
@@ -1526,3 +1527,10 @@ fun isDefined (s : Session) (name : String) =
     or (match s.std with
      | Just (i : Interface) -> V.any (\(e : Export) -> e.kind == "v" and e.name == name) i.exports
      | None -> False)
+
+@test fun aPartDeclaresItsDefinitionsAndValues () =
+  assertEq
+    (declaredIn
+       "def meadow:repl:2/d4f (v: i64; k: ptr) =\n  <v | k>\n\nval meadow:repl:2/d4 : ptr =\n  <meadow:repl:2/d4f | halt>\n")
+    ["meadow:repl:2/d4f", "meadow:repl:2/d4"]
+    "each `def` and `val` at the margin, and nothing it mentions"

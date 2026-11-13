@@ -40,7 +40,7 @@ last release is under _Unreleased_.
   core, written as the Rust compiler writes core, then its Cut, AxCut,
   Glade's bytecode and machine code, and LLVM IR. A package in a symbol of
   Cut may have a `:` in its name, as a prompt's entries do: `meadow:repl:3/d0`.
-  The two prompts agree on 256 of the differential test's 265 entries, where
+  The two prompts agree on 257 of the differential test's 265 entries, where
   they agreed on 240.
 - `meadow repl` no longer runs an `effect` entry's operation, which said
   `program has no entry point`, and no longer shows a derived `impl`'s

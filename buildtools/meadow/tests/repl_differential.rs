@@ -798,14 +798,14 @@ fn progress(line: &str) {
 /// MeadowBoot's prompt answers every entry as `meadow repl` answers it.
 ///
 /// Not yet, so it is ignored: run it with `--ignored` to see how far. On
-/// 2026-11-13 the two agreed on 256 of 265 entries, where on 2026-11-09,
+/// 2026-11-13 the two agreed on 257 of 265 entries, where on 2026-11-09,
 /// when MeadowBoot ran entries on its CEK machine, they agreed on 240:
 ///
 /// ```text
 /// banner           9 / 9      it               2 / 2
 /// command         42 / 47     multi-line       9 / 9
 /// definition      20 / 20     name            10 / 10
-/// error           10 / 13     tour            64 / 65
+/// error           10 / 13     tour            65 / 65
 /// example         33 / 33     expression      57 / 57
 /// ```
 ///
@@ -814,16 +814,17 @@ fn progress(line: &str) {
 /// entry's operation (`program has no entry point`) or shows the bindings
 /// of a derived `impl`, and MeadowBoot's no longer shows a binding the
 /// entries after it cannot see (`@pub(pkg) def`). What is left is what the
-/// two cannot share, and is of four kinds. A parse error is worded by each
+/// two cannot share, and is of three kinds. A parse error is worded by each
 /// parser its own way (three, one of them a `:` line that is no command,
 /// which both prompts hand to the parser). `:ir cut a` shows each
 /// compiler's own Cut, and MeadowBoot names a definition's symbol by its
 /// binder (`meadow:repl:3/d113`) where the Rust compiler names it by its
 /// name (`meadow:repl-3/a`) (one). `:try` with no terminal puts nothing on
 /// the Rust prompt, since rustyline takes no initial text then, where
-/// Lingua's prompt enters the example (four). And `gather [30, 20, 10]`
-/// answers in the order three threads finish, which is the tour's point and
-/// is up to the scheduler, run to run (one).
+/// Lingua's prompt enters the example (four). One more entry agrees only as
+/// the threads it starts allow: `gather [30, 20, 10]` answers in the order
+/// three threads finish, which is the tour's point, and the scheduler may
+/// finish `fib 20` before `fib 10` on either prompt.
 #[test]
 #[ignore = "MeadowBoot's prompt does not agree with meadow repl yet: see the doc comment"]
 fn meadowboot_s_prompt_answers_as_meadow_repl_answers() {

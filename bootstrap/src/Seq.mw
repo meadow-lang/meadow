@@ -1756,6 +1756,7 @@ fun lowered
         datas,
         dataIx = dataIndex datas,
         pkgs = packages,
+        escapes = False,
         wanted = stNewRef [],
         seen = stNewRef [],
         next = stNewRef 0
@@ -1838,8 +1839,9 @@ fun entered out sh (mains : Bool) (pkg : String) (entry : Int) (answerTy : Type)
     : (String, String) =
   aroundWith True pkg entry answerTy types known packages
 
--- The same for a prompt's entry, whose value is shown whatever it is: a
--- function of `()` too, which a program would take for its `main` and run.
+-- The same for a prompt's entry, whose value is shown whatever it is -- a
+-- function of `()` too, which a program would take for its `main` and run
+-- -- and a string in it escaped, as the prompt shows one.
 @pub fun aroundShown
     (pkg : String)
     (entry : Int)
@@ -1868,6 +1870,7 @@ fun aroundWith
           datas = known,
           dataIx = dataIndex known,
           pkgs = packages,
+          escapes = not mains,
           wanted = stNewRef [],
           seen = stNewRef [],
           next = stNewRef 0
@@ -2136,8 +2139,12 @@ fun shownTo sh value (t : Type) k =
           value
           (C.give out C.nowhere (text "False") j)
           (C.give out C.nowhere (text "True") j))
-  -- Quoted, and escaped as the CEK machine and the runtimes show one.
-  | Con "String" [] -> C.prim out C.nowhere "show" [value] [k]
+  -- Quoted, and, for a prompt, escaped as the CEK machine and the runtimes
+  -- show one: a program's answer is quoted alone, which every machine that
+  -- runs Cut can do.
+  | Con "String" [] ->
+      if sh.escapes then C.prim out C.nowhere "show" [value] [k]
+      else joinedTo out [text "\"", value, text "\""] k
   | Con "Unit" [] -> C.give out C.nowhere (text "()") k
   | Tuple items ->
       (let names = V.map (\i -> freshName sh) items in
