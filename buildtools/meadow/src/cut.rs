@@ -29,11 +29,14 @@ pub fn lowered(path: &Path) -> Result<meadow_seq::Program, String> {
 /// Cut it is lowered from once its small definitions are inlined
 /// (`meadow_cut::inline`) and its calls under a constructor made tail calls
 /// (`meadow_cut::trmc`); `axcut`, each definition it is lowered to, under
-/// a line naming it; or `llvm`, the LLVM IR a Silo build of it for this
-/// machine compiles -- each unit, after the first, under a line naming it. A
-/// view of the back end's, for a front end's tools to show: its form is not
-/// a contract (`docs/CUT.md`).
-pub fn emitted(path: &Path, what: &str) -> Result<String, String> {
+/// a line naming it; `llvm`, the LLVM IR a Silo build of it for this
+/// machine compiles -- each unit, after the first, under a line naming it;
+/// `bytecode`, the bytecode Glade runs; or `asm`, the machine code Glade's
+/// code compiled ahead of time is, at `opt`. The last two are what `meadow
+/// dis` prints, for a front end that compiles to Cut to print them. A view of
+/// the back end's, for a front end's tools to show: its form is not a
+/// contract (`docs/CUT.md`).
+pub fn emitted(path: &Path, what: &str, opt: meadow_compiler::OptLevel) -> Result<String, String> {
     use std::fmt::Write;
     let mut out = String::new();
     match what {
@@ -63,9 +66,15 @@ pub fn emitted(path: &Path, what: &str) -> Result<String, String> {
                 out.push_str(&u.text);
             }
         }
+        "bytecode" => out = crate::listing::bytecode(&image(path)?),
+        "asm" => {
+            let arch = aot::Target::host()?.arch;
+            out = crate::listing::asm(&image(path)?, arch, opt);
+        }
         other => {
             return Err(format!(
-                "`{other}` is not what `meadow cut --emit` prints: `inlined`, `axcut` or `llvm`"
+                "`{other}` is not what `meadow cut --emit` prints: `inlined`, `axcut`, `llvm`, \
+                 `bytecode` or `asm`"
             ));
         }
     }

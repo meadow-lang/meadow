@@ -349,8 +349,9 @@ enum Cmd {
         target: Option<String>,
         /// Print what the program is made into, and run nothing: `inlined`,
         /// the Cut it is lowered from once its small definitions are inlined;
-        /// `axcut`, the AxCut it is lowered to; or `llvm`, the LLVM IR a Silo
-        /// build compiles.
+        /// `axcut`, the AxCut it is lowered to; `llvm`, the LLVM IR a Silo
+        /// build compiles; `bytecode`, what Glade runs; or `asm`, the machine
+        /// code Glade compiles it to ahead of time.
         #[arg(long, value_name = "WHAT")]
         emit: Option<String>,
         /// What the program is given, after `--`: what its `argv` answers.
@@ -1188,10 +1189,12 @@ fn command(cli: Cli) {
             };
             let ran = match aot::Runtime::named(&runtime) {
                 _ if emit.is_some() => {
-                    crate::cut::emitted(&file, emit.as_deref().unwrap_or_default()).map(|text| {
-                        print!("{text}");
-                        0
-                    })
+                    crate::cut::emitted(&file, emit.as_deref().unwrap_or_default(), opt).map(
+                        |text| {
+                            print!("{text}");
+                            0
+                        },
+                    )
                 }
                 // A library of what it exports to C is built ahead of time,
                 // whatever else was asked, and there is nothing to run.

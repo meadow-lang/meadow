@@ -22,6 +22,8 @@ mod Inline
 mod Eta
 mod Exhaust
 mod Tests
+mod Testing
+mod Precompile
 mod Cek
 mod Syntax
 mod Parse
@@ -49,6 +51,8 @@ use MeadowBoot.Cek as Cek
 use MeadowBoot.Cek (Machine)
 use MeadowBoot.Seq as Seq
 use MeadowBoot.Tests as Tests
+use MeadowBoot.Testing (Asked, runTests)
+use MeadowBoot.Precompile (precompileStd)
 use MeadowBoot.Parse (parsed, checked)
 use MeadowBoot.Fixity (chainsOf)
 use MeadowBoot.Unit (packageOf, absolute, packageName)
@@ -422,7 +426,13 @@ cli! {
       }
 }
 
-fun main () = catch failed (\() -> match argsCli () with | (every, cli) -> run every cli)
+fun main () =
+  catch failed (\() ->
+    -- `__precompile-std`, the release's and no one else's, is no command
+    -- the command line lists, as the Rust `meadow` hides it.
+    match V.get (Proc.argv ()) 0 with
+    | Just "__precompile-std" -> finish (precompileStd (V.drop (Proc.argv ()) 1))
+    | _ -> (match argsCli () with | (every, cli) -> run every cli))
 
 -- A query read before it was set, or one that needs itself: a mistake of the
 -- compiler's rather than of what it read. It is said, and the run fails.
@@ -438,27 +448,13 @@ fun run (every : CliOptions) (cli : Cli) =
   match cli with
   | Cli.Build r -> driven r.path r.build None
   | Cli.Run r -> driven r.path r.build (Just r.args)
-  -- The standard library's own tests are `meadow`'s to run, for now.
-  | Cli.Test r if r.std -> handedOn ()
+  -- The tests are MeadowBoot's to build and to run, the standard library's
+  -- too (`Testing`).
   | Cli.Test r ->
-      let said =
-        V.foldl
-          (\u flag -> writeError "meadowboot: `${flag}` is not acted on yet\n")
-          ()
-          (V.concat [
-             if M.isSome r.testThreads then ["--test-threads"] else [],
-             if r.noCapture then ["--no-capture"] else [],
-             if r.cek then ["--cek"] else []
-           ])
-      in driven
-           r.path
-           r.build
-           (Just
-              (V.concat [
-                 ["--test"],
-                 M.unwrapOr [] (M.map (\f -> [f]) r.filter),
-                 if r.exact then ["--exact"] else []
-               ]))
+      runTests
+        (testAsked r.build r.path r.filter r.exact r.std r.testThreads r.noCapture r.cek)
+        backEnd
+        (backEndProgram ())
   | Cli.Lex r -> finish (V.foldl (\ok p -> lexFile p and ok) True r.files)
   | Cli.Eval r -> finish (V.foldl (\ok p -> evalFile p and ok) True r.files)
   | Cli.Parse r -> finish (V.foldl (\ok p -> parseFile p and ok) True r.files)
@@ -482,8 +478,91 @@ fun run (every : CliOptions) (cli : Cli) =
   | Cli.Lsp r if V.isEmpty r.check -> serveServer ()
   | Cli.Units r ->
       finish (V.foldl (\ok root -> buildUnits "debug" (told ()) root and ok) True r.roots)
+  -- `dis` is this compiler's build, listed by the back end.
+  | Cli.Dis r -> disassembled r.path r.asm r.build
   -- What is not MeadowBoot's yet is `meadow`'s, asked the same way.
   | _ -> handedOn ()
+
+-- What `meadow test` was asked, as `Testing` runs it: built as `build` would
+-- build it, run on Glade's JIT unless Silo, or Glade's code compiled ahead
+-- of time, or the CEK machine is asked for.
+fun testAsked
+    (b : CliBuild)
+    (path : Maybe String)
+    (filter : Maybe String)
+    (exact : Bool)
+    (std : Bool)
+    (threads : Maybe Int)
+    (noCapture : Bool)
+    (cek : Bool) =
+  let said =
+    V.foldl (\u flag -> writeError "meadowboot: `${flag}` is not acted on yet\n") () (unheeded b)
+  in
+  let threaded =
+    match b.threads with
+    | Just n -> Proc.setEnv ("MEADOW_THREADS", show n)
+    | None -> ()
+  in Asked {
+       path,
+       filter,
+       exact,
+       std,
+       threads,
+       noCapture,
+       cek,
+       profile = if b.release then "release" else "debug",
+       level = levelOf b,
+       pairs = pairsFor b,
+       flags = b.cfg,
+       runtime = M.unwrapOr "glade" b.runtime,
+       ahead = b.aot or b.backend == Just "aot"
+     }
+
+-- How hard a build optimises, as `driven` has it: what `-O` says, or the
+-- profile's, at most 2.
+fun levelOf (b : CliBuild) : Int =
+  let level = M.unwrapOr (if b.release then 2 else 1) b.optLevel in
+  if level > 2 then 2 else level
+
+-- What a build is told over its profile, as `driven` tells it.
+fun pairsFor (b : CliBuild) =
+  let goal = targetOf b.target in
+  V.concat [
+    [("opt", "O${show (levelOf b)}"), ("macros", "Glade")],
+    (if M.isSome b.target then [("os", goal.os), ("arch", goal.arch)] else []),
+    (if V.isEmpty b.cfg then [] else [("flags", S.join "," b.cfg)]),
+    (if b.strict then [("strict", "true")] else if b.lenient then [("strict", "false")] else []),
+    told ()
+  ]
+
+-- `dis`: the package at `path` built by this compiler, as `build` builds it,
+-- and the bytecode the back end makes of its Cut printed -- or, with `--asm`,
+-- the machine code Glade's ahead-of-time compiler makes of that, for this
+-- machine (`meadow cut --emit`).
+fun disassembled (path : Maybe String) (asm : Bool) (b : CliBuild) =
+  let place = absolute (M.unwrapOr "." path) in
+  let root = if S.endsWith ".mw" place then packageOf place else Just place in
+  let said =
+    V.foldl (\u flag -> writeError "meadowboot: `${flag}` is not acted on yet\n") () (unheeded b)
+  in match root with
+     | None -> (let u = writeError "meadowboot: `${place}` is in no package\n" in exit 1)
+     | Just r ->
+         let profile = if b.release then "release" else "debug" in
+         if not (buildUnits profile (pairsFor b) r) then exit 1
+         else
+           (let program = Path.join (linkDirIn r profile) "program.cut" in
+            match backEnd [
+              "cut",
+              program,
+              "--emit",
+              if asm then "asm" else "bytecode",
+              "-O",
+              show (levelOf b)
+            ] with
+            | Ok code -> exit code
+            | Err why ->
+                (let u = writeError "meadowboot: the back end could not be run: ${why}\n" in
+                 exit 1))
 
 -- The Rust compiler's `meadow`: where `MEADOW` says, the one beside this
 -- program -- as a release of it has them -- or the one on the path.
