@@ -20,8 +20,20 @@ use crate::*;
 /// Read `text` as a Cut program, or say where it stops making sense.
 pub fn parse(text: &str) -> Result<Program, String> {
     let toks = lex(text)?;
-    let mut p = Parser { toks, at: 0 };
+    let mut p = Parser {
+        toks,
+        at: 0,
+        sources: Vec::new(),
+    };
     let mut program = p.program()?;
+    for (symbol, path) in p.sources {
+        let Some(path) = path else {
+            return Err(format!(
+                "a position is in `{symbol}`, which no `source` declares"
+            ));
+        };
+        program.sources.push(Source { symbol, path });
+    }
     resolve(&mut program)?;
     Ok(program)
 }
@@ -330,6 +342,9 @@ fn symbol_at(cs: &[char], j: usize, lang: &str) -> Result<Option<(Symbol, usize)
 struct Parser {
     toks: Vec<Spanned>,
     at: usize,
+    /// The files positions are in, by symbol, in the order first named --
+    /// by a position or a `source` -- with the path a `source` gave.
+    sources: Vec<(Symbol, Option<String>)>,
 }
 
 type R<T> = Result<T, String>;
@@ -454,6 +469,7 @@ impl Parser {
             entry: None,
             answer: Answer::None,
             exports: Vec::new(),
+            sources: Vec::new(),
             datas: Vec::new(),
             roles: Vec::new(),
             natives: Vec::new(),
@@ -478,6 +494,7 @@ impl Parser {
                         };
                     }
                     "export" => p.exports.push(self.export()?),
+                    "source" => self.source()?,
                     "data" => p.datas.push(self.data()?),
                     "roles" => self.roles(&mut p.roles)?,
                     "native" => self.natives(&mut p.natives)?,
@@ -490,6 +507,59 @@ impl Parser {
             }
         }
         Ok(p)
+    }
+
+    /// The place among [`Program::sources`] of the file `symbol` names.
+    fn source_index(&mut self, symbol: Symbol) -> u32 {
+        match self.sources.iter().position(|(s, _)| *s == symbol) {
+            Some(i) => i as u32,
+            None => {
+                self.sources.push((symbol, None));
+                (self.sources.len() - 1) as u32
+            }
+        }
+    }
+
+    /// `source S = "path"`: the file positions name `S`. A program put
+    /// together of several may declare one more than once, with one path.
+    fn source(&mut self) -> R<()> {
+        self.word("source")?;
+        let symbol = self.symbol()?;
+        self.punct("=")?;
+        let path = match self.next() {
+            Tok::Str(s) => s,
+            _ => return self.fail("the file's path, in quotes"),
+        };
+        let i = self.source_index(symbol) as usize;
+        match &self.sources[i].1 {
+            Some(other) if *other != path => Err(format!(
+                "`{}` is declared the source `{other}` and `{path}`",
+                self.sources[i].0
+            )),
+            _ => {
+                self.sources[i].1 = Some(path);
+                Ok(())
+            }
+        }
+    }
+
+    /// `@S:a-b`: bytes `a` to `b` of the file `S` names.
+    fn position(&mut self) -> R<Pos> {
+        self.punct("@")?;
+        let symbol = self.symbol()?;
+        self.punct(":")?;
+        let number = |p: &mut Parser| match p.next() {
+            Tok::Int(n) if (0..=u32::MAX as i64).contains(&n) => Ok(n as u32),
+            _ => p.fail("a byte offset"),
+        };
+        let start = number(self)?;
+        self.punct("-")?;
+        let end = number(self)?;
+        Ok(Pos {
+            source: self.source_index(symbol),
+            start,
+            end,
+        })
     }
 
     /// `export "c_name" = S -> rep`.
@@ -637,16 +707,35 @@ impl Parser {
     fn val(&mut self) -> R<Val> {
         self.word("val")?;
         let symbol = self.symbol()?;
+        let shown = self.title();
         self.punct(":")?;
         let rep = self.rep()?;
         self.punct("=")?;
         let body = self.statement()?;
-        Ok(Val { symbol, rep, body })
+        Ok(Val {
+            symbol,
+            shown,
+            rep,
+            body,
+        })
+    }
+
+    /// `@"name"` after a declaration's symbol: what the source calls it.
+    fn title(&mut self) -> Option<String> {
+        match (self.peek(), self.peek_at(1).clone()) {
+            (Tok::Punct("@"), Tok::Str(name)) => {
+                self.next();
+                self.next();
+                Some(name)
+            }
+            _ => None,
+        }
     }
 
     fn def(&mut self) -> R<Def> {
         self.word("def")?;
         let symbol = self.symbol()?;
+        let shown = self.title();
         let mut rep_vars = Vec::new();
         let mut effect_vars = Vec::new();
         if self.eat("<") {
@@ -681,6 +770,7 @@ impl Parser {
         let body = self.statement()?;
         Ok(Def {
             symbol,
+            shown,
             rep_vars,
             effect_vars,
             params,
@@ -747,19 +837,35 @@ impl Parser {
         let name = self.ident()?;
         self.punct(":")?;
         let rep = self.rep()?;
-        self.hints();
-        Ok(Binder { name, rep })
+        let shown = self.hints()?;
+        Ok(Binder { name, rep, shown })
     }
 
-    /// Hints after a binder's representation -- `@once`, `@0..1` -- which v0
-    /// reads and ignores.
-    fn hints(&mut self) {
+    /// Hints after a binder's representation: what the source calls it,
+    /// `@"count" "Int"` -- its name, and its type if the front end says --
+    /// which a debugger shows; and `@once`, `@0..1`, which v0 reads and
+    /// ignores.
+    fn hints(&mut self) -> R<Option<Shown>> {
+        let mut shown = None;
         while self.is_punct("@") && !matches!(self.peek_at(1), Tok::Ident(w) if w == "many") {
             self.next();
+            if let Tok::Str(name) = self.peek().clone() {
+                self.next();
+                let ty = match self.peek().clone() {
+                    Tok::Str(ty) => {
+                        self.next();
+                        ty
+                    }
+                    _ => String::new(),
+                };
+                shown = Some(Shown { name, ty });
+                continue;
+            }
             while matches!(self.peek(), Tok::Ident(_) | Tok::Int(_) | Tok::Punct(".")) {
                 self.next();
             }
         }
+        Ok(shown)
     }
 
     fn rep(&mut self) -> R<Rep> {
@@ -783,6 +889,10 @@ impl Parser {
 
     fn statement(&mut self) -> R<Statement> {
         match self.peek().clone() {
+            Tok::Punct("@") => {
+                let at = self.position()?;
+                Ok(Statement::At(at, Box::new(self.statement()?)))
+            }
             Tok::Punct("<") => {
                 self.next();
                 let p = self.producer()?;
@@ -1168,6 +1278,7 @@ impl Resolver {
                 ps.iter_mut().for_each(|p| self.producer(p));
                 self.consumer(c);
             }
+            Statement::At(_, s) => self.statement(s),
             Statement::Error(_) => {}
         }
     }

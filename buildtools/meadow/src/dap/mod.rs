@@ -21,6 +21,7 @@
 //! where an editor shows a debuggee's console; `Console.readLine` sees the end
 //! of input.
 
+pub mod hosted;
 pub mod session;
 
 use serde_json::{Value as Json, json};

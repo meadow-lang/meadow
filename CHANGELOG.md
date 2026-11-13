@@ -105,6 +105,18 @@ last release is under _Unreleased_.
 
 ### Added
 
+- Cut carries positions and names, for a debugger: `source S = "path"`
+  declares a file, `@S:a-b s` is a statement written at bytes `a` to `b` of
+  it, and `x: i64 @"count" "Int"`, `def S @"fact"` say what the source calls
+  a binder, with its type, and a definition. Every pass keeps them, the
+  lowering makes them AxCut's marks, and Glade's code generator writes the
+  same debug information from them as from the Rust core's. `meadow cut`
+  takes them off before it builds or runs a program, which then compiles to
+  the same bytecode and LLVM IR as without them. A program of Cut built for
+  debugging can be debugged on Glade: `Session::launch_cut`, and
+  `meadow-host`'s `meadow_debug`, a session another program holds open --
+  launch, breakpoints, run and step, the stack, scopes, locals and values,
+  JSON in and out. See `docs/CUT.md`, "Positions and names".
 - MeadowBoot has a prompt of its own: `meadowboot` with no command, as
   `meadow` with none, is now MeadowBoot's REPL (`bootstrap/src/Repl.mw`),
   declared with Lingua's `repl!` rather than handed to the Rust `meadow`. It
