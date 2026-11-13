@@ -395,6 +395,22 @@ fun inferredOf
            imported
          }
 
+-- A studied unit's core, as `Elab` makes it before anything makes it better:
+-- every definition, dictionaries and types as arguments, with no entry.
+-- What a tool shows of a definition as core -- the language server's
+-- `meadow/ir`, as `meadow_core::Program::pretty` writes it (`Core.prettyDefs`)
+-- -- and the core the unit's Cut is lowered from.
+@pub fun studyCore (s : Study) : Maybe CoreProgram =
+  let pkg =
+    M.unwrapOr "" (M.andThen (\x -> V.get (S.split "/" (fileOf (snd x))) 0) (V.get s.sources 0))
+  in
+  let theirs =
+    V.map
+      (\(i : Interface) ->
+        Imported { package = i.package, exports = i.exports, types = i.types, linked = i.linked })
+      s.imported
+  in M.map (\x -> match x with | (p, _, _, _) -> p) (unitCore pkg s.renamed s.inferred theirs None)
+
 -- The unit at `dir` checked and lowered, its types inferred once: what it
 -- exports, each with its scheme; whether it says; what it knows about
 -- types; and, entered at its `entry` if it is to have one -- or `None`, for
