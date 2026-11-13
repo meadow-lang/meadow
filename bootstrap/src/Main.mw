@@ -14,6 +14,7 @@ mod Derive
 mod Macros
 mod Expand
 mod Core
+mod CoreShow
 mod Cut
 mod Seq
 mod Lint
@@ -36,11 +37,13 @@ mod Tour
 mod Repl
 mod Lsp
 mod Find
+mod Dap
 
 use Lingua (cli!)
 use MeadowBoot.Lex (lex, dump)
 use MeadowBoot.Repl (runPrompt)
 use MeadowBoot.Lsp (serveServer, checkPaths)
+use MeadowBoot.Dap (debugAdapter)
 use MeadowBoot.Core (program, erase, linkedUnits, CoreProgram, coreFilePackage)
 use MeadowBoot.Expand (Call, readRound, writeAnswers, callText, seenAfter)
 use MeadowBoot.Scopes (Export)
@@ -482,6 +485,8 @@ fun run (every : CliOptions) (cli : Cli) =
   | Cli.Repl -> runPrompt ()
   -- The language server is MeadowBoot's, and so is what it would mark.
   | Cli.Lsp r -> if V.isEmpty r.check then serveServer () else exit (checkPaths (V.append r.check r.more))
+  -- And so is the debug adapter (`Dap`).
+  | Cli.Dap -> debugAdapter ()
   | Cli.Units r ->
       finish (V.foldl (\ok root -> buildUnits "debug" (told ()) root and ok) True r.roots)
   -- What is not MeadowBoot's yet is `meadow`'s, asked the same way.

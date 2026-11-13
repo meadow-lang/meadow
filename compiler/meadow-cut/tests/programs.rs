@@ -454,6 +454,22 @@ def idyll:Prelude/Nat.\"x'\" (; k: ptr) = <'c' | k>
 }
 
 #[test]
+fn a_prompt_s_entry_is_a_package_with_a_colon_in_its_name() {
+    let p = parse(
+        "cut 0
+entry meadow:repl:3/d0
+answer none
+val meadow:repl:3/d0 : i64 = <7 | halt>
+",
+    )
+    .unwrap();
+    let entry = p.entry.as_ref().expect("an entry");
+    assert_eq!(entry.package, "repl:3");
+    assert_eq!(entry.to_string(), "meadow:repl:3/d0");
+    assert_eq!(p.vals.len(), 1);
+}
+
+#[test]
 fn a_reader_refuses_what_it_cannot_read() {
     assert!(parse("cut 1\n").unwrap_err().contains("version 1"));
     let e = parse("cut 0\ndef idyll:A/f (; k: ptr) = <idyll:A/K(1) | k>\n").unwrap_err();

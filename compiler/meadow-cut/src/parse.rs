@@ -280,7 +280,9 @@ fn symbol_at(cs: &[char], j: usize, lang: &str) -> Result<Option<(Symbol, usize)
     if cs.get(j) != Some(&':') {
         return Ok(None);
     }
-    let pkg_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '@' | '.' | '-' | '+');
+    // A `:` too: a prompt names its entries' packages `repl:3`.
+    let pkg_char =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '@' | '.' | '-' | '+' | ':');
     let mut k = j + 1;
     while k < cs.len() && pkg_char(cs[k]) {
         k += 1;
