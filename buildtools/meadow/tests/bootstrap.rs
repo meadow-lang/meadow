@@ -3572,7 +3572,9 @@ fn a_build_takes_the_standard_library_meadowboot_precompiled() {
             .expect("the standard library's unit");
         std::fs::read_to_string(std.path().join("Std.cut")).expect("its object")
     };
-    for (profile, args) in [("debug", &[][..]), ("release", &["--release"][..])] {
+    // Run on the JIT as `release` too: an executable needs a runtime library
+    // to link, which is not what is tested here.
+    for (profile, args) in [("debug", &[][..]), ("release", &["--release", "--jit"][..])] {
         let fresh = package(&format!("Fresh{profile}"));
         let taken = package(&format!("Taken{profile}"));
         build(&fresh, None, args);
