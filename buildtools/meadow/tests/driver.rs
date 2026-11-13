@@ -763,7 +763,10 @@ fn a_program_of_cut_is_printed_as_axcut_and_as_llvm() {
     assert!(!out.contains("counting\n200002"), "nothing ran: {out}");
     let (ok, _, err) = meadow(&dir, &["cut", "count.cut", "--emit", "bytes"]);
     assert!(!ok);
-    assert!(err.contains("`axcut` or `llvm`"), "{err}");
+    assert!(
+        err.contains("`axcut`, `llvm`, `bytecode`, `asm` or `image`"),
+        "{err}"
+    );
 }
 
 #[test]
