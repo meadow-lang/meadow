@@ -62,7 +62,8 @@ use MeadowBoot.Dictionaries (emptySummary)
 use MeadowBoot.Types
 use MeadowBoot.Core (CoreProgram, joinedUnits)
 use MeadowBoot.Solve (TypeEnv, noTypes, Entry)
-use Std.Macro (Reflect)
+use Std.Macro (Reflect, Datum, toDatum, fromDatum)
+use MeadowBoot.Packed (pack, unpack)
 use Std.Json as J
 use Std.Json (Json)
 use Std.Exn (toResult)
@@ -80,7 +81,7 @@ use Std.Result.Result.*
 -- package's name, what it exports, each with its scheme, whether it says
 -- what it exports -- a unit whose declarations never mention visibility
 -- exports everything -- and what it knows about types.
-@derive(Reflect, Debug, PartialEq)
+@derive(Debug, PartialEq)
 @pub record Interface = {
   fixities : [Declared],
   package : String,
@@ -93,6 +94,54 @@ use Std.Result.Result.*
   macros : [MacroFun],
   bindings : [Binding]
 }
+
+-- An interface is kept between runs as its fields would be, packed into one
+-- string (`Packed`): the standard library's is millions of numbers and
+-- types, and as the JSON a build writes a `Datum` as, reading it back took
+-- longer than compiling most units that import it.
+impl Reflect Interface {
+  fun toDatum i =
+    let whole =
+      Datum.Rec [
+        ("fixities", toDatum i.fixities),
+        ("package", toDatum i.package),
+        ("exports", toDatum i.exports),
+        ("anyVis", toDatum i.anyVis),
+        ("types", toDatum i.types),
+        ("linked", toDatum i.linked),
+        ("macros", toDatum i.macros),
+        ("bindings", toDatum i.bindings)
+      ]
+    in match pack whole with
+       | Just s -> Datum.Str s
+       | None -> whole
+  fun fromDatum d =
+    match d with
+    | Datum.Str s ->
+        (match unpack s with
+         | Just whole -> interfaceOf whole
+         | None -> Err "an interface whose packed text does not read")
+    | whole -> interfaceOf whole
+}
+
+fun interfaceOf (d : Datum) : Result String Interface =
+  match d with
+  | Datum.Rec fs ->
+      (match (
+         fieldIn fs "fixities", fieldIn fs "package", fieldIn fs "exports", fieldIn fs "anyVis",
+         fieldIn fs "types", fieldIn fs "linked", fieldIn fs "macros", fieldIn fs "bindings"
+       ) with
+       | (
+         Ok fixities, Ok package, Ok exports, Ok anyVis, Ok types, Ok linked, Ok macros, Ok bindings
+       ) -> Ok (Interface { fixities, package, exports, anyVis, types, linked, macros, bindings })
+       | _ -> Err "an interface without all of its fields")
+  | _ -> Err "not an interface"
+
+-- Field `name` of `fs`, read as what it is wanted as.
+fun fieldIn (fs : [(String, Datum)]) (name : String) =
+  match V.find (\f -> fst f == name) fs with
+  | Just f -> fromDatum (snd f)
+  | None -> Err "no field `${name}`"
 
 -- An operator, and how it binds.
 @derive(Reflect, Debug, PartialEq)

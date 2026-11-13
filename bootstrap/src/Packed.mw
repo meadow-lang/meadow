@@ -1,0 +1,234 @@
+-- Packed: a `Datum` written as one string, and read back.
+--
+-- A unit's interface is kept between runs as a `Datum`, which Lingua's build
+-- writes as JSON: every number an element of an array, every record an
+-- object of named fields, every constructor an object with its tag. The
+-- standard library's interface comes to millions of those, most of them the
+-- numbers and types of the code kept for inlining, and writing it, reading
+-- it, and turning the JSON to a `Datum` and back took longer than compiling
+-- most units. A datum packed is one string in that JSON instead: nothing to
+-- do for the JSON but copy it, and a string this module reads a byte at a
+-- time.
+--
+-- Each datum is a letter saying what it is and then what it holds:
+--
+--   i<n>;           an integer, in base ten, `-` first if it is negative
+--   b / B           false / true
+--   f<text>         a float, as JSON writes it (a string, below)
+--   s<k>:<bytes>    a string of `k` bytes, the next one numbered
+--   S<n>;           the string numbered `n` again
+--   y<string>       a symbol
+--   l<k>;<datum>…   a list of `k`
+--   r<k>;(<string><datum>)…  a record of `k` named fields
+--   t<string><k>;<datum>…   a constructor and what it is applied to
+--
+-- A string is written once and named by its number after that: a record's
+-- field names, a constructor's and a type's are most of what a datum spells.
+-- `Datum.Code`, source as tokens, is no part of an interface -- JSON has no
+-- way to write it either -- and a datum holding one does not pack.
+
+use Std.Macro (Datum)
+use Std.Json as J
+use Std.Json (Json)
+use Std.Collections.Vector as V
+use Std.Collections.HashMap as H
+use Std.String as S
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+use Lingua.Buf as Buf
+
+-- `d` packed: `None` if it holds what does not pack.
+@pub fun pack (d : Datum) : Maybe String =
+  runSt (\() ->
+    let out = Buf.bufferFor 4096 in
+    let seen = stNewRef H.empty in
+    if packed out seen d then Just (bytesToString (Buf.freeze out)) else None)
+
+-- What `pack` wrote, read back.
+@pub fun unpack (s : String) : Maybe Datum =
+  runSt (\() ->
+    let strings = Buf.buffer () in
+    match datumAt s (stringByteLength s) strings 0 with
+    | Just (d, at) -> if at == stringByteLength s then Just d else None
+    | None -> None)
+
+-- --- writing -------------------------------------------------------------------
+
+fun packed out seen (d : Datum) =
+  match d with
+  | Datum.Int n ->
+      (let u = byte out 105 in
+       let v = number out n in
+       True)
+  | Datum.Bool b -> (let u = byte out (if b then 66 else 98) in True)
+  | Datum.Float f ->
+      (let u = byte out 102 in
+       let v = text out seen (J.render (Json.Float f)) in
+       True)
+  | Datum.Str s -> (let u = text out seen s in True)
+  | Datum.Sym s ->
+      (let u = byte out 121 in
+       let v = text out seen s in
+       True)
+  | Datum.List xs ->
+      (let u = byte out 108 in
+       let v = number out (V.len xs) in
+       V.all (\x -> packed out seen x) xs)
+  | Datum.Rec fs ->
+      (let u = byte out 114 in
+       let v = number out (V.len fs) in
+       V.all (\f -> (let w = text out seen (fst f) in packed out seen (snd f))) fs)
+  | Datum.Tag t xs ->
+      (let u = byte out 116 in
+       let v = text out seen t in
+       let w = number out (V.len xs) in
+       V.all (\x -> packed out seen x) xs)
+  | Datum.Code _ -> False
+
+fun byte out (b : Int) = let i = Buf.push out (toUInt8 b) in ()
+
+-- `n` in base ten, and `;`.
+fun number out (n : Int) =
+  let u = (if n < 0 then byte out 45 else ()) in
+  let v = digits out (if n < 0 then 0 - n else n) in
+  byte out 59
+
+fun digits out (n : Int) =
+  let u = (if n >= 10 then digits out (n / 10) else ()) in
+  byte out (48 + n % 10)
+
+-- A string: by its number, if it was written before; else in full.
+fun text out seen (s : String) =
+  let known = stGetRef seen in
+  match H.lookup s known with
+  | Just k -> (let u = byte out 83 in number out k)
+  | None ->
+      (let n = stringByteLength s in
+       let u = stSetRef seen (H.insert s (H.size known) known) in
+       let v = byte out 115 in
+       let w = digitsThen out n 58 in
+       bytesOf out s 0 n)
+
+fun digitsThen out (n : Int) (after : Int) = let u = digits out n in byte out after
+
+fun bytesOf out (s : String) (i : Int) (n : Int) =
+  if i >= n then () else (let u = Buf.push out (stringByteAt s i) in bytesOf out s (i + 1) n)
+
+-- --- reading -------------------------------------------------------------------
+
+-- The datum at `i` of `s`, `n` bytes long, and where it ends. `strings` are
+-- those read so far, by their numbers.
+fun datumAt (s : String) (n : Int) strings (i : Int) =
+  if i >= n then None
+  else
+    (let c = toInt (stringByteAt s i) in
+     if c == 105 then M.map (\r -> (Datum.Int (fst r), snd r)) (numberAt s n (i + 1))
+     else if c == 115 or c == 83 then
+       M.map (\r -> (Datum.Str (fst r), snd r)) (textAt s n strings i)
+     else if c == 108 then
+       (match numberAt s n (i + 1) with
+        | Just (k, at) -> M.map (\r -> (Datum.List (fst r), snd r)) (itemsAt s n strings at k [])
+        | None -> None)
+     else if c == 114 then
+       (match numberAt s n (i + 1) with
+        | Just (k, at) -> M.map (\r -> (Datum.Rec (fst r), snd r)) (fieldsAt s n strings at k [])
+        | None -> None)
+     else if c == 116 then
+       (match textAt s n strings (i + 1) with
+        | Just (t, at) ->
+            (match numberAt s n at with
+             | Just (k, at2) ->
+                 M.map (\r -> (Datum.Tag t (fst r), snd r)) (itemsAt s n strings at2 k [])
+             | None -> None)
+        | None -> None)
+     else if c == 66 then Just (Datum.Bool True, i + 1)
+     else if c == 98 then Just (Datum.Bool False, i + 1)
+     else if c == 121 then M.map (\r -> (Datum.Sym (fst r), snd r)) (textAt s n strings (i + 1))
+     else if c == 102 then
+       (match textAt s n strings (i + 1) with
+        | Just (t, at) ->
+            (match J.parse t with
+             | Ok j -> M.map (\x -> (Datum.Float x, at)) (J.asFloat j)
+             | Err _ -> None)
+        | None -> None)
+     else None)
+
+-- `k` datums from `i`, after `got`.
+fun itemsAt (s : String) (n : Int) strings (i : Int) (k : Int) (got : [Datum]) =
+  if k <= 0 then Just (got, i)
+  else
+    match datumAt s n strings i with
+    | Just (d, at) -> itemsAt s n strings at (k - 1) (V.pushBack got d)
+    | None -> None
+
+-- `k` named fields from `i`, after `got`.
+fun fieldsAt (s : String) (n : Int) strings (i : Int) (k : Int) (got : [(String, Datum)]) =
+  if k <= 0 then Just (got, i)
+  else
+    match textAt s n strings i with
+    | Just (name, at) ->
+        (match datumAt s n strings at with
+         | Just (d, at2) -> fieldsAt s n strings at2 (k - 1) (V.pushBack got (name, d))
+         | None -> None)
+    | None -> None
+
+-- The string at `i`: written in full, and numbered next; or by its number.
+fun textAt (s : String) (n : Int) strings (i : Int) =
+  if i >= n then None
+  else
+    (let c = toInt (stringByteAt s i) in
+     if c == 83 then
+       (match numberAt s n (i + 1) with
+        | Just (k, at) -> if k < Buf.len strings then Just (Buf.at strings k, at) else None
+        | None -> None)
+     else if c == 115 then
+       (match digitsAt s n (i + 1) 0 58 with
+        | Just (len, at) ->
+            if at + len > n then None
+            else
+              (let t = stringSlice s at (at + len) in
+               let u = Buf.push strings t in
+               Just (t, at + len))
+        | None -> None)
+     else None)
+
+-- A number in base ten from `i`, `-` first if it is negative, and `;`.
+fun numberAt (s : String) (n : Int) (i : Int) =
+  if i < n and toInt (stringByteAt s i) == 45 then
+    M.map (\r -> (0 - fst r, snd r)) (digitsAt s n (i + 1) 0 59)
+  else digitsAt s n i 0 59
+
+-- Digits from `i` up to the byte `stop`: their number, and where they end.
+fun digitsAt (s : String) (n : Int) (i : Int) (acc : Int) (stop : Int) =
+  if i >= n then None
+  else
+    (let c = toInt (stringByteAt s i) in
+     if c == stop then Just (acc, i + 1)
+     else if c >= 48 and c <= 57 then digitsAt s n (i + 1) (acc * 10 + (c - 48)) stop
+     else None)
+
+-- --- tests ---------------------------------------------------------------------
+
+use Std.Test (assertEq)
+
+@test fun aDatumSurvivesBeingPacked () =
+  let d =
+    Datum.Rec [
+      ("name", Datum.Str "a \"quoted\" name\n"),
+      ("n", Datum.Int (0 - 42)),
+      ("big", Datum.Int 1234567890123),
+      ("flags", Datum.List [Datum.Bool True, Datum.Bool False, Datum.Sym "name"]),
+      ("ty", Datum.Tag "Con" [Datum.Str "Int", Datum.List []]),
+      ("again", Datum.Tag "Con" [Datum.Str "Int", Datum.List []]),
+      ("x", Datum.Float 0.5),
+      ("empty", Datum.Str "")
+    ]
+  in assertEq (M.andThen unpack (pack d)) (Just d) "the same datum back"
+
+@test fun aStringWrittenTwiceIsNamedTheSecondTime () =
+  assertEq
+    (pack (Datum.List [Datum.Str "ab", Datum.Str "ab"]))
+    (Just "l2;s2:abS0;")
+    "the second by its number"
+
+@test fun whatIsCutShortIsNotRead () = assertEq (unpack "l2;s2:ab") None "a list one short"

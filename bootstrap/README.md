@@ -251,20 +251,22 @@ server. `--passes` adds the timings above, summed over each case's units.
 
 What it said on one Windows desktop (28 cores), in milliseconds:
 
-| case                          | `meadow` | MeadowBoot before | MeadowBoot now |
-| ----------------------------- | -------: | ----------------: | -------------: |
-| `examples/Euler`, cold build  |      150 |              3469 |           3294 |
-| `examples/Euler`, after edit  |      153 |              1744 |           1626 |
-| `examples/MiniML`, cold build |      217 |              3564 |           3388 |
-| `examples/MiniML`, after edit |      218 |              1966 |           1700 |
-| a prompt entry, checked       |        4 |               179 |             44 |
-| an edit, to its diagnostics   |       16 |               300 |            299 |
+| case                          | `meadow` | MeadowBoot, Nov 13 | MeadowBoot now |
+| ----------------------------- | -------: | -----------------: | -------------: |
+| `examples/Euler`, cold build  |      150 |               3469 |           3378 |
+| `examples/Euler`, after edit  |      153 |               1744 |            758 |
+| `examples/MiniML`, cold build |      217 |               3564 |           3396 |
+| `examples/MiniML`, after edit |      218 |               1966 |            874 |
+| a prompt entry, checked       |        4 |                179 |             42 |
+| the prompt, started and quit  |      131 |               1336 |            554 |
+| a file opened, to diagnostics |      225 |                911 |            500 |
+| an edit, to its diagnostics   |       16 |                300 |            265 |
 
 A cold `meadow` build has the standard library compiled into the binary; a
-cold MeadowBoot build compiles it, about 2.5 s of the time. Of what is left,
-most of a build after an edit is reading the standard library's interface,
-twice -- once for the unit and once for the link. A unit's own passes take
-70-90 ms of a small package's build.
+cold MeadowBoot build compiles it, about 2.5 s of the time. Most of a build
+after an edit is reading the standard library's interface, which Lingua's
+build does twice -- once for the unit and once for the link -- at about
+300 ms each. A unit's own passes take 70-90 ms of a small package's build.
 
 What was slow, and is not now:
 
@@ -283,6 +285,14 @@ What was slow, and is not now:
 - The walk that copies definitions for number types (`Inline.numbered`) also
   worked out which definitions could be inlined and what each dictionary
   holds, which only the walks that inline or read dictionaries ask.
+- An interface was kept as the JSON Lingua writes a `Datum` as: an object
+  for each record and constructor, an array element for each number. The
+  standard library's came to 8.4 MB, and reading it -- the JSON parsed,
+  made a `Datum`, the `Datum` made an interface -- took about 900 ms, and
+  writing it as long. An interface is now one string (`Packed`): each datum
+  a letter and what it holds, each string written once and then named by
+  its number. The standard library's is 4.5 MB, read in about 200 ms and
+  written in about 500.
 
 ## The back end, in the same process
 

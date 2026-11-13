@@ -26,6 +26,15 @@ last release is under _Unreleased_.
 
 ### Changed
 
+- MeadowBoot keeps a unit's interface packed into one string
+  (`bootstrap/src/Packed.mw`) where it was the JSON of a `Datum`, an object
+  for each record and an array element for each number. The standard
+  library's went from 8.4 MB to 4.5 MB, reading it from about 900 ms to
+  about 200, and writing it from about 900 ms to about 500. A build after an
+  edit reads it twice, and the prompt and the language server once at start:
+  `examples/Euler` rebuilds in about 0.75 s where it took 1.6, and the
+  prompt starts in 0.55 s where it took 1.4. What was built before is
+  compiled again, since the compiler that built it is not this one.
 - `x |> f` evaluates `x` first, and then `f`, as it is written, on every
   engine. It used to be exactly `f x`, which evaluates `f` first. Only a
   program in which working out what is piped into performs something can
