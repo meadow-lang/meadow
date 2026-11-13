@@ -1112,7 +1112,11 @@ fun walked
   let a = coreArena p in
   let file = coreRoot p in
   let pkg = coreFilePackage a file in
-  let all = V.pushBack summaries (summary p labels) in
+  -- What dictionaries say and what bodies can be copied are asked only of a
+  -- walk that reads known dictionaries or inlines: a walk that copies for
+  -- number types alone (`numbered`) does neither, and working them out for
+  -- every definition of the unit was most of what it took.
+  let all = if known then V.pushBack summaries (summary p labels) else [] in
   let symbols =
     V.foldl
       (\h x -> H.insert (coreExternId a x) (coreExternSymbol a x) h)
@@ -1124,10 +1128,12 @@ fun walked
   in
   let binders = V.foldl (\h kv -> H.insert (snd kv) (fst kv) h) H.empty (H.toVec symbols) in
   let bodies =
-    V.foldl
-      (\h their -> imported binders traits their h)
-      (candidates p traits inlines generous)
-      theirs
+    if not known and not inlines then H.empty
+    else
+      V.foldl
+        (\h their -> imported binders traits their h)
+        (candidates p traits inlines generous)
+        theirs
   in runSt (\() ->
        let out = newCoreBuilder () in
        let sh =

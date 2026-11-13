@@ -1,0 +1,114 @@
+-- Timings: how long each pass of a unit took, for `MEADOWBOOT_TIMINGS`.
+--
+-- A unit's passes are timed by a clock of its own (`clock`), started when
+-- the unit is given to the compiler. Each pass, as it finishes, adds what it
+-- took (`lap`), and when the unit is done the whole is written to standard
+-- error at once (`report`), so that units compiled side by side do not
+-- interleave their lines:
+--
+--   timings Std: 2738.2 ms
+--     parse          74.3 ms
+--     fixity         95.4 ms
+--     ...
+--
+-- `MEADOWBOOT_TIMES` is older and says something else: the moment each pass
+-- finished, as raw nanoseconds, for scripts that line runs up against each
+-- other. This is the one to read.
+
+use Std.Time (monotonic)
+use Std.Console (writeError)
+use Std.Process (getEnv)
+use Std.Collections.Vector as V
+use Std.String as S
+use Std.Maybe as M
+
+-- Whether passes are timed in this run.
+@pub fun timingsOn () = M.isSome (getEnv "MEADOWBOOT_TIMINGS")
+
+-- What a unit's passes took so far: whether anything is timed, what is
+-- being timed, when its clock started, when the last pass ended, and each
+-- pass with how long it took, in nanoseconds, in the order they first ran.
+@pub record Clock = {
+  on : Bool,
+  what : String,
+  from : Int,
+  last : Ref Int,
+  laps : Ref [(String, Int)]
+}
+
+-- A clock for `what`, started now: one that times nothing unless
+-- `MEADOWBOOT_TIMINGS` is set.
+@pub fun clock (what : String) =
+  let on = timingsOn () in
+  let now = if on then monotonic () else 0 in
+  Clock { on, what, from = now, last = newRef now, laps = newRef [] }
+
+-- The pass `pass` ended now: what it took is added to it, and the next pass
+-- starts. A pass that runs again -- a round of macros -- adds to what it
+-- took before.
+@pub fun lap (c : Clock) (pass : String) =
+  if not c.on or S.isEmpty pass then ()
+  else
+    (let now = monotonic () in
+     let took = now - getRef c.last in
+     let laps = getRef c.laps in
+     let u =
+       setRef
+         c.laps
+         (if V.any (\l -> fst l == pass) laps then
+            V.map (\l -> if fst l == pass then (pass, snd l + took) else l) laps
+          else V.pushBack laps (pass, took))
+     in setRef c.last now)
+
+-- The time since the last pass ended belongs to no pass worth naming: it
+-- starts the next one.
+@pub fun skip (c : Clock) = if not c.on then () else setRef c.last (monotonic ())
+
+-- What the clock timed, written to standard error in one piece.
+@pub fun report (c : Clock) =
+  if not c.on then ()
+  else
+    (let total = monotonic () - c.from in
+     let laps = getRef c.laps in
+     let named = V.foldl (\n l -> n + snd l) 0 laps in
+     let rest = total - named in
+     writeError
+       (S.join
+          ""
+          (V.concat [
+             ["timings ${c.what}: ${millis total}\n"],
+             V.map (\l -> "  ${padded (fst l)} ${millis (snd l)}\n") laps,
+             if rest > 1000000 then ["  ${padded "other"} ${millis rest}\n"] else []
+           ])))
+
+-- A pass's name, padded to a column.
+fun padded (s : String) : String =
+  let n = S.byteLength s in
+  if n >= 12 then s else s ++ S.repeat " " (12 - n)
+
+-- Nanoseconds as milliseconds to a tenth, right-aligned: `   74.3 ms`.
+@pub fun millis (ns : Int) : String =
+  let tenths = (ns + 50000) / 100000 in
+  let text = "${show (tenths / 10)}.${show (tenths % 10)}" in
+  let n = S.byteLength text in
+  "${if n >= 8 then "" else S.repeat " " (8 - n)}${text} ms"
+
+-- What `MEADOWBOOT_TIMES` calls the moment a pass ended, as the pass it
+-- ended: `parsed` is the end of `parse`. A moment that ends no pass is "".
+@pub fun passOf (mark : String) : String =
+  match mark with
+  | "parsed" -> "parse"
+  | "grouped" -> "fixity"
+  | "lowered" -> "lower"
+  | "expanded" -> "macros"
+  | "renamed" -> "rename"
+  | "inferred" -> "infer"
+  | "core" -> "elaborate"
+  | "checked" -> "check"
+  | "numbered" -> "numbers"
+  | "eta" -> "eta"
+  | "optimised" -> "optimise"
+  | "kept" -> "keep"
+  | "cut" -> "cut"
+  | "written" -> "write"
+  | _ -> ""
