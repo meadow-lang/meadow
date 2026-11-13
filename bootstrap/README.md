@@ -243,6 +243,59 @@ runs an entry's program of Cut on Glade and hands back what it answered, and
 `RUSTC_BOOTSTRAP` does rustc. A build from a checkout, or a nightly, needs
 nothing.
 
+## What `build` and `run` are told
+
+MeadowBoot's `build` and `run` take `meadow`'s flags, and each one does
+what it does there. A flag accepted and quietly ignored would be worse than
+one refused: whoever moved from `meadow` to MeadowBoot would take the run
+for the one they asked for. So what MeadowBoot does not act on yet it says
+it does not, on standard error -- ``meadowboot: `--features` is not acted on
+yet`` -- and builds as though the flag were not there.
+
+What a flag asks about the program is the front end's, and MeadowBoot's own
+passes answer it (`src/Listing.mw`, and `drivenWith` in `src/Main.mw`):
+
+- `--types` writes the type of every value each package of the build
+  exports, but the standard library's, then the program's entry, as
+  `meadow`'s `LinkedProgram::dump` writes them: from MeadowBoot's inference,
+  each unit studied again as the language server studies it, its `@cfg`s
+  decided as the build decided them. `--annotations` adds the type of every
+  node, each package's numbered from nought, the standard library's first.
+  A node is numbered as MeadowBoot's typed tree has it -- each expression and
+  pattern -- where the Rust compiler numbers every node of its own tree, so
+  the numbers, and the count `--types` gives of them, are each compiler's
+  own.
+- `run --cek` builds with `@cfg(backend = "cek")` holding and runs `main` on
+  MeadowBoot's CEK machine, every unit's core linked into one program, as
+  the debugger runs one. With `--gc-stats` it says, as `meadow` does, that
+  the machine has no collector to report on.
+- `--no-prune` links every definition of every unit rather than what the
+  entry reaches (the build's `prune` option).
+- `--runtime`, `--backend`, `--jit` and `--aot` decide what
+  `@cfg(backend = …)` holds of, as they do in `meadow`.
+
+What a flag asks about running the program is the back end's, and it is
+handed to `meadow cut` with the program: `--backend vm`, the interpreter
+without the JIT; `--gc` and `--gc-stats`; `--profile-to`, `--sample-every`
+and `--sample-hz`; and `--train`, which writes what the JIT saw to
+`target/<profile>/calls.pgo`, which an `aot` build of that profile is then
+guided by (`meadow cut --calls`). `-j`, `--nursery` and `--leaks` the
+runtimes read from the environment, which MeadowBoot sets as `meadow` does.
+`build --emit image,bytecode,asm,exe` asks `meadow cut --emit` for each, and
+writes it where `meadow` writes it under `target/<profile>`. The image, the
+code and the executable are of MeadowBoot's program, so they are not the
+Rust compiler's byte for byte, and a profile names its frames by the
+symbols of the program's Cut.
+
+What MeadowBoot does not act on yet: `--emit expanded`, which needs each
+macro call written down as MeadowBoot expands it; a package's features
+(`--features`, `--no-default-features`, `--all-features`); and a
+workspace's members (`-p`, `--workspace`, `--exclude`).
+`buildtools/meadow/tests/flags_differential.rs` runs each flag on both
+compilers and compares what they say -- what the front end says as it is,
+and what the back end makes by its shape -- and checks that MeadowBoot says
+which it does not act on.
+
 ## The prompt
 
 `meadow` with no command is the prompt, and MeadowBoot's is its own

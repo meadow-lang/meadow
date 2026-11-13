@@ -1,0 +1,325 @@
+-- What `build --types` and `build --annotations` print, as `meadow` prints
+-- them (`LinkedProgram::dump` and `annotations` in `buildtools/meadow`):
+-- each package the build compiled but the standard library, every value it
+-- exports with its scheme, and how many nodes inference gave a type; which
+-- entry the program has; and, for `--annotations`, each of those nodes'
+-- types.
+--
+-- A node is numbered here as MeadowBoot's typed tree has it, a package's
+-- expressions and patterns in the order they are written, where the Rust
+-- compiler numbers every node its own tree has: the numbers, and so how many
+-- there are, are each compiler's own, and the rest is the same.
+
+use Lingua.Make (Given, unitImports, unitSources)
+use MeadowBoot.Unit (packageName)
+use MeadowBoot.Lower (Cfg)
+use Std.Sort (sortOn)
+use MeadowBoot.Compiler (Interface, Study, studyUnit, unitDatabaseFor, givenUnits)
+use MeadowBoot.Scopes (Export, Vis)
+use MeadowBoot.Rename (Binder)
+use MeadowBoot.Solve (Entry, ImplDef)
+use MeadowBoot.Infer
+use MeadowBoot.Types (Type, Scheme, VarKind, Namer, namerOf, renderIn, showScheme)
+use Std.Collections.Vector as V
+use Std.Collections.HashMap as H
+use Std.Collections.HashMap (HashMap)
+use Std.String as S
+use Std.Char as C
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+use Std.Result.Result.*
+
+-- A unit the build compiled, studied: its package's name, what inference
+-- made of it, and the type of each of its nodes.
+record Studied = {
+  package : String,
+  study : Study,
+  types : [String]
+}
+
+-- Every unit the build of `root` as `profile` compiled, each after the units
+-- it imports -- the order `meadow` links packages in -- with the standard
+-- library's left out unless `withStd`. Each is studied with its `@cfg`s
+-- decided as the build decided them: by `cfg`, but for the standard
+-- library, which is compiled for the platform alone.
+fun studied (profile : String) (cfg : Cfg) (root : String) (withStd : Bool) =
+  V.concatMap
+    (\dir ->
+      match givenUnits profile root dir with
+      | Err _ -> []
+      | Ok (g : Given Interface) ->
+          let pkg = packageOf g in
+          if pkg == "Std" and not withStd then []
+          else
+            let decided =
+              (if pkg == "Std" then { cfg | profile = "debug", backend = "jit", flags = [] }
+               else cfg)
+            in
+            let study = studyUnit (unitDatabaseFor decided g) (V.map fst (unitImports g)) in
+            [Studied { package = pkg, study, types = typesIn study }])
+    (inOrder profile root [root] [])
+
+-- The package unit `g` is, by the name its manifest gives it.
+fun packageOf (g : Given Interface) : String =
+  match V.find (\s -> S.endsWith "Meadow.toml" (fst s)) (unitSources g) with
+  | Just s -> packageName (snd s)
+  | None -> ""
+
+-- Each of `todo` and what it imports, each once and after what it imports.
+fun inOrder (profile : String) (root : String) (todo : [String]) (done : [String]) =
+  V.foldl (\acc dir -> visit profile root dir acc) done todo
+
+fun visit (profile : String) (root : String) (dir : String) (done : [String]) =
+  if V.elem dir done then done
+  else
+    match givenUnits profile root dir with
+    | Err _ -> V.pushBack done dir
+    | Ok (g : Given Interface) ->
+        let before = inOrder profile root (V.map fst (unitImports g)) done in
+        if V.elem dir before then before else V.pushBack before dir
+
+-- What `--types` prints: `=== package P ===`, each value it exports and
+-- its scheme, how many nodes have a type, and then the entry.
+@pub fun typesOf (profile : String) (cfg : Cfg) (root : String) =
+  listing (studied profile cfg root False)
+
+fun listing (units : [Studied]) : String =
+  let packages =
+    S.join
+      ""
+      (V.map
+         (\(u : Studied) ->
+           S.join
+             ""
+             (V.concat [
+                ["=== package ${u.package} ===\n"],
+                V.map (\x -> "  ${spellName (fst x)} : ${snd x}\n") (valuesOf u.study),
+                ["  (${show (V.len u.types)} annotated nodes)\n"]
+              ]))
+         units)
+  in
+  let entry = if V.any (\(u : Studied) -> hasMain u.study) units then "main" else "(none)" in
+  packages ++ "entry: ${entry}\n"
+
+-- What `--annotations` prints: what `--types` does, and then each node of
+-- every package the build compiled -- the standard library's first, as it
+-- is linked first -- as `P#n : type`.
+@pub fun annotationsOf (profile : String) (cfg : Cfg) (root : String) =
+  let units = studied profile cfg root True in
+  let own = V.filter (\(u : Studied) -> u.package != "Std") units in
+  listing own
+    ++ S.join
+      ""
+      (V.concatMap
+         (\(u : Studied) ->
+           V.map
+             (\i -> "${u.package}#${show i} : ${V.getOr "" u.types i}\n")
+             (V.range 0 (V.len u.types)))
+         units)
+
+-- Each value the unit exports, by its name, with its scheme as `--types`
+-- writes one, in the order their binders were made. A unit that says what
+-- it exports exports what is `@pub`, and every `impl`'s dictionary and
+-- trait's default method besides, which a dependent finds by type rather
+-- than by name; one that says nothing exports everything.
+fun valuesOf (s : Study) : [(String, String)] =
+  let named =
+    V.map
+      snd
+      (sortOn
+         fst
+         (V.concatMap
+            (\(e : Export) ->
+              if e.kind != "v" then []
+              else if s.renamed.anyVis and e.vis != Vis.Exported then []
+              else
+                match M.orElse e.scheme (H.lookup e.binder s.inferred.schemes) with
+                | Just sc -> [(e.binder, (e.name, showScheme sc))]
+                | None -> [])
+            s.renamed.exports))
+  in V.append named (hiddenOf s)
+
+-- A name as it is written where a value is: an operator in brackets.
+fun spellName (name : String) : String =
+  match S.charAt name 0 with
+  | Just c -> if C.isAlphaNum c or c == '_' then name else "(${name})"
+  | None -> name
+
+-- Whether the unit's root module has a `main`: what the program runs.
+fun hasMain (s : Study) : Bool =
+  V.any
+    (\(e : Export) ->
+      e.kind == "v" and e.name == "main" and V.isEmpty e.module and S.isEmpty e.owner)
+    s.renamed.exports
+
+-- What the unit's traits and `impl`s bind besides the names they declare,
+-- each module's in the order they are written -- after every name, as the
+-- Rust compiler makes their binders after the names': a trait's default
+-- method, `#default.Trait.m`; an `impl`'s method, `#impl.Trait.m`, which a
+-- unit that says what it exports does not; and an `impl`'s dictionary,
+-- `#impl.Trait`, with the `impl`'s scheme.
+fun hiddenOf (s : Study) : [(String, String)] =
+  let theirs =
+    V.foldl
+      (\h (i : Interface) ->
+        V.foldl (\g (e : Entry ImplDef) -> H.insert e.value.dict True g) h i.types.impls)
+      H.empty
+      s.imported
+  in
+  -- The unit's own, in the order their dictionaries' binders were made,
+  -- which is the order the `impl`s are written in.
+  let own =
+    sortOn
+      (\(d : ImplDef) -> 0 - d.dict)
+      (V.concatMap
+         (\(e : Entry ImplDef) -> if M.isSome (H.lookup e.value.dict theirs) then [] else [e.value])
+         s.inferred.types.impls)
+  in fst
+       (V.foldl
+          (\acc p ->
+            match p with
+            | TypedProgram a root ->
+                V.foldl (\x d -> hiddenIn s own a d x) acc (typedModuleDecls a root))
+          ([], 0)
+          s.inferred.typed)
+
+-- What declaration `d` binds that `hiddenOf` lists, after `acc`: what is
+-- listed so far, and how many `impl`s were met, which is which of `own` the
+-- next one's dictionary is.
+fun hiddenIn
+    (s : Study)
+    (own : [ImplDef])
+    (a : TypedArena)
+    (d : TypedDecl)
+    (acc : ([(String, String)], Int))
+    : ([(String, String)], Int) =
+  match acc with
+  | (out, k) ->
+      (match viewTypedDecl a d with
+       | TypedDeclView.Attributed r -> hiddenIn s own a r.decl acc
+       | TypedDeclView.Trait r ->
+           (V.append out (methodsIn s a r.defaults "#default.${typedNameText a r.name}"), k)
+       | TypedDeclView.Impl r ->
+           let tr = typedNameText a r.tr in
+           let methods = if s.renamed.anyVis then [] else methodsIn s a r.methods "#impl.${tr}" in
+           let dict =
+             (match V.get own k with
+              | Just (i : ImplDef) -> [("#impl.${tr}", showScheme i.scheme)]
+              | None -> [])
+           in (V.concat [out, methods, dict], k + 1)
+       | _ -> acc)
+
+-- Each function of `bs`, named `prefix.name`, with its scheme.
+fun methodsIn (s : Study) (a : TypedArena) (bs : [TypedBind]) (prefix : String)
+    : [(String, String)] =
+  V.concatMap
+    (\b ->
+      match viewTypedBind a b with
+      | TypedBindView.Fun f ->
+          (match M.orElse (H.lookup f.id s.inferred.schemes) (H.lookup f.id s.inferred.general) with
+           | Just sc ->
+               [(
+                 "${prefix}.${M.unwrapOr "" (M.map (\(x : Binder) -> x.name) (V.get s.renamed.binders f.id))}",
+                 showScheme sc
+               )]
+           | None -> [])
+      | _ -> [])
+    bs
+
+-- --- each node's type ------------------------------------------------------------
+
+-- The type of every expression and pattern of the unit, each module's in
+-- the order its nodes are written, a variable no plain type's named by its
+-- kind, and each named once for all of them.
+fun typesIn (s : Study) : [String] =
+  let classes =
+    V.foldl
+      (\h n ->
+        match n with
+        | (id, frac) -> H.insert id (if frac then VarKind.Frac else VarKind.Num) h)
+      H.empty
+      s.inferred.numbers
+  in
+  let ts =
+    V.concatMap
+      (\p ->
+        match p with
+        | TypedProgram a root -> V.foldl (\acc d -> decl a d acc) [] (typedModuleDecls a root))
+      s.inferred.typed
+  in fst
+       (V.foldl
+          (\acc t ->
+            match acc with
+            | (out, nm) ->
+                (match renderIn nm t with
+                 | (text, next) -> (V.pushBack out text, next)))
+          ([], namerOf classes)
+          ts)
+
+fun decl (a : TypedArena) (d : TypedDecl) (acc : [Type]) : [Type] =
+  match viewTypedDecl a d with
+  | TypedDeclView.Bind r -> bind a r.bind acc
+  | TypedDeclView.Attributed r -> decl a r.decl acc
+  | TypedDeclView.Trait r -> V.foldl (\t b -> bind a b t) acc r.defaults
+  | TypedDeclView.Impl r -> V.foldl (\t b -> bind a b t) acc r.methods
+  | _ -> acc
+
+fun bind (a : TypedArena) (b : TypedBind) (acc : [Type]) : [Type] =
+  match viewTypedBind a b with
+  | TypedBindView.Fun r -> expr a r.body (V.foldl (\t p -> pat a p t) acc r.params)
+  | TypedBindView.Pat r -> expr a r.value (pat a r.pat acc)
+
+fun pat (a : TypedArena) (p : TypedPat) (acc : [Type]) : [Type] =
+  let here = V.pushBack acc (typTypedPat a p) in
+  let each = \x ps -> V.foldl (\t q -> pat a q t) x ps in
+  match viewTypedPat a p with
+  | TypedPatView.As r -> pat a r.pat here
+  | TypedPatView.Ann r -> pat a r.pat here
+  | TypedPatView.Cons r -> each here r.args
+  | TypedPatView.Tuple r -> each here r.items
+  | TypedPatView.Array r -> each here r.items
+  | TypedPatView.Vector r -> each here r.items
+  | TypedPatView.List r -> each here r.items
+  | TypedPatView.Record r -> V.foldl (\t f -> pat a (typedPatFieldPat a f) t) here r.fields
+  | TypedPatView.View r -> pat a r.pat (expr a r.fn here)
+  | _ -> here
+
+fun expr (a : TypedArena) (e : TypedExpr) (acc : [Type]) : [Type] =
+  let here = V.pushBack acc (typTypedExpr a e) in
+  let each = \x es -> V.foldl (\t c -> expr a c t) x es in
+  match viewTypedExpr a e with
+  | TypedExprView.Lam r -> expr a r.body (V.foldl (\t p -> pat a p t) here r.params)
+  | TypedExprView.App r -> each (expr a r.func here) r.args
+  | TypedExprView.Let r -> expr a r.body (V.foldl (\t b -> bind a b t) here r.binds)
+  | TypedExprView.If r -> expr a r.no (expr a r.yes (expr a r.cond here))
+  | TypedExprView.Match r ->
+      V.foldl
+        (\t arm ->
+          let withPat = pat a (typedArmPat a arm) t in
+          let withGuard =
+            match typedArmGuard a arm with
+            | Just g -> expr a g withPat
+            | None -> withPat
+          in expr a (typedArmBody a arm) withGuard)
+        (expr a r.scrutinee here)
+        r.arms
+  | TypedExprView.Tuple r -> each here r.items
+  | TypedExprView.Array r -> each here r.items
+  | TypedExprView.List r -> each here r.items
+  | TypedExprView.Cons r -> each here r.args
+  | TypedExprView.Record r ->
+      let fields = V.foldl (\t f -> expr a (typedExprFieldValue a f) t) here r.fields in
+      (match r.base with
+       | Just b -> expr a b fields
+       | None -> fields)
+  | TypedExprView.Update r ->
+      V.foldl (\t f -> expr a (typedExprFieldValue a f) t) (expr a r.base here) r.fields
+  | TypedExprView.Proj r -> expr a r.target here
+  | TypedExprView.Handle r ->
+      let body = expr a r.body here in
+      let arms =
+        V.foldl (\t h -> expr a (typedHArmBody a h) (pat a (typedHArmParam a h) t)) body r.arms
+      in (match r.ret with
+          | Just x -> expr a (typedRetBody a x) (pat a (typedRetPat a x) arms)
+          | None -> arms)
+  | _ -> here

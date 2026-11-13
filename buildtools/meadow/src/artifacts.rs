@@ -74,6 +74,11 @@ pub fn write_text(path: &Path, text: &str) -> Result<(), String> {
 }
 
 /// Write `bytes` to `path`, making the directories on the way.
+pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    write(path, bytes)
+}
+
+/// Write `bytes` to `path`, making the directories on the way.
 fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
