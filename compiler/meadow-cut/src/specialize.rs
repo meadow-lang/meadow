@@ -283,6 +283,7 @@ impl Cx<'_> {
                     .iter()
                     .map(|m| Method {
                         name: m.name.clone(),
+                        shown: m.shown.clone(),
                         params: m.params.iter().map(|b| k.binder(b)).collect(),
                         conts: m.conts.clone(),
                         row: m.row.clone(),

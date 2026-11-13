@@ -86,6 +86,7 @@ fn producer(p: &mut Producer) {
         Producer::Mu(_, s) => statement(s),
         Producer::Cocase(methods) => {
             for m in methods {
+                m.shown = None;
                 binders(&mut m.params);
                 statement(&mut m.body);
             }

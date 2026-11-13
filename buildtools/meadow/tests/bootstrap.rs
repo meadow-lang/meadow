@@ -2699,12 +2699,13 @@ def result = (plus 1 2 4, from1 3 5, again 9, (from1 2) 3, held 3)
 /// the same.
 #[test]
 fn a_definition_that_is_a_function_has_the_parameters_the_function_takes() {
-    // Whether `symbol`'s definition of all its parameters is there, with `n`.
+    // Whether `symbol`'s definition of all its parameters is there, with `n`
+    // -- after the name it is shown by, in a debug build.
     let entry = |cut: &str, n: usize| {
         cut.lines().any(|line| {
             line.starts_with("def meadow:Levels/d")
                 && line.matches("v19000000").count() == n
-                && line.contains("f (")
+                && (line.contains("f (") || line.contains("f @"))
         })
     };
     for opt in ["O0", "O1", "O2", "O3"] {

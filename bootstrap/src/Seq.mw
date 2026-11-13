@@ -179,7 +179,7 @@ pass! {
     | Lam { param, paramTy, raw body } ->
         (let k = "k${show node}" in
          let inner = lowerAt src out { cx | k = C.cont out here k } body in
-         C.give out here (vfunction out cx here param (repIn cx paramTy) k inner) cx.k)
+         C.give out here (vfunction out cx here node param (repIn cx paramTy) k inner) cx.k)
     | App { raw func, raw arg } ->
         (match spine src func [arg] with
          | (head, args) ->
@@ -585,6 +585,7 @@ fun curried out cx (symbol : String) lead (params : [(Int, Type)]) (i : Int) k =
           out
           cx
           C.nowhere
+          (0 - 1)
           (fst p)
           (repIn cx (snd p))
           w
@@ -633,8 +634,66 @@ fun vbinding out cx (m : Meta) (id : Int) (rep : String) rest =
   | None -> C.binding out m "v${show id}" rep rest
 
 -- A function of binder `id`, answering to `k`, as `C.function` makes one.
-fun vfunction out cx (m : Meta) (id : Int) (rep : String) (k : String) body =
-  C.cocase out m [C.method out m "apply" [vparam out cx m id rep] [C.param out m k "ptr"] body]
+-- One the source wrote as the term `node`, a local function, is shown by
+-- the name the Rust core gives what it lifts out of a definition: see
+-- `lambdasIn`.
+fun vfunction out cx (m : Meta) node (id : Int) (rep : String) (k : String) body =
+  let params = [vparam out cx m id rep] in
+  let conts = [C.param out m k "ptr"] in
+  match H.lookup node cx.lambdas with
+  | Just title -> C.cocase out m [C.titledMethod out m "apply" title params conts body]
+  | None -> C.cocase out m [C.method out m "apply" params conts body]
+
+-- The local functions of a definition `name`, written `body`, each with the
+-- name the Rust core gives what it lifts out -- `mainLocal1`, `mainLocal2`,
+-- in the order `Dap` walks a definition: a function that is not the
+-- definition's own, nor one more parameter of a function before it.
+fun lambdasIn src body (name : String) : HashMap Int String =
+  let inner = snd (peel src body) in
+  snd (locals src inner (isLam src inner) name (0, H.empty))
+
+fun locals src t (own : Bool) (name : String) found =
+  let go = \x acc -> locals src x False name acc in
+  let all = \xs acc -> V.foldl (\a x -> go x a) acc xs in
+  match viewCoreTerm src t with
+  | CoreTermView.Lam r ->
+      let counted =
+        if own then found
+        else
+          (match found with
+           | (n, h) -> (n + 1, H.insert t "${name}Local${show (n + 1)}" h))
+      in locals src r.body (isLam src r.body) name counted
+  | CoreTermView.TyLam r -> locals src r.body own name found
+  | CoreTermView.TyApp r -> locals src r.func own name found
+  | CoreTermView.App r -> go r.arg (go r.func found)
+  | CoreTermView.Let r -> go r.body (go r.value found)
+  | CoreTermView.LetRec r -> go r.body (all (V.map (\b -> coreBindValue src b) r.binds) found)
+  | CoreTermView.If r -> all [r.cond, r.yes, r.no] found
+  | CoreTermView.Tuple r -> all r.items found
+  | CoreTermView.Array r -> all r.items found
+  | CoreTermView.Ctor r -> all r.args found
+  | CoreTermView.Prim r -> all r.args found
+  | CoreTermView.Record r -> all (V.map (\f -> coreFieldValue src f) r.fields) found
+  | CoreTermView.Proj r -> go r.tuple found
+  | CoreTermView.Sel r -> go r.target found
+  | CoreTermView.Extend r -> go r.value (go r.target found)
+  | CoreTermView.Case r ->
+      V.foldl
+        (\acc arm ->
+          let guarded =
+            match coreArmGuard src arm with
+            | Just c -> go c acc
+            | None -> acc
+          in go (coreArmBody src arm) guarded)
+        (go r.scrutinee found)
+        r.arms
+  | CoreTermView.Perform r -> go r.arg found
+  | CoreTermView.Handle r ->
+      let clauses = all (V.map (\c -> coreClauseBody src c) r.clauses) (go r.body found) in
+      (match r.ret with | Just b -> go b clauses | None -> clauses)
+  | CoreTermView.Join r -> go r.body (go r.rhs found)
+  | CoreTermView.Jump r -> all r.args found
+  | _ -> found
 
 -- `d`, the definition of binder `id`, with what the source calls it.
 fun titledAs out cx (id : Int) d =
@@ -843,6 +902,7 @@ fun lifted src out cx (m : Meta) binds body =
                         out
                         inner
                         m
+                        value
                         (coreTermLamParam src value)
                         (repIn inner (coreTermLamParamTy src value))
                         k
@@ -1803,6 +1863,7 @@ fun lowered
         arity,
         shown,
         marks = H.empty,
+        lambdas = H.empty,
         source = ""
       }
     in
@@ -1827,7 +1888,14 @@ fun lowered
            -- the unit is built to be debugged.
            let source = H.getOr "" (coreDefId a d) shown.files in
            let marks = if S.isEmpty source then H.empty else stopsIn a (coreDefBody a d) in
-           let within = { cx | tvars = vars, k = stop, lifted = kept, marks, source } in
+           let lambdas =
+             if S.isEmpty source then H.empty
+             else
+               (match H.lookup (coreDefId a d) (Sh.namesOf shown) with
+                | Just (name, _) -> lambdasIn a (coreDefBody a d) name
+                | None -> H.empty)
+           in
+           let within = { cx | tvars = vars, k = stop, lifted = kept, marks, lambdas, source } in
            let (params, body) = lams a inner [] in
            -- A function of parameters is a definition of them all at once,
            -- and the value that takes them one at a time is a call of it.

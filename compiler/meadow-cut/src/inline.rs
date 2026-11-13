@@ -269,6 +269,7 @@ impl<'a> Rename<'a> {
                     .map(|m| {
                         self.scoped(|r| Method {
                             name: m.name.clone(),
+                            shown: m.shown.clone(),
                             params: m.params.iter().map(|b| r.bind(b)).collect(),
                             conts: m.conts.iter().map(|k| r.bind_name(k)).collect(),
                             row: m

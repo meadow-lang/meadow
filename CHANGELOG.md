@@ -34,11 +34,12 @@ last release is under _Unreleased_.
   `source` for each file, a position on each term a step may stop before, and
   what the source calls each binder and definition, the debug profile's new
   `positions` option. A definition copied for a number type or for
-  dictionaries is shown as the one it was copied from. A debug build of the
+  dictionaries is shown as the one it was copied from, and a local function by
+  the name the Rust core gives it (`mainLocal1`). A debug build of the
   standard library has them too, so a step goes into it. `meadow cut` takes
   them off before it builds or runs a program. The CEK machine is still what a session runs on where the library
   cannot be loaded, or where `MEADOWBOOT_DAP=cek` asks for it. The two
-  adapters agree on 957 of the differential test's 1220 answers, where they
+  adapters agree on 961 of the differential test's 1220 answers, where they
   agreed on 894 of 1235.
 - MeadowBoot's prompt runs each entry where `meadow repl` runs one: on
   Glade, with the JIT, in its own process through `meadow-host`, where it

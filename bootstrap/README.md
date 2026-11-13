@@ -340,7 +340,9 @@ names"):
   "Int"`, and what it calls each definition, `def S @"double"`, which the
   stack and the locals are shown by. A definition copied for a number type,
   or for the dictionaries it is given, is shown as the one it is a copy of:
-  `Shown.originsOf` finds that by where the copy's terms were written.
+  `Shown.originsOf` finds that by where the copy's terms were written. A
+  local function is shown by the name the Rust core gives what it lifts out
+  of a definition, `mainLocal1` (`Seq.lambdasIn`).
 
 The standard library is built with them too in a debug build, as the Rust
 compiler's debug information covers it, so a step goes into it as

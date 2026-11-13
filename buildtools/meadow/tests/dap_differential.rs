@@ -812,7 +812,7 @@ const STEPPING: &[&str] = &[
 /// debugging says where it was written in its Cut (`docs/CUT.md`, "Positions
 /// and names"). `MEADOWBOOT_DAP=cek` runs it on MeadowBoot's CEK machine
 /// instead, as it did before. On 2026-11-13, over the five programs written
-/// here and the `Euler` and `Tour` examples, the two agreed on 957 of 1220
+/// here and the `Euler` and `Tour` examples, the two agreed on 961 of 1220
 /// answers, in about six minutes -- on the CEK machine they agreed on 894 of
 /// 1235:
 ///
@@ -820,24 +820,22 @@ const STEPPING: &[&str] = &[
 /// configurationDone   14 / 14     output       10 / 14
 /// evaluate           223 / 322    scopes      234 / 234
 /// initialize          14 / 14     setBreakpoints 7 / 9
-/// launch              14 / 14     stackTrace   60 / 118
+/// launch              14 / 14     stackTrace   64 / 118
 /// step               118 / 118    stopped     125 / 129
 /// variables          138 / 234
 /// ```
 ///
-/// What is left is mostly not the debugger's. Of the 263 answers that
-/// differ, 193 are `Tour`'s and 24 `Euler`'s, whose sessions go another way
+/// What is left is mostly not the debugger's. Of the 259 answers that
+/// differ, 193 are `Tour`'s and 23 `Euler`'s, whose sessions go another way
 /// from the first stop: the back end computes a top-level value that may
 /// perform -- by its analysis, most of them -- when the program starts
 /// (`docs/CUT.md`, "Top-level values"), the Rust core when it is first read,
 /// so MeadowBoot's starts in a value's definition before `main`. A function of
 /// the standard library that MeadowBoot copies into the package for the
 /// dictionaries it is given (`println`) is a copy with no positions, so a step
-/// into it stops in what it calls. A local function's frame is shown by its
-/// definition's name, where the Rust core's lifted one is `mainLocal1`. And
-/// the two lowerings keep different things in a frame: a closure's captures
-/// are its locals here, and a type is written as MeadowBoot's inference has
-/// it.
+/// into it stops in what it calls. And the two lowerings keep different
+/// things in a frame: a closure's captures are its locals here, and a type is
+/// written as MeadowBoot's inference has it.
 #[test]
 #[ignore = "MeadowBoot's debug adapter does not agree with meadow dap yet: see the doc comment"]
 fn meadowboot_s_debugger_answers_as_meadow_dap_answers() {

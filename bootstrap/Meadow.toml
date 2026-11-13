@@ -4,7 +4,7 @@ version = "0.1.0"
 
 [dependencies]
 Lingua = { git = "https://github.com/meadow-lang/Lingua.git", rev = "d40e7af39121cb089ed7997e09d17de1328550a3" }
-Cut = { git = "https://github.com/meadow-lang/Cut.git", rev = "b7a2ba473e2a0c5e7e2a59b5bdba62d969f4e61c" }
+Cut = { git = "https://github.com/meadow-lang/Cut.git", rev = "13d0d8aebd45ea0f8446d9c09442b3da68f015e3" }
 Scythe = { git = "https://github.com/meadow-lang/Scythe.git", branch = "master" }
 
 # Bytecode, on the JIT: a build with no LLVM in it, which is a third of the

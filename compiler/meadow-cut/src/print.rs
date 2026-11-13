@@ -329,6 +329,7 @@ impl Printer {
                     }
                     self.line(indent + 1);
                     self.out.push_str(&m.name);
+                    self.out.push_str(&title(&m.shown));
                     self.params(&m.params, &m.conts);
                     self.row(m.row.as_ref());
                     self.out.push_str(" =>");
