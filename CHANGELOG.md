@@ -26,6 +26,24 @@ last release is under _Unreleased_.
 
 ### Changed
 
+- MeadowBoot's `build` and `run` act on the flags they used to accept and
+  ignore. `--types` and `--annotations` write what MeadowBoot's inference
+  found, as `meadow` writes it; `run --cek` runs the program on MeadowBoot's
+  CEK machine; `--no-prune` links every definition; `build --emit image`,
+  `bytecode`, `asm` and `exe` write what the back end makes of MeadowBoot's
+  program where `meadow` writes each; and `--backend vm`, `--gc`,
+  `--gc-stats`, `--profile-to`, `--sample-every`, `--sample-hz`, `--train`,
+  `--nursery` and `--leaks` reach the back end, as does `-O` for the JIT.
+  `--backend`, `--jit`, `--aot` and `--runtime` decide `@cfg(backend = …)`
+  as in `meadow`. What MeadowBoot does not act on yet -- `--emit expanded`,
+  a package's features, a workspace's members -- it says it does not.
+  `meadow cut`, which it hands a program to, takes `--backend`, `--gc`,
+  `--gc-stats`, `--profile-to`, `--sample-every`, `--sample-hz`, `--train`
+  and `--calls` for it, `--emit bytecode`, `asm` and `image`, and `-o` to
+  write what it emits to a file; and it runs the JIT at the `-O` it is
+  given, where it ran it at `-O2` whatever it was given.
+  `buildtools/meadow/tests/flags_differential.rs` sets each flag on both
+  compilers against each other.
 - MeadowBoot's prompt runs each entry where `meadow repl` runs one: on
   Glade, with the JIT, in its own process through `meadow-host`, where it
   used to run them on MeadowBoot's CEK machine. `fib 30` takes under a
