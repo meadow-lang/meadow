@@ -282,6 +282,69 @@ MEADOWBOOT_EXE=bootstrap/target/release/native/silo/MeadowBoot.exe \
   cargo test --release -p meadow --test repl_differential -- --ignored
 ```
 
+## The debugger
+
+`meadow dap` is MeadowBoot's as well: `src/Dap.mw`, a debug adapter declared
+with Lingua's `dap!`. Lingua speaks the Debug Adapter Protocol -- the
+request queue, running in slices so that a pause lands, the program's output
+sent to the editor's console -- and what is Meadow's own is the machine: a
+program that runs a little at a time and can say where it is and what it
+holds.
+
+That machine is MeadowBoot's CEK machine, as the prompt's is. A launch builds
+the package as `meadow build` would, by a run of this program (`units`), so
+that nothing the build prints reaches the editor; makes each unit's core
+(`compilerWhole`) and links them into one program (`Core.linkedUnits`); and
+runs `main` to its first boundary. The Rust adapter steps Glade's bytecode,
+whose debug information Glade's code generator writes from the Rust core's
+positions; a program MeadowBoot builds reaches Glade as Cut, which carries
+none. So the front end does the whole of debugging here, and the back end
+none of it. For the back end to step MeadowBoot's programs, Cut would have
+to carry positions to AxCut and Glade's debug information, and `meadow-host`
+would need entry points for a session the adapter holds open: launch, step,
+frames and values.
+
+- **Where a step may stop.** The terms that stand where the Rust core has a
+  position (`meadow_core::Term::Loc`) are the machine's boundaries: the head
+  of an application, a function's body, a branch of an `if`, an arm of a
+  `match` and its guard, a `let` as it was written, a definition's body that
+  is not a function. The machine stops before each and hands itself back
+  (`Cek.Watch`), and the adapter decides whether that is a stop: a
+  breakpoint, or the end of a step. Breakpoints are by line, each moved to the
+  first line at or just after it that has a boundary, as the Rust adapter
+  moves them. Only the package's own code has boundaries; what it depends
+  on runs through without one.
+- **The stack.** The CEK machine has a continuation, not a call stack, as
+  Glade has none. While a debugger watches, entering a function's body puts
+  a frame on the continuation saying where its caller waits and with what
+  in scope; a tail call puts none, so the stack is the one a person expects.
+  `next` and `stepOut` compare how many such frames there are.
+- **Names, places and types.** A term's place is its span in the module its
+  definition was written in, found by the binder's site; a frame's name is
+  its definition's; a local's name is its binder's, and its type what
+  inference gave it, its variables named by kind (`n` for a number's) as the
+  Rust compiler names them. A value is shown as the Rust adapter shows
+  Glade's (`Cek.preview`). Evaluating looks a name up in a frame.
+
+What it does not do yet: a launch's `entry`, which starts at an expression
+rather than at `main`; the raw machine's scopes (registers, handlers, the
+heap) beside a frame's locals; and stopping in the standard library, which
+the Rust adapter shows from the library's extracted sources. A frame below
+the top shows everything its scope holds, where the Rust adapter shows what
+its continuation captured. And the CEK machine has no threads.
+
+`buildtools/meadow/tests/dap_differential.rs` drives both adapters through
+the same sessions -- each program stepped in, over and out from its entry,
+and run from breakpoint to breakpoint with one on every line -- and at each
+stop asks for the stack, the scopes and locals of the first frames, and
+every local evaluated. It reports how far they agree by kind of request;
+its doc comment has the numbers.
+
+```sh
+MEADOWBOOT_EXE=bootstrap/target/release/native/silo/MeadowBoot.exe \
+  cargo test --release -p meadow --test dap_differential -- --ignored
+```
+
 ## What the Rust compiler learned
 
 Writing a second compiler finds what the first one does that nothing else

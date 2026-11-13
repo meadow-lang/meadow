@@ -104,6 +104,21 @@ last release is under _Unreleased_.
   session and says by kind of request how far they agree; it is ignored until
   they do. Workspace symbols and `meadow/ir` are not answered yet, and
   `lsp --check` is still `meadow`'s.
+- MeadowBoot has a debug adapter of its own: `dap` in MeadowBoot
+  (`bootstrap/src/Dap.mw`), declared with Lingua's `dap!`, launches a
+  program, stops at breakpoints and on entry, continues and steps in, over
+  and out, and answers the stack, scopes, variables and evaluation in the
+  shapes `meadow dap` answers them, with a failure stopping the program where
+  it failed. The program is built by MeadowBoot and run by its CEK machine,
+  which a debugger can now watch: it stops before each place the Rust core
+  marks with a position -- a call, a branch, a body, a `let` -- and keeps a
+  frame for each function body under way, so the stack reads as a call
+  stack. Names, places and types come from MeadowBoot's renaming and
+  inference. `buildtools/meadow/tests/dap_differential.rs` drives both
+  adapters through the same sessions and says by kind of request how far
+  they agree; it is ignored until they do. A launch's `entry`, the raw
+  machine's scopes and stepping into the standard library are not
+  MeadowBoot's yet.
 - A Silo program that runs out of stack on Windows says so: how deep it got,
   in a stack of what size -- the main thread's gigabyte, or a green thread's
   or a handler's 256 MiB -- and where in the executable. It used to end with
