@@ -47,7 +47,7 @@ use MeadowBoot.Scopes (
   Source, Export, Renamed, DepExports, renameUnit, usesOf, macroFuns, saysVis, moduleFile,
   builtinTyconNames, declsOf
 )
-use MeadowBoot.Infer (inferUnit, Inferred)
+use MeadowBoot.Infer (inferUnit, inferUnitWith, Inferred, Wants)
 use MeadowBoot.Elab (unitCore, defSymbol, Linked, Numbers, DataSig, DefaultSig, Imported, CExport)
 use MeadowBoot.Seq as Seq
 use MeadowBoot.Lint (lint)
@@ -600,7 +600,15 @@ fun checkedOf
              (\x -> match x with | (_, text, _) -> packageName text)
              (V.find (\x -> match x with | (p, _, _) -> S.endsWith "Meadow.toml" p) files))
       in
-      let done = inferUnit r deps (V.map (\(i : Interface) -> i.types) imported) texts in
+      let done =
+        inferUnitWith
+          Wants.ForLowering
+          mark
+          r
+          deps
+          (V.map (\(i : Interface) -> i.types) imported)
+          texts
+      in
       let m2 = mark "inferred" in
       let linked = V.map (\(i : Interface) -> i.linked) imported in
       let theirs =

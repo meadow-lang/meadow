@@ -84,7 +84,7 @@ use Std.Maybe as M
 -- A pass's name, padded to a column.
 fun padded (s : String) : String =
   let n = S.byteLength s in
-  if n >= 12 then s else s ++ S.repeat " " (12 - n)
+  if n >= 16 then s else s ++ S.repeat " " (16 - n)
 
 -- Nanoseconds as milliseconds to a tenth, right-aligned: `   74.3 ms`.
 @pub fun millis (ns : Int) : String =
@@ -111,4 +111,5 @@ fun padded (s : String) : String =
   | "kept" -> "keep"
   | "cut" -> "cut"
   | "written" -> "write"
-  | _ -> ""
+  -- A part of a pass, `infer.bindings`, is its own name.
+  | _ -> if S.contains "." mark then mark else ""

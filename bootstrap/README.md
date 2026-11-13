@@ -233,13 +233,14 @@ took, as the unit finishes -- a build's, a prompt entry's, and each time the
 language server studies a package:
 
 ```text
-timings Std:   2561.8 ms
-  parse            77.2 ms
-  fixity          101.1 ms
-  lower           188.4 ms
-  rename          124.4 ms
-  infer           706.7 ms
-  elaborate       241.4 ms
+timings Std:   2529.9 ms
+  parse                76.5 ms
+  fixity               98.2 ms
+  lower               205.7 ms
+  rename              126.9 ms
+  infer.declared       46.6 ms
+  infer.grouped        43.6 ms
+  infer.bindings      337.5 ms
   ...
 ```
 
@@ -292,12 +293,17 @@ What was slow, and is not now:
   writing it as long. An interface is now one string (`Packed`): each datum
   a letter and what it holds, each string written once and then named by
   its number. The standard library's is 4.5 MB, read in about 200 ms and
-  written in about 500.
+  written in about 350: a byte is written as the byte it is, where turning
+  a number into one was a call into the runtime for every byte.
 - The language server studied a package with a database made as a build's
   was, holding every interface the package imports, and asked it for one
   file after another. It is given the fixities alone, as a build's is, and
   parses, groups and lowers the package's files side by side: a study of
   `examples/MiniML` takes 100 ms where it took 300.
+- A build's inference wrote the infer test's dump of every module's schemes
+  and the language server's type of every binder, which a build reads
+  neither of; it asks for neither now (`Infer.Wants`). Inference also
+  marks its parts, `infer.bindings` and the rest, for the timings.
 
 ## The back end, in the same process
 

@@ -2504,7 +2504,31 @@ fun inferImpl
     (depTypes : [TypeEnv])
     (texts : HashMap String String)
     : Inferred =
+  inferUnitWith Wants.Everything (\x -> ()) r deps depTypes texts
+
+-- What of `Inferred` is wanted besides what lowering reads: the test's dump
+-- of each module's schemes, and the language server's settled type of each
+-- binder no scheme is of. Each is a walk of the whole unit, and a build
+-- reads neither.
+@pub data Wants = Everything | ForLowering
+
+fun everything (asked : Wants) : Bool =
+  match asked with
+  | Wants.Everything -> True
+  | Wants.ForLowering -> False
+
+-- `inferUnit`, writing only what `asked` wants, and telling `mark` as each
+-- part of it is done (`MEADOWBOOT_TIMINGS`).
+@pub fun inferUnitWith
+    (asked : Wants)
+    (mark : String -> () ! e)
+    (r : Renamed)
+    (deps : [DepExports])
+    (depTypes : [TypeEnv])
+    (texts : HashMap String String)
+    : Inferred ! e =
   runSt (\() ->
+    let all = everything asked in
     let i = newInf r in
     let u1 =
       V.foldl
@@ -2530,6 +2554,7 @@ fun inferImpl
         (V.range 0 (V.len r.depItems))
     in
     let u3 = V.foldl (\w t -> loadTypes i t) () depTypes in
+    let m1 = mark "infer.imported" in
     -- The modules, in dependency order.
     let mods =
       V.map
@@ -2562,6 +2587,7 @@ fun inferImpl
         order
     in
     let u7 = V.foldl (\w k -> declarations i k (rootDecls r k) (declaredOf r k).items) () order in
+    let m2 = mark "infer.declared" in
     -- The unit's bindings as one graph, each module's grouped first.
     let grouped =
       V.map
@@ -2572,6 +2598,7 @@ fun inferImpl
         order
     in
     let groups = unitGroups grouped H.empty in
+    let m3 = mark "infer.grouped" in
     let u8 =
       V.foldl
         (\w (g : Group) ->
@@ -2592,9 +2619,11 @@ fun inferImpl
         ()
         groups
     in
+    let m4 = mark "infer.bindings" in
     let u9 =
       V.foldl (\w k -> inferTraits i outs done (hereOf i k) (rootDecls r k) dicts) () order
     in
+    let m5 = mark "infer.impls" in
     let before = V.len (stGetRef i.errors) in
     let u9b = checkMain i r in
     -- What is wrong with `main`: what a unit is not compiled for.
@@ -2609,6 +2638,7 @@ fun inferImpl
     in
     let u11 = defaultNumVars i.ar quantified in
     let u12 = finishWanted i in
+    let m6 = mark "infer.solved" in
     -- What each binding generalized to, for the dump; and each exported
     -- binder's scheme, for the units after this one.
     let general =
@@ -2643,7 +2673,11 @@ fun inferImpl
         own
         r.exports
     in
-    let dumps = V.map (\k -> dumpModule i r k general texts) (V.range 0 (V.len r.modules)) in
+    let m7 = mark "infer.schemes" in
+    let dumps =
+      if all then V.map (\k -> dumpModule i r k general texts) (V.range 0 (V.len r.modules)) else []
+    in
+    let m8 = mark "infer.dumped" in
     let evidence = evidenceOfUnit i in
     let insts = instsOfUnit i in
     let typed =
@@ -2660,39 +2694,42 @@ fun inferImpl
            H.empty
            (H.toVec (stGetRef i.generalized)))
         (H.values (stGetRef i.impls))
-    in Inferred {
-         problems = ofMain,
-         said = stGetRef i.errors,
-         saidAt = stGetRef i.errorsAt,
-         general,
-         monos =
-           V.foldl
-             (\h kv ->
-               (let sc : Scheme = snd kv in
-                if V.isEmpty sc.quant then H.insert (fst kv) (settled i.ar sc.ty) h else h))
-             H.empty
-             (H.toVec (stGetRef i.env)),
-         dumps,
-         schemes = exported,
-         types = ownTypes i,
-         typed,
-         wheres,
-         evidence,
-         generics =
-           V.foldl
-             (\h kv ->
-               (let g : Generalized = snd kv in
-                if V.isEmpty g.vars then h else H.insert (fst kv) g h))
-             H.empty
-             (H.toVec (stGetRef i.generalized)),
-         numbers =
-           V.concatMap
-             (\id ->
-               match numberKind i.ar id with
-               | Just frac -> [(id, frac)]
-               | None -> [])
-             (H.keys quantified)
-       })
+    in
+    let m9 = mark "infer.written" in
+    Inferred {
+      problems = ofMain,
+      said = stGetRef i.errors,
+      saidAt = stGetRef i.errorsAt,
+      general,
+      monos =
+        if not all then H.empty
+        else
+          V.foldl
+            (\h kv ->
+              (let sc : Scheme = snd kv in
+               if V.isEmpty sc.quant then H.insert (fst kv) (settled i.ar sc.ty) h else h))
+            H.empty
+            (H.toVec (stGetRef i.env)),
+      dumps,
+      schemes = exported,
+      types = ownTypes i,
+      typed,
+      wheres,
+      evidence,
+      generics =
+        V.foldl
+          (\h kv ->
+            (let g : Generalized = snd kv in if V.isEmpty g.vars then h else H.insert (fst kv) g h))
+          H.empty
+          (H.toVec (stGetRef i.generalized)),
+      numbers =
+        V.concatMap
+          (\id ->
+            match numberKind i.ar id with
+            | Just frac -> [(id, frac)]
+            | None -> [])
+          (H.keys quantified)
+    })
 
 -- Module `k` as inference wrote it, every type settled.
 fun writtenModule
