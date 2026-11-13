@@ -14,7 +14,6 @@ mod Derive
 mod Macros
 mod Expand
 mod Core
-mod CoreShow
 mod Cut
 mod Seq
 mod Lint

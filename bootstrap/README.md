@@ -373,9 +373,9 @@ prints reaches the prompt. `:tour` takes the Rust prompt's tour, which
 
 `:ir` shows an entry, or the definition a name means, in each IR, a page
 each, as `meadow repl`'s does: its core as MeadowBoot made it, written as
-the Rust compiler writes core (`src/CoreShow.mw`); and then what
-`meadow_repl_pages` says the back end makes of the Cut it is linked into --
-the Cut itself, AxCut, Glade's bytecode and the machine code its JIT
+the Rust compiler writes core (`Core.prettyDefs`, which the language
+server's `meadow/ir` writes with too); and then what `meadow_repl_pages`
+says the back end makes of the Cut it is linked into -- the Cut itself, AxCut, Glade's bytecode and the machine code its JIT
 compiles, and the LLVM IR a Silo build would. They are MeadowBoot's IRs, not
 the Rust compiler's: a definition's symbol is its binder (`meadow:repl:3/d7`),
 where the Rust compiler's is its name (`meadow:repl-3/x`).

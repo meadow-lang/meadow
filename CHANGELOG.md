@@ -37,7 +37,10 @@ last release is under _Unreleased_.
   also what runs it where the library cannot be loaded. `meadow-host` has
   two functions for it, `meadow_repl_run` and `meadow_repl_pages`. `:ir`
   shows an entry or a definition in each IR, as `meadow repl`'s does: its
-  core, written as the Rust compiler writes core, then its Cut, AxCut,
+  core, written as the Rust compiler writes core -- by `Core.prettyDefs`, as
+  the language server's `meadow/ir` writes it, where the prompt had a printer
+  of its own that wrote sized integers and undecided literals otherwise --
+  then its Cut, AxCut,
   Glade's bytecode and machine code, and LLVM IR. A package in a symbol of
   Cut may have a `:` in its name, as a prompt's entries do: `meadow:repl:3/d0`.
   The two prompts agree on 257 of the differential test's 265 entries, where
