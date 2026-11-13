@@ -908,7 +908,17 @@ fun definitionOf (ed : Editor) (a : Asked) =
                       | (_, _, id, _) ->
                           if id < 0 then
                             M.andThen
-                              (\f -> locationOf ed v f 0 0)
+                              -- A module of the library is the copy written
+                              -- out, the document's own too.
+                              (\f ->
+                                if v.package == "Std" then
+                                  M.andThen
+                                    (\path ->
+                                      M.map
+                                        (\t -> location (uriOfPath path) t 0 0)
+                                        (Res.toMaybe (readToString path)))
+                                    (pathNamed v f)
+                                else locationOf ed v f 0 0)
                               (M.andThen
                                  (\m -> match m with | (_, _, name) -> moduleFile v name)
                                  (V.get v.modules (0 - 1 - id)))
@@ -1309,20 +1319,33 @@ fun functionsOf (v : View) : HashMap (Int, Int) Bool =
 
 -- What is in scope by spelling, for a capitalised word nothing resolved: the
 -- constructors, then the types, the package and the library declare.
+-- A trait and an associated type or effect are no types there, as the Rust
+-- server's `types_in_scope` has it, and colour as a module.
 fun scopeOf (v : View) : ([String], [String]) =
-  V.foldl
-    (\acc (b : Binder) ->
-      match acc with
-      | (cs, ts) ->
-          (match siteOf b with
-           | None -> acc
-           | Just _ ->
-               (let bare = M.unwrapOr b.name (V.last (S.split "." b.name)) in
-                if b.kind == "c" then (V.pushBack cs bare, ts)
-                else if b.kind == "t" then (cs, V.pushBack ts bare)
-                else acc)))
-    ([], [])
-    v.study.renamed.binders
+  let notData =
+    V.foldl
+      (\h (i : Item) ->
+        if i.kind == "t" and (i.owner == "trait" or S.startsWith "assoc" i.owner) then
+          H.insert i.id True h
+        else h)
+      H.empty
+      (V.append
+         (V.concatMap (\(d : Declared) -> d.items) v.study.renamed.modules)
+         v.study.renamed.depItems)
+  in V.foldl
+       (\acc k ->
+         match (acc, V.get v.study.renamed.binders k) with
+         | ((cs, ts), Just (b : Binder)) ->
+             (match siteOf b with
+              | None -> acc
+              | Just _ ->
+                  (let bare = M.unwrapOr b.name (V.last (S.split "." b.name)) in
+                   if b.kind == "c" then (V.pushBack cs bare, ts)
+                   else if b.kind == "t" and not (H.member k notData) then (cs, V.pushBack ts bare)
+                   else acc))
+         | _ -> acc)
+       ([], [])
+       (V.range 0 (V.len v.study.renamed.binders))
 
 -- --- formatting ----------------------------------------------------------------
 
@@ -1438,7 +1461,9 @@ fun symbolJson
             ("name", J.jString (if F.isValue d.kind then F.headline d else d.name)),
             ("kind", J.jInt (symbolKind d.kind)),
             ("containerName", J.jString d.module),
-            ("location", location uri text d.from d.to)
+            -- A name nothing wrote -- a derive's -- is where its trait is
+            -- named, and is nothing long.
+            ("location", location uri text d.from (if writtenAt text d then d.to else d.from))
           ]]
 
 -- What an editor draws beside a declaration it lists (`symbol_kind`).
@@ -1464,7 +1489,7 @@ fun openDecls (ed : Editor) =
       []
       (H.values (getRef ed.docs))
   in
-  let all = V.concatMap (\root -> M.unwrapOr [] (M.map unitDecls (studyOf ed root))) roots in
+  let all = V.concatMap (\root -> M.unwrapOr [] (M.map (unitDecls ed) (studyOf ed root))) roots in
   match V.foldl
     (\acc x ->
       match acc with
@@ -1478,29 +1503,86 @@ fun openDecls (ed : Editor) =
 
 -- What a studied package declares -- private names too -- and what each
 -- unit it imports exports, each with the file it is written in.
-fun unitDecls (s : Study) =
+--
+-- The standard library is the Rust server's own: what it exports is the
+-- library compiled into `meadow`, in the copy written out for an editor,
+-- and each module of it open is analysed as a package of its own, named
+-- for the module -- `Collections.Vector`, so its module is
+-- `Collections.Vector.Collections.Vector` -- whose every top-level name is
+-- in the document. Both are listed, as the Rust server lists both.
+fun unitDecls (ed : Editor) (s : Study) =
   let package =
     M.unwrapOr
       ""
       (M.andThen (\(d : Declared) -> V.get (S.split "/" d.file) 0) (V.get s.renamed.modules 0))
   in
-  let own =
-    declsOf package s.renamed.exports s.renamed.anyVis s.inferred.types True (\(e : Export) ->
+  let schemeOf =
+    \(e : Export) ->
       match H.lookup e.binder s.inferred.general with
       | Just sc -> Just sc
-      | None -> H.lookup e.binder s.inferred.schemes)
+      | None -> H.lookup e.binder s.inferred.schemes
   in
+  let own = declsOf package s.renamed.exports s.renamed.anyVis s.inferred.types True schemeOf in
   let theirs =
     V.concatMap
       (\(i : Interface) ->
         declsOf i.package i.exports i.anyVis i.types False (\(e : Export) -> e.scheme))
       s.imported
-  in V.concatMap
-       (\(d : F.Decl) ->
-         match pathIn s package d.file with
-         | Just path -> [(path, d)]
-         | None -> [])
-       (V.append own theirs)
+  in
+  let placed =
+    V.concatMap (\(d : F.Decl) ->
+      match pathIn s package d.file with
+      | Just path -> [(path, d)]
+      | None -> [])
+  in if package != "Std" then placed (V.append own theirs)
+     else
+       (let public =
+          declsOf package s.renamed.exports s.renamed.anyVis s.inferred.types False schemeOf
+        in
+        -- Each value the module exports is in such a package's prelude, which
+        -- lists every one; what a derive wrote is not among its names.
+        let exported =
+          H.fromVec
+            (V.concatMap
+               (\(d : F.Decl) ->
+                 if F.isValue d.kind and d.kind != "constructor" then
+                   [("${d.file}@${show d.from}@${d.kind}", True)]
+                 else [])
+               public)
+        in
+        let opened =
+          V.concatMap
+            (\(d : F.Decl) ->
+              match V.find (\x -> srcFile (snd x) == d.file) s.sources with
+              | Just (path, _) ->
+                  (match V.find
+                     (\(o : Doc) -> keyOf o.known == keyOf path)
+                     (H.values (getRef ed.docs)) with
+                   | Just (o : Doc) ->
+                       if not (writtenAt o.text d) then []
+                       else
+                         (let dotted =
+                            S.join
+                              "."
+                              (S.split "/" (stringSlice d.file 8 (stringByteLength d.file - 3)))
+                          in [(
+                               path,
+                               {
+                                 d | module = "${dotted}.${dotted}",
+                                 package = dotted,
+                                 prelude = H.member "${d.file}@${show d.from}@${d.kind}" exported
+                               }
+                             )])
+                   | None -> [])
+              | None -> [])
+            own
+        in V.append opened (placed (V.append public theirs)))
+
+-- Whether `d`'s name is written where it was declared in `text`: not so of
+-- what a derive wrote, which stands at the trait it is named for.
+fun writtenAt (text : String) (d : F.Decl) : Bool =
+  d.to <= stringByteLength text
+    and (let s = stringSlice text d.from d.to in s == d.name or "(${s})" == d.name)
 
 -- What package `pkg` declares, read off what it exports -- every name it
 -- declares, with how far each is seen: every type, trait and effect and
@@ -2021,7 +2103,10 @@ fun moduleRefs (text : String) (pkg : String) (own : [[String]]) (calls : [(Int,
 fun moduleFile (v : View) (m : String) : Maybe String =
   let segs = S.split "." m in
   let first = V.getOr "" segs 0 in
-  if first == v.package then
+  -- The library's root is its prelude, from inside it too, where `Lib` is
+  -- a root as well.
+  if m == "Std" then Just "Std/src/Prelude.mw"
+  else if first == v.package then
     M.map
       (\(d : Declared) -> d.file)
       (V.find (\(d : Declared) -> d.path == V.drop segs 1) v.study.renamed.modules)
