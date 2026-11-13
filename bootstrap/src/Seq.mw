@@ -1762,7 +1762,7 @@ fun lowered
       }
     in
     let shown =
-      entered out sh pkg entry answerTy (M.unwrapOr 0 (M.map V.len (H.lookup entry generics)))
+      entered out sh True pkg entry answerTy (M.unwrapOr 0 (M.map V.len (H.lookup entry generics)))
     in
     let showers = showersOf sh [] in
     let root =
@@ -1772,15 +1772,15 @@ fun lowered
           out
           C.nowhere
           "${package}\"#entry\""
-          (answering answerTy)
+          (answering True answerTy)
           (V.concat [declared, effects, vals, [shown], showers])
     in (C.finished out root, V.append declared effects, parts))
 
 -- The definition a program is entered at: the value of definition `entry`
 -- of package `pkg`, of type `answerTy` and generic in `types` types, turned
 -- into the text the CEK machine would display -- a `main` run first, and
--- what it answers shown.
-fun entered out sh (pkg : String) (entry : Int) (answerTy : Type) (types : Int) =
+-- what it answers shown, where `mains` says a function of `()` is one.
+fun entered out sh (mains : Bool) (pkg : String) (entry : Int) (answerTy : Type) (types : Int) =
   C.defDecl
     out
     C.nowhere
@@ -1800,7 +1800,7 @@ fun entered out sh (pkg : String) (entry : Int) (answerTy : Type) (types : Int) 
             (repOf answerTy)
             (shownTo sh (C.var out C.nowhere "r") answerTy (C.cont out C.nowhere "k"))]
      else
-       (match mainOf answerTy with
+       (match (if mains then mainOf answerTy else None) with
         -- A `main` is run for what it does: what it answers is the
         -- program's, and nothing is shown of it.
         | Just result ->
@@ -1836,6 +1836,29 @@ fun entered out sh (pkg : String) (entry : Int) (answerTy : Type) (types : Int) 
     (known : [(String, Int, [(String, [Type])])])
     (packages : [String])
     : (String, String) =
+  aroundWith True pkg entry answerTy types known packages
+
+-- The same for a prompt's entry, whose value is shown whatever it is: a
+-- function of `()` too, which a program would take for its `main` and run.
+@pub fun aroundShown
+    (pkg : String)
+    (entry : Int)
+    (answerTy : Type)
+    (types : Int)
+    (known : [(String, Int, [(String, [Type])])])
+    (packages : [String])
+    : (String, String) =
+  aroundWith False pkg entry answerTy types known packages
+
+fun aroundWith
+    (mains : Bool)
+    (pkg : String)
+    (entry : Int)
+    (answerTy : Type)
+    (types : Int)
+    (known : [(String, Int, [(String, [Type])])])
+    (packages : [String])
+    : (String, String) =
   let cut =
     runSt (\() ->
       let out = C.builder () in
@@ -1850,7 +1873,7 @@ fun entered out sh (pkg : String) (entry : Int) (answerTy : Type) (types : Int) 
           next = stNewRef 0
         }
       in
-      let shown = entered out sh pkg entry answerTy types in
+      let shown = entered out sh mains pkg entry answerTy types in
       let showers = showersOf sh [] in
       C.finished
         out
@@ -1858,7 +1881,7 @@ fun entered out sh (pkg : String) (entry : Int) (answerTy : Type) (types : Int) 
            out
            C.nowhere
            "${package}\"#entry\""
-           (answering answerTy)
+           (answering mains answerTy)
            (V.pushFront showers shown)))
   in (C.header cut ++ roles known, C.body cut ++ C.showInt package)
 
@@ -1866,7 +1889,8 @@ fun fst3 (t : (a, b, c)) : a = match t with | (x, _, _) -> x
 
 -- What becomes of a program's answer: a `main`'s is nothing to show, and
 -- anything else is the text its entry made of it.
-fun answering (t : Type) : String = if M.isSome (mainOf t) then "none" else "str"
+fun answering (mains : Bool) (t : Type) : String =
+  if mains and M.isSome (mainOf t) then "none" else "str"
 
 -- What a function of `()` answers, if `t` is one: a program's `main`.
 fun mainOf (t : Type) : Maybe Type =
@@ -2112,7 +2136,8 @@ fun shownTo sh value (t : Type) k =
           value
           (C.give out C.nowhere (text "False") j)
           (C.give out C.nowhere (text "True") j))
-  | Con "String" [] -> joinedTo out [text "\"", value, text "\""] k
+  -- Quoted, and escaped as the CEK machine and the runtimes show one.
+  | Con "String" [] -> C.prim out C.nowhere "show" [value] [k]
   | Con "Unit" [] -> C.give out C.nowhere (text "()") k
   | Tuple items ->
       (let names = V.map (\i -> freshName sh) items in

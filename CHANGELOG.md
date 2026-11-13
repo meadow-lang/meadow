@@ -26,6 +26,31 @@ last release is under _Unreleased_.
 
 ### Changed
 
+- MeadowBoot's prompt runs each entry where `meadow repl` runs one: on
+  Glade, with the JIT, in its own process through `meadow-host`, where it
+  used to run them on MeadowBoot's CEK machine. `fib 30` takes under a
+  millisecond, where it took minutes, and a program that starts threads runs.
+  As the Rust prompt does, it keeps what each entry was compiled to -- here
+  its object of Cut -- and runs an entry as a program of its own, of what its
+  value reaches of the standard library and the entries before it. `:vm`
+  runs it without the JIT, and `:cek` on MeadowBoot's CEK machine, which is
+  also what runs it where the library cannot be loaded. `meadow-host` has
+  two functions for it, `meadow_repl_run` and `meadow_repl_pages`. `:ir`
+  shows an entry or a definition in each IR, as `meadow repl`'s does: its
+  core, written as the Rust compiler writes core, then its Cut, AxCut,
+  Glade's bytecode and machine code, and LLVM IR. A package in a symbol of
+  Cut may have a `:` in its name, as a prompt's entries do: `meadow:repl:3/d0`.
+  The two prompts agree on 256 of the differential test's 265 entries, where
+  they agreed on 240.
+- `meadow repl` no longer runs an `effect` entry's operation, which said
+  `program has no entry point`, and no longer shows a derived `impl`'s
+  dictionary and methods, `(#impl.Debug) : Debug Pair`, as an entry's
+  bindings or in `:module`: `@derive(Debug) data Pair = …` says `defined type`
+  as any other `data` does.
+- A program of Cut that handles no effect and performs an operation that is
+  not the runtime's fails where it performs it, `unhandled effect …`, as one
+  that handles others does. It used to be refused before it ran, though
+  the function that performs it may be one it never calls.
 - `x |> f` evaluates `x` first, and then `f`, as it is written, on every
   engine. It used to be exactly `f x`, which evaluates `f` first. Only a
   program in which working out what is piped into performs something can

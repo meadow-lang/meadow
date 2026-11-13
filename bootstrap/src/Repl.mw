@@ -17,11 +17,23 @@
 -- in it `it` means the entry before. The `use`s typed so far are written
 -- ahead of each entry, so that a qualifier lasts for the session.
 --
--- An entry is run by the CEK machine (`Cek`): the standard library's core,
--- every entry's and its own, made one program (`Core.linkedUnits`), and the
--- last value it defines asked for. `:jit`, `:vm` and `:cek` choose what
--- `@cfg(backend = …)` answers, which is all of the Rust prompt's choice of
--- machine that this one has.
+-- An entry is run by the back end `meadow repl` runs one on: Glade, with its
+-- JIT (`:jit`, the default) or without (`:vm`), in this process, through
+-- `meadow-host` (`buildtools/meadow-host`). As the Rust prompt does, the
+-- prompt keeps what each entry was compiled to -- here its object of Cut,
+-- each definition's declarations with the symbols they mention -- and an
+-- entry is a program of its own: what its last value reaches of the
+-- standard library's object, every entry's and its own, linked as a build
+-- links a program (`linkedEntry`), with an entry that answers that value as
+-- the text the prompt shows. Nothing is kept on the back end's side between
+-- two entries. `:cek` runs it on MeadowBoot's own CEK machine (`Cek`)
+-- instead, the standard library's core, every entry's and its own made one
+-- program (`Core.linkedUnits`) -- and so is every entry where the library
+-- cannot be loaded.
+--
+-- `:ir` shows an entry, or a definition, in each IR: its core, as this
+-- compiler made it, and then each form the back end puts its Cut in
+-- (`meadow::ir::cut_pages`), a page each.
 --
 -- When an entry is finished is the Rust prompt's rule (`needsContinuation`):
 -- `repl!` takes an entry as unfinished when every error `errors` says it has
@@ -31,24 +43,34 @@
 use Lingua (repl!)
 use Lingua.Repl (Reply, Spoken)
 use Lingua.Green (Green)
-use Lingua.Make (Given, unitImports)
+use Lingua.Make (Given, unitImports, unitOut)
 use Lingua.Lang (Meta)
 use Lingua.Lang.Meta.*
 use Lingua.Diagnostic (errorAt, renderAll)
 use MeadowBoot.Syntax (Surface, parseSurface)
 use MeadowBoot.Parse (checkedTree)
 use MeadowBoot.Compiler (
-  Interface, Entered, enteredUnit, givenUnits, unitDatabase, compilerWhole, hostOs, hostArch
+  Interface, Entered, Object, enteredUnit, objectAt, givenUnits, unitDatabase, compilerWhole,
+  hostOs, hostArch
 )
 use MeadowBoot.Lower (Cfg)
-use MeadowBoot.Scopes (Export)
-use MeadowBoot.Types (Scheme, showScheme)
+use MeadowBoot.Scopes (Export, Vis)
+use MeadowBoot.Types (Scheme, Type, VarKind, showScheme)
+use MeadowBoot.Elab (DataSig, defSymbol)
+use MeadowBoot.Solve (Entry)
+use MeadowBoot.Seq as Seq
 use MeadowBoot.Core (CoreProgram, linkedUnits)
 use MeadowBoot.Cek as Cek
+use MeadowBoot.CoreShow as CoreShow
 use MeadowBoot.Unit (stdDir)
 use MeadowBoot.Tour (Step, steps)
 use Std.Collections.Vector as V
 use Std.Collections.HashMap as H
+use Std.Collections.HashMap (HashMap)
+use Std.Ffi as Ffi
+use Std.Ffi (Arg, Function)
+use Std.Json as J
+use Std.Terminal as T
 use Std.String as S
 use Std.Char as C
 use Std.Maybe as M
@@ -86,28 +108,46 @@ repl! {
 -- --- what the prompt keeps ----------------------------------------------------
 
 -- An entry that was run: the unit it was compiled to -- its package's name,
--- what it exports and its interface -- and its core, for the CEK machine;
--- and whether it was a `use`, which is written ahead of every entry after.
+-- what it exports and its interface -- its core, for the CEK machine, and
+-- its object of Cut, for the back end.
 record Kept = {
   pkg : String,
   text : String,
   exports : [Export],
   interface : Interface,
-  core : Maybe CoreProgram
+  core : Maybe CoreProgram,
+  object : Maybe Object
+}
+
+-- What of `meadow-host` an entry is run with: `meadow_repl_run`, which runs
+-- a program of Cut and says what it answered, and `meadow_repl_pages`,
+-- which says what the back end makes of one, for `:ir`.
+record Host = {
+  run : Function,
+  pages : Function
+}
+
+-- The standard library's object, and what each of its definitions
+-- mentions, by symbol: what every entry is linked with, read once.
+record Library = {
+  object : Object,
+  mentions : HashMap String [String]
 }
 
 -- What the prompt keeps between lines: the entry being typed; where it
 -- builds, and the standard library's interface and, once something has
--- been run, its core; the entries run so far, oldest first; the `use`s
--- typed; how to evaluate; whether to time every entry; where the tour is
--- and how many of a step's lines `:try` has handed over; the last entry
--- with code of its own, for `:ir`; and the number the next entry's unit
--- takes.
+-- been run, its core or its object; the back end, once loaded, or that
+-- there is none; the entries run so far, oldest first; the `use`s typed;
+-- how to evaluate; whether to time every entry; where the tour is and how
+-- many of a step's lines `:try` has handed over; the last entry with code
+-- of its own, for `:ir`; and the number the next entry's unit takes.
 @pub record Session = {
   typed : Ref String,
   home : String,
   std : Maybe Interface,
   stdCore : Ref (Maybe CoreProgram),
+  library : Ref (Maybe (Maybe Library)),
+  host : Ref (Maybe (Maybe Host)),
   kept : Ref [Kept],
   uses : Ref [String],
   engine : Ref String,
@@ -133,6 +173,8 @@ record Kept = {
        home,
        std = Res.toMaybe std,
        stdCore = newRef None,
+       library = newRef None,
+       host = newRef None,
        kept = newRef [],
        uses = newRef [],
        engine = newRef "jit",
@@ -527,7 +569,7 @@ fun handled (s : Session) (input : String) (mode : Mode) (timed : Bool) say =
           let wrongly =
             if V.isEmpty wrong then [] else [wrongPart (renderAll "repl" input wrong)]
           in
-          let values = V.filter isBinding done.exports in
+          let values = V.filter (\e -> isBinding e and seen done.interface e) done.exports in
           let label = if isExpr then Just (labelOf input) else None in
           -- A name the entry says nothing binds names no binding: its type
           -- is the error's.
@@ -562,7 +604,8 @@ fun handled (s : Session) (input : String) (mode : Mode) (timed : Bool) say =
                 text = input,
                 exports = done.exports,
                 interface = done.interface,
-                core = done.core
+                core = done.core,
+                object = done.object
               }
             in
             -- What is run is the last value it defines; an effect's
@@ -580,6 +623,10 @@ fun isBinding (e : Export) : Bool =
   e.kind == "v"
     and (S.isEmpty e.owner or S.startsWith "op:" e.owner)
     and not (S.startsWith "$" e.name)
+
+-- Whether the entries after one see what it exports, as the Rust prompt
+-- shows only those: everything, unless the entry says what it exports.
+fun seen (i : Interface) (e : Export) : Bool = not i.anyVis or e.vis == Vis.Exported
 
 -- `name : scheme` of what an export is: its scheme, written as the Rust
 -- compiler writes one.
@@ -731,10 +778,201 @@ fun cfgFor (s : Session) =
     flags = []
   }
 
--- Export `e` of the entry `k` run on the CEK machine with the standard
--- library and every entry before it: `= value`, or what went wrong, for
+-- Export `e` of the entry `k` run with the standard library and every entry
+-- before it -- by the back end, unless `:cek` asks for the CEK machine or
+-- there is no back end to be had: `= value`, or what went wrong, for
 -- standard error. With `timed`, how long it took.
 fun ran (s : Session) (k : Kept) (e : Export) (checked : Int) (timed : Bool) =
+  let backEnd = if getRef s.engine == "cek" then None else hostOf s in
+  match backEnd with
+  | Just h ->
+      let t0 = monotonic () in
+      (match linkedEntry s k e with
+       | Just program -> runOn s h program t0 checked timed
+       | None -> onCek s k e checked timed)
+  | None -> onCek s k e checked timed
+
+-- Entry `program` run by the back end, through `meadow-host`: what it
+-- answered, and how long it took -- linking it, from `t0`, and lowering it
+-- the back end's compile.
+fun runOn (s : Session) (h : Host) (program : String) (t0 : Int) (checked : Int) (timed : Bool) =
+  let request =
+    J.render
+      (J.jObject [
+         ("program", J.jString program),
+         ("engine", J.jString (getRef s.engine)),
+         ("opt", J.jInt 1)
+       ])
+  in
+  let linked = monotonic () - t0 in
+  -- `MEADOWBOOT_REPL_CUT`: each entry's program written where it says, to
+  -- be read or run by `meadow cut`.
+  let kept =
+    match getEnv "MEADOWBOOT_REPL_CUT" with
+    | Just path -> (let w = writeString (path, program) in ())
+    | None -> ()
+  in
+  -- What the prompt has written goes out before what the entry writes:
+  -- writing to standard error sends standard output.
+  let flushed = writeError "" in
+  let answer = Res.andThen J.parse (Ffi.callString h.run [Arg.String request]) in
+  let field =
+    \name ->
+      Res.unwrapOr (J.jNull ()) (Res.map (\a -> M.unwrapOr (J.jNull ()) (J.get name a)) answer)
+  in
+  let nanos = \name -> M.unwrapOr 0 (J.asInt (field name)) in
+  let said =
+    match (answer, J.asString (field "value"), J.asString (field "error")) with
+    | (Err why, _, _) -> Spoken.ToErr "meadowboot: the back end could not be asked: ${why}"
+    | (_, Just v, _) -> Spoken.ToOut "= ${v}"
+    | (_, _, Just why) -> Spoken.ToErr why
+    | _ -> Spoken.ToErr "meadowboot: the back end answered nothing"
+  in if not timed then [said]
+     else
+       let compiled = linked + nanos "compile" in
+       let run = nanos "run" in
+       [
+         said,
+         Spoken.ToOut
+           "time: ${duration (checked + compiled + run)} (check ${duration checked}, compile ${duration compiled}, run ${duration run})"
+       ]
+
+-- The back end, loaded the first time it is wanted: `meadow-host`'s
+-- functions for a prompt, or nothing where there is no library -- or one
+-- too old to have them.
+fun hostOf (s : Session) =
+  match getRef s.host with
+  | Just h -> h
+  | None ->
+      let found = M.andThen hostIn (hostLibrary ()) in
+      let u = setRef s.host (Just found) in
+      found
+
+fun hostIn (lib : String) =
+  match Ffi.open lib with
+  | Err _ -> None
+  | Ok loaded ->
+      match (Ffi.function loaded "meadow_repl_run", Ffi.function loaded "meadow_repl_pages") with
+      | (Ok run, Ok pages) -> Just (Host { run, pages })
+      | _ -> None
+
+-- `meadow-host`, where the rest of MeadowBoot looks for it (`Main.hostLibrary`):
+-- where `MEADOW_HOST` says, or beside this program, unless `MEADOW` names a
+-- program to run instead.
+fun hostLibrary () =
+  match getEnv "MEADOW_HOST" with
+  | Just h -> Just h
+  | None ->
+      if M.isSome (getEnv "MEADOW") then None
+      else
+        (let named =
+           if hostOs == "windows" then "meadow_host.dll"
+           else if hostOs == "macos" then "libmeadow_host.dylib"
+           else "libmeadow_host.so"
+         in match Path.parent (Proc.currentExe ()) with
+            | Just dir ->
+                (let beside = Path.join dir named in if exists beside then Just beside else None)
+            | None -> None)
+
+-- The standard library's object, read back from where its build wrote it
+-- the first time it is wanted, with what each definition mentions.
+fun libraryOf (s : Session) =
+  match getRef s.library with
+  | Just l -> l
+  | None ->
+      let made =
+        (match givenUnits "debug" s.home s.home with
+         | Ok g ->
+             (match stdOf (unitImports g) with
+              | Just (dir, _) ->
+                  (match givenUnits "debug" s.home dir with
+                   | Ok (u : Given Interface) ->
+                       M.map
+                         (\o -> Library { object = o, mentions = mentioning H.empty o })
+                         (objectAt (unitOut u) "Std")
+                   | Err _ -> None)
+              | None -> None)
+         | Err _ -> None)
+      in
+      let u = setRef s.library (Just made) in
+      made
+
+-- `h`, and what each definition of object `o` mentions.
+fun mentioning (h : HashMap String [String]) (o : Object) : HashMap String [String] =
+  V.foldl (\g x -> match x with | (symbol, _, refs) -> H.insert symbol refs g) h (snd o)
+
+-- The program of Cut that answers export `e` of entry `k` as the text the
+-- prompt shows, as a build links one (`Compiler.linkAt`): how it opens; the
+-- standard library's object, then each entry's -- of each, what is always
+-- part of a program and the definitions `e` reaches; and the definition it
+-- is entered at.
+fun linkedEntry (s : Session) (k : Kept) (e : Export) =
+  match (libraryOf s, k.object) with
+  | (Just lib, Just own) ->
+      let objects =
+        V.concat [
+          [lib.object],
+          V.concatMap (\(x : Kept) -> M.unwrapOr [] (M.map (\o -> [o]) x.object)) (getRef s.kept),
+          [own]
+        ]
+      in Just (programOf lib objects k.pkg k.interface e [defSymbol k.pkg e.binder])
+  | _ -> None
+
+-- `objects` linked into one program, of the definitions `wanted` reach,
+-- entered at export `e` of package `pkg` -- whose interface is `i` -- and
+-- answering its value shown.
+fun programOf
+    (lib : Library)
+    (objects : [Object])
+    (pkg : String)
+    (i : Interface)
+    (e : Export)
+    (wanted : [String])
+    : String =
+  let mentions = V.foldl mentioning lib.mentions (V.drop objects 1) in
+  let kept = reached mentions wanted H.empty in
+  let sc = M.unwrapOr (Scheme { quant = [], preds = [], ty = Type.Error, lacks = [] }) e.scheme in
+  let (before, after) =
+    Seq.aroundShown
+      pkg
+      e.binder
+      sc.ty
+      (V.len (V.filter (\v -> v == VarKind.Plain) sc.quant))
+      (V.map
+         (\(d : DataSig) ->
+           (d.name, d.arity, V.map (\(c : Entry [Type]) -> (c.key, c.value)) d.ctors))
+         i.linked.datas)
+      (V.filter (\p -> p != "Std") i.linked.packages)
+  in
+  let texts =
+    V.concatMap
+      (\o ->
+        V.pushFront
+          (V.concatMap
+             (\x ->
+               match x with
+               | (symbol, text, _) -> if M.isSome (H.lookup symbol kept) then [text] else [])
+             (snd o))
+          (fst o))
+      objects
+  in concatStrings (V.toArray (V.concat [[before], texts, [after]]))
+
+-- The symbols reached from `todo`, through what each mentions.
+fun reached (mentions : HashMap String [String]) (todo : [String]) (seen : HashMap String Bool)
+    : HashMap String Bool =
+  match V.get todo (V.len todo - 1) with
+  | None -> seen
+  | Just x ->
+      let rest = V.take todo (V.len todo - 1) in
+      if M.isSome (H.lookup x seen) then reached mentions rest seen
+      else
+        reached
+          mentions
+          (V.append rest (M.unwrapOr [] (H.lookup x mentions)))
+          (H.insert x True seen)
+
+-- The same on the CEK machine.
+fun onCek (s : Session) (k : Kept) (e : Export) (checked : Int) (timed : Bool) =
   let t0 = monotonic () in
   let units =
     V.concat [
@@ -891,12 +1129,7 @@ def sessionCommands =
     ("back", "", "the tour's step before", \s rest -> Reply.Said (backStep s)),
     ("b", "", "the tour's step before", \s rest -> Reply.Said (backStep s)),
     ("try", "", "put the step's next example on the prompt", \s rest -> tryStep s),
-    (
-      "ir",
-      "[<which>] [<name>]",
-      "an entry in the compiler's IRs",
-      \s rest -> Reply.Said (shownIr s rest)
-    )
+    ("ir", "[<which>] [<name>]", "an entry in the compiler's IRs", \s rest -> shownIr s rest)
   ]
 
 fun switched (s : Session) (engine : String) =
@@ -923,7 +1156,10 @@ fun reset (s : Session) =
 fun listed (s : Session) =
   let all =
     V.concatMap
-      (\(k : Kept) -> V.map (\(e : Export) -> (e.name, schemeOf e)) (V.filter isBinding k.exports))
+      (\(k : Kept) ->
+        V.map
+          (\(e : Export) -> (e.name, schemeOf e))
+          (V.filter (\e -> isBinding e and seen k.interface e) k.exports))
       (getRef s.kept)
   in if V.isEmpty all then "(no bindings yet)"
      else
@@ -1070,27 +1306,216 @@ fun tryStep (s : Session) =
 
 -- --- :ir --------------------------------------------------------------------------
 
--- `:ir`: what this prompt has of an entry's IRs. It has none of them yet:
--- the Rust prompt's pages are its own compiler's.
+-- `:ir`, `:ir name` or `:ir which name`: the last entry, or the definition
+-- called `name`, in each IR, a page each in the order a program passes
+-- through them -- or in the one asked for, printed as it is. As the Rust
+-- prompt's (`Session::show_ir`), though the IRs are this compiler's: its
+-- core, and its Cut and what the back end makes of that, which the back end
+-- says (`meadow::ir::cut_pages`).
 fun shownIr (s : Session) (rest : String) =
   let words = V.filter (\w -> not (S.isEmpty w)) (S.split " " (spacedOut rest)) in
   let first = V.getOr "" words 0 in
   -- `:ir which name`, or `:ir which` for the last entry's -- unless `which`
   -- is the name of something defined, which is what it then means.
-  let name =
-    if V.len words > 1 and V.elem first irForms then S.join " " (V.drop words 1)
-    else if V.elem first irForms and not (isDefined s first) then ""
-    else S.trim rest
+  let (which, name) =
+    if V.len words > 1 and V.elem first irForms then (Just first, S.join " " (V.drop words 1))
+    else if V.elem first irForms and not (isDefined s first) then (Just first, "")
+    else (None, S.trim rest)
+  in
+  let nothingYet =
+    Reply.Said "(nothing to show yet: enter an expression or a definition, and `:ir` shows it)"
   in if S.isEmpty name then
-       (match getRef s.last with
-        | None -> "(nothing to show yet: enter an expression or a definition, and `:ir` shows it)"
-        | Just _ -> irNotYet)
-     else if isDefined s name then irNotYet
-     else "(nothing called `${name}` is defined)"
+       (match M.andThen (\l -> V.get (getRef s.kept) (snd l)) (getRef s.last) with
+        | Just (k : Kept) ->
+            (match lastValue k with
+             | Just e ->
+                 irShown
+                   s
+                   which
+                   (M.unwrapOr "" (M.map fst (getRef s.last)))
+                   (Shown {
+                      pkg = k.pkg,
+                      interface = k.interface,
+                      entry = e,
+                      symbols =
+                        V.map (\x -> match x with | (symbol, _, _) -> symbol) (partsOf k.object),
+                      kept = keptUpTo s k.pkg,
+                      core = k.core,
+                      binders = None
+                    })
+             | None -> nothingYet)
+        | None -> nothingYet)
+     else
+       match definitionNamed s name with
+       | Just shown -> irShown s which name shown
+       | None -> Reply.Said "(nothing called `${name}` is defined)"
+
+-- What `:ir` shows: definitions of package `pkg`, whose interface is
+-- `interface` -- by their symbols, the last of them `entry` -- with the
+-- entries before them, and the core they are in.
+record Shown = {
+  pkg : String,
+  interface : Interface,
+  entry : Export,
+  symbols : [String],
+  kept : [Kept],
+  core : Maybe CoreProgram,
+  binders : Maybe [Int]
+}
+
+-- The last value an entry defines: what was run of it.
+fun lastValue (k : Kept) : Maybe Export =
+  let values = V.filter (\(e : Export) -> isBinding e and S.isEmpty e.owner) k.exports in
+  V.get values (V.len values - 1)
+
+fun partsOf (o : Maybe Object) : [(String, String, [String])] =
+  match o with | Just x -> snd x | None -> []
+
+-- The entries kept up to and including the one of package `pkg`.
+fun keptUpTo (s : Session) (pkg : String) =
+  let all = getRef s.kept in
+  match V.find
+    (\i -> M.map (\(k : Kept) -> k.pkg) (V.get all i) == Just pkg)
+    (V.range 0 (V.len all)) with
+  | Just i -> V.take all (i + 1)
+  | None -> all
+
+-- The value called `name` that a mention of it now would mean: the newest
+-- entry's of that name, or else the standard library's.
+fun definitionNamed (s : Session) (name : String) =
+  let named = \(e : Export) -> e.kind == "v" and S.isEmpty e.owner and e.name == name in
+  let own = V.find (\(k : Kept) -> M.isSome (V.find named k.exports)) (V.reverse (getRef s.kept)) in
+  match own with
+  | Just (k : Kept) ->
+      M.map
+        (\(e : Export) ->
+          Shown {
+            pkg = k.pkg,
+            interface = k.interface,
+            entry = e,
+            symbols = [defSymbol k.pkg e.binder],
+            kept = keptUpTo s k.pkg,
+            core = k.core,
+            binders = Just [e.binder]
+          })
+        (V.find named (V.reverse k.exports))
+  | None ->
+      match s.std with
+      | None -> None
+      | Just (std : Interface) ->
+          let candidates = V.filter named std.exports in
+          let rooted = V.find (\(e : Export) -> V.isEmpty e.module) candidates in
+          M.map
+            (\(e : Export) ->
+              Shown {
+                pkg = "Std",
+                interface = std,
+                entry = e,
+                symbols = [defSymbol "Std" e.binder],
+                kept = [],
+                core = None,
+                binders = Just [e.binder]
+              })
+            (match rooted with
+             | Just e -> Just e
+             | None -> V.get candidates 0)
+
+-- The pages of what `shown` is, titled `heading`: printed as they are when
+-- one was asked for; else in a pane, where there is a terminal to draw it
+-- on, and one after another, each under its title, where there is not.
+fun irShown (s : Session) (which : Maybe String) (heading : String) (shown : Shown) =
+  let pages = irPages s which shown in
+  match which with
+  | Just _ ->
+      (let text = S.join "" (V.map snd pages) in
+       Reply.Said
+         (if S.endsWith "\n" text then stringSlice text 0 (stringByteLength text - 1) else text))
+  | None ->
+      if T.enterRaw () then (let u = T.leaveRaw () in Reply.Pages heading pages)
+      else
+        Reply.Said
+          (S.trimEnd
+             (S.join
+                ""
+                (V.map
+                   (\p ->
+                     "=== ${fst p} ===\n${snd p}${if S.endsWith "\n" (snd p) then "" else "\n"}")
+                   pages)))
+
+-- Each page of what `shown` is, or the one `which` asks for: its core, as
+-- this compiler made it, and what the back end says of its Cut -- the Cut
+-- itself, AxCut, Glade's bytecode and machine code, and LLVM's IR. Where
+-- the back end cannot be had, there is only the core.
+fun irPages (s : Session) (which : Maybe String) (shown : Shown) =
+  let wanted = \form -> M.unwrapOr True (M.map (\w -> w == form) which) in
+  let core = if wanted "core" then [("Core", corePage s shown)] else [] in
+  if which == Just "core" then core else V.append core (backEndPages s which shown)
+
+-- What the back end says of the Cut `shown` is in.
+fun backEndPages (s : Session) (which : Maybe String) (shown : Shown) =
+  match (hostOf s, libraryOf s) with
+  | (Just h, Just lib) ->
+      let objects =
+        V.pushFront
+          (V.concatMap (\(k : Kept) -> M.unwrapOr [] (M.map (\o -> [o]) k.object)) shown.kept)
+          lib.object
+      in
+      let program = programOf lib objects shown.pkg shown.interface shown.entry shown.symbols in
+      let own =
+        V.concatMap
+          (\o ->
+            V.concatMap
+              (\x ->
+                match x with
+                | (symbol, text, _) ->
+                    if V.elem symbol shown.symbols then V.pushFront (declaredIn text) symbol
+                    else [])
+              (snd o))
+          objects
+      in
+      let request =
+        J.render
+          (J.jObject [
+             ("program", J.jString program),
+             ("own", J.jArray (V.map J.jString own)),
+             ("only", M.unwrapOr (J.jNull ()) (M.map J.jString which)),
+             ("opt", J.jInt 1)
+           ])
+      in (match Res.andThen J.parse (Ffi.callString h.pages [Arg.String request]) with
+          | Ok answer ->
+              V.concatMap
+                (\p ->
+                  match (
+                    M.andThen J.asString (J.index 0 p),
+                    M.andThen J.asString (J.index 1 p)
+                  ) with
+                  | (Just title, Just text) -> [(title, text)]
+                  | _ -> [])
+                (M.unwrapOr [] (J.asArray answer))
+          | Err why -> [("Cut", "-- the back end could not be asked: ${why}\n")])
+  | _ -> []
+
+-- The symbols the declarations of `text` declare: each line that starts
+-- `def` or `val`, and the symbol after it.
+fun declaredIn (text : String) : [String] =
+  V.concatMap
+    (\line ->
+      let word =
+        if S.startsWith "def " line or S.startsWith "val " line then S.drop line 4 else ""
+      in
+      let symbol = S.fromChars (V.takeWhile (\c -> c != ' ' and c != '(') (S.chars word)) in
+      if S.isEmpty symbol then [] else [symbol])
+    (S.lines text)
+
+-- `:ir core`'s page: the definitions shown, as this compiler's core has
+-- them.
+fun corePage (s : Session) (shown : Shown) =
+  let core = if shown.pkg == "Std" then stdCoreOf s else shown.core in
+  match core with
+  | Just c -> CoreShow.shownDefs c (M.unwrapOr (CoreShow.defIds c) shown.binders)
+  | None -> "-- there is no core to show\n"
 
 def irForms : [String] = ["core", "cut", "axcut", "bytecode", "native", "llvm"]
-
-def irNotYet : String = "(MeadowBoot's prompt does not show IRs yet)"
 
 -- Whether a value called `name` is defined: by an entry, or by the
 -- standard library.
