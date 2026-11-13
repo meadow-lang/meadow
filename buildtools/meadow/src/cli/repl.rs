@@ -1419,7 +1419,7 @@ impl Session {
         let user = &self.prefix[self.std_len.min(self.prefix.len())..];
         let mut out: Vec<(String, String, bool)> = Vec::new();
         for pkg in user {
-            for e in &pkg.exports {
+            for e in pkg.exports.iter().filter(|e| !made(&e.name)) {
                 let name = hir::spell_name(&e.name).to_string();
                 // Anything of this name already listed is now behind this one.
                 for (had, _, shadowed) in out.iter_mut() {
@@ -1552,7 +1552,11 @@ impl Session {
         // `Add n` becomes `Add Int` -- so `it`'s own type says less than
         // `fib`'s. Show the binding the name means instead.
         let named = label.as_ref().and_then(|_| self.named_scheme(&compiled));
-        for e in &compiled.exports {
+        // What the compiler made of a declaration -- a derived `impl`'s
+        // dictionary and methods -- is no binding of the entry's to show.
+        let shown: Vec<&meadow_compiler::Export> =
+            compiled.exports.iter().filter(|e| !made(&e.name)).collect();
+        for e in &shown {
             // `label` is set only for a synthesized expression, so a real
             // `def it = …` still prints as `it`.
             match &label {
@@ -1566,7 +1570,7 @@ impl Session {
                 ),
             }
         }
-        if compiled.exports.is_empty() && !had_error {
+        if shown.is_empty() && !had_error {
             for d in &compiled.data_decls {
                 match d.value() {
                     hir::Decl::Data(dd) => println!("defined type {}", dd.name),
@@ -1578,7 +1582,13 @@ impl Session {
         }
 
         if mode == Mode::Run && !had_error {
-            let entry = compiled.exports.last().map(|e| e.var);
+            // What is run is the last value the entry defines: an effect's
+            // operation is no definition, and has nothing to run.
+            let entry = shown
+                .iter()
+                .rev()
+                .map(|e| e.var)
+                .find(|v| compiled.defs.iter().any(|d| d.var == *v));
             if entry.is_some() {
                 let program = self.program_for(&compiled, entry);
                 let checked = started.elapsed();
@@ -1747,6 +1757,12 @@ impl Default for Session {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Whether an export is one the compiler made rather than one an entry
+/// declared: a derived `impl`'s dictionary or method, `#impl.Debug`.
+fn made(name: &str) -> bool {
+    name.starts_with('#')
 }
 
 /// `time: 12.3ms (check 1.20ms, compile 3.45ms, run 7.65ms)` -- the whole

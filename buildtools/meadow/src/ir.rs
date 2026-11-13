@@ -54,54 +54,96 @@ pub fn pages(
         });
     }
     if FORMS[2..].iter().any(|f| wanted(f)) {
-        let lowered = Lowered::new(program, shown, opt);
-        if wanted("axcut") {
+        Lowered::new(program, shown, opt).later_pages(opt, &wanted, &mut pages);
+    }
+    pages
+}
+
+/// The same pages, but `core`'s, of a program another front end lowered to
+/// Cut: `text`, its symbols `own` the definitions shown -- each one's own
+/// declaration and those of the local functions made of it -- which is how
+/// MeadowBoot's prompt shows an entry in what the back end makes of it. Its
+/// core is the front end's own, and is its to show.
+pub fn cut_pages(text: &str, own: &[String], opt: OptLevel, only: Option<&str>) -> Vec<Page> {
+    let wanted = |form: &str| only.is_none_or(|o| o == form);
+    let program = match meadow_cut::parse(text) {
+        Ok(p) => p,
+        Err(e) => {
+            return vec![Page {
+                title: "Cut".into(),
+                text: format!("-- the program does not read: {e}\n"),
+                notation: Notation::Cut,
+            }];
+        }
+    };
+    let ours = |s: &meadow_cut::Symbol| own.iter().any(|o| *o == s.to_string());
+    let mut pages = Vec::new();
+    if wanted("cut") {
+        let listing = meadow_cut::print::listing(&program);
+        let mut out = String::new();
+        for s in &listing.segments {
+            if let meadow_cut::print::Part::Decl(of) = &s.part
+                && ours(of)
+            {
+                let _ = writeln!(out, "{}\n", &listing.text[s.start..s.end]);
+            }
+        }
+        pages.push(Page {
+            title: "Cut".into(),
+            text: out,
+            notation: Notation::Cut,
+        });
+    }
+    if !FORMS[2..].iter().any(|f| wanted(f)) {
+        return pages;
+    }
+    // What runs: the program made better first, as `meadow cut` makes it.
+    let lowered = match meadow_cut::lower::lower_mapped(&meadow_cut::lower::optimized(&program)) {
+        Ok(l) => l,
+        Err(e) => {
             pages.push(Page {
                 title: "AxCut".into(),
-                text: lowered.axcut(),
+                text: format!("-- the back end cannot lower this: {e}\n"),
                 notation: Notation::AxCut,
             });
+            return pages;
         }
-        let image = (wanted("bytecode") || wanted("native")).then(|| lowered.image());
-        if let Some(image) = &image {
-            if wanted("bytecode") {
-                pages.push(Page {
-                    title: "Bytecode".into(),
-                    text: match image {
-                        Ok(image) => bytecode_text(image),
-                        Err(e) => format!("; {e}\n"),
-                    },
-                    notation: Notation::Bytecode,
-                });
-            }
-            // Glade's JIT compiles for the two machines it knows.
-            if wanted("native")
-                && let Some(arch) = meadow_glade::codegen::Arch::host()
-            {
-                pages.push(Page {
-                    title: format!(
-                        "Machine code ({})",
-                        match arch {
-                            meadow_glade::codegen::Arch::X86_64 => "x86-64",
-                            meadow_glade::codegen::Arch::Aarch64 => "AArch64",
-                        }
-                    ),
-                    text: match image {
-                        Ok(image) => native_text(image, arch, opt),
-                        Err(e) => format!("; {e}\n"),
-                    },
-                    notation: Notation::Asm,
-                });
-            }
-        }
-        if wanted("llvm") {
-            pages.push(Page {
-                title: "LLVM IR".into(),
-                text: lowered.llvm(),
-                notation: Notation::Llvm,
-            });
-        }
-    }
+    };
+    // A block is theirs when it is one of their definitions, or binds a
+    // name lowering one of them made: a top-level value is computed in the
+    // block the program starts at, which is no definition's.
+    let listing = lowered.program.listing();
+    let own = lowered
+        .program
+        .defs
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| {
+            lowered.map.blocks.get(&b.label).is_some_and(|s| ours(s))
+                || listing.defs.iter().any(|(start, end, label)| {
+                    *label == b.label
+                        && listing.names.iter().any(|(s, e, n)| {
+                            start <= s
+                                && e <= end
+                                && lowered
+                                    .map
+                                    .names
+                                    .get(n)
+                                    .and_then(|o| o.of.as_ref())
+                                    .is_some_and(|s| ours(s))
+                        })
+                })
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let lowered = Lowered {
+        lowered: meadow_seq::Lowered {
+            program: lowered.program,
+            unsupported: Default::default(),
+        },
+        own,
+    };
+    lowered.later_pages(opt, &wanted, &mut pages);
     pages
 }
 
@@ -208,6 +250,57 @@ impl Lowered {
             .map(|(i, _)| i)
             .collect();
         Lowered { lowered, own }
+    }
+
+    /// The pages of the forms after Cut that `wanted` asks for, onto
+    /// `pages`, in order.
+    fn later_pages(&self, opt: OptLevel, wanted: &dyn Fn(&str) -> bool, pages: &mut Vec<Page>) {
+        if wanted("axcut") {
+            pages.push(Page {
+                title: "AxCut".into(),
+                text: self.axcut(),
+                notation: Notation::AxCut,
+            });
+        }
+        let image = (wanted("bytecode") || wanted("native")).then(|| self.image());
+        if let Some(image) = &image {
+            if wanted("bytecode") {
+                pages.push(Page {
+                    title: "Bytecode".into(),
+                    text: match image {
+                        Ok(image) => bytecode_text(image),
+                        Err(e) => format!("; {e}\n"),
+                    },
+                    notation: Notation::Bytecode,
+                });
+            }
+            // Glade's JIT compiles for the two machines it knows.
+            if wanted("native")
+                && let Some(arch) = meadow_glade::codegen::Arch::host()
+            {
+                pages.push(Page {
+                    title: format!(
+                        "Machine code ({})",
+                        match arch {
+                            meadow_glade::codegen::Arch::X86_64 => "x86-64",
+                            meadow_glade::codegen::Arch::Aarch64 => "AArch64",
+                        }
+                    ),
+                    text: match image {
+                        Ok(image) => native_text(image, arch, opt),
+                        Err(e) => format!("; {e}\n"),
+                    },
+                    notation: Notation::Asm,
+                });
+            }
+        }
+        if wanted("llvm") {
+            pages.push(Page {
+                title: "LLVM IR".into(),
+                text: self.llvm(),
+                notation: Notation::Llvm,
+            });
+        }
     }
 
     /// Every block of the definitions', under a line naming it.

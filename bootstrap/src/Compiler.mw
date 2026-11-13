@@ -1197,7 +1197,7 @@ fun reach (mentions : HashMap String [String]) (todo : [String]) (seen : HashMap
 
 -- A unit's object: what is always part of a program it is in, and each
 -- definition's text under its symbol with the symbols it mentions.
-type Object = (String, [(String, String, [String])])
+@pub type Object = (String, [(String, String, [String])])
 
 -- An object as it is written: its text, and where each definition is in it
 -- -- a line each, the symbol, where its text starts, how long it is, and
@@ -1228,6 +1228,24 @@ fun written (o : Object) : (String, String) =
 -- The line between an object's parts: one no declaration's text has, a
 -- string's line ends being written as `\n`.
 def parted : String = "\n;; part\n"
+
+-- The object the unit of package `pkg` wrote into `out`, read back, if it
+-- wrote one: what the prompt links each of its entries with.
+@pub fun objectAt (out : String) (pkg : String) : Maybe Object ! { Fs | e } =
+  match (readToString (objectIn out pkg), readToString (indexIn out pkg)) with
+  | (Ok text, Ok index) ->
+      (let pieces = S.split parted text in
+       let parts = indexed index in
+       Just (
+         V.getOr "" pieces 0,
+         V.concatMap
+           (\k ->
+             match V.get parts k with
+             | Just (symbol, _, _, refs) -> [(symbol, V.getOr "" pieces (k + 1), refs)]
+             | None -> [])
+           (V.range 0 (V.len parts))
+       ))
+  | _ -> None
 
 -- An object's index, read back.
 fun indexed (text : String) : [(String, Int, Int, [String])] =
@@ -1522,12 +1540,14 @@ fun answeredIn (file : String) (kept : [(String, String, Int, Int, String)])
 -- ones before it: what is wrong with it, each where it is -- a parse error
 -- at its byte, `@12: why`, anything else at its line and column,
 -- `file:1:5: why` -- what it exports, each with its scheme, its interface
--- for the entries after it, and its core, to be run.
+-- for the entries after it, and its core, to be run, and its object, to be
+-- linked and run by the back end.
 @pub record Entered = {
   wrong : [String],
   exports : [Export],
   interface : Interface,
-  core : Maybe CoreProgram
+  core : Maybe CoreProgram,
+  object : Maybe Object
 }
 
 -- The entry whose files are `files` -- a manifest naming it and one module
@@ -1577,7 +1597,13 @@ fun answeredIn (file : String) (kept : [(String, String, Int, Int, String)])
 
 -- An entry that did not get as far as its names: what is wrong with it.
 fun nothingEntered (pkg : String) (wrong : [String]) : Entered =
-  Entered { wrong, exports = [], interface = { emptyInterface () | package = pkg }, core = None }
+  Entered {
+    wrong,
+    exports = [],
+    interface = { emptyInterface () | package = pkg },
+    core = None,
+    object = None
+  }
 
 -- An entry whose files parsed and grouped, its names resolved, its types
 -- inferred and its core made.
@@ -1635,7 +1661,8 @@ fun enteredChecked cfg (dir : String) (imported : [Interface]) (files : [(String
                macros = [],
                bindings = []
              },
-           core = M.map fst3 made
+           core = M.map fst3 made,
+           object = M.map (\m -> match m with | (_, _, o) -> o) made
          }
 
 -- What a unit links with, but of the labels of records only its own: those

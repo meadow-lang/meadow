@@ -186,6 +186,83 @@ pub fn run_on_glade(path: &Path) -> Result<(), String> {
     .map_err(|e| e.msg)
 }
 
+/// An entry of a prompt run as `meadow repl` runs one of its own: `text`, a
+/// program of Cut whose entry answers the entry's value as the text a
+/// prompt shows (`answer str`), lowered and compiled to Glade's bytecode and
+/// run there -- with the JIT compiling what runs often, for
+/// [`Engine::Jit`](crate::runtime::Engine::Jit) -- and the text it
+/// answered, or why it failed, with how long each part took.
+///
+/// Nothing is kept from one entry to the next, as nothing is for `meadow
+/// repl`'s: each is a program of its own, of what it reaches of the entries
+/// before it, which the front end keeps and links.
+pub fn answered(
+    text: &str,
+    engine: crate::runtime::Engine,
+    opt: meadow_compiler::OptLevel,
+) -> (Result<String, String>, crate::runtime::Timings) {
+    let start = std::time::Instant::now();
+    let image = meadow_cut::parse(text)
+        .map_err(|e| format!("the entry's program does not read: {e}"))
+        // Made better first, as `meadow cut` makes a program it runs.
+        .and_then(|program| meadow_cut::lower::lower(&meadow_cut::lower::optimized(&program)))
+        .and_then(|lowered| meadow_codegen::compile(&lowered).map_err(|e| e.msg));
+    let compile = Some(start.elapsed());
+    let start = std::time::Instant::now();
+    let result = image.and_then(|image| {
+        let native = crate::runtime::native(&image, engine, opt)?;
+        let entry = image.entry.ok_or("the program has no entry")?;
+        meadow_glade::sched::run_native(
+            &image,
+            native.as_ref(),
+            entry,
+            u64::MAX,
+            meadow_glade::sched::workers(),
+        )
+        .result
+        .map(|shown| unquoted(&shown))
+        .map_err(|e| e.msg)
+    });
+    let run = start.elapsed();
+    (result, crate::runtime::Timings { compile, run })
+}
+
+/// A string as Glade shows one -- quoted, and escaped as Rust's `{:?}` does
+/// -- as the text it is: an entry's answer is the text to show already.
+fn unquoted(shown: &str) -> String {
+    let Some(inner) = shown.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+        return shown.to_string();
+    };
+    let mut out = String::with_capacity(inner.len());
+    let mut cs = inner.chars();
+    while let Some(c) = cs.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match cs.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('0') => out.push('\0'),
+            Some('u') => {
+                // `\u{1f600}`
+                let code: String = cs
+                    .by_ref()
+                    .skip_while(|c| *c == '{')
+                    .take_while(|c| *c != '}')
+                    .collect();
+                if let Some(c) = u32::from_str_radix(&code, 16).ok().and_then(char::from_u32) {
+                    out.push(c);
+                }
+            }
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 /// Whether the program at `path` exports functions to C, and so is built as
 /// a library of them rather than run: whether a line of it starts `export`,
 /// which only a top-level declaration can.
@@ -255,4 +332,23 @@ pub fn build_for_silo(
     aot::build_native_of(root, Profile::Release, opt, name, target, None, || {
         lowered(path)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_shown_string_is_the_text_it_shows() {
+        for text in [
+            "plain",
+            "a \"quote\"",
+            "tab\there\nand a line",
+            "back\\slash",
+            "ünï 😀",
+            "\u{7f}",
+        ] {
+            assert_eq!(unquoted(&format!("{text:?}")), text);
+        }
+    }
 }

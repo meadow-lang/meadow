@@ -1,0 +1,1014 @@
+-- The debug adapter: `meadow dap`, MeadowBoot's, declared with Lingua's
+-- `dap!` over the CEK machine (`Cek`).
+--
+-- It answers what the Rust compiler's adapter answers
+-- (`buildtools/meadow/src/dap/`), in the same shapes, and
+-- `buildtools/meadow/tests/dap_differential.rs` drives both through the same
+-- sessions and says how far they agree.
+--
+-- Lingua speaks the protocol. What is Meadow's own is the machine: a program
+-- built by MeadowBoot, made one program of core with every unit it depends
+-- on (`Core.linkedUnits`), and run by the CEK machine a boundary at a time.
+--
+-- **Boundaries.** The Rust adapter steps Glade's bytecode, and stops at the
+-- first instruction of a source position: a call, a branch, a body, a `let`
+-- (`meadow_core::Term::Loc`). The same terms of the package's core are this
+-- one's: each the head of an application, a function's body, a branch of an
+-- `if` or an arm of a `match` and its guard, a `let` as it was written, and a
+-- definition's body that is no function. The machine stops before each and
+-- hands it back (`Cek.Watch`), and the adapter decides whether to stop there
+-- for good: at a breakpoint, or where a step ends. Only the package's own
+-- code has boundaries. What it depends on, the standard library first, runs
+-- through without one, as code a person did not write.
+--
+-- **The stack.** The machine has a continuation and no call stack, as Glade
+-- has none. Entering a function's body puts a frame on the continuation that
+-- says where its caller waits, and a tail call puts none; the stack a person
+-- reads is those frames, innermost first.
+--
+-- **What is shown.** Where each term is comes from its span and the module
+-- its definition was written in, by the binder's site; each name from the
+-- binder renaming gave it, and each type from inference, as the Rust
+-- adapter reads them off its HIR. A value is shown as the Rust adapter shows
+-- the Glade machine's (`Cek.preview`).
+--
+-- What it does not do yet: the launch's `entry` -- an expression to start at
+-- instead of `main` -- and the raw machine's scopes the Rust adapter has
+-- beside a frame's locals (registers, handlers, the heap).
+
+use Lingua (dap!)
+use Lingua.Dap (Frame, Scope, Variable, Mode, Stop)
+use Lingua.Lang (Meta, metaStart, metaEnd)
+use Lingua.Lang.Meta.*
+use Lingua.Make (Given, unitImports, unitSources)
+use MeadowBoot.Core
+use MeadowBoot.Core (CoreProgram, linkedUnits)
+use MeadowBoot.Cek as Cek
+use MeadowBoot.Cek (Machine, Paused, Outcome, Value)
+use MeadowBoot.Compiler (
+  Interface, Study, studyUnit, unitDatabase, givenUnits, compilerWhole, hostOs
+)
+use MeadowBoot.Rename (Binder)
+use MeadowBoot.Scopes (Source, Export)
+use MeadowBoot.Infer
+use MeadowBoot.Types (Type, VarKind, namerOf, renderIn)
+use MeadowBoot.Solve (Generalized)
+use MeadowBoot.Unit (packageOf, absolute)
+use Std.Collections.Vector as V
+use Std.Collections.HashMap as H
+use Std.Collections.HashMap (HashMap)
+use Std.String as S
+use Std.Char as C
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+use Std.Result.Result.*
+use Std.Json (Json)
+use Std.Path as Path
+use Std.Fs (readToString, writeString, exists, isDir, createDirAll)
+use Std.Process (getEnv)
+use Std.Process as Proc
+use Std.Console (withOutput, withInput)
+use Std.Sort (sortOn)
+
+dap! {
+  pub Adapter "meadow"
+    | launch = launched
+    | resume = resumed
+    | run = ran
+    | breakpoints = placed
+    | frames = framesOf
+    | scopes = scopesOf
+    | variables = variablesOf
+    | evaluate = evaluated
+    | output = outputOf
+}
+
+-- --- what the adapter knows of the program --------------------------------------
+
+-- A source file of the package: where it is, as a path and as the editor is
+-- told it; a key it is known by whatever its slashes and case; its text,
+-- and where each of its lines starts.
+record SourceFile = {
+  path : String,
+  shown : String,
+  key : String,
+  text : String,
+  starts : [Int]
+}
+
+-- What does not change while the program runs: the core it is, its source
+-- files; the definition each of the package's terms is part of, the file
+-- each of its definitions was written in and its name; what each name a
+-- person wrote is called and its type, by binder; and the lines of each file
+-- there is somewhere to stop on.
+record Sources = {
+  arena : ErasedArena,
+  files : [SourceFile],
+  owner : HashMap Int Int,
+  defFile : HashMap Int Int,
+  defNames : HashMap Int String,
+  names : HashMap Int (String, String),
+  code : HashMap Int (HashMap Int Bool),
+  stops : HashMap Int Bool,
+  bodies : HashMap Int Bool,
+  parent : HashMap Int Int,
+  mentions : HashMap Int [(Int, Int)],
+  frames : HashMap Int String
+}
+
+-- Where the machine is: stopped at a boundary -- with whether it has yet to
+-- be asked if it stops there, as it has not at the start; finished, with
+-- what it came to; or failed, with why, and the boundary it went by last.
+data Where
+  = At Paused Bool
+  | Ended String
+  | Broke String (Maybe Paused)
+
+use Where.*
+
+-- What a variables reference stands for, until the program runs again: a
+-- frame's locals, by its place on the stack, or a value's parts.
+data Target = Locals Int | Parts Value
+
+-- The machine as the adapter is given it: the CEK machine and what is known
+-- of the program; where it is; how it is to run, and from where -- the file,
+-- line and depth it was resumed at; the file and line of the boundary it
+-- went by last; the lines with breakpoints, by file; what the program wrote
+-- since it was last asked; and what each variables reference stands for.
+type Debugging =
+  {
+    cek : Machine,
+    src : Sources,
+    state : Where,
+    mode : Mode,
+    from : (Int, Int, Int),
+    last : (Int, Int),
+    stops : HashMap Int [Int],
+    out : String,
+    refs : Ref [Target]
+  }
+
+-- --- launching -------------------------------------------------------------------
+
+-- The program at `path` -- a package's directory, a file of one, or a file
+-- of no package -- built, made one program with what it depends on, and
+-- stood at its first boundary, in `main`.
+fun launched (path : String) (args : Json) =
+  let given = absolute path in
+  if not (exists given) then Err "cannot open ${path}: there is no such file or directory"
+  else
+    match rootOf given with
+    | Err why -> Err why
+    | Ok (root, alias) ->
+        (match Proc.run (Proc.currentExe ()) ["units", root] with
+         | Err why -> Err "the build could not be run: ${why}"
+         | Ok (code, out, err) ->
+             if code != 0 then Err "${path} did not compile:\n${S.trim (out ++ err)}"
+             else
+               (match givenUnits "debug" root root with
+                | Err why -> Err why
+                | Ok g -> loaded path root alias g))
+
+-- The package `given` is in, and -- for a file that is in none -- the file
+-- that stands for it in a package made for it alone: its path there, and
+-- its own.
+fun rootOf (given : String) =
+  if isDir given then Ok (given, None)
+  else
+    match packageOf given with
+    | Just root -> Ok (root, None)
+    | None ->
+        (match readToString given with
+         | Err why -> Err "cannot open ${given}: ${why}"
+         | Ok text ->
+             let root = aloneRoot given in
+             let main = Path.joinAll [root, "src", "Main.mw"] in
+             let a = createDirAll (Path.join root "src") in
+             let b =
+               writeString (
+                 Path.join root "Meadow.toml",
+                 "[package]\nname = \"main\"\nversion = \"0.1.0\"\n"
+               )
+             in
+             let c = writeString (main, text) in
+             Ok (root, Just (main, given)))
+
+-- Where the package made for a file of no package is: a directory of its
+-- own, named for the file's path, in the scratch directory.
+fun aloneRoot (path : String) =
+  let tmp =
+    match getEnv "TEMP" with
+    | Just t -> t
+    | None -> M.unwrapOr "/tmp" (getEnv "TMPDIR")
+  in
+  let safe = S.fromChars (V.map (\c -> if C.isAlphaNum c then c else '_') (S.chars (keyOf path))) in
+  Path.joinAll [tmp, "meadowboot-dap", safe]
+
+fun keyOf (path : String) : String = S.toLower (Path.normalize (S.join "/" (S.split "\\" path)))
+
+-- The package built: each unit's core made one program, its `main` found,
+-- and the machine run to its first boundary.
+fun loaded (path : String) (root : String) (alias : Maybe (String, String)) (g : Given Interface) =
+  match dependencies root g with
+  | Err why -> Err why
+  | Ok deps ->
+      let db = unitDatabase g in
+      match compilerWhole db 0 with
+      | None -> Err "${path} did not compile"
+      | Just own ->
+          let study = studyUnit db (V.map fst (unitImports g)) in
+          let units = V.pushBack (V.map snd deps) own in
+          match linkedUnits units with
+          | (whole, table) ->
+              let pkg = packageOfCore own in
+              match V.find
+                (\(e : Export) ->
+                  e.kind == "v" and e.name == "main" and S.isEmpty e.owner and V.isEmpty e.module)
+                study.renamed.exports with
+              | None -> Err "${path} has no `main` to run"
+              | Just (e : Export) ->
+                  (match H.lookup "meadow:${pkg}/d${show e.binder}" table with
+                   | None -> Err "${path} has no `main` to run"
+                   | Just entry ->
+                       let src =
+                         sourcesOf whole (V.len units + 1) (V.len deps) study (unitSources g) alias
+                       in
+                       let cek = Cek.watched (Cek.machine whole) (stopsOf src) src.bodies in
+                       let started =
+                         withOutput (\() -> withInput [] (\() -> Cek.begin cek entry [Value.Unit]))
+                       in Ok
+                            ({
+                              cek,
+                              src,
+                              state = whereAfter (fst started) None,
+                              mode = Mode.Continue,
+                              from = (0 - 1, 0, 0),
+                              last = (0 - 1, 0),
+                              stops = H.empty,
+                              out = snd started,
+                              refs = newRef []
+                            }))
+
+-- Where a run that came to `o` leaves the machine; `last` is the boundary it
+-- went by before.
+fun whereAfter (o : Outcome) (last : Maybe Paused) =
+  match o with
+  | Outcome.Stopped p -> At p True
+  | Outcome.Done v -> Ended (Cek.display v)
+  | Outcome.Failed why -> Broke why last
+
+fun packageOfCore (c : CoreProgram) : String = match c with | CoreProgram a f -> coreFilePackage a f
+
+-- Every unit the package depends on, each once and after what it depends
+-- on: its directory and its core.
+fun dependencies (root : String) (g : Given Interface) =
+  V.foldl
+    (\acc x ->
+      match acc with
+      | Err why -> Err why
+      | Ok done -> withUnit root (fst x) done)
+    (Ok [])
+    (unitImports g)
+
+fun withUnit (root : String) (dir : String) (done : [(String, CoreProgram)]) =
+  if V.any (\d -> fst d == dir) done then Ok done
+  else
+    match givenUnits "debug" root dir with
+    | Err why -> Err why
+    | Ok u ->
+        let before =
+          V.foldl
+            (\acc x ->
+              match acc with
+              | Err why -> Err why
+              | Ok d -> withUnit root (fst x) d)
+            (Ok done)
+            (unitImports u)
+        in match before with
+           | Err why -> Err why
+           | Ok d ->
+               if V.any (\x -> fst x == dir) d then Ok d
+               else
+                 (match compilerWhole (unitDatabase u) 0 with
+                  | Just c -> Ok (V.pushBack d (dir, c))
+                  | None -> Err "${dir} did not compile")
+
+-- --- where each term is ----------------------------------------------------------
+
+-- What is known of the program `whole`, linked from `many - 1` units of which
+-- the package is unit `own`, studied as `study`, from the files `texts`;
+-- `alias` names the file a package made for one file stands for.
+fun sourcesOf
+    (whole : ErasedProgram)
+    (many : Int)
+    (own : Int)
+    (study : Study)
+    (texts : [(String, String)])
+    (alias : Maybe (String, String))
+    : Sources ! { Mut | e } =
+  let a = erasedArena whole in
+  let files =
+    V.map
+      (\x ->
+        match x with
+        | (p, text) ->
+            (let real = realPath alias p in
+             SourceFile {
+               path = real,
+               shown = shownPath real,
+               key = keyOf real,
+               text,
+               starts = lineStarts text
+             }))
+      (V.filter (\x -> S.endsWith ".mw" (fst x)) texts)
+  in
+  let fileOfDump =
+    V.foldl
+      (\h x ->
+        match x with
+        | (p, (s : Source)) ->
+            (let k = keyOf (realPath alias p) in
+             match V.find
+               (\i -> (V.getOr (emptyFile ()) files i).key == k)
+               (V.range 0 (V.len files)) with
+             | Just i -> H.insert s.file i h
+             | None -> h))
+      H.empty
+      study.sources
+  in
+  let binders = study.renamed.binders in
+  let global = \id -> id * many + own in
+  let typing = typesOf study in
+  let classes = classesOf study in
+  let names =
+    V.foldl
+      (\h id ->
+        match V.get binders id with
+        | Just (b : Binder) ->
+            if b.kind != "v" or S.isEmpty b.name then h
+            else
+              H.insert
+                (global id)
+                (b.name, M.unwrapOr "" (M.map (typeText classes) (H.lookup id typing)))
+                h
+        | None -> h)
+      H.empty
+      (V.range 0 (V.len binders))
+  in
+  let owned =
+    V.filter
+      (\d -> (let id = erasedDefId a d in id >= 0 and id % many == own))
+      (erasedFileDefs a (erasedRoot whole))
+  in
+  let defFile =
+    V.foldl
+      (\h d ->
+        let id = erasedDefId a d in
+        match V.get binders (id / many) with
+        | Just (b : Binder) ->
+            (match S.indexOf "@" b.site with
+             | Just k ->
+                 (match H.lookup (S.take b.site k) fileOfDump with
+                  | Just i -> H.insert id i h
+                  | None -> h)
+             | None -> h)
+        | None -> h)
+      H.empty
+      owned
+  in
+  let defNames =
+    V.foldl
+      (\h d ->
+        let id = erasedDefId a d in
+        match V.get binders (id / many) with
+        | Just (b : Binder) -> H.insert id b.name h
+        | None -> h)
+      H.empty
+      owned
+  in
+  let found =
+    Walk {
+      owner = newRef H.empty,
+      stops = newRef H.empty,
+      quiet = newRef H.empty,
+      bodies = newRef H.empty,
+      parent = newRef H.empty,
+      mentions = newRef H.empty,
+      frames = newRef H.empty,
+      base = newRef "",
+      current = newRef "",
+      count = newRef 0,
+      own = newRef False
+    }
+  in
+  let u =
+    V.foldl
+      (\x d ->
+        walkDef
+          a
+          found
+          (erasedDefId a d)
+          (H.getOr "?" (erasedDefId a d) defNames)
+          (erasedDefBody a d))
+      ()
+      owned
+  in
+  let owner = getRef found.owner in
+  let quiet = getRef found.quiet in
+  let stops =
+    H.fromVec
+      (V.concatMap
+         (\t -> if H.getOr False t quiet then [] else [(t, True)])
+         (H.keys (getRef found.stops)))
+  in
+  let code =
+    V.foldl
+      (\h t ->
+        match placeIn a files defFile owner t with
+        | Just (f, line, _) -> H.insert f (H.insert line True (H.getOr H.empty f h)) h
+        | None -> h)
+      H.empty
+      (H.keys stops)
+  in Sources {
+       arena = a,
+       files,
+       owner,
+       defFile,
+       defNames,
+       names,
+       code,
+       stops,
+       bodies = getRef found.bodies,
+       parent = getRef found.parent,
+       mentions = getRef found.mentions,
+       frames = getRef found.frames
+     }
+
+-- The file `p` stands for: itself, unless it was made for a file of no
+-- package.
+fun realPath (alias : Maybe (String, String)) (p : String) : String =
+  match alias with
+  | Just (made, theirs) -> if keyOf made == keyOf p then theirs else p
+  | None -> p
+
+fun emptyFile () : SourceFile =
+  SourceFile { path = "", shown = "", key = "", text = "", starts = [0] }
+
+-- A path as the editor is told it: with the system's own separators.
+fun shownPath (p : String) : String = if hostOs == "windows" then S.join "\\" (S.split "/" p) else p
+
+-- Where each line of `text` starts, by byte.
+fun lineStarts (text : String) : [Int] =
+  let bytes = stringToBytes text in
+  V.foldl
+    (\acc i -> if toInt (arrayGet bytes i) == 10 then V.pushBack acc (i + 1) else acc)
+    [0]
+    (V.range 0 (stringByteLength text))
+
+-- The line byte `at` is on, from 1, and its column, in characters from 1.
+fun positionIn (f : SourceFile) (at : Int) : (Int, Int) =
+  let line = lineOf f.starts at 0 (V.len f.starts - 1) in
+  let start = V.getOr 0 f.starts line in
+  let upto = min (max at start) (stringByteLength f.text) in
+  (line + 1, S.charLength (stringSlice f.text start upto) + 1)
+
+-- The last line of `starts` from `lo` to `hi` that starts at or before `at`.
+fun lineOf (starts : [Int]) (at : Int) (lo : Int) (hi : Int) : Int =
+  if lo >= hi then lo
+  else
+    let mid = (lo + hi + 1) / 2 in
+    if V.getOr 0 starts mid <= at then lineOf starts at mid hi else lineOf starts at lo (mid - 1)
+
+-- The file term `t` is in, and its line and column: where its definition
+-- was written. Nothing, for a term of no file of the package's.
+fun placeIn
+    (a : ErasedArena)
+    (files : [SourceFile])
+    (defFile : HashMap Int Int)
+    (owner : HashMap Int Int)
+    (t : ErasedTerm)
+    : Maybe (Int, Int, Int) =
+  match M.andThen (\d -> H.lookup d defFile) (H.lookup t owner) with
+  | None -> None
+  | Just f ->
+      (match V.get files f with
+       | Just file ->
+           (match positionIn file (metaStart (metaErasedTerm a t)) with
+            | (line, column) -> Just (f, line, column))
+       | None -> None)
+
+fun placeOf (src : Sources) (t : ErasedTerm) : Maybe (Int, Int, Int) =
+  placeIn src.arena src.files src.defFile src.owner t
+
+-- --- boundaries ------------------------------------------------------------------
+
+-- What walking a definition finds: the definition each term is part of, the
+-- terms to stop at and those not to after all, and the terms that are a
+-- function's body.
+record Walk = {
+  owner : Ref (HashMap Int Int),
+  stops : Ref (HashMap Int Bool),
+  quiet : Ref (HashMap Int Bool),
+  bodies : Ref (HashMap Int Bool),
+  parent : Ref (HashMap Int Int),
+  mentions : Ref (HashMap Int [(Int, Int)]),
+  -- The function each term is in, by the name its frame is shown with: the
+  -- definition's, or a local function's; the name of the definition being
+  -- walked, and the function walking is in now; how many local functions it
+  -- has had; and whether a function met next is the one being walked's own.
+  frames : Ref (HashMap Int String),
+  base : Ref String,
+  current : Ref String,
+  count : Ref Int,
+  own : Ref Bool
+}
+
+-- The boundaries the machine stops at: those of a file of the package's.
+fun stopsOf (src : Sources) : HashMap Int Bool =
+  H.fromVec
+    (V.concatMap (\t -> if M.isSome (placeOf src t) then [(t, True)] else []) (H.keys src.stops))
+
+-- A definition's terms walked: its body is somewhere to stop where it is not
+-- a function, whose body is.
+fun walkDef (a : ErasedArena) (w : Walk) (owner : Int) (name : String) (body : ErasedTerm) =
+  let u = setRef w.base name in
+  let v = setRef w.current name in
+  let c = setRef w.count 0 in
+  match (a, body) with
+  | ErasedTermLam _ _ -> (let o = setRef w.own True in walk a w owner body False noMeta)
+  | _ ->
+      (let o = setRef w.own False in
+       let x = stop w body in
+       walk a w owner body False noMeta)
+
+def noMeta : Meta = Meta (0 - 1) (0 - 1)
+
+fun stop (w : Walk) (t : ErasedTerm) = setRef w.stops (H.insert t True (getRef w.stops))
+
+-- Whether `t` is a value already, which a `let` binds without running
+-- anything: the Rust core puts it where it is used, and there is no boundary
+-- at the `let`.
+fun isValue (a : ErasedArena) (t : ErasedTerm) : Bool =
+  match (a, t) with
+  | ErasedTermConst _ -> True
+  | ErasedTermVar _ -> True
+  | ErasedTermLam _ _ -> True
+  | ErasedTermCtor _ xs -> V.all (\x -> isValue a x) xs
+  | ErasedTermTuple xs -> V.all (\x -> isValue a x) xs
+  | _ -> False
+
+fun hush (w : Walk) (t : ErasedTerm) = setRef w.quiet (H.insert t True (getRef w.quiet))
+
+-- A function's body, as it was written, made a boundary. A parameter that is
+-- a pattern -- `()`, a tuple -- is a `match` on the parameter around the
+-- body, spanning the whole function, and the body is its arm's; and a `let`
+-- of a literal is no boundary, as the Rust core puts the literal where it is
+-- used.
+fun stopAtBody (a : ErasedArena) (w : Walk) (fn : ErasedTerm) (param : Int) (t : ErasedTerm) =
+  match (a, t) with
+  | ErasedTermCase s arms ->
+      (match ((a, s), V.get arms 0) with
+       | (ErasedTermVar x, Just arm) ->
+           if x == param and V.len arms == 1 and metaErasedTerm a t == metaErasedTerm a fn then
+             (let u = hush w t in stopAtBody a w fn param (erasedArmBody a arm))
+           else stop w t
+       | _ -> stop w t)
+  | ErasedTermLet _ rhs body ->
+      (if isValue a rhs then (let u = hush w t in stopAtBody a w fn param body) else stop w t)
+  | _ -> stop w t
+
+-- Term `t` of definition `def`, and everything under it. `applied` says it
+-- is the function of an application, which is part of the one around it;
+-- `outer` is the span of the `let` it is the body of, a `let` written with
+-- several bindings being several in core.
+fun walk
+    (a : ErasedArena)
+    (w : Walk)
+    (owner : Int)
+    (t : ErasedTerm)
+    (applied : Bool)
+    (outer : Meta) =
+  let u = setRef w.owner (H.insert t owner (getRef w.owner)) in
+  let named = setRef w.frames (H.insert t (getRef w.current) (getRef w.frames)) in
+  let go =
+    \x ->
+      (let p = setRef w.parent (H.insert x t (getRef w.parent)) in walk a w owner x False noMeta)
+  in
+  let all = \xs -> V.foldl (\acc x -> go x) () xs in
+  match (a, t) with
+  -- A function that is not the definition's own is a local one, named as
+  -- the Rust core names what it lifts out: `mainLocal1`, `mainLocal2`.
+  | ErasedTermLam param body ->
+      let saved = getRef w.current in
+      let local =
+        if getRef w.own then ()
+        else
+          (let k = getRef w.count + 1 in
+           let c = setRef w.count k in
+           setRef w.current "${getRef w.base}Local${show k}")
+      in
+      let walked =
+        (match (a, body) with
+         | ErasedTermLam _ _ -> (let o = setRef w.own True in go body)
+         | _ ->
+             (let o = setRef w.own False in
+              let v = stopAtBody a w t param body in
+              let b = setRef w.bodies (H.insert body True (getRef w.bodies)) in
+              go body))
+      in
+      let back = setRef w.current saved in
+      setRef w.own False
+  | ErasedTermApp f x ->
+      let v = if applied then () else stop w t in
+      let p = setRef w.parent (H.insert f t (getRef w.parent)) in
+      let g = walk a w owner f True noMeta in
+      go x
+  | ErasedTermLet _ rhs body ->
+      let here = metaErasedTerm a t in
+      let v = if here == outer or isValue a rhs then () else stop w t in
+      let r = go rhs in
+      let p = setRef w.parent (H.insert body t (getRef w.parent)) in
+      walk a w owner body False here
+  | ErasedTermLetRec binds body ->
+      let v = all (V.map (\b -> erasedBindValue a b) binds) in
+      go body
+  | ErasedTermIf c y n ->
+      let s = stop w y in
+      let s2 = stop w n in
+      let v = go c in
+      let v2 = go y in
+      go n
+  | ErasedTermTuple xs -> all xs
+  | ErasedTermArray xs -> all xs
+  | ErasedTermCtor _ xs -> all xs
+  | ErasedTermPrim _ xs -> all xs
+  | ErasedTermRecord fs -> all (V.map (\f -> erasedFieldValue a f) fs)
+  | ErasedTermProj x _ -> go x
+  | ErasedTermSel x _ -> go x
+  | ErasedTermExtend r _ val -> (let v = go r in go val)
+  | ErasedTermCase s arms ->
+      let v = go s in
+      V.foldl
+        (\acc arm ->
+          let g =
+            (match erasedArmGuard a arm with
+             | Just c -> (let s1 = stop w c in go c)
+             | None -> ())
+          in
+          let b = erasedArmBody a arm in
+          let s2 = stop w b in
+          go b)
+        ()
+        arms
+  | ErasedTermPerform _ _ x -> go x
+  | ErasedTermHandle body clauses _ r ->
+      let v = go body in
+      let c = all (V.map (\cl -> erasedClauseBody a cl) clauses) in
+      (match r with | Just b -> go b | None -> ())
+  | ErasedTermJoin _ _ rhs body -> (let v = go rhs in go body)
+  | ErasedTermJump _ args -> all args
+  | ErasedTermVar v ->
+      let at = metaStart (metaErasedTerm a t) in
+      setRef
+        w.mentions
+        (H.insert
+           owner
+           (V.pushBack (H.getOr [] owner (getRef w.mentions)) (v, at))
+           (getRef w.mentions))
+  | _ -> ()
+
+-- --- types -----------------------------------------------------------------------
+
+-- The kind of each type variable inference made that is not a plain one: a
+-- number's, or a fraction's, which the Rust compiler names `n` and `f`.
+fun classesOf (s : Study) : HashMap Int VarKind =
+  V.foldl
+    (\h (g : Generalized) ->
+      V.foldl
+        (\h2 i ->
+          match (V.get g.scheme.quant i, V.get g.vars i) with
+          | (Just k, Just var) -> (match k with | VarKind.Plain -> h2 | _ -> H.insert var k h2)
+          | _ -> h2)
+        h
+        (V.range 0 (V.len g.scheme.quant)))
+    (V.foldl
+       (\h n ->
+         match n with
+         | (id, frac) -> H.insert id (if frac then VarKind.Frac else VarKind.Num) h)
+       H.empty
+       s.inferred.numbers)
+    (H.values s.inferred.generics)
+
+-- A type as the Rust compiler writes it, each variable named by its kind.
+fun typeText (classes : HashMap Int VarKind) (t : Type) : String =
+  withoutLoneEffect (fst (renderIn (namerOf classes) t))
+
+-- `Int -> Int ! e` as the Rust adapter writes it, `Int -> Int`: an effect that
+-- is only a variable says nothing.
+fun withoutLoneEffect (ty : String) : String =
+  match lastBang ty 0 (0 - 1) with
+  | k -> if k < 0 then ty else if isTypeVariable (S.drop ty (k + 3)) then S.take ty k else ty
+
+fun lastBang (ty : String) (from : Int) (found : Int) : Int =
+  match S.indexOfFrom " ! " ty from with
+  | Just i -> lastBang ty (i + 1) i
+  | None -> found
+
+-- The type inference gave each name the package's modules bind, by binder.
+fun typesOf (s : Study) : HashMap Int Type =
+  V.foldl
+    (\h p ->
+      match p with
+      | TypedProgram a root -> V.foldl (\acc d -> typedDecl a d acc) h (typedModuleDecls a root))
+    H.empty
+    s.inferred.typed
+
+fun typedDecl (a : TypedArena) (d : TypedDecl) (acc : HashMap Int Type) : HashMap Int Type =
+  match viewTypedDecl a d with
+  | TypedDeclView.Bind r -> typedBind a r.bind acc
+  | TypedDeclView.Attributed r -> typedDecl a r.decl acc
+  | TypedDeclView.Trait r -> V.foldl (\t b -> typedBind a b t) acc r.defaults
+  | TypedDeclView.Impl r -> V.foldl (\t b -> typedBind a b t) acc r.methods
+  | _ -> acc
+
+fun typedBind (a : TypedArena) (b : TypedBind) (acc : HashMap Int Type) : HashMap Int Type =
+  match viewTypedBind a b with
+  | TypedBindView.Fun r -> typedExpr a r.body (V.foldl (\t p -> typedPat a p t) acc r.params)
+  | TypedBindView.Pat r -> typedExpr a r.value (typedPat a r.pat acc)
+
+fun typedPat (a : TypedArena) (p : TypedPat) (acc : HashMap Int Type) : HashMap Int Type =
+  let t = typTypedPat a p in
+  let each = \x qs -> V.foldl (\h q -> typedPat a q h) x qs in
+  match viewTypedPat a p with
+  | TypedPatView.Var r -> H.insert r.id t acc
+  | TypedPatView.As r -> typedPat a r.pat (H.insert r.id t acc)
+  | TypedPatView.Ann r -> typedPat a r.pat acc
+  | TypedPatView.Cons r -> each acc r.args
+  | TypedPatView.Tuple r -> each acc r.items
+  | TypedPatView.Array r -> each acc r.items
+  | TypedPatView.Vector r -> each acc r.items
+  | TypedPatView.List r -> each acc r.items
+  | TypedPatView.Record r -> V.foldl (\h f -> typedPat a (typedPatFieldPat a f) h) acc r.fields
+  | TypedPatView.View r -> typedPat a r.pat (typedExpr a r.fn acc)
+  | _ -> acc
+
+fun typedExpr (a : TypedArena) (e : TypedExpr) (acc : HashMap Int Type) : HashMap Int Type =
+  let each = \x es -> V.foldl (\t c -> typedExpr a c t) x es in
+  match viewTypedExpr a e with
+  | TypedExprView.Lam r -> typedExpr a r.body (V.foldl (\t p -> typedPat a p t) acc r.params)
+  | TypedExprView.App r -> each (typedExpr a r.func acc) r.args
+  | TypedExprView.Let r -> typedExpr a r.body (V.foldl (\t b -> typedBind a b t) acc r.binds)
+  | TypedExprView.If r -> typedExpr a r.no (typedExpr a r.yes (typedExpr a r.cond acc))
+  | TypedExprView.Match r ->
+      V.foldl
+        (\t arm ->
+          let withPat = typedPat a (typedArmPat a arm) t in
+          let withGuard =
+            match typedArmGuard a arm with
+            | Just g -> typedExpr a g withPat
+            | None -> withPat
+          in typedExpr a (typedArmBody a arm) withGuard)
+        (typedExpr a r.scrutinee acc)
+        r.arms
+  | TypedExprView.Tuple r -> each acc r.items
+  | TypedExprView.Array r -> each acc r.items
+  | TypedExprView.List r -> each acc r.items
+  | TypedExprView.Cons r -> each acc r.args
+  | TypedExprView.Record r ->
+      let fields = V.foldl (\t f -> typedExpr a (typedExprFieldValue a f) t) acc r.fields in
+      (match r.base with
+       | Just b -> typedExpr a b fields
+       | None -> fields)
+  | TypedExprView.Update r ->
+      V.foldl (\t f -> typedExpr a (typedExprFieldValue a f) t) (typedExpr a r.base acc) r.fields
+  | TypedExprView.Proj r -> typedExpr a r.target acc
+  | TypedExprView.Handle r ->
+      let body = typedExpr a r.body acc in
+      let arms =
+        V.foldl
+          (\t h -> typedExpr a (typedHArmBody a h) (typedPat a (typedHArmParam a h) t))
+          body
+          r.arms
+      in (match r.ret with
+          | Just x -> typedExpr a (typedRetBody a x) (typedPat a (typedRetPat a x) arms)
+          | None -> arms)
+  | _ -> acc
+
+-- --- running ---------------------------------------------------------------------
+
+-- How it is to run, from where it is now.
+fun resumed (m : Debugging) (mode : Mode) =
+  let u = setRef m.refs [] in
+  match here m with
+  | Just p ->
+      (match placeOf m.src (Cek.pausedTerm p) with
+       | Just (f, line, _) -> { m | mode = mode, from = (f, line, Cek.pausedDepth p) }
+       | None -> { m | mode = mode, from = (0 - 1, 0, Cek.pausedDepth p) })
+  | None -> { m | mode = mode }
+
+-- The boundary the machine is at, or went by last before it failed.
+fun here (m : Debugging) : Maybe Paused =
+  match m.state with
+  | At p _ -> Just p
+  | Broke _ last -> last
+  | Ended _ -> None
+
+-- How many boundaries a slice goes by at most: each is many of the
+-- machine's steps.
+fun boundariesIn (steps : Int) : Int = max 1 (steps / 20)
+
+-- At most a slice: as far as where it is to stop, or its end. What the
+-- program writes meanwhile is kept, and it reads the end of its input: its
+-- standard input is the protocol.
+fun ran (m : Debugging) (steps : Int) =
+  match withOutput (\() -> withInput [] (\() -> sliced m (boundariesIn steps))) with
+  | ((m2, stop), text) -> ({ m2 | out = m2.out ++ text }, stop)
+
+fun sliced (m : Debugging) (left : Int) =
+  match m.state with
+  | Ended v -> (m, Just (Stop.Exited v))
+  | Broke why _ -> (m, Just (Stop.Exception why))
+  | At p fresh ->
+      if fresh then
+        (match stopAt m p with
+         | Just s -> ({ m | state = At p False }, Just s)
+         | None -> onFrom { m | state = At p False } p left)
+      else onFrom m p left
+
+-- On from `p`, to the next boundary, and stopped there or on again.
+fun onFrom (m : Debugging) (p : Paused) (left : Int) =
+  if left <= 0 then (m, None)
+  else
+    let moved = { m | last = lineOfPaused m p } in
+    match Cek.proceed m.cek p with
+    | Outcome.Stopped q ->
+        (match stopAt moved q with
+         | Just s -> ({ moved | state = At q False }, Just s)
+         | None -> onFrom { moved | state = At q False } q (left - 1))
+    | Outcome.Done v ->
+        ({ moved | state = Ended (Cek.display v) }, Just (Stop.Exited (Cek.display v)))
+    | Outcome.Failed why -> ({ moved | state = Broke why (Just p) }, Just (Stop.Exception why))
+
+fun lineOfPaused (m : Debugging) (p : Paused) : (Int, Int) =
+  match placeOf m.src (Cek.pausedTerm p) with
+  | Just (f, line, _) -> (f, line)
+  | None -> (0 - 1, 0)
+
+-- Whether to stop at `p`, and why: at a breakpoint on its line, come to
+-- from another line or by a call; or where the step under way ends. A step
+-- is by line, as a person reads code, and a call or a return is somewhere
+-- new even on the same line.
+fun stopAt (m : Debugging) (p : Paused) : Maybe Stop =
+  match placeOf m.src (Cek.pausedTerm p) with
+  | None -> None
+  | Just (f, line, _) ->
+      let depth = Cek.pausedDepth p in
+      let entered = (f, line) != m.last or H.getOr False (Cek.pausedTerm p) m.src.bodies in
+      if entered and V.elem line (H.getOr [] f m.stops) then Just Stop.Breakpoint
+      else
+        match m.from with
+        | (f0, line0, depth0) ->
+            let moved = f != f0 or line != line0 in
+            (match m.mode with
+             | Mode.Continue -> None
+             | Mode.StepIn -> if moved or depth != depth0 then Just Stop.Step else None
+             | Mode.StepOver ->
+                 if (moved and depth == depth0) or depth < depth0 then Just Stop.Step else None
+             | Mode.StepOut -> if depth < depth0 then Just Stop.Step else None)
+
+-- What the program wrote since it was last asked.
+fun outputOf (m : Debugging) : (Debugging, String) = ({ m | out = "" }, m.out)
+
+-- --- breakpoints -----------------------------------------------------------------
+
+-- A file's breakpoints: each on the first line at or just after the one
+-- asked for that has somewhere to stop, or nowhere.
+fun placed (m : Debugging) (path : String) (lines : [Int]) =
+  let k = keyOf (absolute path) in
+  match V.find
+    (\i -> (V.getOr (emptyFile ()) m.src.files i).key == k)
+    (V.range 0 (V.len m.src.files)) with
+  | None -> (m, V.map (\l -> None) lines)
+  | Just f ->
+      let code = H.getOr H.empty f m.src.code in
+      let landed = V.map (\l -> V.find (\x -> H.getOr False x code) [l, l + 1, l + 2]) lines in
+      let lines = V.concatMap (\l -> match l with | Just x -> [x] | None -> []) landed in
+      ({ m | stops = H.insert f lines m.stops }, landed)
+
+-- --- looking ---------------------------------------------------------------------
+
+-- Where the program is, innermost first: the function a boundary is in and
+-- the boundary; then each function waiting for one it called, at the call.
+-- With each, what its scope holds.
+fun stackOf (m : Debugging) =
+  match here m with
+  | None -> []
+  | Just p ->
+      V.pushFront (V.filter (\c -> fst c >= 0) (Cek.callersOf p)) (
+        Cek.pausedTerm p,
+        Cek.pausedScope p
+      )
+
+fun framesOf (m : Debugging) =
+  V.map
+    (\x ->
+      let t = fst x in
+      let name = nameOf m.src t in
+      match placeOf m.src t with
+      | Just (f, line, column) ->
+          Frame { name, path = (V.getOr (emptyFile ()) m.src.files f).shown, line, column }
+      | None -> Frame { name, path = "", line = 0, column = 0 })
+    (stackOf m)
+
+-- The function term `t` is part of, by the definition it is written in.
+fun nameOf (src : Sources) (t : ErasedTerm) : String =
+  match H.lookup t src.frames with
+  | Just n -> n
+  | None -> M.unwrapOr "?" (M.andThen (\d -> H.lookup d src.defNames) (H.lookup t src.owner))
+
+fun scopesOf (m : Debugging) (frame : Int) =
+  [Scope { name = "Locals", reference = refer m (Target.Locals frame), expensive = False }]
+
+-- A number for `t`, good until the program runs again.
+fun refer (m : Debugging) (t : Target) =
+  let u = setRef m.refs (V.pushBack (getRef m.refs) t) in
+  V.len (getRef m.refs)
+
+fun variablesOf (m : Debugging) (reference : Int) =
+  match V.get (getRef m.refs) (reference - 1) with
+  | None -> []
+  | Just (Target.Locals frame) -> localsOf m frame
+  | Just (Target.Parts v) -> V.map (\x -> row m (fst x) (snd x) "") (Cek.parts v)
+
+-- What frame `frame` sees, each name once: the newest of a name, which is
+-- the one a mention of it there means.
+fun localsOf (m : Debugging) (frame : Int) =
+  match V.get (stackOf m) frame with
+  | None -> []
+  | Just (t, all) ->
+      let live = liveAt m.src t in
+      let scope = if frame == 0 then all else V.filter (\x -> V.elem (fst x) live) all in
+      let named =
+        V.concatMap
+          (\x ->
+            match H.lookup (fst x) m.src.names with
+            | Just (name, ty) -> [(fst x, name, ty, snd x)]
+            | None -> [])
+          scope
+      in
+      let newest = V.reverse (sortOn (\x -> match x with | (k, _, _, _) -> k) named) in
+      let once =
+        V.foldl
+          (\acc x ->
+            match x with
+            | (_, name, ty, v) ->
+                if V.any (\(y : (String, String, Value)) -> fst3 y == name) acc then acc
+                else V.pushBack acc (name, ty, v))
+          []
+          newest
+      in V.map (\x -> match x with | (name, ty, v) -> row m name v ty) (V.reverse once)
+
+-- The names a function waiting at `t` -- the call it made -- still has a use
+-- for: those mentioned in what `t` is part of, but not in `t`. They are what
+-- the Rust adapter shows of a waiting frame, which is what its continuation
+-- kept.
+fun liveAt (src : Sources) (t : ErasedTerm) : [Int] =
+  match (H.lookup t src.parent, H.lookup t src.owner) with
+  | (Just up, Just owner) ->
+      let whole = metaErasedTerm src.arena up in
+      let call = metaErasedTerm src.arena t in
+      V.concatMap
+        (\x ->
+          match x with
+          | (v, at) ->
+              if at >= metaStart whole
+                and at < metaEnd whole
+                and not (at >= metaStart call and at < metaEnd call) then [v]
+              else [])
+        (H.getOr [] owner src.mentions)
+  | _ -> []
+
+fun fst3 (t : (a, b, c)) : a = match t with | (x, _, _) -> x
+
+-- A row of a variables view: a value's name, how it is shown, its type --
+-- the kind of value it is, where its type is only a type variable -- and a
+-- number for its parts, if it has any.
+fun row (m : Debugging) (name : String) (v : Value) (ty : String) =
+  let kind =
+    if isTypeVariable ty then (let k = Cek.kindOf v in if S.isEmpty k then ty else k) else ty
+  in Variable {
+       name,
+       value = Cek.preview (\t -> nameOf m.src t) v,
+       kind,
+       reference = if Cek.opens v then refer m (Target.Parts v) else 0
+     }
+
+-- `a`, `n1`: a type that is only a variable.
+fun isTypeVariable (ty : String) : Bool =
+  match V.get (S.chars ty) 0 with
+  | Just c -> C.isLower c and V.all (\x -> C.isAlphaNum x) (S.chars ty)
+  | None -> False
+
+-- A name, looked up in a frame, as a hover or a watch asks.
+fun evaluated (m : Debugging) (frame : Int) (expr : String) =
+  V.find (\(v : Variable) -> v.name == S.trim expr) (localsOf m frame)
