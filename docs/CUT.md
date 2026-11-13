@@ -142,7 +142,9 @@ meadow:Std/Maybe.Just
 ```
 
 `/` ends the package, so a version's dots and hyphens, and a lower-case name in
-a package's root module, are never mistaken for one another. Within the path,
+a package's root module, are never mistaken for one another. A package's name
+is letters, digits and `_`, `-`, `.`, `+` and `:`: the last for a prompt, whose
+entries are packages of their own, `meadow:repl:3/d0`. Within the path,
 segments are separated by `.`, as Meadow writes paths. A segment that is not
 a plain identifier, such as an operator, a constructor like `(::)`, or a name
 with a prime, is quoted. A language's standard library has no version.

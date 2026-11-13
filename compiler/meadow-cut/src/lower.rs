@@ -1141,12 +1141,16 @@ impl Lower {
             xs.push(self.atom(a, sc, steps)?);
         }
         let kc = self.reify_as(c, sc, steps, self.framing("perform"))?;
-        // A program that handles nothing has nothing to search.
+        // A program that handles nothing has nothing to search. An operation
+        // that is neither the runtime's nor handled fails where it is
+        // performed, as it does in a program that handles others: a
+        // function that performs it may be a value the program never calls,
+        // as a prompt's entry that defines one is.
         if !self.handles {
             let Some((effect, name)) = native else {
-                return Err(format!(
-                    "`{op}` is performed, and nothing handles it or binds it to the runtime"
-                ));
+                return Ok(S::Error(Box::leak(
+                    format!("unhandled effect {op}").into_boxed_str(),
+                )));
             };
             return Ok(self.native(effect, name, &xs, kc, resumed, &sc.env));
         }

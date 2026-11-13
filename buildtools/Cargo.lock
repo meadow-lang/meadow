@@ -1142,6 +1142,7 @@ name = "meadow-host"
 version = "0.5.0"
 dependencies = [
  "meadow",
+ "meadow-compiler",
  "serde_json",
 ]
 
