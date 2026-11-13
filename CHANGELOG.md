@@ -59,6 +59,10 @@ last release is under _Unreleased_.
   local, a field or a pattern variable may be called `end`. It was a keyword
   that no form used, so writing it anywhere was a syntax error. The language
   server, the REPL and the VS Code grammar no longer colour it as a keyword.
+- A module may be empty: a file with no declarations, or only comments or
+  `@!` attributes, is a module that defines nothing. It used to be a syntax
+  error, so a file just made showed an error in the editor until something
+  was written in it. MeadowBoot already took one.
 - MeadowBoot's language server and prompt are built on Lingua 92955a5, and
   Cut moves to it too. The server refuses a rename it cannot do as
   `meadow lsp` does, with the error `-32803` and the reason
