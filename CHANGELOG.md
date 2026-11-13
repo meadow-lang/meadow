@@ -123,6 +123,18 @@ last release is under _Unreleased_.
 
 ### Added
 
+- `MEADOWBOOT_TIMINGS=1` has MeadowBoot say how long each pass of each unit
+  took -- parse, fixity, lower, rename, infer, elaborate, optimise, cut --
+  for a build, a prompt entry and the language server's study of a package;
+  and `scripts/bench-meadowboot.py` runs the same builds, prompt entries and
+  editor edits through MeadowBoot and the Rust `meadow` and prints both.
+  MeadowBoot is to replace the Rust front end, so how much slower it is has
+  to be measurable, and a regression visible. The numbers are in
+  `bootstrap/README.md`. Checking an entry at MeadowBoot's prompt went from
+  about 180 ms to about 45 ms: a unit's database no longer copies every
+  interface it imports, renaming no longer reads every constructor of a
+  dependency for each of its types, and compiling the standard library lost
+  a check that compared every export with every other.
 - MeadowBoot has a prompt of its own: `meadowboot` with no command, as
   `meadow` with none, is now MeadowBoot's REPL (`bootstrap/src/Repl.mw`),
   declared with Lingua's `repl!` rather than handed to the Rust `meadow`. It
@@ -151,6 +163,17 @@ last release is under _Unreleased_.
   session and says by kind of request how far they agree; it is ignored until
   they do. Workspace symbols and `meadow/ir` are not answered yet, and
   `lsp --check` is still `meadow`'s.
+- MeadowBoot's language server answers workspace symbols, `meadow/ir` and
+  `lsp --check`. Workspace symbols are `meadow_find`'s search, ported
+  (`bootstrap/src/Find.mw`): by name, scored as the Rust server's `nucleo`
+  matcher scores it, or by type, priced as `meadow_find` prices a match, over
+  what each open package declares and what it depends on exports.
+  `meadow/ir` answers a definition as core, written as `meadow_core` writes
+  it (`Core.prettyDefs`, from `Compiler.studyCore`); Cut and AxCut are not
+  answered yet. `lsp --check PATH…` opens each `.mw` file under the paths in
+  the server and prints every error it would mark, with the Rust command's
+  output and exit status: it finds no errors in the sources CI and a release
+  check.
 - MeadowBoot has a debug adapter of its own: `dap` in MeadowBoot
   (`bootstrap/src/Dap.mw`), declared with Lingua's `dap!`, launches a
   program, stops at breakpoints and on entry, continues and steps in, over

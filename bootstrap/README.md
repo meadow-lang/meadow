@@ -187,20 +187,42 @@ A document in no package is studied as a package of its own, as the Rust
 server analyses one alone. Formatting is `meadow fmt`'s until MeadowBoot's
 formatter is ready.
 
+Workspace symbols -- the editor's own picker over every declaration, by name
+or by type -- are `meadow_find`'s search, ported as `src/Find.mw`. What is
+searched is read off each open package's study and what each unit it imports
+exports: every type, trait and effect and its constructors, every value a
+dependency exports and every top-level value of the package itself, each a
+value listed as its signature. A name is matched as the Rust server's
+`nucleo` matcher scores it, step for step, so that the same query finds the
+same declarations in the same order; a type, as Hoogle does, by unifying it
+with each signature and pricing what that took.
+
+`meadow/ir` answers a definition as core: the package's core as `Elab` makes
+it (`Compiler.studyCore`), written as `meadow_core` writes its own
+(`Core.prettyDefs`), every binder and type variable renumbered in the order
+it is first written. The two cores are the same program but for effects:
+MeadowBoot's core carries no effect types, since nothing after `Elab` needs
+them, where the Rust core quantifies each definition over its effect
+variables and applies it to them. Cut and AxCut are not answered yet.
+
+`meadow lsp --check PATH…` is the server too, run over files rather than
+an editor: each `.mw` file under the paths opened in turn, as an editor opens
+it, and every error the server would mark printed where it is, then `no
+errors in N files` or how many there were, with the exit status saying which.
+It is what CI and a release run over every source in the repository, so a
+file the editor would mark fails the build whichever compiler is `meadow`.
+
 `buildtools/meadow/tests/lsp_differential.rs` starts both servers and sends
 them the same session: every file of a package opened, then hover, go to
 definition and prepare rename at every name, a rename of each name, semantic
 tokens, inlay hints, code lenses, formatting, completion after each `|>` and
 `.` and inside names, `meadow/ir`, workspace symbols, an edit and its undoing,
 and a close. It reports agreement by kind of request, and is ignored until
-the two agree. Where they cannot yet, the reason is one of three: MeadowBoot
-has not ported it (workspace symbols, `meadow/ir`); Lingua's `lsp!` cannot say
-it (diagnostics without `relatedInformation`, `initialize` without
-`positionEncoding` and `serverInfo`); or the two compilers' answers differ,
-which is what the test is for. A refusal, a file changed on the disk and a
-document closed, which it once could not say either, it now does: a closed
-document's text stops standing for its file (`closed`), and the package goes
-back to what is on the disk.
+the two agree; its doc comment says how far they do, and why the rest
+differs. A refusal, a file changed on the disk and a document closed, which
+Lingua's `lsp!` once could not say, it now does: a closed document's text
+stops standing for its file (`closed`), and the package goes back to what is
+on the disk.
 
 ## Running
 
@@ -221,6 +243,68 @@ MEADOWBOOT_MEADOW=target/release/meadow cargo test -p meadow --test bootstrap
 
 `MEADOWBOOT_MEADOW` names the `meadow` that builds and runs MeadowBoot; the
 debug one the test is built with works too, slowly.
+
+## How fast it is
+
+MeadowBoot is to replace the Rust front end, so it has to be about as quick
+to use: a build, an entry at the prompt and an edit in the editor should not
+be noticeably slower. Two tools say how far off it is.
+
+`MEADOWBOOT_TIMINGS=1` has MeadowBoot say how long each pass of each unit
+took, as the unit finishes -- a build's, a prompt entry's, and each time the
+language server studies a package:
+
+```text
+timings Std:   2561.8 ms
+  parse            77.2 ms
+  fixity          101.1 ms
+  lower           188.4 ms
+  rename          124.4 ms
+  infer           706.7 ms
+  elaborate       241.4 ms
+  ...
+```
+
+`scripts/bench-meadowboot.py` runs the same work through MeadowBoot and the
+Rust `meadow`, both release builds, and prints the two side by side: builds
+of `examples/` cold and after an edit, the standard library from its
+sources, MeadowBoot itself, sixty prompt entries, and edits in the language
+server. `--passes` adds the timings above, summed over each case's units.
+
+What it said on one Windows desktop (28 cores), in milliseconds:
+
+| case                          | `meadow` | MeadowBoot before | MeadowBoot now |
+| ----------------------------- | -------: | ----------------: | -------------: |
+| `examples/Euler`, cold build  |      150 |              3469 |           3294 |
+| `examples/Euler`, after edit  |      153 |              1744 |           1626 |
+| `examples/MiniML`, cold build |      217 |              3564 |           3388 |
+| `examples/MiniML`, after edit |      218 |              1966 |           1700 |
+| a prompt entry, checked       |        4 |               179 |             44 |
+| an edit, to its diagnostics   |       16 |               300 |            299 |
+
+A cold `meadow` build has the standard library compiled into the binary; a
+cold MeadowBoot build compiles it, about 2.5 s of the time. Of what is left,
+most of a build after an edit is reading the standard library's interface,
+twice -- once for the unit and once for the link. A unit's own passes take
+70-90 ms of a small package's build.
+
+What was slow, and is not now:
+
+- A unit's database held the interfaces of every unit it imports, as an
+  input, though only their fixities are asked of it there; a database keeps
+  an input where any thread can read it, which copied the standard library's
+  interface for every unit and every prompt entry -- 90-115 ms each. It is
+  given their fixities alone.
+- Renaming found each dependency's type's constructors by reading every
+  constructor the dependency has, for each of its types; with the standard
+  library that was a few hundred thousand comparisons per unit. They are
+  grouped by their type once.
+- The check for a value a module defines twice compared every export with
+  every other: 150 ms of compiling the standard library. It keeps the first
+  of each name.
+- The walk that copies definitions for number types (`Inline.numbered`) also
+  worked out which definitions could be inlined and what each dictionary
+  holds, which only the walks that inline or read dictionaries ask.
 
 ## The back end, in the same process
 

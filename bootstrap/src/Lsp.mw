@@ -29,12 +29,14 @@ use Lingua (lsp!)
 use Lingua.Lsp (Asked, pathOf, rangeJson, lineStarts, position, uriOf, newName, requestFailed)
 use Lingua.Lang (Meta)
 use Lingua.Lang.Meta.*
-use Lingua.Diagnostic (Diagnostic, Severity)
+use Lingua.Diagnostic (Diagnostic, Severity, whereAt, message)
 use Lingua.Diagnostic.Diagnostic.*
 use Lingua.Make (Given, unitImports, unitDir, unitSources)
 use MeadowBoot.Compiler (
-  Interface, Study, studyUnit, unitDatabase, givenUnits, compilerFiles, setCompilerSource
+  Interface, Study, studyUnit, studyCore, hostOs, unitDatabase, givenUnits, compilerFiles,
+  setCompilerSource
 )
+use MeadowBoot.Core (CoreProgram, prettyDefs, coreArena, coreRoot, coreFileDefs, coreDefId)
 use MeadowBoot.Unit (packageOf, absolute)
 use MeadowBoot.Rename (Binder)
 use MeadowBoot.Scopes (Source, Declared, Item, Export, Vis, builtinTyconNames)
@@ -43,7 +45,8 @@ use MeadowBoot.Types (
   Type, Scheme, VarKind, Namer, newNamer, namerOf, showType, showScheme, showTypeIn, isFun,
   renderIn, renderResultIn, spelling
 )
-use MeadowBoot.Solve (Generalized)
+use MeadowBoot.Solve (Generalized, TypeEnv, Entry)
+use MeadowBoot.Find as F
 use Lingua.Lang (metaStart, metaEnd)
 use Lingua.Lsp (byteIn)
 use MeadowBoot.Types.Type.*
@@ -60,7 +63,8 @@ use Std.Maybe as M
 use Std.Maybe.Maybe.*
 use Std.Result.Result.*
 use Std.Path as Path
-use Std.Fs (readToString, writeString, exists, createDirAll)
+use Std.Fs (readToString, writeString, exists, createDirAll, readDir, isDir, isFile)
+use Std.Console (writeError, writeOutput)
 use Std.Process (getEnv)
 use Std.Process as Proc
 use Std.Exn (toResult)
@@ -68,7 +72,7 @@ use Std.Sort (sortOn, sortBy)
 use Std.Ordering (Ordering)
 use MeadowBoot.Unit (stdDir, sourcesOf)
 use MeadowBoot.Types (
-  Arena, newArena, fresh, freshQuantifiers, substBound, snapshot, rollback, unify
+  Arena, newArena, fresh, freshQuantifiers, substBound, snapshot, rollback, unify, func
 )
 use Std.Char as C
 
@@ -119,7 +123,9 @@ record Loaded = {
   -- was made at.
   views : Ref (HashMap Int (Int, View)),
   -- How often the standard library's sources write each word, once counted.
-  corpus : Ref (Maybe (HashMap String Int))
+  corpus : Ref (Maybe (HashMap String Int)),
+  -- Each package's core, with the count of its changes it was made at.
+  cores : Ref (HashMap String (Int, Maybe CoreProgram))
 }
 
 @pub fun newEditor () =
@@ -129,7 +135,8 @@ record Loaded = {
     edits = newRef H.empty,
     studies = newRef H.empty,
     views = newRef H.empty,
-    corpus = newRef None
+    corpus = newRef None,
+    cores = newRef H.empty
   }
 
 -- A path as the server compares it: the disk does not tell `C:` from `c:`,
@@ -338,6 +345,8 @@ record View = {
   names : [(Int, Int, Int, String)],
   defs : [(Int, Int, Int)],
   calls : [(Int, Int)],
+  -- Where its `@derive(…)`s are.
+  derives : [(Int, Int)],
   -- Each module it mentions: where, and the module (`moduleRefs`).
   modules : [(Int, Int, String)],
   -- What inference says of it, and each constructor's full path by its
@@ -443,6 +452,7 @@ fun viewIn (uri : String) (path : String) (text : String) (file : String) (s : S
        names = V.filter (\x -> match x with | (_, _, _, k) -> k != "v") uses,
        defs,
        calls,
+       derives,
        modules =
          moduleRefs
            text
@@ -609,12 +619,15 @@ fun meadowHome () =
 -- The file a dump names `file` -- `Pkg/src/M.mw` -- of a package the view
 -- knows: the document's own, one it imports, or the standard library's
 -- copy written out for an editor.
-fun pathNamed (v : View) (file : String) =
+fun pathNamed (v : View) (file : String) = pathIn v.study v.package file
+
+-- The same, of a package studied as `s`, whose name is `package`.
+fun pathIn (s : Study) (package : String) (file : String) =
   -- A module of the library other than the document is the copy written
   -- out, even from inside the library: the Rust server analyses a module of
   -- it against the others as compiled into `meadow`.
-  let ownStd = S.startsWith "Std/" file and v.package == "Std" in
-  match (if ownStd then None else V.find (\x -> srcFile (snd x) == file) v.study.sources) with
+  let ownStd = S.startsWith "Std/" file and package == "Std" in
+  match (if ownStd then None else V.find (\x -> srcFile (snd x) == file) s.sources) with
   | Just (path, _) -> Just path
   | None ->
       (let pkg = M.unwrapOr "" (V.get (S.split "/" file) 0) in
@@ -625,7 +638,7 @@ fun pathNamed (v : View) (file : String) =
              (let p = Path.joinAll [home, "std", stdVersion, "Std", S.drop rest 4] in
               if exists p then Just p else None))
            (meadowHome ())
-       else M.map (\x -> Path.join (snd x) rest) (V.find (\x -> fst x == pkg) v.study.homes))
+       else M.map (\x -> Path.join (snd x) rest) (V.find (\x -> fst x == pkg) s.homes))
 
 -- A path as a `file:` uri, as the Rust server writes one (`path_to_uri`):
 -- `/` between its parts, a drive's letter capital, and every byte that is
@@ -691,14 +704,14 @@ def editorRequests =
     ("textDocument/hover", \ed (a : Asked) -> hoverOf ed a),
     ("textDocument/completion", \ed (a : Asked) -> completionOf ed a),
     ("textDocument/definition", \ed (a : Asked) -> definitionOf ed a),
-    ("workspace/symbol", \ed (a : Asked) -> J.jArray []),
+    ("workspace/symbol", \ed (a : Asked) -> symbolsOf ed a),
     ("textDocument/formatting", \ed (a : Asked) -> formattingOf ed a),
     ("textDocument/inlayHint", \ed (a : Asked) -> hintsOf ed a),
     ("textDocument/codeLens", \ed (a : Asked) -> lensesOf ed a),
     ("textDocument/prepareRename", \ed (a : Asked) -> prepareRenameOf ed a),
     ("textDocument/rename", \ed (a : Asked) -> renameOf ed a),
     ("textDocument/semanticTokens/full", \ed (a : Asked) -> tokensOf ed a),
-    ("meadow/ir", \ed (a : Asked) -> J.jNull ()),
+    ("meadow/ir", \ed (a : Asked) -> irOf ed a),
     ("meadowboot/view", \ed (a : Asked) -> viewDump ed a)
   ]
 
@@ -895,7 +908,17 @@ fun definitionOf (ed : Editor) (a : Asked) =
                       | (_, _, id, _) ->
                           if id < 0 then
                             M.andThen
-                              (\f -> locationOf ed v f 0 0)
+                              -- A module of the library is the copy written
+                              -- out, the document's own too.
+                              (\f ->
+                                if v.package == "Std" then
+                                  M.andThen
+                                    (\path ->
+                                      M.map
+                                        (\t -> location (uriOfPath path) t 0 0)
+                                        (Res.toMaybe (readToString path)))
+                                    (pathNamed v f)
+                                else locationOf ed v f 0 0)
                               (M.andThen
                                  (\m -> match m with | (_, _, name) -> moduleFile v name)
                                  (V.get v.modules (0 - 1 - id)))
@@ -1296,20 +1319,33 @@ fun functionsOf (v : View) : HashMap (Int, Int) Bool =
 
 -- What is in scope by spelling, for a capitalised word nothing resolved: the
 -- constructors, then the types, the package and the library declare.
+-- A trait and an associated type or effect are no types there, as the Rust
+-- server's `types_in_scope` has it, and colour as a module.
 fun scopeOf (v : View) : ([String], [String]) =
-  V.foldl
-    (\acc (b : Binder) ->
-      match acc with
-      | (cs, ts) ->
-          (match siteOf b with
-           | None -> acc
-           | Just _ ->
-               (let bare = M.unwrapOr b.name (V.last (S.split "." b.name)) in
-                if b.kind == "c" then (V.pushBack cs bare, ts)
-                else if b.kind == "t" then (cs, V.pushBack ts bare)
-                else acc)))
-    ([], [])
-    v.study.renamed.binders
+  let notData =
+    V.foldl
+      (\h (i : Item) ->
+        if i.kind == "t" and (i.owner == "trait" or S.startsWith "assoc" i.owner) then
+          H.insert i.id True h
+        else h)
+      H.empty
+      (V.append
+         (V.concatMap (\(d : Declared) -> d.items) v.study.renamed.modules)
+         v.study.renamed.depItems)
+  in V.foldl
+       (\acc k ->
+         match (acc, V.get v.study.renamed.binders k) with
+         | ((cs, ts), Just (b : Binder)) ->
+             (match siteOf b with
+              | None -> acc
+              | Just _ ->
+                  (let bare = M.unwrapOr b.name (V.last (S.split "." b.name)) in
+                   if b.kind == "c" then (V.pushBack cs bare, ts)
+                   else if b.kind == "t" and not (H.member k notData) then (cs, V.pushBack ts bare)
+                   else acc))
+         | _ -> acc)
+       ([], [])
+       (V.range 0 (V.len v.study.renamed.binders))
 
 -- --- formatting ----------------------------------------------------------------
 
@@ -1375,6 +1411,518 @@ fun sameSuffix (a : String) (b : String) (room : Int) (k : Int) : Int =
 
 fun backToLine (s : String) (k : Int) : Int =
   if k > 0 and byteOf s (stringByteLength s - k - 1) != 10 then backToLine s (k - 1) else k
+
+-- --- workspace symbols -----------------------------------------------------------
+
+-- The editor's own picker over every declaration there is -- by name, or by
+-- type when the query is one (`Find`): what each open document's package
+-- declares, private names too, and what it depends on exports, the
+-- standard library's among it. A value is listed as its signature, `length
+-- : [a] -> Int`, as the Rust server lists it: most editors show a symbol's
+-- name and little else, and a list of `map`s is no use without their types.
+fun symbolsOf (ed : Editor) (a : Asked) =
+  let query = M.unwrapOr "" (M.andThen J.asString (J.get "query" a.params)) in
+  let decls = openDecls ed in
+  let texts = newRef H.empty in
+  J.jArray
+    (V.concatMap
+       (\i ->
+         match V.get decls i with
+         | Just (path, (d : F.Decl)) -> symbolJson ed texts path d
+         | None -> [])
+       (F.search (V.map snd decls) query 256))
+
+-- One declaration as a workspace symbol, where it is: in the document's own
+-- text when it is open -- which may be newer than its file -- and in the
+-- file otherwise. One whose file is not there is not listed.
+fun symbolJson
+    (ed : Editor)
+    (texts : Ref (HashMap String (Maybe (String, String))))
+    (path : String)
+    (d : F.Decl) =
+  let known =
+    match H.lookup (keyOf path) (getRef texts) with
+    | Just t -> t
+    | None ->
+        (let open =
+           V.find (\(o : Doc) -> keyOf o.known == keyOf path) (H.values (getRef ed.docs))
+         in
+         let t =
+           match open with
+           | Just (o : Doc) -> Just (o.uri, o.text)
+           | None -> M.map (\t -> (uriOfPath path, t)) (Res.toMaybe (readToString path))
+         in
+         let u = setRef texts (H.insert (keyOf path) t (getRef texts)) in
+         t)
+  in match known with
+     | None -> []
+     | Just (uri, text) ->
+         [J.jObject [
+            ("name", J.jString (if F.isValue d.kind then F.headline d else d.name)),
+            ("kind", J.jInt (symbolKind d.kind)),
+            ("containerName", J.jString d.module),
+            -- A name nothing wrote -- a derive's -- is where its trait is
+            -- named, and is nothing long.
+            ("location", location uri text d.from (if writtenAt text d then d.to else d.from))
+          ]]
+
+-- What an editor draws beside a declaration it lists (`symbol_kind`).
+fun symbolKind (kind : String) : Int =
+  if kind == "method" then 6
+  else if kind == "value" then 14
+  else if kind == "constructor" or kind == "pattern" then 22
+  else if kind == "type" then 10
+  else if kind == "record" then 23
+  else if kind == "alias" then 26
+  else if kind == "trait" then 11
+  else if kind == "effect" then 24
+  else 12
+
+-- Every declaration the open documents' packages can reach, each with the
+-- file it is in: one a package declares twice -- open in two documents,
+-- or the library's own module open -- listed once.
+fun openDecls (ed : Editor) =
+  let roots =
+    V.foldl
+      (\acc (d : Doc) ->
+        if V.any (\r -> keyOf r == keyOf d.root) acc then acc else V.pushBack acc d.root)
+      []
+      (H.values (getRef ed.docs))
+  in
+  let all = V.concatMap (\root -> M.unwrapOr [] (M.map (unitDecls ed) (studyOf ed root))) roots in
+  match V.foldl
+    (\acc x ->
+      match acc with
+      | (seen, out) ->
+          (let d = snd x in
+           let key = "${F.qualified d}\n${d.kind}\n${d.detail}" in
+           if H.member key seen then acc else (H.insert key True seen, V.pushBack out x)))
+    (H.empty, [])
+    all with
+  | (_, out) -> out
+
+-- What a studied package declares -- private names too -- and what each
+-- unit it imports exports, each with the file it is written in.
+--
+-- The standard library is the Rust server's own: what it exports is the
+-- library compiled into `meadow`, in the copy written out for an editor,
+-- and each module of it open is analysed as a package of its own, named
+-- for the module -- `Collections.Vector`, so its module is
+-- `Collections.Vector.Collections.Vector` -- whose every top-level name is
+-- in the document. Both are listed, as the Rust server lists both.
+fun unitDecls (ed : Editor) (s : Study) =
+  let package =
+    M.unwrapOr
+      ""
+      (M.andThen (\(d : Declared) -> V.get (S.split "/" d.file) 0) (V.get s.renamed.modules 0))
+  in
+  let schemeOf =
+    \(e : Export) ->
+      match H.lookup e.binder s.inferred.general with
+      | Just sc -> Just sc
+      | None -> H.lookup e.binder s.inferred.schemes
+  in
+  let own = declsOf package s.renamed.exports s.renamed.anyVis s.inferred.types True schemeOf in
+  let theirs =
+    V.concatMap
+      (\(i : Interface) ->
+        declsOf i.package i.exports i.anyVis i.types False (\(e : Export) -> e.scheme))
+      s.imported
+  in
+  let placed =
+    V.concatMap (\(d : F.Decl) ->
+      match pathIn s package d.file with
+      | Just path -> [(path, d)]
+      | None -> [])
+  in if package != "Std" then placed (V.append own theirs)
+     else
+       (let public =
+          declsOf package s.renamed.exports s.renamed.anyVis s.inferred.types False schemeOf
+        in
+        -- Each value the module exports is in such a package's prelude, which
+        -- lists every one; what a derive wrote is not among its names.
+        let exported =
+          H.fromVec
+            (V.concatMap
+               (\(d : F.Decl) ->
+                 if F.isValue d.kind and d.kind != "constructor" then
+                   [("${d.file}@${show d.from}@${d.kind}", True)]
+                 else [])
+               public)
+        in
+        let opened =
+          V.concatMap
+            (\(d : F.Decl) ->
+              match V.find (\x -> srcFile (snd x) == d.file) s.sources with
+              | Just (path, _) ->
+                  (match V.find
+                     (\(o : Doc) -> keyOf o.known == keyOf path)
+                     (H.values (getRef ed.docs)) with
+                   | Just (o : Doc) ->
+                       if not (writtenAt o.text d) then []
+                       else
+                         (let dotted =
+                            S.join
+                              "."
+                              (S.split "/" (stringSlice d.file 8 (stringByteLength d.file - 3)))
+                          in [(
+                               path,
+                               {
+                                 d | module = "${dotted}.${dotted}",
+                                 package = dotted,
+                                 prelude = H.member "${d.file}@${show d.from}@${d.kind}" exported
+                               }
+                             )])
+                   | None -> [])
+              | None -> [])
+            own
+        in V.append opened (placed (V.append public theirs)))
+
+-- Whether `d`'s name is written where it was declared in `text`: not so of
+-- what a derive wrote, which stands at the trait it is named for.
+fun writtenAt (text : String) (d : F.Decl) : Bool =
+  d.to <= stringByteLength text
+    and (let s = stringSlice text d.from d.to in s == d.name or "(${s})" == d.name)
+
+-- What package `pkg` declares, read off what it exports -- every name it
+-- declares, with how far each is seen: every type, trait and effect and
+-- its constructors, and every value it exports -- or, when it is the one
+-- being worked on, every value it declares at the top. As `meadow_find`
+-- collects a package: a name exported twice is one declaration, where it
+-- was defined, and a name another package defines is that one's.
+fun declsOf
+    (pkg : String)
+    (exports : [Export])
+    (anyVis : Bool)
+    (types : TypeEnv)
+    (private : Bool)
+    (schemeOf : Export -> Maybe Scheme)
+    : [F.Decl] =
+  let traits =
+    V.concatMap
+      (\(e : Export) -> if e.kind == "t" and e.owner == "trait" then [e.name] else [])
+      exports
+  in
+  let ctors = H.fromVec (V.map (\(e : Entry Scheme) -> (e.key, e.value)) types.ctors) in
+  let prelude =
+    H.fromVec
+      (V.concatMap (\(e : Export) -> if V.isEmpty e.module then [(e.binder, True)] else []) exports)
+  in match V.foldl
+       (\acc (e : Export) ->
+         match acc with
+         | (seen, out) ->
+             if H.member (e.kind, e.binder) seen then acc
+             else
+               (let seen2 = H.insert (e.kind, e.binder) True seen in
+                match declOf pkg exports anyVis private schemeOf traits ctors prelude e with
+                | Just d -> (seen2, V.pushBack out d)
+                | None -> (seen2, out)))
+       (H.empty, [])
+       exports with
+     | (_, out) -> out
+
+-- One name a package exports, as a declaration, if it is one a search
+-- finds.
+fun declOf pkg exports anyVis private schemeOf traits ctors prelude (e : Export) : Maybe F.Decl =
+  let site =
+    match siteParts e.site with
+    | Just s -> Just s
+    -- A record's constructor is declared nowhere of its own: it is where
+    -- its type is.
+    | None ->
+        if e.kind == "c" then
+          M.andThen
+            (\(t : Export) -> siteParts t.site)
+            (V.find
+               (\(t : Export) -> t.kind == "t" and t.name == e.owner and t.module == e.module)
+               exports)
+        else None
+  in match site with
+     | None -> None
+     | Just (file, from) ->
+         if not (S.startsWith "${pkg}/" file) then None
+         else
+           (let module = moduleOfFile pkg file in
+            let named =
+              \kind name detail shape ->
+                F.Decl {
+                  name,
+                  module,
+                  package = pkg,
+                  kind,
+                  detail,
+                  shape,
+                  prelude = H.member e.binder prelude,
+                  file,
+                  from,
+                  to = from + stringByteLength e.name
+                }
+            in if e.kind == "t" then
+                 (let kind =
+                    if e.owner == "data" then "type"
+                    else if e.owner == "record" then "record"
+                    else if e.owner == "alias" then "alias"
+                    else if e.owner == "trait" then "trait"
+                    else if e.owner == "effect" then "effect"
+                    else ""
+                  in if S.isEmpty kind then None else Just (named kind (spelling e.name) "" None))
+               else if e.kind == "c" then
+                 (match M.orElse (H.lookup e.name ctors) (H.lookup e.canon ctors) with
+                  | Just sc ->
+                      (let made = madeBy sc in
+                       Just
+                         (named
+                            "constructor"
+                            (spelling e.name)
+                            (F.signatureOf (showScheme made))
+                            (Just (F.sigOf made))))
+                  | None -> None)
+               else if e.kind != "v" or S.startsWith "$" e.name then None
+               else
+                 (let seen = if private then True else not anyVis or e.vis == Vis.Exported in
+                  if not seen then None
+                  else
+                    match schemeOf e with
+                    | None -> None
+                    | Just sc ->
+                        (let shape = F.sigOf sc in
+                         let kind =
+                           if S.startsWith "op:" e.owner then "operation"
+                           else if V.elem e.owner traits then "method"
+                           else if V.isEmpty shape.args then "value"
+                           else "function"
+                         in Just
+                              (named
+                                 kind
+                                 (spellName e.name)
+                                 (F.signatureOf (showScheme sc))
+                                 (Just shape)))))
+
+-- A constructor's scheme as `meadow_find` makes one from its fields: each
+-- field an argument, curried, pure, over its type's parameters, each any
+-- type.
+fun madeBy (sc : Scheme) : Scheme =
+  match curriedArgs sc.ty with
+  | (args, result) ->
+      Scheme {
+        quant = V.map (\k -> VarKind.Plain) sc.quant,
+        preds = [],
+        ty = func args result,
+        lacks = []
+      }
+
+fun curriedArgs (t : Type) : ([Type], Type) =
+  match t with
+  | Fun ps r _ ->
+      (match curriedArgs r with
+       | (rest, result) -> (V.append ps rest, result))
+  | _ -> ([], t)
+
+-- A site as a dump writes it, `Pkg/src/M.mw@123`: the file, and the byte.
+fun siteParts (site : String) : Maybe (String, Int) =
+  match S.indexOf "@" site with
+  | None -> None
+  | Just at -> M.map (\from -> (S.take site at, from)) (S.toInt (S.drop site (at + 1)))
+
+-- The module a file of package `pkg` is, by its dotted path: `Std.Maybe`
+-- for `Std/src/Maybe.mw`, and the package's name for its root.
+fun moduleOfFile (pkg : String) (file : String) : String =
+  let rel = S.drop file (stringByteLength pkg + 5) in
+  let bare = if S.endsWith ".mw" rel then stringSlice rel 0 (stringByteLength rel - 3) else rel in
+  let segs = S.split "/" bare in
+  if segs == ["Main"] or segs == ["Lib"] or (pkg == "Std" and segs == ["Prelude"]) then pkg
+  else S.join "." (V.pushFront segs pkg)
+
+-- --- the compiler's IRs -----------------------------------------------------------
+
+-- `meadow/ir`: the definition at a place in one of the compiler's IRs, as
+-- text, with what each part of the text is and where in it the name at the
+-- place is -- what an editor that knows of it shows beside the source. Of
+-- the Rust server's three, `core` is answered: the definition as `Elab`
+-- makes it (`Compiler.studyCore`), written as `meadow_core` writes its own
+-- (`Core.prettyDefs`). `cut` and `axcut` are not yet: MeadowBoot's Cut is
+-- written by the `Cut` package, and its AxCut is the Rust back end's.
+fun irOf (ed : Editor) (a : Asked) =
+  let ir = M.unwrapOr "" (M.andThen J.asString (J.get "ir" a.params)) in
+  match viewOf ed a with
+  | None -> J.jNull ()
+  | Just v ->
+      if ir != "core" then J.jNull ()
+      else
+        (match M.andThen
+           (\p -> M.map (\id -> (p, id)) (definitionAround v p a.offset))
+           (coreOf ed v) with
+         | None -> J.jNull ()
+         | Just (p, id) ->
+             J.jObject [
+               ("ir", J.jString ir),
+               ("name", J.jString (spellName (binderOf v id).name)),
+               ("text", J.jString (prettyDefs p [id])),
+               ("segments", J.jArray []),
+               ("focus", J.jArray [])
+             ])
+
+-- The core of the document's package, as it was last studied.
+fun coreOf (ed : Editor) (v : View) =
+  let root =
+    M.unwrapOr
+      ""
+      (M.map
+         (\(d : Doc) -> d.root)
+         (V.find (\(d : Doc) -> d.uri == v.uri) (H.values (getRef ed.docs))))
+  in
+  let k = keyOf root in
+  let n = H.getOr 0 k (getRef ed.edits) in
+  match H.lookup k (getRef ed.cores) with
+  | Just (m, p) if m == n -> p
+  | _ ->
+      (let p = M.andThen (\x -> x) (Res.toMaybe (toResult (\() -> studyCore v.study))) in
+       let u = setRef ed.cores (H.insert k (n, p) (getRef ed.cores)) in
+       p)
+
+-- The definition of core `offset` is in, by its binder, as the Rust server
+-- finds it (`definition_around`): a definition's own name where it is
+-- written; the definition a name mentioned in it is used in; or the one
+-- written last before `offset`.
+fun definitionAround (v : View) (p : CoreProgram) (offset : Int) : Maybe Int =
+  let a = coreArena p in
+  let defined = V.map (\d -> coreDefId a d) (coreFileDefs a (coreRoot p)) in
+  let tops =
+    V.concatMap
+      (\top ->
+        match siteOf (binderOf v (fst top)) with
+        | Just (f, from, to) -> if f == v.file then [(fst top, from, to)] else []
+        | None -> [])
+      v.typing.tops
+  in
+  let atHome =
+    M.andThen
+      (\id ->
+        if V.elem id defined
+          and V.any
+            (\t ->
+              match t with
+              | (i, from, to) -> i == id and from <= offset and offset <= to)
+            tops then Just id
+        else None)
+      (valueAt v offset)
+  in match atHome with
+     | Just id -> Just id
+     | None ->
+         (let before =
+            V.foldl
+              (\acc t ->
+                match t with
+                | (i, from, _) ->
+                    if from > offset then acc
+                    else
+                      (match acc with
+                       | Just (_, f0) -> if from > f0 then Just (i, from) else acc
+                       | None -> Just (i, from)))
+              None
+              tops
+          in M.andThen (\x -> if V.elem (fst x) defined then Just (fst x) else None) before)
+
+-- --- `meadow lsp --check` -----------------------------------------------------------
+
+-- Every `.mw` file under `paths` -- a directory's, but for what builds write
+-- and dot-directories -- opened in the server one after another, as an
+-- editor opens them, and each error the server would mark printed where it
+-- is: `file:line:column: error: what`, on standard output. Then how many
+-- there were, on standard error, and the exit status says whether there
+-- were any: 0, 1, or 2 for a path that is not there. What CI and a release
+-- run over every source in the repository, as `meadow lsp --check` does.
+--
+-- A package's files are studied together: each file is opened as it is on
+-- the disk, which changes nothing the package was built with, so the one
+-- study answers for all of them.
+@pub fun checkPaths (paths : [String]) =
+  match V.find (\p -> not (exists p)) paths with
+  | Just p -> (let u = writeError "error: ${plainPath p}: no such file or directory\n" in 2)
+  | None ->
+      let files = V.concatMap sourcesUnder paths in
+      let ed = newEditor () in
+      let n = V.len files in
+      match V.foldl
+        (\acc k ->
+          match acc with
+          | (errors, marked) ->
+              (let file = V.getOr "" files k in
+               let found = checkedFile ed k file in
+               let u =
+                 V.foldl
+                   (\z x ->
+                     match x with
+                     | ((line, col), message) ->
+                         writeOutput
+                           "${plainPath file}:${show (line + 1)}:${show (col + 1)}: error: ${message}\n")
+                   ()
+                   found
+               in if V.isEmpty found then acc else (errors + V.len found, marked + 1)))
+        (0, 0)
+        (V.range 0 n) with
+      | (errors, marked) ->
+          if errors == 0 then (let u = writeError "no errors in ${show n} files\n" in 0)
+          else
+            (let s = if errors == 1 then "" else "s" in
+             let u = writeError "${show errors} error${s} in ${show marked} of ${show n} files\n" in
+             1)
+
+-- What the server says of `file`, opened as document `k` and closed again:
+-- each place it marks, as a line and a column, and the first line of what
+-- it says there.
+fun checkedFile (ed : Editor) (k : Int) (file : String) =
+  let path = absolute file in
+  match readToString path with
+  | Err _ -> [((0, 0), "this file cannot be read")]
+  | Ok text ->
+      let a = openedAt ed k (uriOfPath path) in
+      let b = textAt ed k text in
+      let found = diagnosticsOf ed k in
+      -- Closed again, as an editor closes it: nothing of it is kept for the
+      -- next.
+      let c = setRef ed.docs (H.delete k (getRef ed.docs)) in
+      let d = setRef ed.views (H.delete k (getRef ed.views)) in
+      let starts = lineStarts text in
+      -- In the order they are in the file.
+      V.map
+        fst
+        (sortBy
+           (\x y ->
+             match (x, y) with
+             | (((p, _), i), ((q, _), j)) -> if p == q then compare i j else compare p q)
+           (V.zip
+              (V.map
+                 (\(x : Diagnostic) ->
+                   (
+                     position text starts (metaStart (whereAt x)),
+                     M.unwrapOr "" (V.get (S.lines (message x)) 0)
+                   ))
+                 found)
+              (V.range 0 (V.len found))))
+
+-- The `.mw` files `path` is, or holds: a directory's in the order its
+-- entries sort in, but for dot-directories and what builds write.
+fun sourcesUnder (path : String) =
+  if isFile path then (if S.endsWith ".mw" path then [path] else [])
+  else if not (isDir path) then []
+  else
+    let sep = if hostOs == "windows" then "\\" else "/" in
+    let names = sortBy S.compare (M.unwrapOr [] (Res.toMaybe (readDir path))) in
+    V.concatMap
+      (\name ->
+        (let full =
+           if S.endsWith "/" path or S.endsWith sep path then path ++ name else path ++ sep ++ name
+         in if isDir full and (S.startsWith "." name or name == "target") then []
+            else sourcesUnder full))
+      names
+
+-- A path as it is shown: without the `\\?\` Windows puts in front of a
+-- long one.
+fun plainPath (p : String) : String =
+  if S.startsWith "\\\\?\\UNC\\" p then "\\\\" ++ S.drop p 8
+  else if S.startsWith "\\\\?\\" p then S.drop p 4
+  else p
 
 -- --- not yet answered as the Rust server answers ------------------------------
 
@@ -1555,7 +2103,10 @@ fun moduleRefs (text : String) (pkg : String) (own : [[String]]) (calls : [(Int,
 fun moduleFile (v : View) (m : String) : Maybe String =
   let segs = S.split "." m in
   let first = V.getOr "" segs 0 in
-  if first == v.package then
+  -- The library's root is its prelude, from inside it too, where `Lib` is
+  -- a root as well.
+  if m == "Std" then Just "Std/src/Prelude.mw"
+  else if first == v.package then
     M.map
       (\(d : Declared) -> d.file)
       (V.find (\(d : Declared) -> d.path == V.drop segs 1) v.study.renamed.modules)
@@ -1810,6 +2361,11 @@ fun hoverOf (ed : Editor) (a : Asked) =
              [("contents", J.jObject [("kind", J.jString "markdown"), ("value", J.jString md)])])
 
 fun hoverText (v : View) (o : Int) : Maybe String =
+  -- What a derive wrote stands at the trait it is named for, and the Rust
+  -- server says nothing of it there.
+  if V.any (\d -> fst d <= o and o < snd d) v.derives then None else hoverAt v o
+
+fun hoverAt (v : View) (o : Int) : Maybe String =
   let innermost = V.get (namesAt v o) 0 in
   match innermost with
   | Just (_, _, id, "c") -> Just "```meadow\n${ctorPath v id}\n```"
@@ -2763,19 +3319,30 @@ fun candidatesOf (ed : Editor) (v : View) =
       v.study.renamed.exports
   in
   -- Of the library, every value of a name its prelude brings: what can be
-  -- written here without a `use`, every one of that name.
+  -- written here without a `use`, every one of that name. An effect's
+  -- operation counts when the prelude names it, as it does `readToString`,
+  -- and not when it only comes with its effect, as `readLine` does with
+  -- `Console`: the Rust server offers what the prelude lists. One it names
+  -- is there twice, once with the effect and once by name.
   let flat =
     V.foldl
       (\h (i : Interface) ->
         if i.package != "Std" then h
         else
-          V.foldl
-            (\h2 (e : Export) ->
-              if V.isEmpty e.module and not (S.startsWith "op:" e.owner) then
-                H.insert e.name True h2
-              else h2)
-            h
-            i.exports)
+          (let rooted =
+             V.foldl
+               (\c (e : Export) ->
+                 if V.isEmpty e.module then H.insert e.binder (H.getOr 0 e.binder c + 1) c else c)
+               H.empty
+               i.exports
+           in V.foldl
+                (\h2 (e : Export) ->
+                  if V.isEmpty e.module
+                    and (not (S.startsWith "op:" e.owner) or H.getOr 0 e.binder rooted > 1) then
+                    H.insert e.name True h2
+                  else h2)
+                h
+                i.exports))
       H.empty
       v.study.imported
   in
