@@ -145,6 +145,17 @@ last release is under _Unreleased_.
   session and says by kind of request how far they agree; it is ignored until
   they do. Workspace symbols and `meadow/ir` are not answered yet, and
   `lsp --check` is still `meadow`'s.
+- MeadowBoot's language server answers workspace symbols, `meadow/ir` and
+  `lsp --check`. Workspace symbols are `meadow_find`'s search, ported
+  (`bootstrap/src/Find.mw`): by name, scored as the Rust server's `nucleo`
+  matcher scores it, or by type, priced as `meadow_find` prices a match, over
+  what each open package declares and what it depends on exports.
+  `meadow/ir` answers a definition as core, written as `meadow_core` writes
+  it (`Core.prettyDefs`, from `Compiler.studyCore`); Cut and AxCut are not
+  answered yet. `lsp --check PATH…` opens each `.mw` file under the paths in
+  the server and prints every error it would mark, with the Rust command's
+  output and exit status: it finds no errors in the sources CI and a release
+  check.
 - MeadowBoot has a debug adapter of its own: `dap` in MeadowBoot
   (`bootstrap/src/Dap.mw`), declared with Lingua's `dap!`, launches a
   program, stops at breakpoints and on entry, continues and steps in, over

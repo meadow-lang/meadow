@@ -187,20 +187,42 @@ A document in no package is studied as a package of its own, as the Rust
 server analyses one alone. Formatting is `meadow fmt`'s until MeadowBoot's
 formatter is ready.
 
+Workspace symbols -- the editor's own picker over every declaration, by name
+or by type -- are `meadow_find`'s search, ported as `src/Find.mw`. What is
+searched is read off each open package's study and what each unit it imports
+exports: every type, trait and effect and its constructors, every value a
+dependency exports and every top-level value of the package itself, each a
+value listed as its signature. A name is matched as the Rust server's
+`nucleo` matcher scores it, step for step, so that the same query finds the
+same declarations in the same order; a type, as Hoogle does, by unifying it
+with each signature and pricing what that took.
+
+`meadow/ir` answers a definition as core: the package's core as `Elab` makes
+it (`Compiler.studyCore`), written as `meadow_core` writes its own
+(`Core.prettyDefs`), every binder and type variable renumbered in the order
+it is first written. The two cores are the same program but for effects:
+MeadowBoot's core carries no effect types, since nothing after `Elab` needs
+them, where the Rust core quantifies each definition over its effect
+variables and applies it to them. Cut and AxCut are not answered yet.
+
+`meadow lsp --check PATH…` is the server too, run over files rather than
+an editor: each `.mw` file under the paths opened in turn, as an editor opens
+it, and every error the server would mark printed where it is, then `no
+errors in N files` or how many there were, with the exit status saying which.
+It is what CI and a release run over every source in the repository, so a
+file the editor would mark fails the build whichever compiler is `meadow`.
+
 `buildtools/meadow/tests/lsp_differential.rs` starts both servers and sends
 them the same session: every file of a package opened, then hover, go to
 definition and prepare rename at every name, a rename of each name, semantic
 tokens, inlay hints, code lenses, formatting, completion after each `|>` and
 `.` and inside names, `meadow/ir`, workspace symbols, an edit and its undoing,
 and a close. It reports agreement by kind of request, and is ignored until
-the two agree. Where they cannot yet, the reason is one of three: MeadowBoot
-has not ported it (workspace symbols, `meadow/ir`); Lingua's `lsp!` cannot say
-it (diagnostics without `relatedInformation`, `initialize` without
-`positionEncoding` and `serverInfo`); or the two compilers' answers differ,
-which is what the test is for. A refusal, a file changed on the disk and a
-document closed, which it once could not say either, it now does: a closed
-document's text stops standing for its file (`closed`), and the package goes
-back to what is on the disk.
+the two agree; its doc comment says how far they do, and why the rest
+differs. A refusal, a file changed on the disk and a document closed, which
+Lingua's `lsp!` once could not say, it now does: a closed document's text
+stops standing for its file (`closed`), and the package goes back to what is
+on the disk.
 
 ## Running
 

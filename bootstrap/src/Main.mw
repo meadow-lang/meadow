@@ -36,12 +36,13 @@ mod Scopes
 mod Tour
 mod Repl
 mod Lsp
+mod Find
 mod Dap
 
 use Lingua (cli!)
 use MeadowBoot.Lex (lex, dump)
 use MeadowBoot.Repl (runPrompt)
-use MeadowBoot.Lsp (serveServer)
+use MeadowBoot.Lsp (serveServer, checkPaths)
 use MeadowBoot.Dap (debugAdapter)
 use MeadowBoot.Core (program, erase, linkedUnits, CoreProgram, coreFilePackage)
 use MeadowBoot.Expand (Call, readRound, writeAnswers, callText, seenAfter)
@@ -284,6 +285,7 @@ cli! {
           "Serve nothing: print every error the server would mark in each `.mw` file under these paths, and exit 1 if there is one"
           value
           "PATH"
+      more : [String] "More paths to check: `--check` takes every path after it, as `meadow`'s does"
     }
     | dap "Run the debug adapter, speaking the Debug Adapter Protocol over stdin and stdout" {}
     | fmt "Re-indent `.mw` sources in place" {
@@ -481,8 +483,8 @@ fun run (every : CliOptions) (cli : Cli) =
   | Cli.Expand r -> finish (expandRound r.files)
   -- The prompt is MeadowBoot's (`Repl`).
   | Cli.Repl -> runPrompt ()
-  -- The language server is MeadowBoot's; `--check` is still `meadow`'s.
-  | Cli.Lsp r if V.isEmpty r.check -> serveServer ()
+  -- The language server is MeadowBoot's, and so is what it would mark.
+  | Cli.Lsp r -> if V.isEmpty r.check then serveServer () else exit (checkPaths (V.append r.check r.more))
   -- And so is the debug adapter (`Dap`).
   | Cli.Dap -> debugAdapter ()
   | Cli.Units r ->
