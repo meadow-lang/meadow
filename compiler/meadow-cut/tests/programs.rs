@@ -142,6 +142,7 @@ fn positioned(p: &mut meadow_cut::Program) {
                 Producer::Mu(_, s) => self.statement(s),
                 Producer::Cocase(ms) => {
                     for m in ms {
+                        m.shown = Some(format!("src_{}", m.name));
                         m.params.iter_mut().for_each(|b| self.binder(b));
                         self.statement(&mut m.body);
                     }

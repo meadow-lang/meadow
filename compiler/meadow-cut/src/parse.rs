@@ -1079,12 +1079,14 @@ impl Parser {
                     let mut methods = Vec::new();
                     while !self.is_punct("}") {
                         let name = self.ident()?;
+                        let shown = self.title();
                         let (params, conts) = self.params()?;
                         let row = self.row()?;
                         self.punct("=>")?;
                         let body = self.statement()?;
                         methods.push(Method {
                             name,
+                            shown,
                             params,
                             conts,
                             row,

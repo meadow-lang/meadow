@@ -228,6 +228,9 @@ pub enum Producer {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Method {
     pub name: String,
+    /// What the source calls the function it is part of, for a debugger's
+    /// stack: `apply @"mainLocal1"(..)`, as `Def::shown` for a definition.
+    pub shown: Option<String>,
     pub params: Vec<Binder>,
     pub conts: Vec<String>,
     /// What it may perform, if the front end says: see [`Row`].

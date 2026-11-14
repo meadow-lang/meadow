@@ -861,7 +861,7 @@ fun hostIn (lib : String) =
 -- `meadow-host`, where the rest of MeadowBoot looks for it (`Main.hostLibrary`):
 -- where `MEADOW_HOST` says, or beside this program, unless `MEADOW` names a
 -- program to run instead.
-fun hostLibrary () =
+@pub fun hostLibrary () =
   match getEnv "MEADOW_HOST" with
   | Just h -> Just h
   | None ->

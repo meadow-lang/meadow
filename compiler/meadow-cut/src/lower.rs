@@ -135,6 +135,10 @@ pub struct Map {
     /// What the source calls the definition each block is, where the front
     /// end said ([`Def::shown`]).
     pub titles: HashMap<Label, String>,
+    /// What the source calls the function each method shown by a name is
+    /// part of ([`crate::Method::shown`]), by a name its block alone takes:
+    /// the evidence it is entered with.
+    pub methods: HashMap<Name, String>,
 }
 
 /// Where a name of the AxCut came from.
@@ -2115,6 +2119,9 @@ impl Lower {
                     }
                     let ev = self.fresh(ax::Rep::Ref);
                     inner.bind(EV, ev);
+                    if let Some(title) = &m.shown {
+                        self.map.methods.insert(ev, title.clone());
+                    }
                     let params = inner.env.clone();
                     // Graded by what it can perform, wherever it is made.
                     let its = self.graded(m.row.as_ref());
@@ -2729,6 +2736,7 @@ fn rehalted(s: &Statement) -> Statement {
                 ms.iter()
                     .map(|m| Method {
                         name: m.name.clone(),
+                        shown: m.shown.clone(),
                         params: m.params.clone(),
                         conts: m.conts.clone(),
                         row: m.row.clone(),

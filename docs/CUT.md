@@ -941,11 +941,14 @@ def meadow:App/d12f @"double" (v3: i64 @"x" "Int"; k: ptr) =
 - **`x: rep @"name" "type"`** says what the source calls the binder `x`, and
   its type as the front end writes types; the type may be left out. A
   debugger shows a value by these. `def S @"name"` and `val S @"name"` say
-  the same of a declaration, which a stack is shown by.
+  the same of a declaration, which a stack is shown by, and
+  `apply @"name"(..) => s` of the function a method is part of: a local
+  function, which a front end makes an object of, and the Rust core lifts out
+  as a definition of its own (`mainLocal1`).
 
 In memory, a position is `Statement::At(Pos, s)` (`Pos` is a source's place
 among `Program::sources` and the two offsets), a name `Binder::shown`, and a
-declaration's `Def::shown` and `Val::shown`.
+declaration's or a method's `Def::shown`, `Val::shown` and `Method::shown`.
 
 **Through the passes.** Every pass keeps them: `specialize`, `inline` and
 `trmc` look under a position for the shapes they rewrite, so that a program
@@ -954,7 +957,9 @@ keeps its positions, which name their own file; a copy and a twin are shown
 by the name of what they were made of. The lowering makes each position an
 AxCut `Mark`, as `meadow_seq` makes a core mark one, and records which AxCut
 name each shown binder became (`lower::Map::shown`) and what each block's
-definition is shown as (`Map::titles`). Glade's code generator, compiling
+definition is shown as (`Map::titles`) and each shown method's
+(`Map::methods`, by the evidence its block alone takes). Glade's code
+generator, compiling
 with debug information, writes the same line, scope and register tables
 from them that it writes for the Rust front end.
 

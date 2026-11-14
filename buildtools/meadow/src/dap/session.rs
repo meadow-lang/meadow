@@ -181,6 +181,13 @@ pub struct Session {
     /// definitions by symbols (`meadow:App/d12f`), which a stack shows by
     /// what their source called them.
     titles: HashMap<InternedString, String>,
+    /// What the source calls the function a block is part of, where it is
+    /// not its definition -- a local function's, `mainLocal1` -- by a name
+    /// only that function's blocks take.
+    functions: HashMap<u32, String>,
+    /// Whether locals are shown in the order their names were bound, rather
+    /// than the order the registers hold them: for a program of Cut.
+    bound_order: bool,
     /// `boundary[pc]`: the first instruction of a source position.
     boundary: Vec<bool>,
     /// `breakpoint[pc]`: stop before running it.
@@ -359,7 +366,16 @@ impl Session {
             .iter()
             .filter_map(|d| Some((d.name, lowered.map.titles.get(&d.label)?.clone())))
             .collect();
-        Session::from_parts(image, files, vars, titles)
+        let functions = lowered
+            .map
+            .methods
+            .iter()
+            .map(|(n, t)| (n.0, t.clone()))
+            .collect();
+        let mut session = Session::from_parts(image, files, vars, titles)?;
+        session.bound_order = true;
+        session.functions = functions;
+        Ok(session)
     }
 
     /// Stand at the first boundary, as a launch for a debugger that stops
@@ -464,6 +480,8 @@ impl Session {
             vm,
             files,
             vars,
+            bound_order: false,
+            functions: HashMap::new(),
             titles,
             boundary,
             breakpoint: vec![false; n],
@@ -792,7 +810,7 @@ impl Session {
             name: self
                 .debug
                 .region(pc)
-                .map_or("?".to_string(), |r| self.display_name(r.name)),
+                .map_or("?".to_string(), |r| self.region_title(r)),
             loc: self.debug.loc(pc).or_else(|| self.nearest_loc(pc)),
             vars: env
                 .iter()
@@ -810,7 +828,7 @@ impl Session {
                 .filter_map(|i| region.params.get(i).map(|p| (*p, heap.field(a, i))))
                 .collect();
             out.push(Frame {
-                name: self.display_name(region.name),
+                name: self.region_title(region),
                 // Where it is waiting: the call that made the continuation.
                 loc: region.origin.or_else(|| self.nearest_loc(region.entry)),
                 vars,
@@ -818,6 +836,15 @@ impl Session {
             k = self.parent_return(k.expect("walked above"));
         }
         out
+    }
+
+    /// What a frame of the block `r` is shown as: the function it is part of,
+    /// where a program of Cut says, and otherwise its definition.
+    fn region_title(&self, r: &meadow_bytecode::Region) -> String {
+        if let Some(title) = r.params.iter().find_map(|p| self.functions.get(p)) {
+            return title.clone();
+        }
+        self.display_name(r.name)
     }
 
     /// What a frame of the definition the image calls `name` is shown as.
@@ -917,17 +944,27 @@ impl Session {
                 };
                 let mut seen = HashSet::new();
                 let mut rows = Vec::new();
+                let mut vars = f.vars;
+                // A program of Cut is lowered with its environment in another
+                // order than the Rust core's: its names are taken newest
+                // first by when they were bound, and shown in that order.
+                if self.bound_order {
+                    vars.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
+                }
                 // Newest first, so a shadowed name shows its current binding.
-                for (name, value) in f.vars {
+                for (name, value) in vars {
                     let Some(info) = self.vars.get(&name).cloned() else {
                         continue;
                     };
                     if !seen.insert(info.name.clone()) {
                         continue;
                     }
-                    rows.push(self.row(info.name, value, Some(info.ty)));
+                    rows.push((name, self.row(info.name, value, Some(info.ty))));
                 }
-                rows
+                if self.bound_order {
+                    rows.sort_by_key(|(n, _)| *n);
+                }
+                rows.into_iter().map(|(_, row)| row).collect()
             }
             Target::Registers => {
                 let pc = self.here();
@@ -1161,7 +1198,7 @@ impl Session {
                 let entry = self.entry_of(heap, a);
                 let name = entry
                     .and_then(|pc| self.debug.region_at(pc))
-                    .map(|r| self.display_name(r.name));
+                    .map(|r| self.region_title(r));
                 match name {
                     Some(name) => out.push_str(&format!("<function in {name}>")),
                     None => out.push_str("<function>"),

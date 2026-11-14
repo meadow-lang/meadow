@@ -2699,12 +2699,13 @@ def result = (plus 1 2 4, from1 3 5, again 9, (from1 2) 3, held 3)
 /// the same.
 #[test]
 fn a_definition_that_is_a_function_has_the_parameters_the_function_takes() {
-    // Whether `symbol`'s definition of all its parameters is there, with `n`.
+    // Whether `symbol`'s definition of all its parameters is there, with `n`
+    // -- after the name it is shown by, in a debug build.
     let entry = |cut: &str, n: usize| {
         cut.lines().any(|line| {
             line.starts_with("def meadow:Levels/d")
                 && line.matches("v19000000").count() == n
-                && line.contains("f (")
+                && (line.contains("f (") || line.contains("f @"))
         })
     };
     for opt in ["O0", "O1", "O2", "O3"] {
@@ -3584,23 +3585,22 @@ fn a_build_takes_the_standard_library_meadowboot_precompiled() {
             objects(&taken, profile),
             "the library compiled, and taken precompiled, as `{profile}`"
         );
+        // A debug build says where each file of the program is (its Cut's
+        // `source`s), and the two packages are in directories of their own:
+        // that is all that may differ.
+        let linked = |dir: &Path| {
+            std::fs::read_to_string(
+                dir.join("target")
+                    .join(profile)
+                    .join("link")
+                    .join("program.cut"),
+            )
+            .ok()
+        };
+        let name = |dir: &Path| dir.file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(
-            std::fs::read_to_string(
-                fresh
-                    .join("target")
-                    .join(profile)
-                    .join("link")
-                    .join("program.cut")
-            )
-            .ok(),
-            std::fs::read_to_string(
-                taken
-                    .join("target")
-                    .join(profile)
-                    .join("link")
-                    .join("program.cut")
-            )
-            .ok(),
+            linked(&fresh),
+            linked(&taken).map(|t| t.replace(&name(&taken), &name(&fresh))),
             "the program linked with the library compiled, and taken precompiled, as `{profile}`"
         );
     }

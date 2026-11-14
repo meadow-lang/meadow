@@ -340,6 +340,7 @@ impl Lower<'_> {
                 give(
                     Producer::Cocase(vec![Method {
                         name: "apply".to_string(),
+                        shown: None,
                         params: vec![binder(&x, rep_of(ty))],
                         conts: vec![ret],
                         // Meadow's resumptions are all one-shot, so no
@@ -628,6 +629,7 @@ impl Lower<'_> {
                 body: give(
                     Producer::Cocase(vec![Method {
                         name: "apply".to_string(),
+                        shown: None,
                         params: vec![binder(&x, rep_of(pty))],
                         conts: vec![ret],
                         row: None,

@@ -540,15 +540,53 @@ fn rust_adapter(root: &Path) -> Adapter {
     Adapter::start(c)
 }
 
+/// MeadowBoot's adapter, debugging on Glade through `meadow-host` -- or,
+/// where `MEADOWBOOT_DAP=cek` asks, on its CEK machine, with the Rust `meadow`
+/// run for what it hands on.
 fn boot_adapter(root: &Path, exe: &Path) -> Adapter {
     let mut c = Command::new(exe);
     c.arg("dap")
         .current_dir(root)
         .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
-        .env("MEADOW", meadow())
         .env("MEADOWBOOT_SET", "macros=Glade")
         .env_remove("MEADOWBOOT_EXPANSIONS");
+    if std::env::var("MEADOWBOOT_DAP").as_deref() == Ok("cek") {
+        c.env("MEADOW", meadow());
+    } else {
+        c.env("MEADOW_HOST", meadow_host()).env_remove("MEADOW");
+    }
     Adapter::start(c)
+}
+
+/// `meadow-host`, the Rust `meadow` as a library, built beside the `meadow`
+/// this test runs -- or the one `MEADOWBOOT_HOST` names.
+fn meadow_host() -> PathBuf {
+    if let Some(given) = std::env::var_os("MEADOWBOOT_HOST") {
+        return PathBuf::from(given);
+    }
+    static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            let dir = meadow().parent().expect("meadow's directory").to_path_buf();
+            let mut c = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+            c.args(["build", "-q", "-p", "meadow-host", "--manifest-path"])
+                .arg(repo().join("buildtools").join("Cargo.toml"));
+            if dir.file_name().is_some_and(|n| n == "release") {
+                c.arg("--release");
+            }
+            let out = c.output().expect("cargo runs");
+            assert!(
+                out.status.success(),
+                "meadow-host did not build:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            dir.join(format!(
+                "{}meadow_host{}",
+                std::env::consts::DLL_PREFIX,
+                std::env::consts::DLL_SUFFIX
+            ))
+        })
+        .clone()
 }
 
 /// Both adapters asked the same thing, and what they answered tallied.
@@ -768,30 +806,36 @@ const STEPPING: &[&str] = &[
 /// MeadowBoot's debug adapter answers every request as `meadow dap`
 /// answers it.
 ///
-/// Not yet, so it is ignored: run it with `--ignored` to see how far. On
-/// 2026-11-13, over the five programs written here and the `Euler` and
-/// `Tour` examples, the two agreed on 894 of 1235 answers, in about eight
-/// minutes:
+/// Not yet, so it is ignored: run it with `--ignored` to see how far.
+/// MeadowBoot's adapter debugs on Glade, through `meadow-host`, with the
+/// Rust adapter's own session, and the program MeadowBoot built for
+/// debugging says where it was written in its Cut (`docs/CUT.md`, "Positions
+/// and names"). `MEADOWBOOT_DAP=cek` runs it on MeadowBoot's CEK machine
+/// instead, as it did before. On 2026-11-13, over the five programs written
+/// here and the `Euler` and `Tour` examples, the two agreed on 961 of 1220
+/// answers, in about six minutes -- on the CEK machine they agreed on 894 of
+/// 1235:
 ///
 /// ```text
-/// configurationDone   14 / 14     output        8 / 14
-/// evaluate           261 / 342    scopes      111 / 230
+/// configurationDone   14 / 14     output       10 / 14
+/// evaluate           223 / 322    scopes      234 / 234
 /// initialize          14 / 14     setBreakpoints 7 / 9
-/// launch              14 / 14     stackTrace   69 / 119
-/// step               119 / 119    stopped     124 / 130
-/// variables          153 / 230
+/// launch              14 / 14     stackTrace   64 / 118
+/// step               118 / 118    stopped     125 / 129
+/// variables          138 / 234
 /// ```
 ///
-/// What is left is of three kinds. MeadowBoot's adapter has no scopes of the
-/// raw machine beside a frame's locals (all 119 of the scopes that differ),
-/// and does not stop in the standard library, which the Rust adapter steps
-/// into from the library's extracted sources (42 of the stacks, and the
-/// stops, outputs and locals that follow from a session going another way).
-/// And the two machines keep different things: the innermost Glade frame
-/// shows only the names its registers still hold -- not one a constant was
-/// folded into, nor one whose register was taken again -- and a lifted
-/// function's captures are not its locals, where the CEK machine has the
-/// whole scope.
+/// What is left is mostly not the debugger's. Of the 259 answers that
+/// differ, 193 are `Tour`'s and 23 `Euler`'s, whose sessions go another way
+/// from the first stop: the back end computes a top-level value that may
+/// perform -- by its analysis, most of them -- when the program starts
+/// (`docs/CUT.md`, "Top-level values"), the Rust core when it is first read,
+/// so MeadowBoot's starts in a value's definition before `main`. A function of
+/// the standard library that MeadowBoot copies into the package for the
+/// dictionaries it is given (`println`) is a copy with no positions, so a step
+/// into it stops in what it calls. And the two lowerings keep different
+/// things in a frame: a closure's captures are its locals here, and a type is
+/// written as MeadowBoot's inference has it.
 #[test]
 #[ignore = "MeadowBoot's debug adapter does not agree with meadow dap yet: see the doc comment"]
 fn meadowboot_s_debugger_answers_as_meadow_dap_answers() {
