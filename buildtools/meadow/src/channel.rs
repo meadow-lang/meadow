@@ -8,10 +8,11 @@
 //! that uses it, as `#![feature(…)]` is at the top of a crate's:
 //!
 //! ```text
-//! @!feature(ffi)
-//!
-//! use Std.Ffi as Ffi
+//! @!feature(name)
 //! ```
+//!
+//! There are none just now: [`UNSTABLE`] is empty. `ffi`, calling C through
+//! `Std.Ffi`, was the first, and is settled: see [`STABILISED`].
 //!
 //! A build from a checkout is **dev**, and takes what nightly takes. These
 //! are not the features a package offers the ones that build it, which are
@@ -35,20 +36,40 @@ pub const NUMBER: &str = env!("CARGO_PKG_VERSION");
 
 /// The features that are not settled: each one's name in `@!feature(…)`,
 /// and what it is, for the error that asks for it.
-pub const UNSTABLE: &[(&str, &str)] = &[("ffi", "calling C through `Std.Ffi`")];
+pub const UNSTABLE: &[(&str, &str)] = &[];
+
+/// The features that were unstable once and are settled now: each one's name
+/// and the release that settled it. A package that still asks for one builds
+/// on every channel, as Rust takes a `#![feature(…)]` that has since been
+/// stabilised, and is told that the line can go.
+pub const STABILISED: &[(&str, &str)] = &[("ffi", "0.5.0")];
 
 /// The file beside a `Meadow.toml` that says which toolchain the project is
 /// built with: a channel, or a version.
 pub const TOOLCHAIN_FILE: &str = "meadow-toolchain";
 
 /// What is wrong with a package asking for `feature` on `channel`, if
-/// anything.
+/// anything. A feature that is settled is not wrong to ask for, on any
+/// channel: [`feature_settled`] says what such a package is told instead.
 pub fn feature_problem(feature: &str, channel: &str) -> Option<String> {
-    if !UNSTABLE.iter().any(|(name, _)| *name == feature) {
-        let known: Vec<String> = UNSTABLE.iter().map(|(n, _)| format!("`{n}`")).collect();
+    problem_among(UNSTABLE, feature, channel)
+}
+
+/// [`feature_problem`], with `unstable` for the features that are not
+/// settled: so that what is said of one can be tested while there is none.
+fn problem_among(unstable: &[(&str, &str)], feature: &str, channel: &str) -> Option<String> {
+    if feature_settled(feature).is_some() {
+        return None;
+    }
+    if !unstable.iter().any(|(name, _)| *name == feature) {
+        let known: Vec<String> = unstable.iter().map(|(n, _)| format!("`{n}`")).collect();
+        let has = if known.is_empty() {
+            "it has no unstable features".to_string()
+        } else {
+            format!("the ones it has are {}", known.join(", "))
+        };
         return Some(format!(
-            "`{feature}` is not a feature this `meadow` knows: the ones it has are {}",
-            known.join(", ")
+            "`{feature}` is not a feature this `meadow` knows: {has}"
         ));
     }
     (channel == "stable").then(|| {
@@ -59,23 +80,18 @@ pub fn feature_problem(feature: &str, channel: &str) -> Option<String> {
     })
 }
 
-/// The channel whose features a package may ask for: this build's, except
-/// that `MEADOW_BOOTSTRAP=1` lets a stable one take what nightly takes.
-///
-/// That is for building Meadow's own compiler, as `RUSTC_BOOTSTRAP` is for
-/// rustc's: MeadowBoot calls the Rust back end through `Std.Ffi`, and a
-/// release's stable `meadow` is what builds and tests it. Anything else that
-/// sets it gives up what stable promises, by its own say.
-pub fn accepting() -> &'static str {
-    accepting_on(CHANNEL, std::env::var("MEADOW_BOOTSTRAP").ok().as_deref())
-}
-
-fn accepting_on(channel: &'static str, bootstrap: Option<&str>) -> &'static str {
-    if channel == "stable" && bootstrap == Some("1") {
-        "nightly"
-    } else {
-        channel
-    }
+/// The warning for a package that asks for `feature` when it is settled:
+/// that it needs asking for no longer. `None` for any other feature.
+pub fn feature_settled(feature: &str) -> Option<String> {
+    STABILISED
+        .iter()
+        .find(|(name, _)| *name == feature)
+        .map(|(name, since)| {
+            format!(
+                "the feature `{name}` is stable since {since}, and is not asked for any more: \
+                 `@!feature({name})` can go"
+            )
+        })
 }
 
 /// What is wrong with building here, when the project's toolchain file asks
@@ -129,16 +145,6 @@ pub fn check_toolchain(root: &Path) -> Option<String> {
     toolchain_problem(wanted, CHANNEL, NUMBER)
 }
 
-/// What is wrong with a package that reaches `Std.Ffi` without having asked
-/// for the feature: `asked` is what its root module's `@!feature(…)`s name.
-pub fn ffi_problem(asked: &[String]) -> Option<String> {
-    (!asked.iter().any(|f| f == "ffi")).then(|| {
-        "`Std.Ffi` is unstable: a package that uses it says so, with `@!feature(ffi)` \
-         at the top of its root module"
-            .to_string()
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,32 +154,31 @@ mod tests {
         for channel in ["stable", "nightly", "dev"] {
             let said = feature_problem("warp", channel).expect("a problem");
             assert!(said.contains("`warp` is not a feature"), "{said}");
-            assert!(said.contains("`ffi`"), "{said}");
+            assert!(said.contains("it has no unstable features"), "{said}");
+
+            let warp = [("warp", "going faster")];
+            let said = problem_among(&warp, "weft", channel).expect("a problem");
+            assert!(said.contains("the ones it has are `warp`"), "{said}");
         }
     }
 
     #[test]
     fn an_unstable_feature_is_refused_on_stable_and_nowhere_else() {
-        let said = feature_problem("ffi", "stable").expect("a problem");
+        let warp = [("warp", "going faster")];
+        let said = problem_among(&warp, "warp", "stable").expect("a problem");
         assert!(said.contains("meadowup default nightly"), "{said}");
-        assert_eq!(feature_problem("ffi", "nightly"), None);
-        assert_eq!(feature_problem("ffi", "dev"), None);
+        assert_eq!(problem_among(&warp, "warp", "nightly"), None);
+        assert_eq!(problem_among(&warp, "warp", "dev"), None);
     }
 
     #[test]
-    fn the_compiler_s_own_build_takes_nightly_s_features_on_stable() {
-        assert_eq!(accepting_on("stable", Some("1")), "nightly");
-        assert_eq!(accepting_on("stable", None), "stable");
-        assert_eq!(accepting_on("stable", Some("yes")), "stable");
-        assert_eq!(accepting_on("dev", Some("1")), "dev");
-    }
-
-    #[test]
-    fn calling_c_is_asked_for_by_name() {
-        let with = vec!["ffi".to_string()];
-        assert_eq!(ffi_problem(&with), None);
-        let said = ffi_problem(&[]).expect("a problem");
-        assert!(said.contains("@!feature(ffi)"), "{said}");
+    fn a_settled_feature_is_taken_on_every_channel_and_said_to_be_settled() {
+        for channel in ["stable", "nightly", "dev"] {
+            assert_eq!(feature_problem("ffi", channel), None);
+        }
+        let said = feature_settled("ffi").expect("a warning");
+        assert!(said.contains("`@!feature(ffi)` can go"), "{said}");
+        assert_eq!(feature_settled("warp"), None);
     }
 
     #[test]

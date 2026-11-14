@@ -351,10 +351,8 @@ runs an entry's program of Cut on Glade and hands back what it answered, and
 `meadow_repl_pages`, which says what the back end makes of it, for `:ir`
 (see the next section).
 
-`Std.Ffi` is unstable, so a stable `meadow` builds MeadowBoot only with
-`MEADOW_BOOTSTRAP=1`, which lets it take what a nightly takes, as
-`RUSTC_BOOTSTRAP` does rustc. A build from a checkout, or a nightly, needs
-nothing.
+`Std.Ffi` is stable, so any `meadow` builds MeadowBoot, a release's as
+well as a nightly or a build from a checkout.
 
 ## What `build` and `run` are told
 
