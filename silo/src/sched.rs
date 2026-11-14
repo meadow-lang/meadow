@@ -337,9 +337,30 @@ pub fn let_go_var(at: usize) {
     }
 }
 
+/// Held by whoever is letting go of what nothing can reach, from taking a
+/// list to dropping the last of what was on it: see [`forget_all`].
+static FORGETTING: Mutex<()> = Mutex::new(());
+
+/// [`FORGETTING`], unless somebody else has it -- then they are already
+/// letting go of what is on the lists, and keep at it until they are empty.
+fn forgetting() -> Option<std::sync::MutexGuard<'static, ()>> {
+    match FORGETTING.try_lock() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 /// Let go of the values of the `TVar`s nothing can reach. Takes no lock but
-/// each cell's own, so it may be called from wherever no cell's is held.
+/// each cell's own and [`FORGETTING`], which it only tries, so it may be
+/// called from wherever no cell's is held.
 pub fn forget_vars() {
+    if let Some(_forgetting) = forgetting() {
+        forgetting_vars();
+    }
+}
+
+fn forgetting_vars() {
     // A value let go of may hold the last handles to other `TVar`s, which
     // puts them on the list in turn: until it is empty.
     loop {
@@ -395,22 +416,42 @@ pub fn let_go(tid: u32) {
 /// Let go of what the threads nobody can await answered. Called with the
 /// scheduler's lock not held: the answers are dropped once it is released.
 pub fn forget() {
-    forget_vars();
-    let gone = std::mem::take(&mut *FORGOTTEN.lock().unwrap_or_else(|p| p.into_inner()));
-    if gone.is_empty() {
-        return;
+    if let Some(_forgetting) = forgetting() {
+        forgetting_all();
     }
-    let answers: Vec<_> = {
-        let mut w = world();
-        gone.iter()
-            .filter_map(|t| {
-                let task = w.tasks.get_mut(*t as usize)?;
-                task.nobody = true;
-                task.outcome.take()
-            })
-            .collect()
-    };
-    drop(answers);
+}
+
+/// Let go of everything nothing can reach, as [`forget`] does -- but waiting
+/// for whoever is letting go already, rather than leaving it to them. For the
+/// leak check at exit, which counts the regions left: a worker that took the
+/// lists a moment before `main` finished may still be dropping what was on
+/// them, and every region it has yet to drop was counted as left behind.
+pub fn forget_all() {
+    let _forgetting = FORGETTING.lock().unwrap_or_else(|p| p.into_inner());
+    forgetting_all();
+}
+
+fn forgetting_all() {
+    // An answer let go of may hold the last handles to `TVar`s and to other
+    // threads, which puts them on the lists in turn: until both are empty.
+    loop {
+        forgetting_vars();
+        let gone = std::mem::take(&mut *FORGOTTEN.lock().unwrap_or_else(|p| p.into_inner()));
+        if gone.is_empty() {
+            return;
+        }
+        let answers: Vec<_> = {
+            let mut w = world();
+            gone.iter()
+                .filter_map(|t| {
+                    let task = w.tasks.get_mut(*t as usize)?;
+                    task.nobody = true;
+                    task.outcome.take()
+                })
+                .collect()
+        };
+        drop(answers);
+    }
 }
 
 /// A channel: what has been sent and not yet taken, and the threads waiting

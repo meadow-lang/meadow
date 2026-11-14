@@ -392,8 +392,10 @@ pub unsafe extern "C" fn meadow_run(
             // first, as it would when its context goes.
             main_ctx.regions.settle();
             // And the answers of threads nobody can await any more, which
-            // the scheduler lets go of when it next looks.
-            sched::forget();
+            // the scheduler lets go of when it next looks, and the values of
+            // `TVar`s nothing can reach -- waiting for a worker still letting
+            // go of some, which is not done with them just because `main` is.
+            sched::forget_all();
             eprintln!("aot: {} regions live at exit", region::live());
             for (refs, n, words) in region::census().iter().take(12) {
                 eprintln!(

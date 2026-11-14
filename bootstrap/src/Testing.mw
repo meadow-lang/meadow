@@ -1,0 +1,460 @@
+-- `meadow test`: a package's `@test` functions, compiled by this compiler and
+-- run as the Rust `meadow test` runs them (`buildtools/meadow/src/test.rs`),
+-- saying what it says.
+--
+-- The package is built with `@cfg(test)` holding in it, entered at what runs
+-- one test (`Tests`); `--std` builds the standard library by itself the same
+-- way, and its tests are run beside the package's, or alone when no package
+-- is named. The back end makes the program ready once -- its bytecode kept,
+-- or an executable linked -- and each test is then a run of it of its own,
+-- told which test to run and where to write how it went. So a test that
+-- stops at a runtime error fails alone, with what stopped it, as the Rust
+-- runner's do; and what a test prints is the run's, kept to be shown beside
+-- it if it fails (`--no-capture` lets it through as it comes). Runs go side
+-- by side, as many as `--test-threads` says -- one a core, unless
+-- `MEADOW_TEST_THREADS` says otherwise -- each said as it finishes, and the
+-- failures, at the end, in the order the tests are declared.
+--
+-- `--cek` runs them on this compiler's CEK machine, in this process: the
+-- units' core linked into one program, and the root module's
+-- `meadowTestsOneQ` asked for each test -- `meadowTestsKeptQ` where what it
+-- writes is kept, which a handler of the program's own does. The machine
+-- holds cells that cannot cross to another thread, so its tests run one
+-- after another.
+
+use MeadowBoot.Tests as Tests
+use MeadowBoot.Unit (packageOf, absolute, stdDir)
+use MeadowBoot.Compiler (
+  buildUnits, givenUnits, cekDatabase, compilerWhole, compilerInferred, Interface, hostOs
+)
+use MeadowBoot.Core (linkedUnits, CoreProgram, coreFilePackage)
+use MeadowBoot.Cek as Cek
+use MeadowBoot.Cek (Value, Machine)
+use MeadowBoot.Scopes (Export)
+use Lingua.Make (linkDirIn, unitImports, unitSources, Given)
+use Std.Collections.Vector as V
+use Std.Collections.HashMap as H
+use Std.String as S
+use Std.Path as Path
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+use Std.Result as Res
+use Std.Result.Result.*
+use Std.Fs (readToString, removeFile, createDirAll, exists, isDir)
+use Std.Console (writeOutput, writeError)
+use Std.Process (exit, getEnv, isTerminal)
+use Std.Process as Proc
+use Std.Thread (spawn, await, newChannel, send, receive)
+use Std.Time (monotonic)
+
+-- What `meadow test` was asked: the package, which tests, how to run them,
+-- and how to build them -- the profile, its optimisation level, the options
+-- over it, `--cfg`'s flags, the runtime and whether Glade's program is
+-- compiled ahead of time.
+@pub record Asked = {
+  path : Maybe String,
+  filter : Maybe String,
+  exact : Bool,
+  std : Bool,
+  threads : Maybe Int,
+  noCapture : Bool,
+  cek : Bool,
+  profile : String,
+  level : Int,
+  pairs : [(String, String)],
+  flags : [String],
+  runtime : String,
+  ahead : Bool
+}
+
+-- How one test went: whether it failed, why, and what it wrote that was
+-- kept.
+record Told = {
+  failed : Bool,
+  why : String,
+  output : String,
+  -- What it wrote to standard error, which is passed on as it is, never kept.
+  errors : String
+}
+
+-- What runs the tests of one built package: the CEK machine over its program,
+-- with where the root module's two functions are; or a program, what it is
+-- given before each test's arguments, and where the tests write how they
+-- went.
+data Runner
+  = OnCek Machine Int Int
+  | Run String [String] String
+
+use Runner.*
+
+-- Each test to run: its name, the runner it is one of, and its number there.
+record Case = {
+  name : String,
+  runner : Int,
+  index : Int
+}
+
+-- `meadow test`, as asked; `backEnd` runs the Rust back end's command line,
+-- and `program` is what runs it as a process of its own.
+@pub fun runTests (a : Asked) backEnd (program : String) =
+  let started = monotonic () in
+  let place = absolute (M.unwrapOr "." a.path) in
+  -- `--std` from anywhere that is no package tests the standard library
+  -- alone, as `meadow test --std` does.
+  let stdOnly = a.std and not (isPackage place) in
+  let package =
+    if stdOnly then None else if S.endsWith ".mw" place then packageOf place else Just place
+  in
+  let std = if a.std then stdDir () else None in
+  if not stdOnly and M.isNone package then
+    (let u = writeError "meadowboot: `${place}` is in no package\n" in exit 1)
+  else if a.std and M.isNone std then
+    (let u =
+       writeError
+         "meadowboot: the standard library's sources are not where `MEADOWBOOT_STD` says, nor beside this program\n"
+     in exit 1)
+  else
+    -- The standard library's tests first, as the Rust runner has them: it is
+    -- linked first.
+    let roots =
+      V.concat [M.unwrapOr [] (M.map (\s -> [s]) std), M.unwrapOr [] (M.map (\p -> [p]) package)]
+    in
+    let pairs = V.concat [a.pairs, [("test", "true"), ("entry", Tests.runner)]] in
+    let built = V.all (\r -> buildUnits a.profile pairs r) roots in
+    if not built then exit 1
+    else
+      let runners = V.map (\r -> readied a backEnd program r) roots in
+      match V.find (\x -> Res.isErr x) runners with
+      | Just (Err why) -> (let u = writeError "meadowboot: ${why}\n" in exit 1)
+      | _ ->
+          let ready = V.concatMap (\x -> match x with | Ok r -> [r] | Err _ -> []) runners in
+          let cases =
+            V.filter
+              (\(c : Case) -> wanted a c.name)
+              (V.concatMap
+                 (\k ->
+                   let root = V.getOr "" roots k in
+                   let names =
+                     (match givenUnits a.profile root root with
+                      | Ok (u : Given Interface) -> Tests.testNames root (unitSources u)
+                      | Err _ -> [])
+                   in V.map
+                        (\i -> Case { name = V.getOr "" names i, runner = k, index = i })
+                        (V.range 0 (V.len names)))
+                 (V.range 0 (V.len roots)))
+          in
+          let total = V.len cases in
+          let u1 =
+            writeError
+              "    Finished `test` profile [O${show a.level}, ${engineOf a}] in ${elapsed (monotonic () - started)}\n"
+          in
+          let u2 =
+            writeError "     Running ${show total} test${if total == 1 then "" else "s"}\n"
+          in
+          let u3 = writeOutput "running ${show total} test${if total == 1 then "" else "s"}\n" in
+          if total == 0 then
+            (let u = writeOutput "\ntest result: ${paint "ok" "32"}. 0 passed; 0 failed\n" in ())
+          else
+            let told = ranAll a ready cases in
+            let failures =
+              V.concatMap
+                (\i ->
+                  match (V.get cases i, V.get told i) with
+                  | (Just (c : Case), Just (t : Told)) -> if t.failed then [(c.name, t)] else []
+                  | _ -> [])
+                (V.range 0 total)
+            in
+            let u4 =
+              (if V.isEmpty failures then ()
+               else
+                 writeOutput
+                   (S.join
+                      ""
+                      (V.concat [
+                         ["\nfailures:\n\n"],
+                         V.map (\f -> failureText (fst f) (snd f)) failures
+                       ])))
+            in
+            let passed = total - V.len failures in
+            let u5 =
+              writeOutput
+                "\ntest result: ${if V.isEmpty failures then paint "ok" "32" else paint "FAILED" "31"}. ${show passed} passed; ${show (V.len failures)} failed\n"
+            in if V.isEmpty failures then () else exit 1
+
+-- A failed test as the Rust runner shows it: its name, why, and what it
+-- wrote, if it wrote anything.
+fun failureText (name : String) (t : Told) : String =
+  let shown =
+    if S.isEmpty t.output then ""
+    else "---- ${name} output ----\n${t.output}${if S.endsWith "\n" t.output then "" else "\n"}"
+  in "---- ${name} ----\n${t.why}\n${shown}\n"
+
+-- Whether the test named `name` is one the filter asks for: whose name holds
+-- it, or with `--exact` is it.
+fun wanted (a : Asked) (name : String) : Bool =
+  match a.filter with
+  | None -> True
+  | Just f -> if a.exact then name == f else S.contains f name
+
+-- Whether `path` is something a build would take for a package: a `.mw`
+-- file, or a directory with a manifest or a `src`.
+fun isPackage (path : String) =
+  S.endsWith ".mw" path or exists (Path.join path "Meadow.toml") or isDir (Path.join path "src")
+
+-- What runs the tests, as the Rust runner's `Finished` line names it.
+fun engineOf (a : Asked) : String =
+  if a.cek then "cek"
+  else if a.runtime == "silo" then "silo"
+  else if a.ahead then "glade aot"
+  else "glade jit"
+
+-- How long something took, as `meadow` says it: `0.42s`, or `1m 05s`.
+fun elapsed (nanos : Int) : String =
+  let ms = nanos / 1000000 in
+  if ms < 60000 then "${show (ms / 1000)}.${twoDigits ((ms % 1000) / 10)}s"
+  else "${show (ms / 60000)}m ${twoDigits ((ms / 1000) % 60)}s"
+
+fun twoDigits (n : Int) : String = if n < 10 then "0${show n}" else show n
+
+-- `text` coloured `code`, where standard output is a terminal that wants it.
+fun paint (text : String) (code : String) =
+  if isTerminal 1 and M.isNone (getEnv "NO_COLOR") then "\u{1b}[${code}m${text}\u{1b}[0m" else text
+
+-- --- making the program ready ----------------------------------------------
+
+-- What runs the tests of the package at `root`, which is built: the CEK
+-- machine over its program, or the program the back end made of it.
+fun readied (a : Asked) backEnd (program : String) (root : String) =
+  let link = linkDirIn root a.profile in
+  let cut = Path.join link "program.cut" in
+  let scratch = Path.join link "tests" in
+  let made = createDirAll scratch in
+  if a.cek then onCek a root
+  else
+    let level = ["-O", show a.level] in
+    let exe = if hostOs == "windows" then "program.exe" else "program" in
+    let native = Path.joinAll [link, "target", "release", "native"] in
+    if a.runtime == "silo" then
+      (match backEnd (V.concat [["cut", cut, "--runtime", "silo", "--no-run"], level]) with
+       | Ok 0 -> Ok (Run (Path.joinAll [native, "silo", exe]) [] scratch)
+       | Ok code -> Err "the back end could not build the tests: it ended with ${show code}"
+       | Err why -> Err "the back end could not be run: ${why}")
+    else if a.ahead then
+      (match backEnd (V.concat [["cut", cut, "--aot", "--no-run"], level]) with
+       | Ok 0 -> Ok (Run (Path.join native exe) [] scratch)
+       | Ok code -> Err "the back end could not build the tests: it ended with ${show code}"
+       | Err why -> Err "the back end could not be run: ${why}")
+    else
+      -- Lowered once, and its bytecode kept beside it for every run after.
+      match backEnd ["cut", cut, "--no-run"] with
+      | Ok 0 -> Ok (Run program ["cut", cut, "--"] scratch)
+      | Ok code -> Err "the back end could not lower the tests: it ended with ${show code}"
+      | Err why -> Err "the back end could not be run: ${why}"
+
+-- The package at `root`, and every unit it is made with, as one program of
+-- core on the CEK machine, `@cfg(test)` holding in the package; and where
+-- the root module's two functions are in it.
+fun onCek (a : Asked) (root : String) =
+  let made =
+    V.concatMap
+      (\dir ->
+        match givenUnits a.profile root dir with
+        | Ok u ->
+            (let db = cekDatabase u (dir == root) a.flags in
+             match (compilerWhole db 0, compilerInferred db 0) with
+             | (Just core, (_, exports, _, _)) -> [Ok (dir, core, exports)]
+             | _ -> [Err "${dir} has no core"])
+        | Err why -> [Err "${dir}: ${why}"])
+      (unitsUnder a.profile root [root] [])
+  in
+  let missing = V.concatMap (\x -> match x with | Err why -> [why] | Ok _ -> []) made in
+  let units = V.concatMap (\x -> match x with | Ok y -> [y] | Err _ -> []) made in
+  if not (V.isEmpty missing) then Err (S.join "; " missing)
+  else
+    match linkedUnits (V.map (\x -> match x with | (_, core, _) -> core) units) with
+    | (whole, table) ->
+        let mine = V.find (\x -> match x with | (dir, _, _) -> dir == root) units in
+        let placeOf =
+          \name ->
+            M.andThen
+              (\x ->
+                match x with
+                | (_, (CoreProgram ar file), exports) ->
+                    M.andThen
+                      (\(e : Export) ->
+                        H.lookup "meadow:${coreFilePackage ar file}/d${show e.binder}" table)
+                      (V.find
+                         (\(e : Export) -> e.kind == "v" and e.name == name and V.isEmpty e.module)
+                         exports))
+              mine
+        in match (placeOf Tests.oneTest, placeOf Tests.keptTest) with
+           | (Just one, Just kept) -> Ok (OnCek (Cek.machine whole) one kept)
+           | _ -> Err "the program of `${root}`'s tests has nothing that runs them"
+
+-- Every unit the units `todo` of the build at `root` are made with, and
+-- they themselves, each once, each after what it is made with.
+fun unitsUnder (profile : String) (root : String) (todo : [String]) (seen : [String]) =
+  match V.get todo 0 with
+  | None -> V.reverse seen
+  | Just dir ->
+      if V.elem dir seen then unitsUnder profile root (V.drop todo 1) seen
+      else
+        let more =
+          (match givenUnits profile root dir with
+           | Ok (u : Given Interface) -> V.map fst (unitImports u)
+           | Err _ -> [])
+        in unitsUnder profile root (V.append (V.drop todo 1) more) (V.pushBack seen dir)
+
+-- --- running them -----------------------------------------------------------
+
+-- Each case run, `--test-threads` at a time, each said as it finishes; what
+-- came of each, in the order of `cases`.
+fun ranAll (a : Asked) (ready : [Runner]) (cases : [Case]) =
+  let capture = not a.noCapture in
+  let total = V.len cases in
+  let one =
+    \k ->
+      (match V.get cases k with
+       | Just (c : Case) ->
+           (match V.get ready c.runner with
+            | Just r -> ranCase r capture k c.index
+            | None -> Told { failed = True, why = "it has no program", output = "", errors = "" })
+       | None -> Told { failed = True, why = "no such test", output = "", errors = "" })
+  in
+  -- Each said as it finishes: what it wrote to standard error first, and,
+  -- not kept, what it wrote to standard output, which is then not shown
+  -- again beside a failure.
+  let said =
+    \k (t : Told) ->
+      (let name = M.unwrapOr "?" (M.map (\(c : Case) -> c.name) (V.get cases k)) in
+       let o = if capture or S.isEmpty t.output then () else writeOutput t.output in
+       let e = if S.isEmpty t.errors then () else writeError t.errors in
+       let w =
+         writeOutput
+           "test ${name} ... ${if t.failed then paint "FAILED" "31" else paint "ok" "32"}\n"
+       in if capture then t else Told { failed = t.failed, why = t.why, output = "", errors = "" })
+  in
+  let onCek = V.any (\r -> match r with | OnCek _ _ _ -> True | _ -> False) ready in
+  if onCek then V.map (\k -> said k (one k)) (V.range 0 total)
+  else
+    let threads = clampTo 1 total (M.unwrapOr (testThreads ()) (M.andThen positive a.threads)) in
+    let jobs = newChannel () in
+    let results = newChannel () in
+    let queued = V.foldl (\u k -> send jobs k) () (V.range 0 total) in
+    let stops = V.foldl (\u k -> send jobs (0 - 1)) () (V.range 0 threads) in
+    let workers = V.map (\w -> spawn (\() -> worker jobs results one)) (V.range 0 threads) in
+    let heard =
+      V.foldl
+        (\acc n ->
+          match receive results with
+          | (k, (t : Told)) -> H.insert k (said k t) acc)
+        H.empty
+        (V.range 0 total)
+    in
+    let joined = V.foldl (\u w -> await w) () workers in
+    V.map
+      (\k ->
+        M.unwrapOr
+          (Told { failed = True, why = "it did not finish", output = "", errors = "" })
+          (H.lookup k heard))
+      (V.range 0 total)
+
+-- Take the next case from `jobs` and run it, until told to stop.
+fun worker jobs results one =
+  let k = receive jobs in
+  if k < 0 then ()
+  else
+    (let t = one k in
+     let u = send results (k, t) in
+     worker jobs results one)
+
+fun positive (n : Int) : Maybe Int = if n > 0 then Just n else None
+
+fun clampTo (low : Int) (high : Int) (n : Int) : Int =
+  if n > high then (if high < low then low else high) else if n < low then low else n
+
+-- How many tests run at once when nobody says: `MEADOW_TEST_THREADS`, or one
+-- a core, as the Rust runner has it.
+fun testThreads () =
+  match M.andThen (\n -> M.andThen positive (S.toInt n)) (getEnv "MEADOW_TEST_THREADS") with
+  | Just n -> n
+  | None -> cores ()
+
+-- How many cores this machine has: what Windows says, or `getconf`.
+fun cores () =
+  match M.andThen S.toInt (getEnv "NUMBER_OF_PROCESSORS") with
+  | Just n -> n
+  | None ->
+      (match Proc.run "getconf" ["_NPROCESSORS_ONLN"] with
+       | Ok (0, out, _) -> M.unwrapOr 1 (S.toInt (S.trim out))
+       | _ -> 1)
+
+-- Test `index` of runner `r`, run as case `k`.
+fun ranCase (r : Runner) (capture : Bool) (k : Int) (index : Int) =
+  match r with
+  | OnCek m one kept -> onMachine m one kept capture index
+  | Run exe before scratch ->
+      let file = Path.join scratch "${show k}.told" in
+      let cleared = removeFile file in
+      let args = V.concat [before, [file, show index]] in
+      -- What it writes is the run's, kept, whether or not it is shown as it
+      -- came (`ranAll`): the error a run stopped at is the last of it.
+      match Proc.run exe args with
+      | Err why -> notRun why
+      | Ok (code, out, err) -> toldBy file code out err
+
+fun notRun (why : String) : Told =
+  Told { failed = True, why = "the test could not be run: ${why}", output = "", errors = "" }
+
+-- How a run of one test went, by what it wrote to `file`: `ok`, or `FAILED`
+-- and why. A run that wrote nothing stopped before it could, and why is the
+-- error it stopped with, the last line of what it wrote to standard error.
+fun toldBy (file : String) (code : Int) (out : String) (err : String) =
+  match readToString file with
+  | Ok "ok" -> Told { failed = False, why = "", output = out, errors = err }
+  | Ok text if S.startsWith "FAILED\n" text ->
+      Told { failed = True, why = S.drop text 7, output = out, errors = err }
+  | _ ->
+      let lines = V.filter (\l -> not (S.isEmpty (S.trim l))) (S.lines err) in
+      let last = V.getOr "" lines (V.len lines - 1) in
+      let why =
+        if S.startsWith "error: " last then S.drop last 7
+        else if S.isEmpty last then "it stopped, with status ${show code}"
+        else last
+      in
+      let rest = S.join "" (V.map (\l -> l ++ "\n") (V.take lines (V.len lines - 1))) in
+      Told { failed = True, why, output = out, errors = rest }
+
+-- Test `index` on the CEK machine: its answer read, or what stopped it.
+fun onMachine (m : Machine) (one : Int) (kept : Int) (capture : Bool) (index : Int) =
+  match Cek.call m (if capture then kept else one) [Value.Int index] with
+  | Err why -> Told { failed = True, why, output = "", errors = "" }
+  | Ok v ->
+      let answered =
+        (if capture then
+           (match v with
+            | Value.Tuple parts ->
+                M.andThen
+                  (\verdict ->
+                    M.map (\out -> (verdict, out)) (M.andThen Cek.textOf (V.get parts 1)))
+                  (M.andThen verdictOf (V.get parts 0))
+            | _ -> None)
+         else M.map (\verdict -> (verdict, "")) (verdictOf v))
+      in match answered with
+         | Just ((failed, why), out) -> Told { failed, why, output = out, errors = "" }
+         | None ->
+             Told {
+               failed = True,
+               why = "the test answered ${Cek.display v}",
+               output = "",
+               errors = ""
+             }
+
+-- Whether a test failed, and why, as `meadowTestsOneQ` answers it.
+fun verdictOf (v : Value) : Maybe (Bool, String) =
+  match v with
+  | Value.Tuple parts ->
+      (match (V.get parts 0, M.andThen Cek.textOf (V.get parts 1)) with
+       | (Just (Value.Bool failed), Just why) -> Just (failed, why)
+       | _ -> None)
+  | _ -> None

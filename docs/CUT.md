@@ -20,10 +20,11 @@ end. What does reach it is described here, and nothing else is.
 7. [Primitives](#primitives)
 8. [Effects](#effects)
 9. [Tail recursion modulo context](#tail-recursion-modulo-context)
-10. [AxCut: the lower IR](#axcut-the-lower-ir)
-11. [Evidence](#evidence)
-12. [Versions](#versions)
-13. [Open questions](#open-questions)
+10. [Positions and names: a program to debug](#positions-and-names-a-program-to-debug)
+11. [AxCut: the lower IR](#axcut-the-lower-ir)
+12. [Evidence](#evidence)
+13. [Versions](#versions)
+14. [Open questions](#open-questions)
 
 ## Two IRs
 
@@ -142,7 +143,9 @@ meadow:Std/Maybe.Just
 ```
 
 `/` ends the package, so a version's dots and hyphens, and a lower-case name in
-a package's root module, are never mistaken for one another. Within the path,
+a package's root module, are never mistaken for one another. A package's name
+is letters, digits and `_`, `-`, `.`, `+` and `:`: the last for a prompt, whose
+entries are packages of their own, `meadow:repl:3/d0`. Within the path,
 segments are separated by `.`, as Meadow writes paths. A segment that is not
 a plain identifier, such as an operator, a constructor like `(::)`, or a name
 with a prime, is quoted. A language's standard library has no version.
@@ -455,7 +458,11 @@ parameters.
 need, written after its representation with `@`: `x: ptr @once`,
 `x: ptr @0..1`. Idyll's grades are the intended source, for Silo's
 linearisation to skip uniqueness checks or place drops. v0 parses and ignores
-them.
+them. One hint is read: `@"name" "type"`, what the source calls the binder,
+for a debugger (see [Positions and names](#positions-and-names-a-program-to-debug)).
+
+A statement may be written at a position, `@S:a-b s`, which does nothing but
+say where `s` came from: see the same section.
 
 The **reference interpreter** runs Cut directly, by cut elimination: a cut of a
 constructor against a `case` picks the arm, a cut of a `μ` against a consumer
@@ -904,6 +911,77 @@ renaming its own unit, as it did before.
 `MEADOW_CUT_TRMC=0` leaves the rewrite out, to measure it by;
 `meadow cut --emit inlined` prints the twins.
 
+## Positions and names: a program to debug
+
+The Rust front end's core marks where a person wrote what it is compiled
+from (`meadow_core::Term::Loc`), and Glade's code generator turns those marks
+into the debug information `meadow dap` steps by. A program a front end hands
+the back end as Cut says the same of itself, so that the back end can step a
+program of any front end's: MeadowBoot's, whose debugger otherwise has only
+its own interpreter to run on.
+
+```text
+source meadow:App/"src/Main.mw" = "/home/me/App/src/Main.mw"
+
+def meadow:App/d12f @"double" (v3: i64 @"x" "Int"; k: ptr) =
+  @meadow:App/"src/Main.mw":15-20 prim add(v3, v3; k)
+```
+
+- **`source S = "path"`** declares a file positions are in, by a symbol.
+  It is a symbol so that programs put together text by text, as MeadowBoot
+  links the objects of its units, name their files apart: a package's own
+  are under its own name. A program may declare one more than once, with one
+  path, and a position in a file nothing declares is refused.
+- **`@S:a-b s`** is the statement `s`, written at bytes `a` to `b` of the
+  file `S` names. It does nothing. A debugger stops before the first
+  instruction of a position, so a front end puts one where a person expects a
+  step to stop: where the Rust core puts its marks -- a call, a function's
+  body, a branch of an `if` and an arm of a `match`, a `let` that computes,
+  a top-level value's body.
+- **`x: rep @"name" "type"`** says what the source calls the binder `x`, and
+  its type as the front end writes types; the type may be left out. A
+  debugger shows a value by these. `def S @"name"` and `val S @"name"` say
+  the same of a declaration, which a stack is shown by, and
+  `apply @"name"(..) => s` of the function a method is part of: a local
+  function, which a front end makes an object of, and the Rust core lifts out
+  as a definition of its own (`mainLocal1`).
+
+In memory, a position is `Statement::At(Pos, s)` (`Pos` is a source's place
+among `Program::sources` and the two offsets), a name `Binder::shown`, and a
+declaration's or a method's `Def::shown`, `Val::shown` and `Method::shown`.
+
+**Through the passes.** Every pass keeps them: `specialize`, `inline` and
+`trmc` look under a position for the shapes they rewrite, so that a program
+with positions is rewritten as it would be without; an inlined definition
+keeps its positions, which name their own file; a copy and a twin are shown
+by the name of what they were made of. The lowering makes each position an
+AxCut `Mark`, as `meadow_seq` makes a core mark one, and records which AxCut
+name each shown binder became (`lower::Map::shown`) and what each block's
+definition is shown as (`Map::titles`) and each shown method's
+(`Map::methods`, by the evidence its block alone takes). Glade's code
+generator, compiling
+with debug information, writes the same line, scope and register tables
+from them that it writes for the Rust front end.
+
+**Not when running.** `meadow cut`, building or running, takes all of it off
+first (`meadow_cut::strip`), so a program built to be debugged compiles to
+what it would have without, to the byte -- Glade's bytecode and Silo's LLVM
+alike, which `buildtools/meadow/tests/dap_cut.rs` checks. A statement under a
+position is one more shape for a pass to look through, and nothing a program
+runs should depend on each pass having done so. `meadow-cut`'s own tests check
+the stronger thing anyway: every program of `tests/programs.rs`, with a
+position on every statement and a name on every binder, reads back as
+printed, answers what it answers without, is rewritten by the passes to the
+same program once they are taken off, and compiles to the same bytecode.
+
+**Debugging one.** `meadow::dap::session::Session::launch_cut` builds a
+program of Cut for debugging, lowered by `lower::debuggable`: copied for its
+representations and given its twins, as a debug build of Meadow's is, but
+with nothing inlined, since a call inlined is not one to step into.
+`meadow-host` hands a session to whoever holds it open (`meadow_debug`, JSON
+in and out; `meadow::dap::hosted` says what it takes), which is how
+MeadowBoot's debug adapter runs the program it built on Glade.
+
 ## AxCut: the lower IR
 
 AxCut's statements are listed in `meadow-axcut` (`Statement`, `Extern`), and
@@ -972,7 +1050,9 @@ The first line of either IR's text is its name and version: `cut 0`,
 `axcut 0`. A reader refuses a version it does not know rather than guessing,
 and says which it found. Adding a primitive or a runtime operation does not
 change the version, since an old reader refuses the unknown name. Changing a
-statement, a representation, or what the table means does.
+statement, a representation, or what the table means does. Positions,
+`source` and shown names are still `cut 0`: a reader that does not know them
+refuses a program that has them, and one with none is the program it was.
 
 ## Open questions
 

@@ -1,0 +1,1008 @@
+-- Find: a declaration found by name or by type -- `meadow_find`'s search,
+-- which the language server's workspace symbols answer with.
+--
+-- What is searched is a list of declarations (`Decl`): every value,
+-- function, constructor, type, trait and effect a program can reach, each
+-- with its signature and where it was written. A query is read one of two
+-- ways, as `meadow_find::Query::parse` reads it:
+--
+-- - **By name**, fuzzily, as the Rust server's `nucleo` matcher scores it:
+--   `len` finds `length`. A query with a `.` or a space in it is matched
+--   against the qualified name, so `vec len` finds `length` in
+--   `Std.Collections.Vector`.
+-- - **By type**, as Hoogle does, when the query is a type rather than a
+--   name: it has an arrow in it, or starts with `:`. `[a] -> Int` finds
+--   `length`. A match is a unification of the query with the declaration's
+--   signature under every way of pairing their arguments, priced as
+--   `meadow_find::shape` prices one: see `costOf`.
+--
+-- The answers are ordered as the Rust index orders them -- best first, the
+-- prelude's before others as good, then the shorter name and the shorter
+-- module -- so that the same query finds the same declarations in the same
+-- order from either compiler.
+
+use MeadowBoot.Types (Type, Scheme, Pred, spelling)
+use MeadowBoot.Types.Type.*
+use Std.Collections.Vector as V
+use Std.Collections.HashMap as H
+use Std.Collections.HashMap (HashMap)
+use Std.String as S
+use Std.Char as C
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+use Std.Sort (sortBy)
+use Std.Ordering (Ordering)
+use Std.Ordering.Ordering.*
+
+-- --- declarations ------------------------------------------------------------
+
+-- One thing a program can name: as a program writes it (`length`, `(++)`);
+-- the module it is declared in, by its dotted path, and its package; what it
+-- is (`kindNames`); for a value its type as a signature writes it, and for a
+-- type its declaration on one line; its type as a search compares it;
+-- whether a program names it with no `use`; and where it was written -- its
+-- file as a dump names it, and the bytes of its name there.
+@pub record Decl = {
+  name : String,
+  module : String,
+  package : String,
+  kind : String,
+  detail : String,
+  shape : Maybe Sig,
+  prelude : Bool,
+  file : String,
+  from : Int,
+  to : Int
+}
+
+-- What a declaration can be, as `meadow_find::Kind` says.
+@pub def kindNames : [String] =
+  [
+    "function", "value", "macro", "method", "operation", "constructor", "type", "record", "alias",
+    "trait", "effect", "pattern"
+  ]
+
+-- Something with a type of its own, that a program can use as a value.
+@pub fun isValue (kind : String) : Bool =
+  V.elem kind ["function", "value", "macro", "method", "operation", "constructor", "pattern"]
+
+-- `Std.Collections.Vector.length`.
+@pub fun qualified (d : Decl) : String =
+  if S.isEmpty d.module then d.name else "${d.module}.${d.name}"
+
+-- One line saying what it is: `length : [a] -> Int` for a value, the
+-- declaration itself for a type.
+@pub fun headline (d : Decl) : String =
+  if isValue d.kind then "${d.name} : ${d.detail}" else d.detail
+
+-- A scheme as a signature writes it: the compiler's `forall a b.` in front
+-- left off, since a type variable is quantified by being written.
+@pub fun signatureOf (shown : String) : String =
+  if S.startsWith "forall " shown then
+    match S.indexOf ". " shown with
+    | Just at -> S.drop shown (at + 2)
+    | None -> shown
+  else shown
+
+-- `text` on one line, and no longer than `max` characters.
+@pub fun oneLine (text : String) (max : Int) : String =
+  let words = V.filter (\w -> not (S.isEmpty w)) (splitSpace text) in
+  let s = S.join " " words in
+  if S.charLength s > max then S.fromChars (V.take (S.chars s) (max - 1)) ++ "…" else s
+
+fun splitSpace (text : String) : [String] =
+  S.split " " (S.fromChars (V.map (\c -> if C.isSpace c then ' ' else c) (S.chars text)))
+
+-- --- types, as a search sees them ---------------------------------------------
+
+-- A type, as simple as matching makes do with: a variable, numbered within
+-- its signature; a named type applied to its arguments, spelled as written
+-- (`Vector a` for `[a]`); a function taken or returned as a value, its
+-- arguments flattened; a tuple; a record, its fields sorted by label; and
+-- anything at all -- `_`, what is not typed yet, a row.
+@pub data Ty
+  = TVar Int
+  | TCon String [Ty]
+  | TFun [Ty] Ty
+  | TTuple [Ty]
+  | TRecord [(String, Ty)]
+  | TAny
+
+use Ty.*
+
+-- A signature flattened for comparison: the traits it asks for, its
+-- arguments in order, and its result.
+@pub record Sig = {
+  context : [String],
+  args : [Ty],
+  result : Ty
+}
+
+-- Where a scheme's unsolved meta variables are numbered from, clear of its
+-- quantified ones; and a declaration's, while it is matched, clear of the
+-- query's.
+def metaBase : Int = 65536
+
+def declBase : Int = 16777216
+
+-- A top-level scheme, as a search compares it.
+@pub fun sigOf (s : Scheme) : Sig =
+  match flatten s.ty with
+  | (args, result) -> Sig { context = V.map (\(p : Pred) -> spelling p.tr) s.preds, args, result }
+
+fun flatten (t : Type) : ([Ty], Ty) =
+  match t with
+  | Fun ps r _ ->
+      (match flatten r with
+       | (rest, result) -> (V.append (V.map tyOf ps) rest, result))
+  | _ -> ([], tyOf t)
+
+fun tyOf (t : Type) : Ty =
+  match t with
+  | Bound i -> TVar i
+  | Var v -> TVar (metaBase + v)
+  | Con name args -> TCon (spelling name) (V.map tyOf args)
+  | Fun _ _ _ -> (match flatten t with | (args, result) -> TFun args result)
+  | Tuple items -> TTuple (V.map tyOf items)
+  | Record row -> TRecord (sortFields (rowFields row []))
+  | _ -> TAny
+
+fun rowFields (t : Type) (acc : [(String, Ty)]) : [(String, Ty)] =
+  match t with
+  | RowExtend label field rest -> rowFields rest (V.pushBack acc (label, tyOf field))
+  | _ -> acc
+
+fun sortFields (fields : [(String, Ty)]) : [(String, Ty)] =
+  V.map
+    (\x -> match x with | (f, _) -> f)
+    (sortBy
+       (\a b ->
+         match (a, b) with
+         | (((la, _), ia), ((lb, _), ib)) ->
+             (match S.compare la lb with | Equal -> compare ia ib | o -> o))
+       (V.zip fields (V.range 0 (V.len fields))))
+
+-- --- a query, as somebody types it ---------------------------------------------
+
+-- What somebody typed: nothing yet, a name, or a type.
+@pub data Query = Empty | Named String | Typed Sig
+
+use Query.*
+
+-- A type when it looks like one -- an arrow, a `=>`, or a leading `:` to
+-- say so outright -- and a name otherwise.
+@pub fun queryOf (text : String) : Query =
+  let t = S.trim text in
+  if S.isEmpty t then Empty
+  else if S.startsWith ":" t then
+    (let rest = S.drop t 1 in if S.isEmpty (S.trim rest) then Empty else Typed (parseSig rest))
+  else if S.contains "->" t or S.contains "=>" t then Typed (parseSig t)
+  else Named t
+
+-- The tokens a type is written with.
+data Tok
+  = Arrow
+  | FatArrow
+  | Open
+  | Close
+  | OpenList
+  | OpenArray
+  | Semi
+  | CloseList
+  | OpenBrace
+  | CloseBrace
+  | Comma
+  | Colon
+  | Bang
+  | Upper String
+  | Lower String
+  | Hole
+
+use Tok.*
+
+fun tokEq (a : Tok) (b : Tok) : Bool =
+  match (a, b) with
+  | (Arrow, Arrow) -> True
+  | (FatArrow, FatArrow) -> True
+  | (Open, Open) -> True
+  | (Close, Close) -> True
+  | (OpenList, OpenList) -> True
+  | (OpenArray, OpenArray) -> True
+  | (Semi, Semi) -> True
+  | (CloseList, CloseList) -> True
+  | (OpenBrace, OpenBrace) -> True
+  | (CloseBrace, CloseBrace) -> True
+  | (Comma, Comma) -> True
+  | (Colon, Colon) -> True
+  | (Bang, Bang) -> True
+  | (Hole, Hole) -> True
+  | (Upper x, Upper y) -> x == y
+  | (Lower x, Lower y) -> x == y
+  | _ -> False
+
+fun lexQuery (s : String) : [Tok] = lexFrom (V.toArray (S.chars s)) 0 []
+
+fun lexFrom (cs : #[Char]) (i : Int) (out : [Tok]) : [Tok] =
+  if i >= arrayLen cs then out
+  else
+    let c = arrayGet cs i in
+    let next = if i + 1 < arrayLen cs then Just (arrayGet cs (i + 1)) else None in
+    if C.isSpace c then lexFrom cs (i + 1) out
+    else if c == '-' and next == Just '>' then lexFrom cs (i + 2) (V.pushBack out Arrow)
+    else if c == '=' and next == Just '>' then lexFrom cs (i + 2) (V.pushBack out FatArrow)
+    else if c == '#' and next == Just '[' then lexFrom cs (i + 2) (V.pushBack out OpenArray)
+    else if c == '(' then lexFrom cs (i + 1) (V.pushBack out Open)
+    else if c == ')' then lexFrom cs (i + 1) (V.pushBack out Close)
+    else if c == '[' then lexFrom cs (i + 1) (V.pushBack out OpenList)
+    else if c == ']' then lexFrom cs (i + 1) (V.pushBack out CloseList)
+    else if c == '{' then lexFrom cs (i + 1) (V.pushBack out OpenBrace)
+    else if c == '}' then lexFrom cs (i + 1) (V.pushBack out CloseBrace)
+    else if c == ',' then lexFrom cs (i + 1) (V.pushBack out Comma)
+    else if c == ';' then lexFrom cs (i + 1) (V.pushBack out Semi)
+    else if c == ':' then lexFrom cs (i + 1) (V.pushBack out Colon)
+    else if c == '!' then lexFrom cs (i + 1) (V.pushBack out Bang)
+    else if C.isAlphaNum c or c == '_' then
+      (let stop = wordEnd cs i in
+       let word = S.fromChars (V.map (\k -> arrayGet cs k) (V.range i stop)) in
+       -- `Std.Maybe.Maybe` is `Maybe`: a search matches spellings.
+       let last = M.unwrapOr word (V.last (S.split "." word)) in
+       let tok =
+         if last == "_" then Hole
+         else if C.isUpper (M.unwrapOr 'a' (V.get (S.chars last) 0)) then Upper last
+         else Lower last
+       in lexFrom cs stop (V.pushBack out tok))
+    else lexFrom cs (i + 1) out
+
+fun wordEnd (cs : #[Char]) (i : Int) : Int =
+  if i >= arrayLen cs then i
+  else
+    let c = arrayGet cs i in
+    let dotted = c == '.' and i + 1 < arrayLen cs and C.isAlpha (arrayGet cs (i + 1)) in
+    if C.isAlphaNum c or c == '_' or c == '\'' or dotted then wordEnd cs (i + 1) else i
+
+-- A query read as a signature: the tokens, where reading is, and each
+-- variable's number in the order the query first mentions it.
+record Reading = {
+  toks : #[Tok],
+  at : Int,
+  vars : HashMap String Int
+}
+
+fun peek (r : Reading) : Maybe Tok =
+  if r.at < arrayLen r.toks then Just (arrayGet r.toks r.at) else None
+
+fun eat (r : Reading) (t : Tok) : (Bool, Reading) =
+  match peek r with
+  | Just u -> if tokEq u t then (True, { r | at = r.at + 1 }) else (False, r)
+  | None -> (False, r)
+
+-- Read a type the way it is written in a signature, and forgive whatever has
+-- not been typed yet: `[a] -> ` is a function from `[a]` to anything.
+@pub fun parseSig (query : String) : Sig =
+  let toks = V.toArray (lexQuery query) in
+  let r0 = Reading { toks, at = 0, vars = H.empty } in
+  match contextOf r0 with
+  | (context, r1) ->
+      (match arrow r1 with
+       | (body, _) ->
+           (match body with
+            | TFun args result -> Sig { context, args, result }
+            | other -> Sig { context, args = [], result = other }))
+
+-- `Show a =>` or `(Show a, Ord b) =>`, if the query starts with one: the
+-- names of the traits.
+fun contextOf (r : Reading) : ([String], Reading) =
+  let n = arrayLen r.toks in
+  match V.find (\i -> tokEq (arrayGet r.toks i) FatArrow) (V.range 0 n) with
+  | None -> ([], r)
+  | Just fat ->
+      (
+        V.concatMap
+          (\i ->
+            match arrayGet r.toks i with
+            | Upper name -> [name]
+            | _ -> [])
+          (V.range 0 fat),
+        { r | at = fat + 1 }
+      )
+
+-- A type, arrows and all: right-associative, and flattened as it goes.
+fun arrow (r : Reading) : (Ty, Reading) =
+  match app r with
+  | (first, r1) ->
+      (match eat r1 Arrow with
+       | (False, r2) -> (first, r2)
+       | (True, r2) ->
+           (match (if startsAtom r2 then arrow r2 else (TAny, r2)) with
+            | (rest, r3) ->
+                (match rest with
+                 | TFun args result -> (TFun (V.pushFront args first) result, r3)
+                 | result -> (TFun [first] result, r3))))
+
+fun startsAtom (r : Reading) : Bool =
+  match peek r with
+  | Just (Upper _) -> True
+  | Just (Lower _) -> True
+  | Just Hole -> True
+  | Just Open -> True
+  | Just OpenList -> True
+  | Just OpenArray -> True
+  | Just OpenBrace -> True
+  | _ -> False
+
+-- `Maybe a`, or anything else an atom starts.
+fun app (r : Reading) : (Ty, Reading) =
+  if not (startsAtom r) then (TAny, r)
+  else
+    match atom r with
+    | (head, r1) ->
+        (match atomsFrom r1 [] with
+         | (args, r2) ->
+             (match head with
+              | TCon name already ->
+                  if V.isEmpty already then (TCon name args, r2)
+                  else if V.isEmpty args then (head, r2)
+                  else (TAny, r2)
+              -- A variable applied to something, `f a`, is more than this
+              -- search compares: it matches anything.
+              | _ -> if V.isEmpty args then (head, r2) else (TAny, r2)))
+
+fun atomsFrom (r : Reading) (acc : [Ty]) : ([Ty], Reading) =
+  if startsAtom r then
+    match atom r with
+    | (t, r1) -> atomsFrom r1 (V.pushBack acc t)
+  else (acc, r)
+
+fun atom (r0 : Reading) : (Ty, Reading) =
+  match peek r0 with
+  | None -> (TAny, r0)
+  | Just t ->
+      let r = { r0 | at = r0.at + 1 } in
+      (match t with
+       | Upper name -> (TCon name [], r)
+       | Lower name ->
+           (match H.lookup name r.vars with
+            | Just n -> (TVar n, r)
+            | None -> (let n = H.size r.vars in (TVar n, { r | vars = H.insert name n r.vars })))
+       | Hole -> (TAny, r)
+       | Open ->
+           (match eat r Close with
+            | (True, r1) -> (TCon "Unit" [], r1)
+            | (False, r1) ->
+                (match arrow r1 with
+                 | (first, r2) ->
+                     (match commaItems r2 [first] with
+                      | (items, r3) ->
+                          (let r4 = snd (eat r3 Close) in
+                           if V.len items == 1 then (V.getOr TAny items 0, r4)
+                           else (TTuple items, r4)))))
+       -- `[a]` is a vector and `[a;]` a list, as the language writes
+       -- them; `[;]`, with nothing in it yet, is a list of anything.
+       | OpenList ->
+           (match (if startsAtom r then arrow r else (TAny, r)) with
+            | (item, r1) ->
+                (match eat r1 Semi with
+                 | (list, r2) ->
+                     (let r3 = snd (eat r2 CloseList) in
+                      (TCon (if list then "List" else "Vector") [item], r3))))
+       | OpenArray ->
+           (match arrow r with
+            | (item, r1) -> (TCon "Array" [item], snd (eat r1 CloseList)))
+       | OpenBrace ->
+           (match recordFields r [] with
+            | (fields, r1) -> (TRecord (sortFields fields), snd (eat r1 CloseBrace)))
+       -- Punctuation where a type should be: `!` starts an effect, which is
+       -- the end of what is compared; anything else is a slip.
+       | _ -> (TAny, { r | at = arrayLen r.toks }))
+
+fun commaItems (r : Reading) (acc : [Ty]) : ([Ty], Reading) =
+  match eat r Comma with
+  | (True, r1) ->
+      (match arrow r1 with
+       | (t, r2) -> commaItems r2 (V.pushBack acc t))
+  | (False, r1) -> (acc, r1)
+
+fun recordFields (r : Reading) (acc : [(String, Ty)]) : ([(String, Ty)], Reading) =
+  match peek r with
+  | Just (Lower label) ->
+      (let r1 = snd (eat { r | at = r.at + 1 } Colon) in
+       match arrow r1 with
+       | (t, r2) ->
+           (let acc2 = V.pushBack acc (label, t) in
+            match eat r2 Comma with
+            | (True, r3) -> recordFields r3 acc2
+            | (False, r3) -> (acc2, r3)))
+  | _ -> (acc, r)
+
+-- --- matching by type ------------------------------------------------------------
+
+-- What it costs to read `decl` as an answer to `query`: `None` if it is not
+-- one, and the cheaper the better otherwise. The result has to unify; then
+-- the same type up to naming costs nothing, arguments in another order 1, a
+-- declaration's variable made a particular type 1, an argument the query
+-- did not give 2, two of the query's variables made one 2, a query's
+-- variable made a particular type 3, and a declaration whose result is only
+-- a variable 3 (`meadow_find::shape`). A query is also read as one not
+-- finished -- every type an argument, the result not said yet -- at 1 more.
+@pub fun costOf (query : Sig) (decl : Sig) : Maybe Int =
+  let whole = costAsWritten query decl in
+  let started =
+    if not (V.isEmpty query.args) and not (isAny query.result) then
+      M.map
+        (\c -> c + 1)
+        (costAsWritten
+           (Sig {
+              context = query.context,
+              args = V.pushBack query.args query.result,
+              result = TAny
+            })
+           decl)
+    else None
+  in match (whole, started) with
+     | (Just a, Just b) -> Just (if a < b then a else b)
+     | (Just a, None) -> Just a
+     | (None, b) -> b
+
+fun isAny (t : Ty) : Bool = match t with | TAny -> True | _ -> False
+
+fun isVar (t : Ty) : Bool = match t with | TVar _ -> True | _ -> False
+
+fun costAsWritten (query : Sig) (decl : Sig) : Maybe Int =
+  let m = V.len query.args in
+  let n = V.len decl.args in
+  if m > n then None
+  else
+    let result = renamed decl.result in
+    let args = V.toArray (V.map renamed decl.args) in
+    match unify H.empty query.result result with
+    | None -> None
+    | Just base ->
+        let best =
+          V.foldl
+            (\best pick ->
+              if best == Just 0 then best
+              else
+                match V.foldl
+                  (\s k ->
+                    M.andThen
+                      (\sub ->
+                        unify sub (V.getOr TAny query.args k) (arrayGet args (V.getOr 0 pick k)))
+                      s)
+                  (Just base)
+                  (V.range 0 m) with
+                | None -> best
+                | Just s ->
+                    (let extra = n - m in
+                     let c1 = price s query decl + extra * (if m == 0 then 1 else 2) in
+                     let c = if outOfOrder pick then c1 + 1 else c1 in
+                     match best with
+                     | Just b -> Just (if c < b then c else b)
+                     | None -> Just c))
+            None
+            (pairings m n)
+        in M.map (\c -> c + contextCost query decl + anythingCost query decl) best
+
+fun outOfOrder (pick : [Int]) : Bool =
+  V.any (\i -> V.getOr 0 pick i > V.getOr 0 pick (i + 1)) (V.range 0 (V.len pick - 1))
+
+-- A declaration whose result is a bare type variable answers every query,
+-- and is rarely what was meant.
+fun anythingCost (query : Sig) (decl : Sig) : Int =
+  let asked = not (isVar query.result or isAny query.result) in
+  if asked and isVar decl.result then 3 else 0
+
+-- A trait the query names that the declaration does not ask for is a small
+-- mismatch; one the declaration asks for that the query did not name, a
+-- smaller one -- and nothing when the query names none.
+fun contextCost (query : Sig) (decl : Sig) : Int =
+  if V.isEmpty query.context then 0
+  else
+    let missing = V.len (V.filter (\c -> not (V.elem c decl.context)) query.context) in
+    let extra = V.len (V.filter (\c -> not (V.elem c query.context)) decl.context) in
+    2 * missing + extra
+
+-- Every way of giving `m` query arguments to `n` declaration arguments, one
+-- each: all of them while there are few, and past that only those that keep
+-- the query's order.
+fun pairings (m : Int) (n : Int) : [[Int]] =
+  let every = permutations n m <= 120 in
+  pairFrom m n every [] []
+
+fun pairFrom (m : Int) (n : Int) (every : Bool) (current : [Int]) (out : [[Int]]) : [[Int]] =
+  if V.len current == m then V.pushBack out current
+  else
+    let from = if every then 0 else M.unwrapOr 0 (M.map (\j -> j + 1) (V.last current)) in
+    V.foldl
+      (\acc j -> if V.elem j current then acc else pairFrom m n every (V.pushBack current j) acc)
+      out
+      (V.range from n)
+
+fun permutations (n : Int) (m : Int) : Int =
+  let p = V.foldl (\acc k -> acc * k) 1 (V.range (n - m + 1) (n + 1)) in
+  if p < 1 then 1 else p
+
+-- A declaration's type, its variables moved clear of the query's.
+fun renamed (t : Ty) : Ty =
+  match t with
+  | TVar v -> TVar (declBase + v)
+  | TCon n args -> TCon n (V.map renamed args)
+  | TFun args r -> TFun (V.map renamed args) (renamed r)
+  | TTuple items -> TTuple (V.map renamed items)
+  | TRecord fields -> TRecord (V.map (\f -> match f with | (l, x) -> (l, renamed x)) fields)
+  | TAny -> TAny
+
+fun walk (s : HashMap Int Ty) (t : Ty) : Ty =
+  match t with
+  | TVar v ->
+      (match H.lookup v s with
+       | Just next -> walk s next
+       | None -> t)
+  | _ -> t
+
+fun resolve (s : HashMap Int Ty) (t : Ty) : Ty =
+  match walk s t with
+  | TCon n args -> TCon n (V.map (resolve s) args)
+  | TFun args r -> TFun (V.map (resolve s) args) (resolve s r)
+  | TTuple items -> TTuple (V.map (resolve s) items)
+  | TRecord fields -> TRecord (V.map (\f -> match f with | (l, x) -> (l, resolve s x)) fields)
+  | other -> other
+
+fun occurs (s : HashMap Int Ty) (v : Int) (t : Ty) : Bool =
+  match walk s t with
+  | TVar w -> w == v
+  | TCon _ args -> V.any (occurs s v) args
+  | TTuple args -> V.any (occurs s v) args
+  | TFun args r -> V.any (occurs s v) args or occurs s v r
+  | TRecord fields -> V.any (\f -> occurs s v (snd f)) fields
+  | TAny -> False
+
+fun unify (s : HashMap Int Ty) (a0 : Ty) (b0 : Ty) : Maybe (HashMap Int Ty) =
+  let a = walk s a0 in
+  let b = walk s b0 in
+  match (a, b) with
+  | (TAny, _) -> Just s
+  | (_, TAny) -> Just s
+  | (TVar x, TVar y) if x == y -> Just s
+  | (TVar x, t) -> if occurs s x t then None else Just (H.insert x t s)
+  | (t, TVar x) -> if occurs s x t then None else Just (H.insert x t s)
+  | (TCon n1 a1, TCon n2 a2) -> if n1 == n2 and V.len a1 == V.len a2 then unifyAll s a1 a2 else None
+  | (TFun p1 r1, TFun p2 r2) ->
+      if V.len p1 == V.len p2 then M.andThen (\s1 -> unify s1 r1 r2) (unifyAll s p1 p2) else None
+  | (TTuple a1, TTuple a2) -> if V.len a1 == V.len a2 then unifyAll s a1 a2 else None
+  | (TRecord f1, TRecord f2) ->
+      if V.len f1 == V.len f2
+        and V.all
+          (\k -> fst (V.getOr ("", TAny) f1 k) == fst (V.getOr ("", TAny) f2 k))
+          (V.range 0 (V.len f1)) then unifyAll s (V.map snd f1) (V.map snd f2)
+      else None
+  | _ -> None
+
+fun unifyAll (s : HashMap Int Ty) (xs : [Ty]) (ys : [Ty]) : Maybe (HashMap Int Ty) =
+  V.foldl
+    (\acc k -> M.andThen (\s1 -> unify s1 (V.getOr TAny xs k) (V.getOr TAny ys k)) acc)
+    (Just s)
+    (V.range 0 (V.len xs))
+
+-- What the variables had to become for the match to hold.
+fun price (s : HashMap Int Ty) (query : Sig) (decl : Sig) : Int =
+  let qvars = distinct (V.concatMap varsOf (V.pushBack query.args query.result)) in
+  let dvars =
+    distinct (V.concatMap (\t -> varsOf (renamed t)) (V.pushBack decl.args decl.result))
+  in
+  let fromQuery =
+    V.foldl
+      (\acc v ->
+        match acc with
+        | (cost, classes) ->
+            (match resolve s (TVar v) with
+             | TVar root -> (cost, bump classes root True)
+             | TAny -> acc
+             | _ -> (cost + 3, classes)))
+      (0, H.empty)
+      qvars
+  in
+  let fromDecl =
+    V.foldl
+      (\acc v ->
+        match acc with
+        | (cost, classes) ->
+            (match resolve s (TVar v) with
+             | TVar root -> (cost, bump classes root False)
+             | TAny -> acc
+             | _ -> (cost + 1, classes)))
+      fromQuery
+      dvars
+  in match fromDecl with
+     | (cost, classes) ->
+         V.foldl
+           (\c qd ->
+             match qd with
+             | (q, d) -> c + 2 * (if q > 1 then q - 1 else 0) + (if d > 1 then d - 1 else 0))
+           cost
+           (H.values classes)
+
+fun bump (classes : HashMap Int (Int, Int)) (root : Int) (fromQuery : Bool)
+    : HashMap Int (Int, Int) =
+  match H.getOr (0, 0) root classes with
+  | (q, d) -> H.insert root (if fromQuery then (q + 1, d) else (q, d + 1)) classes
+
+fun distinct (xs : [Int]) : [Int] =
+  V.foldl (\acc x -> if V.elem x acc then acc else V.pushBack acc x) [] xs
+
+fun varsOf (t : Ty) : [Int] =
+  match t with
+  | TVar v -> [v]
+  | TCon _ args -> V.concatMap varsOf args
+  | TTuple args -> V.concatMap varsOf args
+  | TFun args r -> V.append (V.concatMap varsOf args) (varsOf r)
+  | TRecord fields -> V.concatMap (\f -> varsOf (snd f)) fields
+  | TAny -> []
+
+-- --- matching by name ------------------------------------------------------------
+--
+-- `nucleo`'s fuzzy score, as `meadow_find` asks for it: each word of the
+-- query found in order in the name, a letter matched worth 16, more at the
+-- start of a word -- after a space, a delimiter or punctuation, or a capital
+-- after a small letter -- and more again for the first letter and for
+-- letters side by side; a gap costs 3 to open and 1 to go on. A word in
+-- small letters matches either case. Of every way the letters can be found,
+-- the score is what `nucleo`'s table works out, step for step.
+
+def scoreMatch : Int = 16
+
+def gapStart : Int = 3
+
+def gapExtension : Int = 1
+
+def bonusBoundary : Int = 8
+
+def bonusCamel : Int = 5
+
+def bonusConsecutive : Int = 4
+
+def boundaryWhite : Int = 10
+
+def boundaryDelimiter : Int = 9
+
+-- A byte's class: 0 a space, 1 punctuation, 2 a delimiter (`/,:;|`), 3 a
+-- small letter, 4 a capital, 6 a digit.
+fun classOf (b : Int) : Int =
+  if b >= 97 and b <= 122 then 3
+  else if b >= 65 and b <= 90 then 4
+  else if b >= 48 and b <= 57 then 6
+  else if b == 32 or b == 9 or b == 10 or b == 12 or b == 13 then 0
+  else if b == 47 or b == 44 or b == 58 or b == 59 or b == 124 then 2
+  else if b >= 128 then 3
+  else 1
+
+-- What matching a byte of class `cls` after one of class `prev` is worth.
+fun bonusFor (prev : Int) (cls : Int) : Int =
+  if cls > 2 and prev == 0 then boundaryWhite
+  else if cls > 2 and prev == 2 then boundaryDelimiter
+  else if cls > 2 and prev == 1 then bonusBoundary
+  else if (prev == 3 and cls == 4) or (prev != 6 and cls == 6) then bonusCamel
+  else if cls == 0 then boundaryWhite
+  else if cls == 1 then bonusBoundary
+  else 0
+
+fun lowered (fold : Bool) (b : Int) : Int = if fold and b >= 65 and b <= 90 then b + 32 else b
+
+fun sat (x : Int) : Int = if x < 0 then 0 else x
+
+fun maxOf (a : Int) (b : Int) : Int = if a > b then a else b
+
+-- How well `query` names `hay`, or `None` when it does not: each word of
+-- the query must be found, and the score is their sum.
+@pub fun fuzzyScore (query : String) (hay : String) : Maybe Int =
+  let words = V.filter (\w -> not (S.isEmpty w)) (splitSpace query) in
+  let h = bytesOf hay in
+  V.foldl
+    (\acc w ->
+      M.andThen
+        (\total ->
+          (let q = bytesOf w in
+           let fold =
+             not (V.any (\i -> arrayGet q i >= 65 and arrayGet q i <= 90) (V.range 0 (arrayLen q)))
+           in M.map (\s -> total + s) (fuzzyWord h q fold)))
+        acc)
+    (Just 0)
+    words
+
+fun bytesOf (s : String) : #[Int] =
+  V.toArray (V.map (\i -> toInt (stringByteAt s i)) (V.range 0 (stringByteLength s)))
+
+fun byteIs (fold : Bool) (h : Int) (q : Int) : Bool = lowered fold h == q
+
+-- One word, as `Matcher::fuzzy_match` scores it.
+fun fuzzyWord (h : #[Int]) (q : #[Int]) (fold : Bool) : Maybe Int =
+  let n = arrayLen h in
+  let m = arrayLen q in
+  if m > n then None
+  else if m == 0 then Just 0
+  else if m == n then
+    (if V.all (\i -> lowered fold (arrayGet h i) == lowered fold (arrayGet q i)) (V.range 0 n) then
+       Just (scoreRun h q 0 n fold)
+     else None)
+  else if m == 1 then oneByte h (arrayGet q 0) fold
+  else
+    match prefiltered h q fold with
+    | None -> None
+    | Just (start, end) ->
+        if m == end - start then Just (scoreRun h q start end fold)
+        else Just (optimal h q start end fold)
+
+-- The first byte of `from .. to` that is `c`.
+fun findFrom (h : #[Int]) (c : Int) (fold : Bool) (from : Int) (to : Int) : Maybe Int =
+  if from >= to then None
+  else if byteIs fold (arrayGet h from) c then Just from
+  else findFrom h c fold (from + 1) to
+
+fun findBack (h : #[Int]) (c : Int) (fold : Bool) (from : Int) (to : Int) : Maybe Int =
+  if to <= from then None
+  else if byteIs fold (arrayGet h (to - 1)) c then Just (to - 1)
+  else findBack h c fold from (to - 1)
+
+-- Where a match can start and end: the first place the first letter is, and
+-- after the letters found greedily, the last place the last letter is.
+fun prefiltered (h : #[Int]) (q : #[Int]) (fold : Bool) : Maybe (Int, Int) =
+  let n = arrayLen h in
+  let m = arrayLen q in
+  match findFrom h (arrayGet q 0) fold 0 (n - m + 1) with
+  | None -> None
+  | Just start ->
+      (let greedy =
+         V.foldl
+           (\acc k ->
+             M.andThen (\at -> M.map (\i -> i + 1) (findFrom h (arrayGet q k) fold at n)) acc)
+           (Just (start + 1))
+           (V.range 1 m)
+       in match greedy with
+          | None -> None
+          | Just ge ->
+              (match findBack h (arrayGet q (m - 1)) fold ge n with
+               | Just i -> Just (start, i + 1)
+               | None -> Just (start, ge)))
+
+-- A query of one letter: the best place it is.
+fun oneByte (h : #[Int]) (c : Int) (fold : Bool) : Maybe Int =
+  let best =
+    V.foldl
+      (\top i ->
+        if not (byteIs fold (arrayGet h i) c) then top
+        else
+          (let prev = if i == 0 then 0 else classOf (arrayGet h (i - 1)) in
+           let s = bonusFor prev (classOf (arrayGet h i)) * 2 + scoreMatch in
+           if s > top then s else top))
+      0
+      (V.range 0 (arrayLen h))
+  in if best == 0 then None else Just best
+
+-- The letters at `start .. end`, one after another (`calculate_score`).
+fun scoreRun (h : #[Int]) (q : #[Int]) (start : Int) (end : Int) (fold : Bool) : Int =
+  let prev0 = if start == 0 then 0 else classOf (arrayGet h (start - 1)) in
+  let cls0 = classOf (arrayGet h start) in
+  let first0 = bonusFor prev0 cls0 in
+  let next0 = if arrayLen q > 1 then 1 else 0 in
+  match V.foldl
+    (\st i ->
+      match st with
+      | (score, prev, first, k, inGap, consecutive) ->
+          let c = lowered fold (arrayGet h i) in
+          let cls = classOf (arrayGet h i) in
+          if c == arrayGet q k then
+            (let b = bonusFor prev cls in
+             let first2 =
+               if consecutive != 0 then (if b >= bonusBoundary and b > first then b else first)
+               else b
+             in
+             let b2 = if consecutive != 0 then maxOf (maxOf b first2) bonusConsecutive else b in
+             let k2 = if k + 1 < arrayLen q then k + 1 else k in
+             (score + scoreMatch + b2, cls, first2, k2, False, consecutive + 1))
+          else
+            (let penalty = if inGap then gapExtension else gapStart in
+             (sat (score - penalty), cls, first, k, True, 0)))
+    (scoreMatch + first0 * 2, cls0, first0, next0, False, 1)
+    (V.range (start + 1) end) with
+  | (score, _, _, _, _, _) -> score
+
+-- A cell of the table: a score, the bonus a run of letters side by side
+-- carries, and whether the letter was matched right after the one before.
+-- `unmatched` is no way at all.
+def unmatched : (Int, Int, Bool) = (0, 0, True)
+
+fun nextCell (p : Int) (bonus : Int) (cell : (Int, Int, Bool)) : (Int, Int, Bool) =
+  if cell == unmatched then (p + bonus + scoreMatch, bonus, False)
+  else
+    match cell with
+    | (score, consecutive, _) ->
+        let c0 = maxOf consecutive bonusConsecutive in
+        let c = if bonus >= bonusBoundary and bonus > c0 then bonus else c0 in
+        let viaMatch = score + maxOf c bonus in
+        let viaSkip = p + bonus in
+        if viaMatch > viaSkip then (viaMatch + scoreMatch, c, True)
+        else (viaSkip + scoreMatch, bonus, False)
+
+-- `fuzzy_match_optimal`: a row a letter of the query, a column a byte of
+-- `start .. end`, each row worked out from the one before.
+fun optimal (h : #[Int]) (q : #[Int]) (start : Int) (end : Int) (fold : Bool) : Int =
+  let len = end - start in
+  let m = arrayLen q in
+  let hs = V.toArray (V.map (\j -> lowered fold (arrayGet h (start + j))) (V.range 0 len)) in
+  let bonus =
+    V.toArray
+      (V.map
+         (\j ->
+           (let at = start + j in
+            let prev = if at == 0 then 0 else classOf (arrayGet h (at - 1)) in
+            bonusFor prev (classOf (arrayGet h at))))
+         (V.range 0 len))
+  in
+  -- Where each letter is first found, after the one before it.
+  let offs =
+    match V.foldl
+      (\acc j ->
+        match acc with
+        | (k, found) ->
+            if k < m and arrayGet hs j == arrayGet q k then (k + 1, V.pushBack found j) else acc)
+      (0, [])
+      (V.range 0 len) with
+    | (_, found) -> V.toArray found
+  in
+  let firstRow =
+    V.map
+      (\j ->
+        if arrayGet hs j == arrayGet q 0 then
+          (arrayGet bonus j * 2 + scoreMatch, arrayGet bonus j, False)
+        else unmatched)
+      (V.range 0 len)
+  in
+  let last =
+    V.foldl
+      (\row k ->
+        -- `row` is letter `k`'s cells by column; this makes letter `k + 1`'s.
+        (let rowOff = arrayGet offs k in
+         let nextOff = arrayGet offs (k + 1) in
+         match V.foldl
+           (\st j ->
+             match st with
+             | (prevP, prevM, out) ->
+                 (let viaM = sat (prevM - gapStart) in
+                  let viaP = sat (prevP - gapExtension) in
+                  let p = if viaM > viaP then viaM else viaP in
+                  let cell = V.getOr unmatched row j in
+                  let out2 =
+                    if j >= nextOff - 1 then
+                      V.set
+                        out
+                        (j + 1)
+                        (if arrayGet hs (j + 1) == arrayGet q (k + 1) then
+                           nextCell p (arrayGet bonus (j + 1)) cell
+                         else unmatched)
+                    else out
+                  in (p, fst3 cell, out2)))
+           (0, 0, V.replicate len unmatched)
+           (V.range rowOff (len - 1)) with
+         | (_, _, out) -> out))
+      firstRow
+      (V.range 0 (m - 1))
+  in V.foldl
+       (\top j -> maxOf top (fst3 (V.getOr unmatched last j)))
+       0
+       (V.range (arrayGet offs (m - 1)) len)
+
+fun fst3 (t : (Int, Int, Bool)) : Int = match t with | (a, _, _) -> a
+
+-- --- searching ---------------------------------------------------------------------
+
+-- The best `limit` of `decls` for `text`, best first, as indices into them.
+-- `prefer` says what wins a tie.
+@pub fun search (decls : [Decl]) (text : String) (limit : Int) : [Int] =
+  let hits =
+    match queryOf text with
+    | Empty -> V.map (\i -> (i, 0)) (V.range 0 (V.len decls))
+    | Named t -> byName decls t
+    | Typed sig -> byType decls sig
+  in
+  let ordered =
+    sortBy
+      (\a b ->
+        match (a, b) with
+        | ((i, x), (j, y)) ->
+            (let d = V.getOr emptyDecl decls i in
+             let e = V.getOr emptyDecl decls j in
+             thenBy [
+               compare y x,
+               compare e.prelude d.prelude,
+               compare (stringByteLength d.name) (stringByteLength e.name),
+               compare (stringByteLength d.module) (stringByteLength e.module),
+               S.compare d.name e.name,
+               S.compare d.module e.module,
+               compare i j
+             ]))
+      hits
+  in V.map fst (V.take ordered limit)
+
+fun thenBy (os : [Ordering]) : Ordering =
+  V.foldl (\acc o -> match acc with | Equal -> o | _ -> acc) Equal os
+
+def emptyDecl : Decl =
+  Decl {
+    name = "", module = "", package = "", kind = "", detail = "", shape = None, prelude = False,
+    file = "", from = 0, to = 0
+  }
+
+-- Fuzzily, against the name -- or the qualified name, once the query says
+-- something of the module with a `.` or a space. The name itself, exactly,
+-- above anything that merely contains it, and exactly as typed above
+-- exactly but for case.
+fun byName (decls : [Decl]) (text : String) : [(Int, Int)] =
+  let isQualified = S.contains "." text or S.contains " " text in
+  let wanted = S.trim text in
+  V.concatMap
+    (\i ->
+      (let d = V.getOr emptyDecl decls i in
+       let hay = if isQualified then qualified d else unwrapped d.name in
+       match fuzzyScore text hay with
+       | None -> []
+       | Just score ->
+           (let bonus =
+              if isQualified then 0
+              else if hay == wanted then 1048576
+              else if S.toLower hay == S.toLower wanted then 524288
+              else 0
+            in [(i, score + bonus)])))
+    (V.range 0 (V.len decls))
+
+-- A name without the parentheses an operator is written in.
+fun unwrapped (name : String) : String =
+  let n = stringByteLength name in
+  let from = V.len (V.takeWhile (\i -> stringSlice name i (i + 1) == "(") (V.range 0 n)) in
+  let back =
+    V.len (V.takeWhile (\i -> stringSlice name i (i + 1) == ")") (V.reverse (V.range from n)))
+  in stringSlice name from (n - back)
+
+fun byType (decls : [Decl]) (sig : Sig) : [(Int, Int)] =
+  V.concatMap
+    (\i ->
+      (let d = V.getOr emptyDecl decls i in
+       match d.shape with
+       | None -> []
+       | Just shape ->
+           (match costOf sig shape with
+            | Just c -> [(i, 0 - c)]
+            | None -> [])))
+    (V.range 0 (V.len decls))
+
+-- --- tests -------------------------------------------------------------------
+
+use Std.Test (assertEq)
+
+@test fun aQueryIsANameOrAType () =
+  let a = assertEq (match queryOf "map" with | Named t -> t | _ -> "") "map" "a name" in
+  let b =
+    assertEq
+      (match queryOf "[a] -> Int" with
+       | Typed s -> V.len s.args
+       | _ -> 0 - 1)
+      1
+      "an arrow says a type"
+  in assertEq (match queryOf "  " with | Empty -> True | _ -> False) True "nothing typed"
+
+@test fun nucleoScoresAsTheRustServerDoes () =
+  -- What `nucleo_matcher` 0.3 answers for these, with `Config::DEFAULT`.
+  let a = assertEq (fuzzyScore "map" "map") (Just 88) "the whole name" in
+  let b = assertEq (fuzzyScore "map" "mapMaybe") (Just 88) "a prefix" in
+  let c = assertEq (fuzzyScore "map" "concatMap") (Just 68) "a word at the end" in
+  let d = assertEq (fuzzyScore "map" "formatReport") (Just 47) "letters apart" in
+  assertEq (fuzzyScore "String" "toString") (Just 131) "a capital asks for a capital"
+
+@test fun aTypeQueryFindsWhatItsSignatureFits () =
+  let q = parseSig "[a] -> Int" in
+  let length = Sig { context = [], args = [TCon "Vector" [TVar 0]], result = TCon "Int" [] } in
+  let sum = Sig { context = [], args = [TCon "Vector" [TCon "Int" []]], result = TCon "Int" [] } in
+  let a = assertEq (costOf q length) (Just 0) "exactly" in
+  let b = assertEq (costOf q sum) (Just 3) "a variable of the query made a type" in
+  assertEq
+    (costOf q (Sig { context = [], args = [], result = TCon "String" [] }))
+    None
+    "not the result"

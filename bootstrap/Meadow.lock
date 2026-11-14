@@ -12,9 +12,9 @@ tree = "344ca224a72f8d22632104c46f238d134138b8d9"
 
 [[package]]
 name = "Cut"
-source = "git+https://github.com/meadow-lang/Cut.git?rev=a82dc40a8c25509d6740277b44dfe68ea6cfb009"
-rev = "a82dc40a8c25509d6740277b44dfe68ea6cfb009"
-tree = "f91e84860a9e22baf3b777590c83e9b7c3972d52"
+source = "git+https://github.com/meadow-lang/Cut.git?rev=13d0d8aebd45ea0f8446d9c09442b3da68f015e3"
+rev = "13d0d8aebd45ea0f8446d9c09442b3da68f015e3"
+tree = "de425bc308856cc3a6a4539408b167d0b600ec34"
 
 [[package]]
 name = "Doodle"
