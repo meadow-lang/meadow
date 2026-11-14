@@ -1,0 +1,146 @@
+-- `meadow __precompile-std OUT [--target TARGET]`: the standard library,
+-- compiled by this compiler ahead of time, into OUT, for a release to lay
+-- beside it as `lib/Std.mwstd` (see `Compiler.precompiledFor`).
+--
+-- The Rust `meadow`'s command of the name writes what its own front end
+-- makes of the library, a serialised `CompiledPackage` that only it reads.
+-- This one writes MeadowBoot's: for each profile a build compiles the
+-- library as -- `debug` and `release` -- the unit's interface, as a build
+-- keeps it, and the objects of Cut it wrote, which the back end links into
+-- any program as it links them from a build. A build that finds it compiles
+-- none of the library: it takes the compile its options ask for, and
+-- compiles the library itself only when none in the file is that.
+--
+-- It is made by building a package that is nothing but the library's
+-- dependent, once for each profile, and reading back what the build kept of
+-- the library. `--target` builds it for another system and processor, as a
+-- build with `--target` would want it: a triple, or an architecture alone.
+
+use MeadowBoot.Compiler (buildUnits, precompiledVariant, precompiledStd, stdKeyFile, hostOs)
+use MeadowBoot.Unit (stdDir, selfSize, absolute)
+use Std.Collections.Vector as V
+use Std.String as S
+use Std.Path as Path
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+use Std.Result as Res
+use Std.Result.Result.*
+use Std.Fs (readToString, writeString, readDir, createDirAll, removeDirAll, isDir)
+use Std.Console (writeError)
+use Std.Process (getEnv, setEnv, currentPid)
+
+-- Write the precompiled library where `args` say; whether it was written.
+@pub fun precompileStd (args : [String]) =
+  let target = targetIn args in
+  let outs = V.filter (\x -> not (S.startsWith "-" x) and Just x != target) args in
+  match (V.get outs 0, stdDir ()) with
+  | (None, _) ->
+      (let u =
+         writeError "meadowboot: `__precompile-std OUT [--target TARGET]`: where to write it\n"
+       in False)
+  | (_, None) ->
+      (let u =
+         writeError
+           "meadowboot: the standard library's sources are not where `MEADOWBOOT_STD` says, nor beside this program\n"
+       in False)
+  | (Just out, Just std) ->
+      let home =
+        Path.join
+          (M.unwrapOr (M.unwrapOr "/tmp" (getEnv "TMPDIR")) (getEnv "TEMP"))
+          "meadowboot-precompile-${show (currentPid ())}"
+      in
+      let made = createDirAll (Path.join home "src") in
+      let a =
+        writeString (
+          Path.join home "Meadow.toml",
+          "[package]\nname = \"PrecompileStd\"\nversion = \"0.1.0\"\n"
+        )
+      in
+      let b = writeString (Path.join (Path.join home "src") "Main.mw", "fun main () = ()\n") in
+      -- What it is made of is the library's sources, never a precompiled
+      -- library already there.
+      let c = setEnv ("MEADOWBOOT_PRECOMPILED_STD", Path.join home "none.mwstd") in
+      let placed =
+        V.map
+          (\x ->
+            match x with
+            | (profile, level) ->
+                variantOf
+                  home
+                  profile
+                  (V.append [("opt", level), ("macros", "Glade")] (aimed target)))
+          [("debug", "O1"), ("release", "O2")]
+      in
+      let gone = removeDirAll home in
+      match V.find Res.isErr placed with
+      | Just (Err why) -> (let u = writeError "meadowboot: ${why}\n" in False)
+      | _ ->
+          let variants = V.concatMap (\x -> match x with | Ok v -> [v] | Err _ -> []) placed in
+          let to = absolute out in
+          let dir = M.map createDirAll (Path.parent to) in
+          (match writeString (to, precompiledStd (selfSize ()) variants) with
+           | Ok _ -> True
+           | Err why ->
+               (let u = writeError "meadowboot: could not write ${out}: ${why}\n" in False))
+
+-- The library as the build of `home` as `profile`, with `pairs`, compiled it:
+-- the compile's name, its interface and its files.
+fun variantOf (home : String) (profile : String) (pairs : [(String, String)]) =
+  if not (buildUnits profile pairs home) then
+    Err "the standard library did not build as `${profile}`"
+  else
+    let kept = Path.joinAll [home, "target", profile] in
+    let units = Path.join kept "units" in
+    let named =
+      V.find (\n -> S.startsWith "Std-" n) (M.unwrapOr [] (Res.toMaybe (readDir units)))
+    in match named with
+       | None -> Err "the build as `${profile}` kept no standard library"
+       | Just name ->
+           let dir = Path.join units name in
+           let files = M.unwrapOr [] (Res.toMaybe (readDir dir)) in
+           let texts =
+             V.concatMap
+               (\f ->
+                 if f == stdKeyFile or isDir (Path.join dir f) then []
+                 else
+                   (match readToString (Path.join dir f) with
+                    | Ok text -> [(f, text)]
+                    | Err _ -> []))
+               files
+           in match (
+                readToString (Path.join dir stdKeyFile),
+                readToString (Path.joinAll [kept, "interfaces", "${name}.json"])
+              ) with
+              | (Ok key, Ok interface) -> Ok (precompiledVariant key interface texts)
+              | _ -> Err "the build as `${profile}` kept the standard library without what names it"
+
+-- `--target TARGET` or `--target=TARGET`, if given.
+fun targetIn (args : [String]) : Maybe String =
+  V.foldl
+    (\found i ->
+      if M.isSome found then found
+      else
+        (let x = V.getOr "" args i in
+         if x == "--target" then V.get args (i + 1)
+         else if S.startsWith "--target=" x then Just (S.drop x 9)
+         else None))
+    None
+    (V.range 0 (V.len args))
+
+-- What a build for `target` is told: the system and the processor `@cfg`
+-- answers for, as `meadow build --target` tells it.
+fun aimed (target : Maybe String) : [(String, String)] =
+  match target with
+  | None -> []
+  | Just t ->
+      let arch =
+        if S.startsWith "aarch64" t or S.startsWith "arm64" t then "aarch64" else "x86_64"
+      in
+      let os =
+        if S.contains "android" t then "android"
+        else if S.contains "apple-ios" t then "ios"
+        else if S.contains "apple-darwin" t then "macos"
+        else if S.contains "windows" t then "windows"
+        else if S.contains "linux" t then "linux"
+        else hostOs
+      in [("os", os), ("arch", arch)]

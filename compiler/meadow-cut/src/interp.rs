@@ -507,7 +507,8 @@ impl<'p> Machine<'p> {
                 let ks = self.conts(conts, &env, &handlers)?;
                 return self.invoke(obj, m, vals, ks, handlers);
             }
-            Focused::Statement(s) => s,
+            // A position does nothing.
+            Focused::Statement(s) => s.bare(),
         };
         match s {
             // A `μ` cut against a consumer runs its body with the consumer as `k`.
@@ -601,6 +602,7 @@ impl<'p> Machine<'p> {
                 ))
             }
             Statement::Error(msg) => err(msg.clone()),
+            Statement::At(..) => unreachable!("a position is looked under"),
         }
     }
 

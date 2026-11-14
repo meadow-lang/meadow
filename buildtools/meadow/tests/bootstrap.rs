@@ -2699,12 +2699,13 @@ def result = (plus 1 2 4, from1 3 5, again 9, (from1 2) 3, held 3)
 /// the same.
 #[test]
 fn a_definition_that_is_a_function_has_the_parameters_the_function_takes() {
-    // Whether `symbol`'s definition of all its parameters is there, with `n`.
+    // Whether `symbol`'s definition of all its parameters is there, with `n`
+    // -- after the name it is shown by, in a debug build.
     let entry = |cut: &str, n: usize| {
         cut.lines().any(|line| {
             line.starts_with("def meadow:Levels/d")
                 && line.matches("v19000000").count() == n
-                && line.contains("f (")
+                && (line.contains("f (") || line.contains("f @"))
         })
     };
     for opt in ["O0", "O1", "O2", "O3"] {
@@ -3282,6 +3283,390 @@ fn a_package_s_tests_are_run_by_meadowboot_as_meadow_test_runs_them() {
         "{said}"
     );
     assert_eq!(code, Some(0), "{said}");
+}
+
+/// What `meadow test` says, from `running N tests` on, set out so that two
+/// runs can be compared whatever order their tests finished in: the line
+/// saying how many, each test's line sorted, each failure -- its message and
+/// what it wrote -- sorted, and the result. Tests run side by side are said
+/// as they finish, and failures are listed as the tests are declared, which
+/// two compilers may order differently across modules.
+fn test_report(out: &str) -> String {
+    let from = out.find("running ").map_or(out, |i| &out[i..]);
+    let mut lines = from.lines();
+    let head = lines.next().unwrap_or_default().to_string();
+    let rest: Vec<&str> = lines.collect();
+    let mut tests: Vec<&str> = rest
+        .iter()
+        .copied()
+        .filter(|l| l.starts_with("test ") && l.contains(" ... "))
+        .collect();
+    tests.sort_unstable();
+    let failures = from
+        .split_once("\nfailures:\n")
+        .map(|(_, f)| f.rsplit_once("\ntest result:").map_or(f, |(f, _)| f))
+        .unwrap_or_default();
+    let mut blocks: Vec<String> = Vec::new();
+    for line in failures.lines() {
+        if line.starts_with("---- ") && !line.ends_with(" output ----") {
+            blocks.push(String::new());
+        }
+        if let Some(b) = blocks.last_mut() {
+            b.push_str(line);
+            b.push('\n');
+        }
+    }
+    let mut blocks: Vec<String> = blocks.iter().map(|b| b.trim_end().to_string()).collect();
+    blocks.sort_unstable();
+    let result = from
+        .lines()
+        .rfind(|l| l.starts_with("test result:"))
+        .unwrap_or_default();
+    format!(
+        "{head}\n{}\n\n{}\n\n{result}\n",
+        tests.join("\n"),
+        blocks.join("\n\n")
+    )
+}
+
+/// A package with tests of every kind `meadow test` reports: passing and
+/// failing, in the root module and in another, one that prints, one that
+/// prints and fails, one stopped by a runtime error, and some that print in
+/// between work, so that run side by side they overlap.
+fn tested_package(name: &str) -> meadow_scratch::Scratch {
+    let dir = meadow_scratch::scratch!("meadowboot-{name}-{}", std::process::id());
+    std::fs::create_dir_all(dir.join("src")).expect("a package directory");
+    std::fs::write(
+        dir.join("Meadow.toml"),
+        "[package]\nname = \"Tq\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("a manifest");
+    let mut main = String::from(
+        "mod Sums\n\nuse Std.Test (assert, assertEq)\n\n\
+         fun fib (n : Int) : Int = if n < 2 then n else fib (n - 1) + fib (n - 2)\n\n\
+         fun say (k : Int) = let u = println (\"line from \" ++ show k) in fib 15\n\n\
+         @test fun addsUp () = assert (1 + 1 == 2) \"sums\"\n\n\
+         @test fun isWrong () = let u = println \"about to fail\" in assert (1 > 2) \"one is not more than two\"\n\n\
+         @test fun divides () = let z = 0 in assert (10 / z == 1) \"divides\"\n\n",
+    );
+    for k in 0..6 {
+        let want = if k % 3 == 2 { 0 } else { 610 };
+        main.push_str(&format!(
+            "@test fun t{k} () = let u = say {k} in let v = say {k} in assertEq (say {k}) {want} \"t{k}\"\n\n"
+        ));
+    }
+    main.push_str("fun main () = println \"hi\"\n");
+    std::fs::write(dir.join("src").join("Main.mw"), main).expect("the root module");
+    std::fs::write(
+        dir.join("src").join("Sums.mw"),
+        "use Std.Test (assert)\n\nfun double x = x * 2\n\n\
+         @test fun doubles () = assert (double 4 == 8) \"doubles\"\n\n\
+         @test fun halves () = assert (double 4 == 2) \"halves\"\n",
+    )
+    .expect("a module");
+    dir
+}
+
+/// `args` run by the Rust `meadow`, and by MeadowBoot with the Rust `meadow`
+/// in its own process as its back end: each one's status and standard output.
+fn both_say(args: &[&std::ffi::OsStr]) -> ((Option<i32>, String), (Option<i32>, String)) {
+    let rust = Command::new(meadow())
+        .args(args)
+        .output()
+        .expect("meadow runs");
+    let boot = Command::new(meadowboot_exe())
+        .args(args)
+        .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+        .env("MEADOW_HOST", meadow_host())
+        .env_remove("MEADOW")
+        .env_remove("MEADOWBOOT_EXPANSIONS")
+        .output()
+        .expect("MeadowBoot runs");
+    let said = |o: &std::process::Output| {
+        (
+            o.status.code(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                if o.stdout.is_empty() {
+                    String::from_utf8_lossy(&o.stderr).into_owned()
+                } else {
+                    String::new()
+                }
+            ),
+        )
+    };
+    (said(&rust), said(&boot))
+}
+
+/// `meadowboot test` says of a package what `meadow test` says, flag for
+/// flag: which tests passed, each failure with its message and -- unless
+/// `--no-capture` let it through as it came -- what the test printed, a
+/// runtime error as the test's failure and not the run's, a filter and
+/// `--exact`, any number of `--test-threads`, and `--cek`, which MeadowBoot
+/// runs on its own CEK machine. With one thread and nothing kept, what each
+/// test prints comes before the line saying how it went, in the order the
+/// tests are declared: compared as it is.
+#[test]
+fn meadowboot_test_says_what_meadow_test_says() {
+    let dir = tested_package("test-flags");
+    let path = dir.as_os_str();
+    let runs: &[&[&str]] = &[
+        &[],
+        &["--test-threads", "1"],
+        &["--test-threads", "4"],
+        &["--cek"],
+        &["t"],
+        &["t1", "--exact"],
+        &["Sums.halves", "--exact"],
+        &["nothing-has-this"],
+    ];
+    let mut wrong = Vec::new();
+    for more in runs {
+        let mut args: Vec<&std::ffi::OsStr> = vec!["test".as_ref(), path];
+        args.extend(more.iter().map(|a| std::ffi::OsStr::new(a)));
+        let ((rust_code, rust), (boot_code, boot)) = both_say(&args);
+        if rust_code != boot_code || test_report(&rust) != test_report(&boot) {
+            wrong.push(format!(
+                "`test {}`: meadow ({rust_code:?}) said\n{}\nMeadowBoot ({boot_code:?}) said\n{}",
+                more.join(" "),
+                test_report(&rust),
+                test_report(&boot)
+            ));
+        }
+    }
+    // One module, so the order the tests are declared in is one order.
+    std::fs::write(dir.join("src").join("Sums.mw"), "fun double x = x * 2\n").expect("a module");
+    let args: Vec<&std::ffi::OsStr> = ["test", "--no-capture", "--test-threads", "1"]
+        .iter()
+        .map(|a| std::ffi::OsStr::new(a))
+        .chain([path])
+        .collect();
+    let ((rust_code, rust), (boot_code, boot)) = both_say(&args);
+    let from = |s: &str| {
+        s.find("running ")
+            .map_or(String::new(), |i| s[i..].to_string())
+    };
+    if rust_code != boot_code || from(&rust) != from(&boot) {
+        wrong.push(format!(
+            "`test --no-capture --test-threads 1`: meadow ({rust_code:?}) said\n{}\nMeadowBoot ({boot_code:?}) said\n{}",
+            from(&rust),
+            from(&boot)
+        ));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+}
+
+/// `meadowboot test --std` runs the standard library's own tests, compiled by
+/// MeadowBoot, and they say what `meadow test --std` says of them; and with a
+/// package, its tests beside them.
+#[test]
+fn meadowboot_runs_the_standard_library_s_tests() {
+    let dir = tested_package("test-std");
+    let elsewhere = meadow_scratch::scratch!("meadowboot-test-std-cwd-{}", std::process::id());
+    std::fs::create_dir_all(&elsewhere).expect("a directory that is no package");
+    let alone = |exe: PathBuf, boot: bool| {
+        let mut c = Command::new(exe);
+        c.args(["test", "--std"]).current_dir(&elsewhere);
+        if boot {
+            c.env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+                .env("MEADOW_HOST", meadow_host())
+                .env_remove("MEADOW")
+                .env_remove("MEADOWBOOT_EXPANSIONS");
+        }
+        let o = c.output().expect("it runs");
+        (
+            o.status.code(),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+        )
+    };
+    let (rust_code, rust) = alone(meadow(), false);
+    let (boot_code, boot) = alone(meadowboot_exe(), true);
+    assert!(
+        rust.contains("test result: ok."),
+        "the Rust `meadow test --std`:\n{rust}"
+    );
+    assert_eq!(
+        (rust_code, test_report(&rust)),
+        (boot_code, test_report(&boot)),
+        "the standard library's tests"
+    );
+
+    let ((rust_code, rust), (boot_code, boot)) =
+        both_say(&["test".as_ref(), "--std".as_ref(), dir.as_os_str()]);
+    assert!(rust.contains("test Sums.doubles ... ok"), "{rust}");
+    assert_eq!(
+        (rust_code, test_report(&rust)),
+        (boot_code, test_report(&boot)),
+        "a package's tests and the standard library's"
+    );
+}
+
+/// `meadowboot __precompile-std` writes the standard library compiled, and a
+/// build that finds it compiles none of the library and links what a build
+/// that compiled it links; one that finds it made by another compiler, or
+/// for other options, compiles the library itself.
+#[test]
+fn a_build_takes_the_standard_library_meadowboot_precompiled() {
+    let scratch = meadow_scratch::scratch!("meadowboot-precompile-{}", std::process::id());
+    std::fs::create_dir_all(&scratch).expect("a scratch directory");
+    let out = scratch.join("Std.mwstd");
+    let made = Command::new(meadowboot_exe())
+        .arg("__precompile-std")
+        .arg(&out)
+        .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+        .env("MEADOW_HOST", meadow_host())
+        .env_remove("MEADOW")
+        .env_remove("MEADOWBOOT_EXPANSIONS")
+        .output()
+        .expect("MeadowBoot runs");
+    assert!(
+        made.status.success() && out.is_file(),
+        "{}{}",
+        String::from_utf8_lossy(&made.stdout),
+        String::from_utf8_lossy(&made.stderr)
+    );
+    // Each a directory of its own, and all one package: the program names it.
+    let package = |name: &str| {
+        let dir = scratch.join(name);
+        std::fs::create_dir_all(dir.join("src")).expect("a package directory");
+        std::fs::write(
+            dir.join("Meadow.toml"),
+            "[package]\nname = \"Summed\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("a manifest");
+        std::fs::write(
+            dir.join("src").join("Main.mw"),
+            "use Std.Collections.Vector as V\n\nfun main () = println (V.foldl (\\a x -> a + x) 0 [1, 2, 3])\n",
+        )
+        .expect("the root module");
+        dir
+    };
+    let build = |dir: &Path, precompiled: Option<&Path>, args: &[&str]| {
+        let mut c = Command::new(meadowboot_exe());
+        c.arg("run")
+            .args(args)
+            .arg(dir)
+            .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+            .env("MEADOW_HOST", meadow_host())
+            .env_remove("MEADOW")
+            .env_remove("MEADOWBOOT_EXPANSIONS");
+        match precompiled {
+            Some(p) => c.env("MEADOWBOOT_PRECOMPILED_STD", p),
+            None => c.env("MEADOWBOOT_PRECOMPILED_STD", scratch.join("none.mwstd")),
+        };
+        let o = c.output().expect("MeadowBoot runs");
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        assert!(o.status.success(), "{said}");
+        assert!(said.ends_with("6\n"), "{said}");
+    };
+    let objects = |dir: &Path, profile: &str| {
+        let units = dir.join("target").join(profile).join("units");
+        let std = std::fs::read_dir(&units)
+            .expect("the build's units")
+            .flatten()
+            .find(|e| e.file_name().to_string_lossy().starts_with("Std-"))
+            .expect("the standard library's unit");
+        std::fs::read_to_string(std.path().join("Std.cut")).expect("its object")
+    };
+    // Run on the JIT as `release` too: an executable needs a runtime library
+    // to link, which is not what is tested here.
+    for (profile, args) in [("debug", &[][..]), ("release", &["--release", "--jit"][..])] {
+        let fresh = package(&format!("Fresh{profile}"));
+        let taken = package(&format!("Taken{profile}"));
+        build(&fresh, None, args);
+        build(&taken, Some(&out), args);
+        assert_eq!(
+            objects(&fresh, profile),
+            objects(&taken, profile),
+            "the library compiled, and taken precompiled, as `{profile}`"
+        );
+        // A debug build says where each file of the program is (its Cut's
+        // `source`s), and the two packages are in directories of their own:
+        // that is all that may differ.
+        let linked = |dir: &Path| {
+            std::fs::read_to_string(
+                dir.join("target")
+                    .join(profile)
+                    .join("link")
+                    .join("program.cut"),
+            )
+            .ok()
+        };
+        let name = |dir: &Path| dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(
+            linked(&fresh),
+            linked(&taken).map(|t| t.replace(&name(&taken), &name(&fresh))),
+            "the program linked with the library compiled, and taken precompiled, as `{profile}`"
+        );
+    }
+    // Taken, the library's unit has no record of having been compiled: the
+    // compile writes what it was compiled as, and taking it writes nothing
+    // but what was precompiled.
+    let taken = package("TakenAgain");
+    build(&taken, Some(&out), &[]);
+    let units = taken.join("target").join("debug").join("units");
+    let std = std::fs::read_dir(&units)
+        .expect("the build's units")
+        .flatten()
+        .find(|e| e.file_name().to_string_lossy().starts_with("Std-"))
+        .expect("the standard library's unit");
+    assert!(
+        !std.path().join("Std.key").exists(),
+        "the library was compiled, not taken"
+    );
+    // For options it holds no compile for, the library is compiled.
+    let other = package("Other");
+    build(&other, Some(&out), &["-O", "0"]);
+    let units = other.join("target").join("debug").join("units");
+    let std = std::fs::read_dir(&units)
+        .expect("the build's units")
+        .flatten()
+        .find(|e| e.file_name().to_string_lossy().starts_with("Std-"))
+        .expect("the standard library's unit");
+    assert!(
+        std.path().join("Std.key").exists(),
+        "the library was taken for `-O 0`, which it holds no compile for"
+    );
+}
+
+/// `meadowboot dis` is MeadowBoot's build listed by the back end: the
+/// bytecode Glade runs, in the form `meadow dis` writes it, and with `--asm`
+/// the machine code.
+#[test]
+fn meadowboot_disassembles_what_it_builds() {
+    let dir = tested_package("dis");
+    let ((rust_code, rust), (boot_code, boot)) = both_say(&["dis".as_ref(), dir.as_os_str()]);
+    assert_eq!(rust_code, Some(0), "{rust}");
+    assert_eq!(boot_code, Some(0), "{boot}");
+    // The first line of a listing says what it is the same way, whatever
+    // compiler made the bytecode.
+    let first = |s: &str| {
+        s.lines()
+            .find(|l| !l.starts_with("   ") && !l.starts_with("meadow:"))
+            .unwrap_or_default()
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert_eq!(
+        first(&rust),
+        first(&boot),
+        "meadow:\n{rust}\nMeadowBoot:\n{boot}"
+    );
+    let ((_, rust), (boot_code, boot)) =
+        both_say(&["dis".as_ref(), "--asm".as_ref(), dir.as_os_str()]);
+    assert_eq!(boot_code, Some(0), "{boot}");
+    assert_eq!(
+        first(&rust),
+        first(&boot),
+        "meadow:\n{rust}\nMeadowBoot:\n{boot}"
+    );
 }
 
 /// `meadow-host`, the Rust `meadow` as a library, built beside the `meadow`

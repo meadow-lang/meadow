@@ -169,21 +169,12 @@ pub fn program(p: &Program) -> Program {
             hole: hole.clone(),
         };
         let body = Walk::new(k).statement(&d.body, &mut dps);
-        let ptr = |name: &str| Binder {
-            name: name.to_string(),
-            rep: Rep::Ptr,
-        };
-        let mut params = vec![
-            ptr(&dst),
-            Binder {
-                name: at,
-                rep: Rep::I64,
-            },
-            ptr(&hole),
-        ];
+        let ptr = |name: &str| Binder::new(name, Rep::Ptr);
+        let mut params = vec![ptr(&dst), Binder::new(at, Rep::I64), ptr(&hole)];
         params.extend(d.params.iter().cloned());
         out.defs.push(Def {
             symbol: twin(&d.symbol),
+            shown: d.shown.clone(),
             rep_vars: d.rep_vars.clone(),
             effect_vars: d.effect_vars.clone(),
             params,
@@ -466,6 +457,7 @@ impl Walk {
                 }
                 Statement::Perform(op.clone(), args.clone(), self.consumer(c, v)?)
             }
+            Statement::At(at, inner) => Statement::At(*at, Box::new(self.statement(inner, v)?)),
             Statement::Error(_) => s.clone(),
         })
     }
@@ -510,6 +502,9 @@ impl Walk {
         let mut s = s;
         let (root, to) = loop {
             match s {
+                // Where a context was written is not kept: it only builds,
+                // and is built before the call it follows.
+                Statement::At(_, inner) => s = inner,
                 Statement::Let(b, p, rest) if built(p) => {
                     lets.push((b.clone(), p.clone()));
                     s = rest;
@@ -608,13 +603,7 @@ fn cells(
             Some(next) => Producer::Var(next.clone()),
             None => Producer::Var(hole.to_string()),
         };
-        lets.push((
-            Binder {
-                name: named[i].clone(),
-                rep: Rep::Ptr,
-            },
-            cell.with(inner),
-        ));
+        lets.push((Binder::new(named[i].clone(), Rep::Ptr), cell.with(inner)));
     }
     let root = named[0].clone();
     let last = named[named.len() - 1].clone();
@@ -698,26 +687,14 @@ impl Leaves for Entry<'_> {
         let hole = self.names.fresh("hole");
         let (mut lets, root, last) = cells(c, &hole, self.names);
         let at = Producer::Int(c.cells[c.cells.len() - 1].at as i64);
-        let filled = Binder {
-            name: self.names.fresh("filled"),
-            rep: Rep::Unit,
-        };
+        let filled = Binder::new(self.names.fresh("filled"), Rep::Unit);
         let answer = Statement::Cut(Producer::Var(root), Consumer::Var(c.to.clone()));
         let fill = Statement::Call(
             twin(g),
             twin_args(&last, at, &hole, args),
             vec![Consumer::MuTilde(filled, Box::new(answer))],
         );
-        lets.insert(
-            0,
-            (
-                Binder {
-                    name: hole,
-                    rep: Rep::Ptr,
-                },
-                self.hole.clone(),
-            ),
-        );
+        lets.insert(0, (Binder::new(hole, Rep::Ptr), self.hole.clone()));
         with_lets(lets, fill)
     }
     fn answer(&mut self, to: &str) -> Consumer {
@@ -768,10 +745,7 @@ impl Leaves for Dps<'_> {
     fn site(&mut self, g: &Symbol, args: &[Producer], c: &Context, _: &Statement) -> Statement {
         let (lets, root, last) = cells(c, &self.hole, self.names);
         let at = Producer::Int(c.cells[c.cells.len() - 1].at as i64);
-        let filled = Binder {
-            name: self.names.fresh("filled"),
-            rep: Rep::Unit,
-        };
+        let filled = Binder::new(self.names.fresh("filled"), Rep::Unit);
         let next = Statement::Call(
             twin(g),
             twin_args(&last, at, &self.hole, args),
@@ -788,13 +762,7 @@ impl Leaves for Dps<'_> {
     fn answer(&mut self, to: &str) -> Consumer {
         let v = self.names.fresh("answer");
         let write = self.write(Producer::Var(v.clone()), to);
-        Consumer::MuTilde(
-            Binder {
-                name: v,
-                rep: Rep::Ptr,
-            },
-            Box::new(write),
-        )
+        Consumer::MuTilde(Binder::new(v, Rep::Ptr), Box::new(write))
     }
 }
 
@@ -842,6 +810,7 @@ fn mentions_s(s: &Statement, x: &str) -> bool {
                 || mentions_c(&h.cont, x)
         }
         Statement::Perform(_, args, c) => args.iter().any(|a| mentions_p(a, x)) || mentions_c(c, x),
+        Statement::At(_, s) => mentions_s(s, x),
         Statement::Error(_) => false,
     }
 }
@@ -880,6 +849,7 @@ fn binders_s(s: &Statement, out: &mut HashSet<String>) {
             args.iter().for_each(|a| binders_p(a, out));
             binders_c(c, out);
         }
+        Statement::At(_, s) => binders_s(s, out),
         Statement::Error(_) => {}
     }
 }

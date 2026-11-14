@@ -21,6 +21,7 @@ pub mod parse;
 pub mod print;
 pub mod pure;
 pub mod specialize;
+pub mod strip;
 pub mod trmc;
 
 pub use parse::parse;
@@ -148,6 +149,53 @@ impl fmt::Display for Symbol {
 pub struct Binder {
     pub name: String,
     pub rep: Rep,
+    /// What the source calls it, for a debugger: see [`Shown`]. Nothing
+    /// but a debugger reads it.
+    pub shown: Option<Shown>,
+}
+
+impl Binder {
+    /// `name: rep`, with no name of the source's.
+    pub fn new(name: impl Into<String>, rep: Rep) -> Binder {
+        Binder {
+            name: name.into(),
+            rep,
+            shown: None,
+        }
+    }
+}
+
+/// A variable as the source wrote it: its name, and its type as the front
+/// end writes types -- `count`, `Int`. Written after a binder's
+/// representation, `v12: i64 @"count" "Int"`, by a front end building a
+/// program to be debugged; what a debugger shows a value under.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Shown {
+    pub name: String,
+    pub ty: String,
+}
+
+/// A source file the positions of a program are in: the symbol positions
+/// name it by, and its path. `source meadow:App/"src/Main.mw" = "/home/me/App/src/Main.mw"`.
+///
+/// A symbol, so that programs of several packages put together text by text
+/// -- as MeadowBoot links its units -- name their files apart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Source {
+    pub symbol: Symbol,
+    pub path: String,
+}
+
+/// Where a statement was written: bytes `start..end` of the source file at
+/// [`Program::sources`]`[source]`. `@meadow:App/"src/Main.mw":120-134 s`.
+///
+/// A position says what a debugger stops at and shows: it does nothing,
+/// and a program runs as it would without it ([`strip`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Pos {
+    pub source: u32,
+    pub start: u32,
+    pub end: u32,
 }
 
 /// What makes a value.
@@ -180,6 +228,9 @@ pub enum Producer {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Method {
     pub name: String,
+    /// What the source calls the function it is part of, for a debugger's
+    /// stack: `apply @"mainLocal1"(..)`, as `Def::shown` for a definition.
+    pub shown: Option<String>,
     pub params: Vec<Binder>,
     pub conts: Vec<String>,
     /// What it may perform, if the front end says: see [`Row`].
@@ -231,6 +282,20 @@ pub enum Statement {
     /// `perform E.op(p, ..; c)`
     Perform(Symbol, Vec<Producer>, Consumer),
     Error(String),
+    /// `@S:a-b s`: `s`, written at that position. It does nothing; see
+    /// [`Pos`].
+    At(Pos, Box<Statement>),
+}
+
+impl Statement {
+    /// The statement under any positions around it.
+    pub fn bare(&self) -> &Statement {
+        let mut s = self;
+        while let Statement::At(_, inner) = s {
+            s = inner;
+        }
+        s
+    }
 }
 
 /// `handle { clauses; return(..) } in μ b. body ; cont`
@@ -302,6 +367,9 @@ pub enum Kind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Def {
     pub symbol: Symbol,
+    /// What the source calls it, for a debugger's stack: `def S @"fact" ..`.
+    /// A copy of it, or a twin, is shown by the same name.
+    pub shown: Option<String>,
     /// Each representation variable, with the descriptor parameter that
     /// carries it.
     pub rep_vars: Vec<(String, String)>,
@@ -327,6 +395,8 @@ pub struct Row {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Val {
     pub symbol: Symbol,
+    /// What the source calls it, as [`Def::shown`]: `val S @"answer" : ..`.
+    pub shown: Option<String>,
     pub rep: Rep,
     pub body: Statement,
 }
@@ -352,6 +422,8 @@ pub struct Program {
     pub answer: Answer,
     /// What C may call, by the names it calls them.
     pub exports: Vec<Export>,
+    /// The files its positions are in: see [`Pos`].
+    pub sources: Vec<Source>,
     pub datas: Vec<DataDecl>,
     /// Each role a runtime knows (`meadow_rt::roles`), by its name, and the
     /// constructor that plays it.

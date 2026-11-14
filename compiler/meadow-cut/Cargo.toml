@@ -12,7 +12,11 @@ path = "src/lib.rs"
 # What Cut is lowered to, and the primitives and descriptors the two share.
 meadow-axcut.workspace = true
 meadow-rt.workspace = true
+meadow-span.workspace = true
 meadow-intern.workspace = true
 
 [dev-dependencies]
+# The bytecode a program is compiled to, to check that positions change none of it.
+meadow-codegen.workspace = true
+meadow-bytecode.workspace = true
 meadow-scratch.workspace = true
