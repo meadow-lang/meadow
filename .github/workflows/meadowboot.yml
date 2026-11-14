@@ -191,8 +191,11 @@ jobs:
           # local ones.
           if [ "$RUNNER_OS" != "Windows" ]; then strip "$dir/MeadowBoot" "$dir/meadow"; strip -x "$dir/$host"; fi
           # MeadowBoot's standard library compiled, beside its sources, so
-          # that no build compiles it. After `strip`: the file is named by the
-          # size of the MeadowBoot that wrote it, which is the one shipped.
+          # that no build compiles it. Written by the very MeadowBoot that is
+          # shipped, after `strip` and after anything else that would change
+          # its bytes: the file is named by the MeadowBoot that wrote it, and
+          # any other takes it for another compiler's and compiles the library
+          # itself. `meadowup` copies the executable as it is, renaming it.
           env -u MEADOW -u MEADOWBOOT_STD "$dir/MeadowBoot$exe" __precompile-std "$dir/lib/Std.mwstd"
           ls -l "$dir" "$dir/lib"
           echo "BUNDLE=$dir" >> "$GITHUB_ENV"
@@ -276,6 +279,17 @@ jobs:
             exit 1
           fi
           "$bin" init "$RUNNER_TEMP/smokepkg"
+          # Its first build takes the standard library from `lib/Std.mwstd`:
+          # a compile of it times its passes, and one taken from the file
+          # does not. One that compiles it is a `Std.mwstd` this MeadowBoot
+          # does not take as its own.
+          (cd "$RUNNER_TEMP/smokepkg" && MEADOWBOOT_TIMINGS=1 "$bin" build . > "$RUNNER_TEMP/timings.txt" 2>&1) || { cat "$RUNNER_TEMP/timings.txt"; exit 1; }
+          grep -q '^timings Std:' "$RUNNER_TEMP/timings.txt"
+          if awk '/^timings /{std = ($2 == "Std:")} std && /^  parse /' "$RUNNER_TEMP/timings.txt" | grep -q .; then
+            cat "$RUNNER_TEMP/timings.txt"
+            echo "Std was compiled: the installed meadow did not take lib/Std.mwstd" >&2
+            exit 1
+          fi
           (cd "$RUNNER_TEMP/smokepkg" && "$bin" run --release --aot . | tail -1 | grep -q 'Hello, world!')
           (cd "$RUNNER_TEMP/smokepkg" && "$bin" run --all-features . 2>&1 | tee "$RUNNER_TEMP/fallback.txt" | tail -1 | grep -q 'Hello, world!')
           grep -q 'meadow-rust' "$RUNNER_TEMP/fallback.txt"
