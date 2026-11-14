@@ -1218,9 +1218,10 @@ fn parse_manifest(text: &str, dir: &Path) -> (Manifest, Inherits) {
                     // Where an unstable feature was asked for until 0.3:
                     // said, since what is written there now does nothing.
                     "features" => problems.push(
-                        "`features` under `[package]` is not read any more: an unstable \
-                         feature is asked for in the source, `@!feature(ffi)` at the top of \
-                         the package's root module, and the features a package offers go \
+                        "`features` under `[package]` is not read any more: `ffi`, which \
+                         was asked for there, is stable and needs no asking; an unstable \
+                         feature is asked for in the source, `@!feature(…)` at the top of \
+                         the package's root module; and the features a package offers go \
                          under `[features]`"
                             .to_string(),
                     ),

@@ -2029,7 +2029,7 @@ fun compiled (o : UnitsOptions) (u : Given Interface) (clk : Clock) =
 -- MeadowBoot can carry it compiled, as a release of the Rust `meadow` carries
 -- its own (`buildtools/meadow/src/stdlib.rs`): `meadow __precompile-std OUT`
 -- writes it, and a build that finds it -- `Std.mwstd` beside the library's
--- sources, or where `MEADOWBOOT_PRECOMPILED_STD` says (`Unit.precompiledStd`)
+-- sources, or where `MEADOWBOOT_PRECOMPILED_STD` says (`Unit.precompiledOf`)
 -- -- takes the library's interface and objects from it in place of compiling
 -- it. What the Rust one keeps is its own front end's output, which nothing of
 -- MeadowBoot's reads; this is MeadowBoot's: the unit's interface, as the
@@ -2039,11 +2039,20 @@ fun compiled (o : UnitsOptions) (u : Given Interface) (clk : Clock) =
 -- It is the precompiled library only for the build that would have made it:
 -- each compile in it is named by everything compiling depends on -- the
 -- options (`keyOf`) and the library's sources (`stdKeyOf`) -- and the file
--- by the compiler that wrote it, this program's size (`MEADOWBOOT_SELF`), so
--- a MeadowBoot built from other sources does not take another's objects.
+-- by the compiler that wrote it, a hash of this program (`Unit.selfKey`,
+-- `MEADOWBOOT_SELF`), so a MeadowBoot built from other sources does not take
+-- another's objects, even one of the same size.
+--
+-- A compile for a debugger says where each of the library's files is (its
+-- Cut's `source`s), which is where they were on the machine that made the
+-- precompiled library. So the file keeps each of those paths from the
+-- library's directory, and a build that takes it says them from where the
+-- library is there (`relocated`): a debugger stepping into the library opens
+-- the sources beside it, and the program linked is the one a build that
+-- compiled the library there would have linked.
 
 -- How a precompiled library is laid out: one made another way is no match.
-def stdLayout : Int = 1
+def stdLayout : Int = 2
 
 -- Where a compile of the standard library says what it was compiled as.
 @pub def stdKeyFile : String = "Std.key"
@@ -2106,29 +2115,112 @@ fun precompiledFor (o : UnitsOptions) (u : Given Interface)
            | _ -> None)
       | _ -> None
 
--- The interface read, and each object written into the unit's directory:
--- nothing, if either cannot be.
+-- The interface read, and each object written into the unit's directory,
+-- the files its `source`s name said from where the library is: nothing, if
+-- either cannot be.
 fun placed (u : Given Interface) (interface : String) (files : [Wire])
     : Maybe Interface ! { Fs | e } =
   let read =
     M.andThen
       (\d -> Res.toMaybe (fromDatum d))
       (M.andThen jsonDatum (Res.toMaybe (J.parse interface)))
+  in
+  let held =
+    V.concatMap
+      (\w ->
+        match w with
+        | Wire.Node name parts ->
+            (match V.get parts 0 with
+             | Just (Wire.Text content) -> [(name, content)]
+             | _ -> [])
+        | _ -> [])
+      files
   in match read with
      | None -> None
      | Just (i : Interface) ->
+         let dir = unitDir u in
          let written =
-           V.all
-             (\w ->
-               match w with
-               | Wire.Node name held ->
-                   (match V.get held 0 with
-                    | Just (Wire.Text content) ->
-                        Res.isOk (writeString (Path.join (unitOut u) name, content))
-                    | _ -> False)
-               | _ -> False)
-             files
+           V.len held == V.len files
+             and V.all
+               (\f -> Res.isOk (writeString (Path.join (unitOut u) (fst f), snd f)))
+               (relocated
+                  (\p -> if Path.isAbsolute p then p else Path.normalize (Path.join dir p))
+                  held)
          in if written then Just i else None
+
+-- A unit's files, each path its Cut's `source`s name made `moved`, and its
+-- index of where each definition is in that Cut kept true. The `source`s are
+-- all in what a Cut always has, ahead of its first definition (`written`),
+-- so every definition moves by as much as that does.
+@pub fun relocated (moved : String -> String) (files : [(String, String)]) : [(String, String)] =
+  let cuts =
+    V.concatMap
+      (\f ->
+        match f with
+        | (name, text) ->
+            if S.endsWith ".cut" name then
+              (let after = resourced moved text in
+               [(stemOf name, (after, stringByteLength after - stringByteLength text))])
+            else [])
+      files
+  in V.map
+       (\f ->
+         match f with
+         | (name, text) ->
+             let stem = stemOf name in
+             if S.endsWith ".cut" name then
+               (match V.find (\c -> fst c == stem) cuts with
+                | Just (_, (after, _)) -> (name, after)
+                | None -> f)
+             else if S.endsWith ".idx" name then
+               (match V.find (\c -> fst c == stem) cuts with
+                | Just (_, (_, by)) -> (name, if by == 0 then text else shiftedIndex by text)
+                | None -> f)
+             else f)
+       files
+
+-- A unit's file's name without its extension, `Std.cut`'s `Std`: what its
+-- object and its index are both named by.
+fun stemOf (name : String) : String =
+  match S.indexOf "." name with
+  | Just at -> stringSlice name 0 at
+  | None -> name
+
+-- The Cut `text`, the file each `source` names made `moved`: a `source`
+-- whose path is written with no escape, as every path a build writes is.
+fun resourced (moved : String -> String) (text : String) : String =
+  let always =
+    (match S.indexOf parted text with
+     | Just at -> at
+     | None -> stringByteLength text)
+  in
+  let lines =
+    V.map
+      (\l ->
+        match (if S.startsWith "source " l then S.indexOf " = \"" l else None) with
+        | Just at ->
+            let path = stringSlice l (at + 4) (stringByteLength l - 1) in
+            if not (S.endsWith "\"" l) or S.contains "\\" path or S.contains "\"" path then l
+            else "${stringSlice l 0 (at + 3)}${cutQuoted (moved path)}"
+        | None -> l)
+      (S.split "\n" (stringSlice text 0 always))
+  in S.join "\n" lines ++ stringSlice text always (stringByteLength text)
+
+-- A path as Cut quotes a string.
+fun cutQuoted (s : String) : String =
+  "\"" ++ S.join "\\\\" (V.map (\p -> S.join "\\\"" (S.split "\"" p)) (S.split "\\" s)) ++ "\""
+
+-- An object's index, each definition `by` bytes further on.
+fun shiftedIndex (by : Int) (index : String) : String =
+  S.join
+    "\n"
+    (V.map
+       (\line ->
+         let cols = S.split "\t" line in
+         match (if V.len cols >= 3 then S.toInt (V.getOr "" cols 1) else None) with
+         | Just at -> S.join "\t" (V.concat [V.take cols 1, [show (at + by)], V.drop cols 2])
+         | None -> line)
+       (S.split "\n" index))
 
 -- A compile of the standard library as a precompiled library keeps it: its
 -- interface, as the build kept it, and each file its compile wrote, by name.
