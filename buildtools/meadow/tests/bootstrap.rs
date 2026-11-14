@@ -3502,19 +3502,13 @@ fn meadowboot_runs_the_standard_library_s_tests() {
     );
 }
 
-/// `meadowboot __precompile-std` writes the standard library compiled, and a
-/// build that finds it compiles none of the library and links what a build
-/// that compiled it links; one that finds it made by another compiler, or
-/// for other options, compiles the library itself.
-#[test]
-fn a_build_takes_the_standard_library_meadowboot_precompiled() {
-    let scratch = meadow_scratch::scratch!("meadowboot-precompile-{}", std::process::id());
-    std::fs::create_dir_all(&scratch).expect("a scratch directory");
-    let out = scratch.join("Std.mwstd");
+/// `meadowboot __precompile-std` of the standard library at `library`, into
+/// `out`.
+fn precompile_std(library: &Path, out: &Path) {
     let made = Command::new(meadowboot_exe())
         .arg("__precompile-std")
-        .arg(&out)
-        .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+        .arg(out)
+        .env("MEADOWBOOT_STD", library)
         .env("MEADOW_HOST", meadow_host())
         .env_remove("MEADOW")
         .env_remove("MEADOWBOOT_EXPANSIONS")
@@ -3526,112 +3520,243 @@ fn a_build_takes_the_standard_library_meadowboot_precompiled() {
         String::from_utf8_lossy(&made.stdout),
         String::from_utf8_lossy(&made.stderr)
     );
-    // Each a directory of its own, and all one package: the program names it.
-    let package = |name: &str| {
-        let dir = scratch.join(name);
-        std::fs::create_dir_all(dir.join("src")).expect("a package directory");
-        std::fs::write(
-            dir.join("Meadow.toml"),
-            "[package]\nname = \"Summed\"\nversion = \"0.1.0\"\n",
-        )
-        .expect("a manifest");
-        std::fs::write(
-            dir.join("src").join("Main.mw"),
-            "use Std.Collections.Vector as V\n\nfun main () = println (V.foldl (\\a x -> a + x) 0 [1, 2, 3])\n",
-        )
-        .expect("the root module");
-        dir
+}
+
+/// Where a build finds the standard library precompiled.
+#[derive(Clone, Copy)]
+enum Precompiled<'a> {
+    /// Nowhere: it compiles the library.
+    None,
+    /// Where `MEADOWBOOT_PRECOMPILED_STD` says.
+    At(&'a Path),
+    /// As a release lays it out: `Std.mwstd` beside the library's sources.
+    Beside,
+}
+
+/// A package at `dir` whose program sums with the standard library: the
+/// same package wherever it is, named `Summed`.
+fn summed_package(dir: &Path) {
+    std::fs::create_dir_all(dir.join("src")).expect("a package directory");
+    std::fs::write(
+        dir.join("Meadow.toml"),
+        "[package]\nname = \"Summed\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("a manifest");
+    std::fs::write(
+        dir.join("src").join("Main.mw"),
+        "use Std.Collections.Vector as V\n\nfun main () = println (V.foldl (\\a x -> a + x) 0 [1, 2, 3])\n",
+    )
+    .expect("the root module");
+}
+
+/// `meadowboot run` of the package at `dir`, with `args`, the standard
+/// library's sources at `library` and its precompiled self where `precompiled`
+/// says: from nothing, its `target/` gone first.
+fn summed_run(dir: &Path, library: &Path, precompiled: Precompiled, args: &[&str]) {
+    let _ = std::fs::remove_dir_all(dir.join("target"));
+    let mut c = Command::new(meadowboot_exe());
+    c.arg("run")
+        .args(args)
+        .arg(dir)
+        .env("MEADOWBOOT_STD", library)
+        .env("MEADOW_HOST", meadow_host())
+        .env_remove("MEADOW")
+        .env_remove("MEADOWBOOT_EXPANSIONS");
+    match precompiled {
+        Precompiled::None => c.env("MEADOWBOOT_PRECOMPILED_STD", dir.join("none.mwstd")),
+        Precompiled::At(p) => c.env("MEADOWBOOT_PRECOMPILED_STD", p),
+        Precompiled::Beside => c.env_remove("MEADOWBOOT_PRECOMPILED_STD"),
     };
-    let build = |dir: &Path, precompiled: Option<&Path>, args: &[&str]| {
-        let mut c = Command::new(meadowboot_exe());
-        c.arg("run")
-            .args(args)
-            .arg(dir)
-            .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
-            .env("MEADOW_HOST", meadow_host())
-            .env_remove("MEADOW")
-            .env_remove("MEADOWBOOT_EXPANSIONS");
-        match precompiled {
-            Some(p) => c.env("MEADOWBOOT_PRECOMPILED_STD", p),
-            None => c.env("MEADOWBOOT_PRECOMPILED_STD", scratch.join("none.mwstd")),
-        };
-        let o = c.output().expect("MeadowBoot runs");
-        let said = format!(
-            "{}{}",
-            String::from_utf8_lossy(&o.stdout),
-            String::from_utf8_lossy(&o.stderr)
-        );
-        assert!(o.status.success(), "{said}");
-        assert!(said.ends_with("6\n"), "{said}");
-    };
-    let objects = |dir: &Path, profile: &str| {
-        let units = dir.join("target").join(profile).join("units");
-        let std = std::fs::read_dir(&units)
-            .expect("the build's units")
-            .flatten()
-            .find(|e| e.file_name().to_string_lossy().starts_with("Std-"))
-            .expect("the standard library's unit");
-        std::fs::read_to_string(std.path().join("Std.cut")).expect("its object")
-    };
+    let o = c.output().expect("MeadowBoot runs");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(o.status.success(), "{said}");
+    assert!(said.ends_with("6\n"), "{said}");
+}
+
+/// The standard library's unit in the build of `dir` as `profile`: the one
+/// that wrote `Std.cut`, whatever the build named it by.
+fn std_unit(dir: &Path, profile: &str) -> PathBuf {
+    let units = dir.join("target").join(profile).join("units");
+    std::fs::read_dir(&units)
+        .expect("the build's units")
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.join("Std.cut").is_file())
+        .expect("the standard library's unit")
+}
+
+/// What the build of `dir` as `profile` linked.
+fn summed_linked(dir: &Path, profile: &str) -> String {
+    std::fs::read_to_string(
+        dir.join("target")
+            .join(profile)
+            .join("link")
+            .join("program.cut"),
+    )
+    .expect("the program linked")
+}
+
+/// `meadowboot __precompile-std` writes the standard library compiled, and a
+/// build that finds it compiles none of the library and links what a build
+/// that compiled it links; one that finds it made for other options compiles
+/// the library itself.
+#[test]
+fn a_build_takes_the_standard_library_meadowboot_precompiled() {
+    let scratch = meadow_scratch::scratch!("meadowboot-precompile-{}", std::process::id());
+    let library = repo().join("lib").join("Std");
+    let out = scratch.join("Std.mwstd");
+    precompile_std(&library, &out);
     // Run on the JIT as `release` too: an executable needs a runtime library
     // to link, which is not what is tested here.
     for (profile, args) in [("debug", &[][..]), ("release", &["--release", "--jit"][..])] {
-        let fresh = package(&format!("Fresh{profile}"));
-        let taken = package(&format!("Taken{profile}"));
-        build(&fresh, None, args);
-        build(&taken, Some(&out), args);
+        // One package, built with the library compiled and then with it
+        // taken: the same program, to the byte -- a debug build's `source`s,
+        // which say where each file of the program is, the library's too.
+        let dir = scratch.join(format!("Summed{profile}"));
+        summed_package(&dir);
+        summed_run(&dir, &library, Precompiled::None, args);
+        let unit = std_unit(&dir, profile);
+        assert!(
+            unit.join("Std.key").exists(),
+            "the library was taken as `{profile}`, where there was none to take"
+        );
+        let object = |name: &str| std::fs::read_to_string(unit.join(name)).expect("its object");
+        let (fresh, fresh_index, fresh_linked) = (
+            object("Std.cut"),
+            object("Std.idx"),
+            summed_linked(&dir, profile),
+        );
+        summed_run(&dir, &library, Precompiled::At(&out), args);
+        // Taken, the library's unit has no record of having been compiled:
+        // the compile writes what it was compiled as, and taking it writes
+        // nothing but what was precompiled.
+        assert!(
+            !unit.join("Std.key").exists(),
+            "the library was compiled as `{profile}`, not taken"
+        );
         assert_eq!(
-            objects(&fresh, profile),
-            objects(&taken, profile),
+            (fresh, fresh_index),
+            (object("Std.cut"), object("Std.idx")),
             "the library compiled, and taken precompiled, as `{profile}`"
         );
-        // A debug build says where each file of the program is (its Cut's
-        // `source`s), and the two packages are in directories of their own:
-        // that is all that may differ.
-        let linked = |dir: &Path| {
-            std::fs::read_to_string(
-                dir.join("target")
-                    .join(profile)
-                    .join("link")
-                    .join("program.cut"),
-            )
-            .ok()
-        };
-        let name = |dir: &Path| dir.file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(
-            linked(&fresh),
-            linked(&taken).map(|t| t.replace(&name(&taken), &name(&fresh))),
+            fresh_linked,
+            summed_linked(&dir, profile),
             "the program linked with the library compiled, and taken precompiled, as `{profile}`"
         );
     }
-    // Taken, the library's unit has no record of having been compiled: the
-    // compile writes what it was compiled as, and taking it writes nothing
-    // but what was precompiled.
-    let taken = package("TakenAgain");
-    build(&taken, Some(&out), &[]);
-    let units = taken.join("target").join("debug").join("units");
-    let std = std::fs::read_dir(&units)
-        .expect("the build's units")
-        .flatten()
-        .find(|e| e.file_name().to_string_lossy().starts_with("Std-"))
-        .expect("the standard library's unit");
-    assert!(
-        !std.path().join("Std.key").exists(),
-        "the library was compiled, not taken"
-    );
     // For options it holds no compile for, the library is compiled.
-    let other = package("Other");
-    build(&other, Some(&out), &["-O", "0"]);
-    let units = other.join("target").join("debug").join("units");
-    let std = std::fs::read_dir(&units)
-        .expect("the build's units")
-        .flatten()
-        .find(|e| e.file_name().to_string_lossy().starts_with("Std-"))
-        .expect("the standard library's unit");
+    let other = scratch.join("Other");
+    summed_package(&other);
+    summed_run(&other, &library, Precompiled::At(&out), &["-O", "0"]);
     assert!(
-        std.path().join("Std.key").exists(),
+        std_unit(&other, "debug").join("Std.key").exists(),
         "the library was taken for `-O 0`, which it holds no compile for"
     );
+    // Made by another compiler, though one of the same size, the library is
+    // compiled: the file names its compiler by its size and a hash of it
+    // (`T<n>:<size>-<hash>`, after the layout), whose last digit is changed.
+    let mut theirs = std::fs::read(&out).expect("the precompiled library");
+    let after = |from: usize, what: &[u8]| {
+        from + theirs[from..]
+            .windows(what.len())
+            .position(|w| w == what)
+            .expect("the file's header")
+    };
+    let text = after(after(0, b"meadowboot-std"), b";T") + 2;
+    let colon = after(text, b":");
+    let n: usize = std::str::from_utf8(&theirs[text..colon])
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .expect("the compiler's length");
+    let last = colon + n;
+    theirs[last] = if theirs[last] == b'1' { b'2' } else { b'1' };
+    let theirs_at = scratch.join("Theirs.mwstd");
+    std::fs::write(&theirs_at, &theirs).expect("another compiler's library");
+    let another = scratch.join("Another");
+    summed_package(&another);
+    summed_run(&another, &library, Precompiled::At(&theirs_at), &[]);
+    assert!(
+        std_unit(&another, "debug").join("Std.key").exists(),
+        "the library another compiler of the same size made was taken"
+    );
+}
+
+/// The standard library precompiled in one place and used from another -- a
+/// release's `lib/Std` and `lib/Std.mwstd`, made on the machine that built
+/// the release and unpacked wherever its user puts it -- is taken there, and
+/// says that each of the library's files is where it is now: what a debugger
+/// stepping into the library opens.
+#[test]
+fn a_precompiled_standard_library_moved_says_where_its_files_are_now() {
+    let scratch = meadow_scratch::scratch!("meadowboot-precompile-moved-{}", std::process::id());
+    // The library as a release lays it out, precompiled where it was made.
+    let made = scratch.join("Made");
+    copy_tree(
+        &repo().join("lib").join("Std"),
+        &made.join("lib").join("Std"),
+    );
+    precompile_std(
+        &made.join("lib").join("Std"),
+        &made.join("lib").join("Std.mwstd"),
+    );
+    // Then moved: nothing is where it was made any more.
+    let unpacked = scratch.join("Unpacked");
+    std::fs::rename(&made, &unpacked).expect("the release moved");
+    let library = unpacked.join("lib").join("Std");
+
+    let dir = scratch.join("Summed");
+    summed_package(&dir);
+    summed_run(&dir, &library, Precompiled::Beside, &[]);
+    assert!(
+        !std_unit(&dir, "debug").join("Std.key").exists(),
+        "the library beside its sources was not taken"
+    );
+    let linked = summed_linked(&dir, "debug");
+    let root = std::fs::canonicalize(&library).expect("the library's directory");
+    let files: Vec<&str> = linked
+        .lines()
+        .filter(|l| l.starts_with("source meadow:Std/"))
+        .filter_map(|l| l.split_once(" = \"").map(|(_, p)| p.trim_end_matches('"')))
+        .collect();
+    assert!(
+        !files.is_empty(),
+        "a debug build says where the library's files are:\n{linked}"
+    );
+    for f in &files {
+        let at = std::fs::canonicalize(f).unwrap_or_else(|e| panic!("{f}: {e}"));
+        assert!(at.starts_with(&root), "{f} is not in {}", library.display());
+    }
+    // And the program is the one a build that compiled the library there
+    // links.
+    summed_run(&dir, &library, Precompiled::None, &[]);
+    assert_eq!(
+        linked,
+        summed_linked(&dir, "debug"),
+        "the program linked with the library moved, and compiled where it is"
+    );
+}
+
+/// The files under `from`, copied to `to`, but for what a build left there.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("a directory to copy into");
+    for e in std::fs::read_dir(from)
+        .expect("a directory to copy")
+        .flatten()
+    {
+        let (src, dst) = (e.path(), to.join(e.file_name()));
+        if src.is_dir() {
+            if e.file_name() != "target" {
+                copy_tree(&src, &dst);
+            }
+        } else {
+            std::fs::copy(&src, &dst).expect("a file copied");
+        }
+    }
 }
 
 /// `meadowboot dis` is MeadowBoot's build listed by the back end: the

@@ -451,6 +451,20 @@ last release is under _Unreleased_.
 
 ### Fixed
 
+- A precompiled standard library made by MeadowBoot (`Std.mwstd`) can be
+  shipped. A debug build says where each file of the program is, and the
+  library's files were said where they were on the machine that precompiled
+  it, so a debugger stepping into `Std` on another machine looked for
+  sources in a directory that does not exist there. The file now keeps those
+  paths from the library's directory, and a build that takes it says them
+  from where the library is -- `lib/Std` beside MeadowBoot, in a release --
+  so the program it links is the one compiling the library there would
+  have linked. And the file was named by the size of the MeadowBoot that
+  wrote it, so a different compiler of the same size would have taken
+  another's objects and miscompiled; it is named by the size and a hash of
+  the program now. Hashing it takes about two seconds, once for each build
+  of MeadowBoot: the hash is kept in the temporary directory, and a prompt
+  starts as quickly as before.
 - Silo's leak check (`MEADOW_SILO_LEAKS`) no longer counts as left behind
   the regions of `TVar`s that a worker was still letting go of when `main`
   finished. A worker takes the list of `TVar`s nothing can reach and drops
