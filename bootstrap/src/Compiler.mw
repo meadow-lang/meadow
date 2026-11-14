@@ -1983,7 +1983,8 @@ fun keyOf (o : UnitsOptions) : String =
     show o.macros,
     show o.whole,
     show o.strict,
-    show o.checked
+    show o.checked,
+    show o.positions
   ]
 
 -- The options, and the unit's sources -- by their paths in it, so that where
