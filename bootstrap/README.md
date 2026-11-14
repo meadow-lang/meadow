@@ -351,10 +351,8 @@ runs an entry's program of Cut on Glade and hands back what it answered, and
 `meadow_repl_pages`, which says what the back end makes of it, for `:ir`
 (see the next section).
 
-`Std.Ffi` is unstable, so a stable `meadow` builds MeadowBoot only with
-`MEADOW_BOOTSTRAP=1`, which lets it take what a nightly takes, as
-`RUSTC_BOOTSTRAP` does rustc. A build from a checkout, or a nightly, needs
-nothing.
+`Std.Ffi` is stable, so any `meadow` builds MeadowBoot, a release's as
+well as a nightly or a build from a checkout.
 
 ## Shipped as `meadow`
 
@@ -549,11 +547,24 @@ as it links any unit's. A build finds it where `MEADOWBOOT_PRECOMPILED_STD`
 says, or as `Std.mwstd` beside the library's sources, as a release would lay
 it out, and takes the compile its options ask for in place of compiling the
 library. Each compile in the file is named by the options and the library's
-sources, the file by the size of the MeadowBoot that wrote it, so another
-compiler's, or one for other options, is not taken: the library is compiled
-as before. The file is one of the library's sources to the build, read
-each time it plans; its 34 MB cost a warm build about a third of a second,
-and save a cold one the library's compile, two to three seconds.
+sources, the file by the MeadowBoot that wrote it -- its size and a hash of
+its bytes (`Unit.selfKey`) -- so another compiler's, even one of the same
+size, or one for other options, is not taken: the library is compiled as
+before. Hashing MeadowBoot takes about two seconds, so it is done once for
+each build of it: what it came to is kept in the temporary directory with
+the program's path, size and the time it was written, and a run takes it
+from there while the program is still that.
+
+The file is made on one machine and used on others, so where it was made
+must not be in it. A debug build's Cut says where each file of the program
+is (its `source`s), for a debugger to open; the file keeps the library's as
+paths from the library's directory, and a build that takes it says them
+from wherever the library is (`Compiler.relocated`), its index moved to
+match. The program linked is then the one a build that compiled the library
+there would have linked, to the byte. The file is one of the library's
+sources to the build, read each time it plans; its 34 MB cost a warm build
+about a third of a second, and save a cold one the library's compile, two
+to three seconds.
 
 ## The debugger
 

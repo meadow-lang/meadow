@@ -1,11 +1,16 @@
-//! What is not settled is asked for by name, in the source: `@!feature(ffi)`
+//! What is not settled is asked for by name, in the source: `@!feature(…)`
 //! at the top of a package's root module, as `#![feature(…)]` is at the top
 //! of a crate's. See `meadow::channel`.
 //!
-//! These run as the `meadow` they are built with: a build from a checkout
-//! takes what a nightly takes, and a release's stable one refuses what is
-//! asked for (`accepted`). What a stable `meadow` says is `channel`'s own
-//! tests'.
+//! There is no unstable feature just now. `ffi`, calling C through
+//! `Std.Ffi`, was one, and is stable: a package uses `Std.Ffi` without
+//! asking, on every channel, and one that still asks builds and is told the
+//! line can go. What a stable `meadow` says of a feature still unstable is
+//! `channel`'s own tests'.
+//!
+//! These run as the `meadow` they are built with: a build from a checkout,
+//! or a release's stable one when `MEADOW_CHANNEL=stable` built them, as
+//! `release.yml` does.
 
 use meadow::pipeline;
 use std::path::Path;
@@ -38,48 +43,36 @@ fn said(dir: &Path) -> String {
         .join("\n")
 }
 
-/// What a package that asks for `ffi` rightly is told: nothing, by a build
-/// from a checkout or a nightly; and by a release's stable `meadow`, which
-/// takes no unstable feature, only that -- unless `MEADOW_BOOTSTRAP=1` says
-/// the compiler's own build is under way, as a release's checks do.
-fn accepted(said: &str) {
-    if meadow::channel::accepting() == "stable" {
-        assert!(
-            said.contains("the feature `ffi` is unstable, and this is a stable `meadow`"),
-            "{said}"
-        );
-    } else {
-        assert_eq!(said, "");
-    }
-}
-
 const CALLS: &str = "use Std.Ffi as Ffi\n\ndef result = 1\n";
 
+/// A package that uses `Std.Ffi` in more than one module, and asks for
+/// nothing, builds on the stable channel: what a release's checks run, with
+/// the stable `meadow` they build, and what a stable `meadow` that still
+/// refused `Std.Ffi` would fail. On any other channel it builds the same.
 #[test]
-fn a_package_that_calls_c_says_so_at_the_top_of_its_root_module() {
-    let without = package("without", MANIFEST, &[("Main.mw", CALLS)]);
-    let problem = said(&without);
-    assert!(
-        problem.contains("`Std.Ffi` is unstable") && problem.contains("`@!feature(ffi)`"),
-        "{problem}"
+fn a_stable_meadow_builds_a_package_that_calls_c_without_asking() {
+    let dir = package(
+        "stable",
+        MANIFEST,
+        &[
+            ("Main.mw", CALLS),
+            ("Other.mw", "use Std.Ffi (Arg)\n\n@pub def two = 2\n"),
+        ],
     );
-
-    let asked = format!("@!feature(ffi)\n\n{CALLS}");
-    let with = package("with", MANIFEST, &[("Main.mw", &asked)]);
-    accepted(&said(&with));
+    assert_eq!(
+        said(&dir),
+        "",
+        "a {} `meadow` refused `Std.Ffi`",
+        meadow::channel::CHANNEL
+    );
+    assert_eq!(meadow::channel::feature_problem("ffi", "stable"), None);
 }
 
 #[test]
-fn the_root_module_asks_for_the_whole_package() {
-    let dir = package(
-        "whole",
-        MANIFEST,
-        &[
-            ("Main.mw", "@!feature(ffi)\n\ndef result = 1\n"),
-            ("Other.mw", "use Std.Ffi as Ffi\n\n@pub def two = 2\n"),
-        ],
-    );
-    accepted(&said(&dir));
+fn a_package_that_still_asks_for_ffi_builds() {
+    let asked = format!("@!feature(ffi)\n\n{CALLS}");
+    let with = package("with", MANIFEST, &[("Main.mw", &asked)]);
+    assert_eq!(said(&with), "");
 }
 
 #[test]
@@ -95,8 +88,6 @@ fn a_module_that_is_not_the_root_cannot_ask() {
         problem.contains("it goes at the top of the root module"),
         "{problem}"
     );
-    // And so nothing asked: the `use` is refused as well.
-    assert!(problem.contains("`Std.Ffi` is unstable"), "{problem}");
 }
 
 #[test]
@@ -124,17 +115,17 @@ fn the_manifest_is_not_where_it_is_asked_any_more() {
     let problem = said(&dir);
     assert!(
         problem.contains("`features` under `[package]` is not read any more")
-            && problem.contains("`@!feature(ffi)`"),
+            && problem.contains("`ffi`, which was asked for there, is stable"),
         "{problem}"
     );
 }
 
 #[test]
-fn a_lone_file_asks_as_a_package_does() {
+fn a_lone_file_calls_c_as_a_package_does() {
     let dir = scratch("lone");
     let file = dir.join("calls.mw");
     std::fs::write(&file, CALLS).unwrap();
-    assert!(said(&file).contains("`@!feature(ffi)`"));
+    assert_eq!(said(&file), "");
     std::fs::write(&file, format!("@!feature(ffi)\n\n{CALLS}")).unwrap();
-    accepted(&said(&file));
+    assert_eq!(said(&file), "");
 }

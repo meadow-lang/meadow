@@ -61,6 +61,14 @@ last release is under _Unreleased_.
   version's tag used to start `meadowboot.yml` on its own and wait for the
   release to attach them to. The experimental targets (Intel macOS, ARM
   Linux) still do not hold one up.
+- `Std.Ffi` is stable. Meadow's own compiler depends on it -- MeadowBoot
+  runs the Rust back end through it -- so a release's stable `meadow` has to
+  build code that calls C, and what the compiler leans on that hard is
+  settled enough to promise. A package uses `Std.Ffi` on every channel
+  without asking. One that still says `@!feature(ffi)` builds, with a
+  warning that the line can go, as Rust takes a feature that has been
+  stabilised. `@!feature(…)` stays for what is not settled, of which there
+  is nothing just now.
 - MeadowBoot writes a packed interface in about 350 ms where it took 540
   (the standard library's), and a build's inference no longer writes the
   infer test's dump of every scheme or the language server's type of every
@@ -318,11 +326,9 @@ last release is under _Unreleased_.
   Cut, and the commands it has no code for yet. It used to start the Rust
   `meadow` as a second program for each, so a MeadowBoot could not be
   `meadow` without one beside it. MeadowBoot's archives carry the library,
-  and `MEADOW_HOST` names another. `MEADOW_BOOTSTRAP=1` lets a stable
-  `meadow` take unstable features, as `RUSTC_BOOTSTRAP` does rustc, for
-  building MeadowBoot, which uses `Std.Ffi` to do this. MeadowBoot reads a
-  module's own attributes, `@!feature(ffi)`, as the Rust compiler does; it
-  could not parse a file that began with one.
+  and `MEADOW_HOST` names another. MeadowBoot reads a module's own
+  attributes, `@!feature(…)`, as the Rust compiler does; it could not parse
+  a file that began with one.
 - `meadow update --breaking` moves a dependency past a release that breaks
   the `version` it asks for: the `version` in `Meadow.toml` is raised to the
   newest release, and the lockfile follows. With `--dry-run` it says what it
@@ -480,6 +486,20 @@ last release is under _Unreleased_.
 
 ### Fixed
 
+- A precompiled standard library made by MeadowBoot (`Std.mwstd`) can be
+  shipped. A debug build says where each file of the program is, and the
+  library's files were said where they were on the machine that precompiled
+  it, so a debugger stepping into `Std` on another machine looked for
+  sources in a directory that does not exist there. The file now keeps those
+  paths from the library's directory, and a build that takes it says them
+  from where the library is -- `lib/Std` beside MeadowBoot, in a release --
+  so the program it links is the one compiling the library there would
+  have linked. And the file was named by the size of the MeadowBoot that
+  wrote it, so a different compiler of the same size would have taken
+  another's objects and miscompiled; it is named by the size and a hash of
+  the program now. Hashing it takes about two seconds, once for each build
+  of MeadowBoot: the hash is kept in the temporary directory, and a prompt
+  starts as quickly as before.
 - Silo's leak check (`MEADOW_SILO_LEAKS`) no longer counts as left behind
   the regions of `TVar`s that a worker was still letting go of when `main`
   finished. A worker takes the list of `TVar`s nothing can reach and drops

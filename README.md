@@ -747,10 +747,13 @@ accepts unstable features, each named at the top of the root module of the
 package that uses it, as `#![feature(…)]` is in Rust:
 
 ```meadow
-@!feature(ffi)      -- calling C through Std.Ffi
-
-use Std.Ffi as Ffi
+@!feature(name)
 ```
+
+There are none just now. `ffi`, calling C through `Std.Ffi`, was the first,
+and is stable since 0.5.0: a package uses `Std.Ffi` on every channel without
+asking, and one that still says `@!feature(ffi)` builds, with a warning that
+the line can go.
 
 These are not the features a package offers the ones that build it, which are
 `[features]` in its `Meadow.toml` and work on every channel.

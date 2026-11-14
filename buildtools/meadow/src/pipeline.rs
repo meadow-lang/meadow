@@ -551,29 +551,6 @@ pub(crate) fn compile_graph(
     }
 }
 
-/// Where `decls` -- or a module written among them -- first says `use
-/// Std.Ffi`, if they do.
-fn uses_ffi(decls: &[meadow_compiler::ast::LDecl]) -> Option<Span> {
-    use meadow_compiler::ast::Decl;
-    decls.iter().find_map(|d| {
-        let base = match d.value() {
-            Decl::Attributed(_, inner) => inner.value(),
-            other => other,
-        };
-        match base {
-            Decl::Use(u)
-                if u.path.len() >= 2
-                    && &**u.path[0].value() == "Std"
-                    && &**u.path[1].value() == "Ffi" =>
-            {
-                Some(u.path[1].span)
-            }
-            Decl::Module(_, inner) => uses_ffi(inner),
-            _ => None,
-        }
-    })
-}
-
 fn compile_package(
     pkg: &Package,
     ident: InternedString,
@@ -604,7 +581,6 @@ fn compile_package(
 
     // What the package asks of a `meadow` that is not stable: `@!feature(…)`
     // at the top of its root module, as `#![feature(…)]` is a crate's to say.
-    let mut asked: Vec<String> = Vec::new();
     for m in &modules {
         for attr in &m.ast.value().attrs {
             let name = &**attr.name.value();
@@ -634,29 +610,17 @@ fn compile_package(
             } else {
                 for meta in &attr.meta {
                     let feature = meta.name();
-                    match crate::channel::feature_problem(
-                        feature.value(),
-                        crate::channel::accepting(),
-                    ) {
-                        Some(msg) => problem(msg, feature.span),
-                        None => asked.push(feature.value().to_string()),
+                    if let Some(msg) =
+                        crate::channel::feature_problem(feature.value(), crate::channel::CHANNEL)
+                    {
+                        problem(msg, feature.span);
+                    } else if let Some(msg) = crate::channel::feature_settled(feature.value()) {
+                        // As rustc takes a feature that has been stabilised:
+                        // the package builds, and is told the line can go.
+                        status::warning(format!("{}: {msg}", m.source.name()));
                     }
                 }
             }
-        }
-    }
-
-    // `Std.Ffi` is unstable: the package that names it has to have asked.
-    for m in &modules {
-        if let Some(span) = uses_ffi(&m.ast.value().decls)
-            && let Some(msg) = crate::channel::ffi_problem(&asked)
-        {
-            diags.push(Diagnostic {
-                msg,
-                filename: m.source.name().to_string(),
-                label: ("used here".to_string(), span),
-                extra_labels: vec![],
-            });
         }
     }
 

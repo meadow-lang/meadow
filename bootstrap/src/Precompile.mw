@@ -16,8 +16,15 @@
 -- the library. `--target` builds it for another system and processor, as a
 -- build with `--target` would want it: a triple, or an architecture alone.
 
-use MeadowBoot.Compiler (buildUnits, precompiledVariant, precompiledStd, stdKeyFile, hostOs)
-use MeadowBoot.Unit (stdDir, selfSize, absolute)
+use MeadowBoot.Compiler (
+  buildUnits,
+  precompiledVariant,
+  precompiledStd,
+  stdKeyFile,
+  hostOs,
+  relocated
+)
+use MeadowBoot.Unit (stdDir, selfKey, absolute)
 use Std.Collections.Vector as V
 use Std.String as S
 use Std.Path as Path
@@ -67,6 +74,7 @@ use Std.Process (getEnv, setEnv, currentPid)
             | (profile, level) ->
                 variantOf
                   home
+                  std
                   profile
                   (V.append [("opt", level), ("macros", "Glade")] (aimed target)))
           [("debug", "O1"), ("release", "O2")]
@@ -78,14 +86,16 @@ use Std.Process (getEnv, setEnv, currentPid)
           let variants = V.concatMap (\x -> match x with | Ok v -> [v] | Err _ -> []) placed in
           let to = absolute out in
           let dir = M.map createDirAll (Path.parent to) in
-          (match writeString (to, precompiledStd (selfSize ()) variants) with
+          (match writeString (to, precompiledStd (selfKey ()) variants) with
            | Ok _ -> True
            | Err why ->
                (let u = writeError "meadowboot: could not write ${out}: ${why}\n" in False))
 
--- The library as the build of `home` as `profile`, with `pairs`, compiled it:
--- the compile's name, its interface and its files.
-fun variantOf (home : String) (profile : String) (pairs : [(String, String)]) =
+-- The library at `std` as the build of `home` as `profile`, with `pairs`,
+-- compiled it: the compile's name, its interface and its files -- each file
+-- of the library its Cut names said from `std`, for a build to say from
+-- wherever the library is when it takes them (`Compiler.placed`).
+fun variantOf (home : String) (std : String) (profile : String) (pairs : [(String, String)]) =
   if not (buildUnits profile pairs home) then
     Err "the standard library did not build as `${profile}`"
   else
@@ -117,8 +127,16 @@ fun variantOf (home : String) (profile : String) (pairs : [(String, String)]) =
                 readToString (Path.join dir stdKeyFile),
                 readToString (Path.joinAll [kept, "interfaces", "${name}.json"])
               ) with
-              | (Ok key, Ok interface) -> Ok (precompiledVariant key interface texts)
+              | (Ok key, Ok interface) ->
+                  Ok (precompiledVariant key interface (relocated (fromDir std) texts))
               | _ -> Err "the build as `${profile}` kept the standard library without what names it"
+
+-- A path as it is from `dir`, with `/` between its parts, where it is under
+-- it; any other as it is.
+fun fromDir (dir : String) (path : String) : String =
+  let d = Path.normalize dir in
+  let p = Path.normalize path in
+  if S.startsWith (d ++ "/") p then S.drop p (stringByteLength d + 1) else path
 
 -- `--target TARGET` or `--target=TARGET`, if given.
 fun targetIn (args : [String]) : Maybe String =
