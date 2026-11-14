@@ -3585,23 +3585,22 @@ fn a_build_takes_the_standard_library_meadowboot_precompiled() {
             objects(&taken, profile),
             "the library compiled, and taken precompiled, as `{profile}`"
         );
+        // A debug build says where each file of the program is (its Cut's
+        // `source`s), and the two packages are in directories of their own:
+        // that is all that may differ.
+        let linked = |dir: &Path| {
+            std::fs::read_to_string(
+                dir.join("target")
+                    .join(profile)
+                    .join("link")
+                    .join("program.cut"),
+            )
+            .ok()
+        };
+        let name = |dir: &Path| dir.file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(
-            std::fs::read_to_string(
-                fresh
-                    .join("target")
-                    .join(profile)
-                    .join("link")
-                    .join("program.cut")
-            )
-            .ok(),
-            std::fs::read_to_string(
-                taken
-                    .join("target")
-                    .join(profile)
-                    .join("link")
-                    .join("program.cut")
-            )
-            .ok(),
+            linked(&fresh),
+            linked(&taken).map(|t| t.replace(&name(&taken), &name(&fresh))),
             "the program linked with the library compiled, and taken precompiled, as `{profile}`"
         );
     }
