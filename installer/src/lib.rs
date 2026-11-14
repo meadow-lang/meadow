@@ -84,8 +84,25 @@ pub fn record(home: &Path, what: &Provenance) -> std::io::Result<()> {
     };
     std::fs::write(
         provenance_file(home),
-        format!("{line}\n# Written by meadowup: where the installed toolchain came from.\n"),
+        format!(
+            "{line}\n{WHOLE}\n# Written by meadowup: where the installed toolchain came from.\n"
+        ),
     )
+}
+
+/// The line a record carries when the meadowup that wrote it installs all of
+/// a release's toolchain (see [`toolchain`]).
+const WHOLE: &str = "whole";
+
+/// Whether the last install into `home` put all of its release in place. A
+/// meadowup older than [`toolchain`] installs only the file called `meadow`,
+/// which in a release of MeadowBoot is the Rust compiler, and records the
+/// release's tag all the same: then the version alone does not say the
+/// toolchain is here, and `update` installs it again rather than say it is
+/// unchanged.
+pub fn recorded_whole(home: &Path) -> bool {
+    std::fs::read_to_string(provenance_file(home))
+        .is_ok_and(|text| text.lines().any(|l| l.trim() == WHOLE))
 }
 
 /// Which releases `meadowup update` follows, as rustup's channels: `stable`,
@@ -271,6 +288,7 @@ pub fn version_of(exe: &Path) -> Option<String> {
 }
 
 pub mod release;
+pub mod toolchain;
 pub mod ui;
 
 /// True when this process owns its console, which on Windows means it was
@@ -616,6 +634,28 @@ mod provenance_tests {
 
         record(&home, &Provenance::Local).unwrap();
         assert_eq!(provenance(&home), Some(Provenance::Local));
+    }
+
+    #[test]
+    fn a_record_an_older_meadowup_wrote_does_not_say_all_of_it_is_here() {
+        let home = scratch_dir("meadowup-whole").unwrap();
+        assert!(!recorded_whole(&home));
+        std::fs::write(
+            provenance_file(&home),
+            "release v0.5.0\n# Written by meadowup: where the installed toolchain came from.\n",
+        )
+        .unwrap();
+        assert_eq!(
+            provenance(&home),
+            Some(Provenance::Release("v0.5.0".into()))
+        );
+        assert!(!recorded_whole(&home));
+        record(&home, &Provenance::Release("v0.6.0".into())).unwrap();
+        assert!(recorded_whole(&home));
+        assert_eq!(
+            provenance(&home),
+            Some(Provenance::Release("v0.6.0".into()))
+        );
     }
 }
 
