@@ -36,7 +36,22 @@ impl fmt::Display for Rep {
 
 impl fmt::Display for Binder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.name, self.rep)
+        write!(f, "{}: {}", self.name, self.rep)?;
+        if let Some(shown) = &self.shown {
+            write!(f, " {shown}")?;
+        }
+        Ok(())
+    }
+}
+
+/// `@"name" "type"`, or `@"name"` with no type.
+impl fmt::Display for Shown {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "@{}", string(&self.name))?;
+        if !self.ty.is_empty() {
+            write!(f, " {}", string(&self.ty))?;
+        }
+        Ok(())
     }
 }
 
@@ -153,6 +168,9 @@ enum Mark {
 struct Printer {
     out: String,
     marks: Vec<(usize, usize, Mark)>,
+    /// The symbols of the program's sources, by their place: how a
+    /// position names its file.
+    sources: std::rc::Rc<[String]>,
 }
 
 impl Printer {
@@ -179,6 +197,9 @@ impl Printer {
             }
             self.var(&b.name);
             let _ = write!(self.out, ": {}", b.rep);
+            if let Some(shown) = &b.shown {
+                let _ = write!(self.out, " {shown}");
+            }
         }
     }
 
@@ -308,6 +329,7 @@ impl Printer {
                     }
                     self.line(indent + 1);
                     self.out.push_str(&m.name);
+                    self.out.push_str(&title(&m.shown));
                     self.params(&m.params, &m.conts);
                     self.row(m.row.as_ref());
                     self.out.push_str(" =>");
@@ -392,6 +414,12 @@ impl Printer {
             Statement::Error(msg) => {
                 let _ = write!(self.out, "error {}", string(msg));
             }
+            Statement::At(at, inner) => {
+                let source = self.sources.get(at.source as usize).cloned();
+                let source = source.unwrap_or_else(|| format!("#{}", at.source));
+                let _ = write!(self.out, "@{source}:{}-{} ", at.start, at.end);
+                self.statement(inner, indent);
+            }
             Statement::Handle(h) => {
                 self.out.push_str("handle {");
                 for c in &h.clauses {
@@ -420,6 +448,13 @@ impl Printer {
             }
         }
     }
+}
+
+/// ` @"name"`, what the source calls a declaration, if it says.
+fn title(shown: &Option<String>) -> String {
+    shown
+        .as_ref()
+        .map_or_else(String::new, |name| format!(" @{}", string(name)))
 }
 
 /// A program as the text [`crate::parse`] reads.
@@ -472,6 +507,17 @@ pub fn listing(p: &Program) -> Listing {
     for e in &p.exports {
         let _ = writeln!(out, "export {:?} = {} -> {}", e.name, e.symbol, e.result);
     }
+    if !p.sources.is_empty() {
+        out.push('\n');
+        for s in &p.sources {
+            let _ = writeln!(out, "source {} = {}", s.symbol, string(&s.path));
+        }
+    }
+    let sources: std::rc::Rc<[String]> = p.sources.iter().map(|s| s.symbol.to_string()).collect();
+    let printer = || Printer {
+        sources: sources.clone(),
+        ..Printer::default()
+    };
     for d in &p.datas {
         let vars = if d.rep_vars.is_empty() {
             String::new()
@@ -527,8 +573,8 @@ pub fn listing(p: &Program) -> Listing {
         declared(&mut out, &mut segments, &e.symbol, pr);
     }
     for v in &p.vals {
-        let mut pr = Printer::default();
-        let _ = write!(pr.out, "val {} : {} =", v.symbol, v.rep);
+        let mut pr = printer();
+        let _ = write!(pr.out, "val {}{} : {} =", v.symbol, title(&v.shown), v.rep);
         pr.nested(&v.body, 1);
         declared(&mut out, &mut segments, &v.symbol, pr);
     }
@@ -555,8 +601,8 @@ pub fn listing(p: &Program) -> Listing {
         } else {
             format!(" <{}>", head.join("; "))
         };
-        let mut pr = Printer::default();
-        let _ = write!(pr.out, "def {}{generics} ", d.symbol);
+        let mut pr = printer();
+        let _ = write!(pr.out, "def {}{}{generics} ", d.symbol, title(&d.shown));
         pr.params(&d.params, &d.conts);
         pr.row(d.row.as_ref());
         pr.out.push_str(" =");

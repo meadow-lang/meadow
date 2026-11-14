@@ -1662,6 +1662,14 @@ fun patBindParts (cx : Cx s) out pat value =
   | Mode.Top -> alonePat cx out True pat value
   | Mode.Local -> alonePat cx out False pat value
 
+-- A pattern binding's pattern unified with its value, a disagreement said
+-- to be at the pattern, as `meadow_infer` says it (`unify_at(pat.span, …)`).
+fun atPat (cx : Cx s) (at : Int) (x : Type) (y : Type) : () ! { St s | e } =
+  let before = stGetRef cx.i.at in
+  let u = stSetRef cx.i.at (cx.here.m, at) in
+  let v = unifyAt cx.i x y in
+  stSetRef cx.i.at before
+
 fun alonePat (cx : Cx s) out (toplevel : Bool) pat value =
   let i = cx.i in
   let u1 = enterLevel i.ar in
@@ -1673,7 +1681,9 @@ fun alonePat (cx : Cx s) out (toplevel : Bool) pat value =
   let pc = binding cx in
   let p = pat pc in
   let bound = stGetRef pc.bound in
-  let u3 = unifyAt i (typInferringPat out p) (typInferringExpr out v) in
+  let u3 =
+    atPat cx (metaStart (metaInferringPat out p)) (typInferringPat out p) (typInferringExpr out v)
+  in
   let u4 = V.foldl (\w x -> seedSig i (fst x) (snd x)) () bound in
   let u5 = stSetRef i.curEffect saved in
   let u6 = solveOverloads i toplevel in
@@ -1733,7 +1743,9 @@ fun memberPat (cx : Cx s) out (seed : [(Int, Type)]) pat value =
   let v = value (plain cx) in
   let pc = binding cx in
   let p = pat pc in
-  let w = unifyAt i (typInferringPat out p) (typInferringExpr out v) in
+  let w =
+    atPat cx (metaStart (metaInferringPat out p)) (typInferringPat out p) (typInferringExpr out v)
+  in
   let x = stSetRef i.curEffect saved in
   let y =
     V.foldl

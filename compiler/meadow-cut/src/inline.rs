@@ -174,7 +174,7 @@ impl<'a> Rename<'a> {
     fn bind(&mut self, b: &Binder) -> Binder {
         Binder {
             name: self.bind_name(&b.name),
-            rep: b.rep.clone(),
+            ..b.clone()
         }
     }
 
@@ -253,6 +253,7 @@ impl<'a> Rename<'a> {
                 self.consumer(c),
             ),
             Statement::Error(m) => Statement::Error(m.clone()),
+            Statement::At(at, s) => Statement::At(*at, Box::new(self.statement(s))),
         }
     }
 
@@ -268,6 +269,7 @@ impl<'a> Rename<'a> {
                     .map(|m| {
                         self.scoped(|r| Method {
                             name: m.name.clone(),
+                            shown: m.shown.clone(),
                             params: m.params.iter().map(|b| r.bind(b)).collect(),
                             conts: m.conts.iter().map(|k| r.bind_name(k)).collect(),
                             row: m
@@ -374,6 +376,7 @@ fn count(s: &Statement, looped: bool, out: &mut HashMap<String, Uses>) {
             args.iter().for_each(|a| count_p(a, looped, out));
             count_c(c, looped, out);
         }
+        Statement::At(_, s) => count(s, looped, out),
         Statement::Error(_) => {}
     }
 }
@@ -428,6 +431,9 @@ fn size(s: &Statement) -> usize {
         }
     }
     1 + match s {
+        // A position is no node: a definition is as small with one as
+        // without.
+        Statement::At(_, s) => return size(s),
         Statement::Cut(x, y) => p(x) + c(y),
         Statement::Call(_, args, conts) | Statement::Prim(_, args, conts) => {
             args.iter().map(p).sum::<usize>() + conts.iter().map(c).sum::<usize>()
@@ -483,6 +489,7 @@ fn calls(s: &Statement, f: &Symbol) -> bool {
                 || h.clauses.iter().any(|cl| calls(&cl.body, f))
         }
         Statement::Perform(_, args, k) => args.iter().any(|a| p(a, f)) || c(k, f),
+        Statement::At(_, s) => calls(s, f),
         Statement::Error(_) => false,
     }
 }
@@ -661,6 +668,7 @@ impl Simplify {
                 self.cons(c),
             ),
             Statement::Error(m) => Statement::Error(m.clone()),
+            Statement::At(at, s) => Statement::At(*at, Box::new(self.stmt(s))),
         }
     }
 

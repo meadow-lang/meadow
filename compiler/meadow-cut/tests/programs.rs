@@ -16,7 +16,178 @@ fn runs(text: &str) -> Outcome {
     let out = run(&p, &Options::default()).unwrap_or_else(|(e, out)| panic!("{e}\n{out:?}"));
     lowered_agrees(&p, &out);
     inlined_agrees(&p, &out);
+    positioned_agrees(&p, &out);
     out
+}
+
+/// `p` with a position on every statement and a name to show on every
+/// binder, as a front end writes a program to be debugged: it reads back
+/// as printed, does what `p` does, and is `p` again once they are taken
+/// off -- and so is what the back end's passes make of it, and the bytecode
+/// it compiles to, debug information aside. Positions change nothing a
+/// program does, nor what it is compiled to.
+#[track_caller]
+fn positioned_agrees(p: &meadow_cut::Program, out: &Outcome) {
+    let mut marked = p.clone();
+    positioned(&mut marked);
+    let shown = print::program(&marked);
+    let again = parse(&shown).unwrap_or_else(|e| panic!("positioned, read back: {e}\n{shown}"));
+    assert_eq!(marked, again, "positioned, printed and read back:\n{shown}");
+    match run(&marked, &Options::default()) {
+        Ok(o) => {
+            assert_eq!(o.output, out.output, "positioned:\n{shown}");
+            assert_eq!(o.status, out.status, "positioned:\n{shown}");
+        }
+        Err((e, _)) => panic!("positioned, it fails: {e}\n{shown}"),
+    }
+    let mut stripped = marked.clone();
+    meadow_cut::strip::program(&mut stripped);
+    assert_eq!(&stripped, p, "positioned and stripped");
+    let optimized = meadow_cut::lower::optimized(p);
+    let mut marked_optimized = meadow_cut::lower::optimized(&marked);
+    meadow_cut::strip::program(&mut marked_optimized);
+    assert_eq!(
+        print::program(&marked_optimized),
+        print::program(&optimized),
+        "positioned, optimised and stripped"
+    );
+    let (Ok(plain), Ok(lowered)) = (
+        meadow_cut::lower::executable(p),
+        meadow_cut::lower::executable_mapped(&marked),
+    ) else {
+        return;
+    };
+    let image = |ax: &meadow_axcut::Program| {
+        meadow_codegen::compile(ax).map(|i| meadow_bytecode::image::encode(&i))
+    };
+    if let Ok(bytes) = image(&plain) {
+        assert_eq!(
+            image(&lowered.program).ok(),
+            Some(bytes),
+            "the bytecode of the positioned program"
+        );
+        let debug = meadow_codegen::compile_with_debug_info(&lowered.program)
+            .expect("compiled with debug information");
+        let info = debug.debug.expect("debug information");
+        assert!(
+            info.locs.iter().any(Option::is_some),
+            "a position reaches the debug information"
+        );
+    }
+    assert!(
+        !lowered.map.shown.is_empty() || p.defs.iter().all(|d| d.params.is_empty()),
+        "a name to show reaches the lowering's map"
+    );
+}
+
+/// Every statement of `p` put at a position of its own, in one file, and
+/// every value's binder given a name to show.
+fn positioned(p: &mut meadow_cut::Program) {
+    use meadow_cut::*;
+    struct Marker(u32);
+    impl Marker {
+        fn binder(&mut self, b: &mut Binder) {
+            b.shown = Some(Shown {
+                name: format!("src_{}", b.name),
+                ty: "T".to_string(),
+            });
+        }
+        fn statement(&mut self, s: &mut Statement) {
+            match s {
+                Statement::Cut(p, c) => {
+                    self.producer(p);
+                    self.consumer(c);
+                }
+                Statement::Call(_, args, conts) | Statement::Prim(_, args, conts) => {
+                    args.iter_mut().for_each(|a| self.producer(a));
+                    conts.iter_mut().for_each(|c| self.consumer(c));
+                }
+                Statement::Let(b, p, rest) => {
+                    self.binder(b);
+                    self.producer(p);
+                    self.statement(rest);
+                }
+                Statement::Handle(h) => {
+                    for c in &mut h.clauses {
+                        c.params.iter_mut().for_each(|b| self.binder(b));
+                        self.statement(&mut c.body);
+                    }
+                    self.binder(&mut h.ret.0);
+                    self.statement(&mut h.ret.2);
+                    self.statement(&mut h.body);
+                    self.consumer(&mut h.cont);
+                }
+                Statement::Perform(_, args, c) => {
+                    args.iter_mut().for_each(|a| self.producer(a));
+                    self.consumer(c);
+                }
+                Statement::At(_, s) => return self.statement(s),
+                Statement::Error(_) => {}
+            }
+            self.0 += 1;
+            let at = Pos {
+                source: 0,
+                start: self.0 * 10,
+                end: self.0 * 10 + 5,
+            };
+            let inner = std::mem::replace(s, Statement::Error(String::new()));
+            *s = Statement::At(at, Box::new(inner));
+        }
+        fn producer(&mut self, p: &mut Producer) {
+            match p {
+                Producer::Con(_, xs) | Producer::Tuple(xs) | Producer::Array(xs) => {
+                    xs.iter_mut().for_each(|x| self.producer(x))
+                }
+                Producer::Record(fs) => fs.iter_mut().for_each(|(_, x)| self.producer(x)),
+                Producer::Mu(_, s) => self.statement(s),
+                Producer::Cocase(ms) => {
+                    for m in ms {
+                        m.shown = Some(format!("src_{}", m.name));
+                        m.params.iter_mut().for_each(|b| self.binder(b));
+                        self.statement(&mut m.body);
+                    }
+                }
+                _ => {}
+            }
+        }
+        fn consumer(&mut self, c: &mut Consumer) {
+            match c {
+                Consumer::MuTilde(b, s) => {
+                    self.binder(b);
+                    self.statement(s);
+                }
+                Consumer::Case(arms) => {
+                    for a in arms {
+                        a.fields.iter_mut().for_each(|b| self.binder(b));
+                        self.statement(&mut a.body);
+                    }
+                }
+                Consumer::Method(_, args, conts) => {
+                    args.iter_mut().for_each(|a| self.producer(a));
+                    conts.iter_mut().for_each(|c| self.consumer(c));
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut m = Marker(0);
+    p.sources = vec![Source {
+        symbol: Symbol {
+            lang: "t".to_string(),
+            package: "Main".to_string(),
+            path: vec!["src/Main.idr".to_string()],
+        },
+        path: "/home/t/src/Main.idr".to_string(),
+    }];
+    for v in &mut p.vals {
+        v.shown = Some(format!("src_{}", v.symbol.last()));
+        m.statement(&mut v.body);
+    }
+    for d in &mut p.defs {
+        d.shown = Some(format!("src_{}", d.symbol.last()));
+        d.params.iter_mut().for_each(|b| m.binder(b));
+        m.statement(&mut d.body);
+    }
 }
 
 /// `p` with its small definitions inlined (`meadow_cut::inline`) does what
@@ -451,6 +622,22 @@ def idyll:Prelude/Nat.\"x'\" (; k: ptr) = <'c' | k>
     assert_eq!(p.roles[1].1.to_string(), "idyll:Prelude/List.\"::\"");
     assert_eq!(p.defs[0].symbol.package, "Json@1.2.0-alpha.1");
     assert_eq!(p.defs[1].symbol.path, ["Nat", "x'"]);
+}
+
+#[test]
+fn a_prompt_s_entry_is_a_package_with_a_colon_in_its_name() {
+    let p = parse(
+        "cut 0
+entry meadow:repl:3/d0
+answer none
+val meadow:repl:3/d0 : i64 = <7 | halt>
+",
+    )
+    .unwrap();
+    let entry = p.entry.as_ref().expect("an entry");
+    assert_eq!(entry.package, "repl:3");
+    assert_eq!(entry.to_string(), "meadow:repl:3/d0");
+    assert_eq!(p.vals.len(), 1);
 }
 
 #[test]

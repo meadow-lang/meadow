@@ -106,10 +106,42 @@ use Control.*
   | PerformWith String String
   | HandleMark [ErasedClause] (Maybe (Int, ErasedTerm)) (Map (Ref Value))
   | Cache Int
+  -- A function's body under way, while a debugger watches (`Watch`): the
+  -- term its caller was at when it called, the caller's scope, and how many
+  -- such bodies are under way, this one among them. It passes the value on.
+  | Called ErasedTerm (Map (Ref Value)) Int
 
 @pub data Shape = Tuple | Array | Ctor String | Prim String
 
 data Control = Eval ErasedTerm (Map (Ref Value)) | Ret Value
+
+-- --- a debugger's view ---------------------------------------------------------
+
+-- What a debugger watching the machine keeps beside it (`Dap`): the terms it
+-- stops at before evaluating -- its boundaries, a call, a branch or a body --
+-- and the terms that are a function's body, entering which is a call; where
+-- it stopped last, if it has stopped since it was resumed; and the boundary
+-- it last went by, with its scope, which a call made from there waits at.
+--
+-- A function's body is a `Called` frame on the continuation, so that the
+-- stack a person reads is there to be read off it. A tail call puts none: a
+-- body whose caller had nothing left to do takes the place of the caller's,
+-- as the call stack of a machine that has one would.
+@pub record Watch = {
+  stops : HashMap Int Bool,
+  bodies : HashMap Int Bool,
+  at : Ref (Maybe Paused),
+  here : Ref (ErasedTerm, Map (Ref Value))
+}
+
+-- A machine stopped at a boundary, before evaluating it: the term, its
+-- scope, and what waits for its value.
+@pub data Paused
+  = Paused ErasedTerm (Map (Ref Value)) (List Frame)
+
+-- How a watched run ended: it finished, with a value; it failed, and why; or
+-- it stopped at a boundary, to go on from when it is resumed.
+@pub data Outcome = Done Value | Failed String | Stopped Paused
 
 -- What does not change as the machine runs: the program's tables, the
 -- definitions, each a cell, and each constructor's named fields.
@@ -121,7 +153,9 @@ data Control = Eval ErasedTerm (Map (Ref Value)) | Ret Value
 @pub record Machine = {
   arena : ErasedArena,
   root : HashMap Int (Ref Value),
-  fields : [(String, [String])]
+  fields : [(String, [String])],
+  -- A debugger's, while one watches it.
+  watch : Maybe Watch
 }
 
 -- `p`'s entry point evaluated, or what went wrong: `meadow_eval::run`.
@@ -143,8 +177,86 @@ data Control = Eval ErasedTerm (Map (Ref Value)) | Ret Value
   in Machine {
        arena = a,
        root,
-       fields = V.map (\n -> (erasedNamedName a n, erasedNamedLabels a n)) (erasedFileNamed a file)
+       fields = V.map (\n -> (erasedNamedName a n, erasedNamedLabels a n)) (erasedFileNamed a file),
+       watch = None
      }
+
+-- `m`, watched by a debugger that stops at the terms `stops`, and to whom
+-- `bodies` are the terms that are a function's body.
+@pub fun watched (m : Machine) (stops : HashMap Int Bool) (bodies : HashMap Int Bool)
+    : Machine ! { Mut | e } =
+  { m | watch = Just (Watch { stops, bodies, at = newRef None, here = newRef (0 - 1, Map.empty) }) }
+
+-- Definition `f` applied to `args` by a watched machine: as far as its
+-- first boundary.
+@pub fun begin (m : Machine) (f : Int) (args : [Value]) : Outcome ! { Mut | e } =
+  let u = cleared m in outcomeOf m (call m f args)
+
+-- A watched machine on from where it stopped, as far as the next boundary:
+-- the one it stopped at is evaluated, not stopped at again.
+@pub fun proceed (m : Machine) (p : Paused) : Outcome ! { Mut | e } =
+  let u = cleared m in
+  match p with
+  | Paused t env k -> outcomeOf m (eval m t env k)
+
+fun cleared (m : Machine) = match m.watch with | Just w -> setRef w.at None | None -> ()
+
+-- What a watched run came to: stopped, if it says where; or its answer.
+fun outcomeOf (m : Machine) (r : Result String Value) : Outcome ! { Mut | e } =
+  match Mb.andThen (\(w : Watch) -> getRef w.at) m.watch with
+  | Just p -> Outcome.Stopped p
+  | None ->
+      (match r with
+       | Ok v -> Outcome.Done v
+       | Err why -> Outcome.Failed why)
+
+-- The term a stopped machine is at, and what each name in its scope holds,
+-- by binder.
+@pub fun pausedTerm (p : Paused) : ErasedTerm = match p with | Paused t _ _ -> t
+
+@pub fun pausedScope (p : Paused) : [(Int, Value)] ! { Mut | e } =
+  match p with | Paused _ env _ -> scopeValues env
+
+fun scopeValues (env : Map (Ref Value)) : [(Int, Value)] ! { Mut | e } =
+  V.map (\x -> (fst x, getRef (snd x))) (Map.toVec env)
+
+-- Each body under way below the one a stopped machine is in, innermost
+-- first: the term its caller waits at, and what the caller's scope holds.
+@pub fun callersOf (p : Paused) : [(ErasedTerm, [(Int, Value)])] ! { Mut | e } =
+  match p with
+  | Paused _ _ k ->
+      L.foldl
+        (\acc f ->
+          match f with
+          | Called t env _ -> V.pushBack acc (t, scopeValues env)
+          | _ -> acc)
+        []
+        k
+
+-- How many bodies are under way where a machine stopped.
+@pub fun pausedDepth (p : Paused) : Int = match p with | Paused _ _ k -> depthIn k
+
+fun depthIn (k : List Frame) : Int =
+  match k with
+  | [;] -> 0
+  | f :: rest -> (match f with | Called _ _ d -> d | _ -> depthIn rest)
+
+-- `k`, as `body` is entered with it to go to: with a `Called` frame on top
+-- where a debugger watches and `body` is a function's, unless the caller had
+-- nothing left to do but answer.
+fun entering (m : Machine) (body : ErasedTerm) (k : List Frame) : List Frame ! { Mut | e } =
+  match m.watch with
+  | None -> k
+  | Just w ->
+      if not (H.getOr False body w.bodies) then k
+      else
+        (match k with
+         | f :: _ -> (match f with | Called _ _ _ -> k | _ -> calledFrom w k)
+         | [;] -> calledFrom w k)
+
+fun calledFrom (w : Watch) (k : List Frame) : List Frame ! { Mut | e } =
+  match getRef w.here with
+  | (t, env) -> Called t env (depthIn k + 1) :: k
 
 -- A text as a value, and a value's text if it is one: what a caller of
 -- the machine hands it and reads back.
@@ -165,8 +277,18 @@ fun loaded (a : ErasedArena) (t : ErasedTerm) : Value =
 
 fun go (m : Machine) (c : Control) (k : List Frame) =
   match c with
-  | Eval t env -> eval m t env k
+  | Eval t env ->
+      (match m.watch with
+       | None -> eval m t env k
+       | Just w -> if H.getOr False t w.stops then stopped w t env k else eval m t env k)
   | Ret v -> (match k with | [;] -> Ok v | f :: rest -> ret m v f rest)
+
+-- A watched machine stopped at boundary `t`: where it is is kept, and the run
+-- ends here, to be taken up again (`proceed`).
+fun stopped (w : Watch) (t : ErasedTerm) (env : Map (Ref Value)) (k : List Frame) =
+  let u = setRef w.at (Just (Paused t env k)) in
+  let v = setRef w.here (t, env) in
+  Err ""
 
 -- The cell `v` is in: the scope's, or a definition's.
 fun lookup (m : Machine) (env : Map (Ref Value)) (v : Int) : Maybe (Ref Value) =
@@ -325,6 +447,13 @@ fun ret (m : Machine) (v : Value) (f : Frame) (k : List Frame) =
       (match r with
        | Just (param, body) -> go m (Eval body (define henv param v)) k
        | None -> go m (Ret v) k)
+  -- A body answered: its caller is where the machine is again.
+  | Called t env _ ->
+      let u =
+        (match m.watch with
+         | Just w -> setRef w.here (t, env)
+         | None -> ())
+      in go m (Ret v) k
 
 fun fill (scope : Map (Ref Value)) (var : Int) (v : Value) =
   match Map.lookup var scope with
@@ -453,7 +582,7 @@ fun apply (m : Machine) (f : Value) (arg : Value) (k : List Frame) =
       (match V.get ps 0 with
        | Just p ->
            let scope = define env p arg in
-           if V.len ps == 1 then go m (Eval body scope) k
+           if V.len ps == 1 then go m (Eval body scope) (entering m body k)
            else go m (Ret (Closure (V.drop ps 1) body scope)) k
        | None -> go m (Eval body env) k)
   | Cont cell ->
@@ -1097,6 +1226,149 @@ fun normalised (a : Float) (e : Int) : (Float, Int) =
   if a >= 9007199254740992.0 then normalised (a * 0.5) (e + 1)
   else if a < 4503599627370496.0 and e > 0 - 1074 then normalised (a * 2.0) (e - 1)
   else (a, e)
+
+-- --- a value as a debugger shows it ------------------------------------------
+--
+-- As `meadow dap`'s variables view shows the Glade machine's values
+-- (`buildtools/meadow/src/dap/session.rs`): short, a few levels deep and a
+-- few dozen values long at most, with a value that has parts opened a level
+-- at a time.
+
+-- `v`, shown five levels deep at most; `named` says which function a body is
+-- the body of, or nothing.
+@pub fun preview (named : ErasedTerm -> String) (v : Value) : String ! { Mut | e } =
+  let budget = newRef 60 in previewed named v 5 budget
+
+fun previewed (named : ErasedTerm -> String) (v : Value) (depth : Int) (budget : Ref Int)
+    : String ! { Mut | e } =
+  if getRef budget <= 0 then "…"
+  else
+    let u = setRef budget (getRef budget - 1) in
+    match v with
+    | Str s -> show (S.fromChars (V.take (S.chars s) 80))
+    | Ref r -> "ref ${nestedPreview named (getRef r) depth budget}"
+    | Compact x -> "compact ${nestedPreview named x depth budget}"
+    | Closure _ body _ ->
+        (let n = named body in if S.isEmpty n then "<function>" else "<function in ${n}>")
+    | Cont _ -> "<resumption>"
+    | Array xs -> "#[${previewList named xs depth budget}]"
+    | Mut r -> "mut #[${previewList named (getRef r) depth budget}]"
+    | Tuple xs -> "(${previewList named xs depth budget})"
+    | Record fs ->
+        let sorted = sortOn fst fs in
+        "{ ${previewFields named sorted depth budget} }"
+    | Ctor name xs ->
+        if name == "List.Cons" or name == "List.Nil" then
+          (let items = Mb.unwrapOr [] (listItems v []) in
+           if V.isEmpty items then "[;]" else "[${previewItems named items depth budget "; "}]")
+        else if V.isEmpty xs then bare name
+        else V.foldl (\acc x -> "${acc} ${nestedPreview named x depth budget}") (bare name) xs
+    | Lazy _ -> "<unevaluated>"
+    | other -> display other
+
+-- A value inside another: in brackets where it has parts of its own.
+fun nestedPreview (named : ErasedTerm -> String) (v : Value) (depth : Int) (budget : Ref Int)
+    : String ! { Mut | e } =
+  if depth <= 0 then "…"
+  else
+    let wrap =
+      (match v with
+       | Ctor name xs -> not (V.isEmpty xs) and name != "List.Cons"
+       | _ -> False)
+    in
+    let shown = previewed named v (depth - 1) budget in
+    if wrap then "(${shown})" else shown
+
+fun previewList (named : ErasedTerm -> String) (xs : [Value]) (depth : Int) (budget : Ref Int)
+    : String ! { Mut | e } =
+  previewItems named xs depth budget ", "
+
+-- Each of `xs`, `sep` between them, until the depth or the budget runs out.
+fun previewItems
+    (named : ErasedTerm -> String)
+    (xs : [Value])
+    (depth : Int)
+    (budget : Ref Int)
+    (sep : String)
+    : String ! { Mut | e } =
+  let shown =
+    V.foldl
+      (\acc x ->
+        match acc with
+        | (parts, True) -> (parts, True)
+        | (parts, False) ->
+            if getRef budget <= 0 or depth <= 0 then (V.pushBack parts "…", True)
+            else (V.pushBack parts (previewed named x (depth - 1) budget), False))
+      ([], False)
+      xs
+  in S.join sep (fst shown)
+
+fun previewFields
+    (named : ErasedTerm -> String)
+    (fs : [(String, Value)])
+    (depth : Int)
+    (budget : Ref Int)
+    : String ! { Mut | e } =
+  let shown =
+    V.foldl
+      (\acc f ->
+        match acc with
+        | (parts, True) -> (parts, True)
+        | (parts, False) ->
+            if getRef budget <= 0 or depth <= 0 then (V.pushBack parts "…", True)
+            else
+              (V.pushBack parts "${fst f} = ${previewed named (snd f) (depth - 1) budget}", False))
+      ([], False)
+      fs
+  in S.join ", " (fst shown)
+
+-- Whether `v` has parts to open.
+@pub fun opens (v : Value) : Bool ! { Mut | e } =
+  match v with
+  | Tuple xs -> not (V.isEmpty xs)
+  | Array xs -> not (V.isEmpty xs)
+  | Record fs -> not (V.isEmpty fs)
+  | Ctor _ xs -> not (V.isEmpty xs)
+  | Ref _ -> True
+  | Mut r -> not (V.isEmpty (getRef r))
+  | Compact _ -> True
+  | _ -> False
+
+-- `v`'s parts, each with what it is called: a record's by label, an array's
+-- by index in brackets, a constructor's or a tuple's by place.
+@pub fun parts (v : Value) : [(String, Value)] ! { Mut | e } =
+  match v with
+  | Record fs -> sortOn fst fs
+  | Array xs -> V.map (\i -> ("[${show i}]", V.getOr Unit xs i)) (V.range 0 (min 1000 (V.len xs)))
+  | Mut r ->
+      (let xs = getRef r in
+       V.map (\i -> ("[${show i}]", V.getOr Unit xs i)) (V.range 0 (min 1000 (V.len xs))))
+  | Tuple xs -> V.map (\i -> (show i, V.getOr Unit xs i)) (V.range 0 (V.len xs))
+  | Ctor _ xs -> V.map (\i -> (show i, V.getOr Unit xs i)) (V.range 0 (min 1000 (V.len xs)))
+  | Ref r -> [("contents", getRef r)]
+  | Compact x -> [("contents", x)]
+  | _ -> []
+
+-- What kind of value `v` is, by the type a value of its kind has: what a
+-- variable whose type is only a type variable is shown as.
+@pub fun kindOf (v : Value) : String =
+  match v with
+  | Int _ -> "Int"
+  | I8 _ -> "Int8"
+  | I16 _ -> "Int16"
+  | I32 _ -> "Int32"
+  | U8 _ -> "UInt8"
+  | U16 _ -> "UInt16"
+  | U32 _ -> "UInt32"
+  | U64 _ -> "UInt64"
+  | Big _ -> "BigInt"
+  | Float _ -> "Float"
+  | F32 _ -> "Float32"
+  | Bool _ -> "Bool"
+  | Str _ -> "String"
+  | Char _ -> "Char"
+  | Unit -> "()"
+  | _ -> ""
 
 -- --- display -----------------------------------------------------------------
 

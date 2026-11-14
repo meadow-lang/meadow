@@ -26,7 +26,8 @@
 //! [`meadowboot_s_prompt_answers_as_meadow_repl_answers`].
 //!
 //! `MEADOWBOOT_EXE` runs a MeadowBoot already built rather than building
-//! one; `MEADOWBOOT_PATIENCE` is how many seconds a session may take (1800);
+//! one, and `MEADOWBOOT_HOST` names the `meadow-host` library its prompt runs
+//! entries on, rather than building one beside the `meadow` under test; `MEADOWBOOT_PATIENCE` is how many seconds a session may take (1800);
 //! `MEADOW_REPL_SESSIONS` (comma-separated) runs only the sessions named.
 //! What each side printed, where they differ, is written to
 //! `repl-differences.txt` in `CARGO_TARGET_TMPDIR`, or `MEADOW_REPL_OUT`.
@@ -85,6 +86,33 @@ fn meadowboot_exe() -> PathBuf {
     );
     dir.join("target/release/native/silo")
         .join(format!("MeadowBoot{}", std::env::consts::EXE_SUFFIX))
+}
+
+/// `meadow-host`, the Rust `meadow` as a library, which MeadowBoot's prompt
+/// runs its entries on: built beside the `meadow` this test runs, or where
+/// `MEADOWBOOT_HOST` says one already is.
+fn meadow_host() -> PathBuf {
+    if let Some(given) = std::env::var_os("MEADOWBOOT_HOST") {
+        return PathBuf::from(given);
+    }
+    let dir = meadow().parent().expect("meadow's directory").to_path_buf();
+    let mut c = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    c.args(["build", "-q", "-p", "meadow-host", "--manifest-path"])
+        .arg(repo().join("buildtools").join("Cargo.toml"));
+    if dir.file_name().is_some_and(|n| n == "release") {
+        c.arg("--release");
+    }
+    let out = c.output().expect("cargo runs");
+    assert!(
+        out.status.success(),
+        "meadow-host did not build:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    dir.join(format!(
+        "{}meadow_host{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX
+    ))
 }
 
 /// Where what the test writes goes: `MEADOW_REPL_OUT`, or the test's own
@@ -770,31 +798,38 @@ fn progress(line: &str) {
 /// MeadowBoot's prompt answers every entry as `meadow repl` answers it.
 ///
 /// Not yet, so it is ignored: run it with `--ignored` to see how far. On
-/// 2026-11-09 the two agreed on 240 of 265 entries:
+/// 2026-11-13 the two agreed on 257 of 265 entries, where on 2026-11-09,
+/// when MeadowBoot ran entries on its CEK machine, they agreed on 240:
 ///
 /// ```text
 /// banner           9 / 9      it               2 / 2
-/// command         40 / 47     multi-line       9 / 9
-/// definition      19 / 20     name            10 / 10
-/// error           10 / 13     tour            54 / 65
-/// example         30 / 33     expression      57 / 57
+/// command         42 / 47     multi-line       9 / 9
+/// definition      20 / 20     name            10 / 10
+/// error           10 / 13     tour            65 / 65
+/// example         33 / 33     expression      57 / 57
 /// ```
 ///
-/// What is left is of four kinds. MeadowBoot's CEK machine has no threads
-/// (`ThreadSpawn`), which ten lines of the tour's second part need, and
-/// `:ir` shows none of the compiler's IRs (two). A parse error is worded by
-/// each parser its own way (three, one of them a `:` line that is no
-/// command, which both prompts hand to the parser). And the Rust prompt does what is better not copied: `:try` with no
-/// terminal does nothing, since rustyline takes no initial text then (four);
-/// an `effect` entry shows its operations and then runs one, `program has no
-/// entry point` (three); `@derive(Debug) data` shows the derived `impl`'s
-/// bindings and runs its dictionary, `= #dict(<closure>)`, and `:module`
-/// lists them (two); and a `@pub(pkg) def` entry is compiled and shown as
-/// nothing (one).
+/// Both run an entry on Glade now, MeadowBoot through `meadow-host`, so
+/// threads run on both; and the Rust prompt no longer runs an `effect`
+/// entry's operation (`program has no entry point`) or shows the bindings
+/// of a derived `impl`, and MeadowBoot's no longer shows a binding the
+/// entries after it cannot see (`@pub(pkg) def`). What is left is what the
+/// two cannot share, and is of three kinds. A parse error is worded by each
+/// parser its own way (three, one of them a `:` line that is no command,
+/// which both prompts hand to the parser). `:ir cut a` shows each
+/// compiler's own Cut, and MeadowBoot names a definition's symbol by its
+/// binder (`meadow:repl:3/d113`) where the Rust compiler names it by its
+/// name (`meadow:repl-3/a`) (one). `:try` with no terminal puts nothing on
+/// the Rust prompt, since rustyline takes no initial text then, where
+/// Lingua's prompt enters the example (four). One more entry agrees only as
+/// the threads it starts allow: `gather [30, 20, 10]` answers in the order
+/// three threads finish, which is the tour's point, and the scheduler may
+/// finish `fib 20` before `fib 10` on either prompt.
 #[test]
 #[ignore = "MeadowBoot's prompt does not agree with meadow repl yet: see the doc comment"]
 fn meadowboot_s_prompt_answers_as_meadow_repl_answers() {
     let exe = meadowboot_exe();
+    let host = meadow_host();
     let scratch = out_dir().join("repl-sessions");
     let _ = std::fs::remove_dir_all(&scratch);
     let tmp = scratch.join("tmp");
@@ -811,6 +846,7 @@ fn meadowboot_s_prompt_answers_as_meadow_repl_answers() {
         let mut c = Command::new(&exe);
         c.env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
             .env("MEADOW", meadow())
+            .env("MEADOW_HOST", &host)
             .env("MEADOWBOOT_SET", "macros=Glade")
             .env("TEMP", &tmp)
             .env("TMP", &tmp)

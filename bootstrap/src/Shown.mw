@@ -1,0 +1,398 @@
+-- Shown: what a program built to be debugged says of itself, and what a
+-- debugger shows of it -- the files its positions are in, the file each
+-- definition was written in, and what the source calls each name a person
+-- wrote, with its type as the Rust compiler writes types.
+--
+-- `Seq` writes it into a unit's Cut, as `docs/CUT.md` in meadow has it
+-- ("Positions and names"): a `source` for each file, a position on each
+-- term a step may stop before, and `@"name" "type"` on each binder. The
+-- back end takes all of it off before it builds or runs the program, and a
+-- debugger steps by it. The debug adapter (`Dap`) reads the same names and
+-- types off a unit it studied, where it runs a program on the CEK machine.
+
+use MeadowBoot.Rename (Binder)
+use MeadowBoot.Infer
+use MeadowBoot.Types (Type, VarKind, namerOf, renderIn)
+use MeadowBoot.Solve (Generalized)
+use MeadowBoot.Core
+use MeadowBoot.Core (CoreProgram)
+use Lingua.Lang (Meta, metaStart, metaEnd)
+use Std.Collections.Vector as V
+use Std.Collections.HashMap as H
+use Std.Collections.HashMap (HashMap)
+use Std.String as S
+use Std.Char as C
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+use Std.Path as Path
+
+-- What a unit built to be debugged shows: each file it was written in, by
+-- the symbol its positions name it by, and its path; the file each binder
+-- was declared in, by that symbol; and what the source calls each name a
+-- person wrote, and its type, by binder. A unit built otherwise shows
+-- nothing (`nothing`).
+@pub record Shown = {
+  sources : [(String, String)],
+  files : HashMap Int String,
+  names : HashMap Int (String, String)
+}
+
+@pub fun nothing () : Shown = Shown { sources = [], files = H.empty, names = H.empty }
+
+-- What the source calls each name, by binder.
+@pub fun namesOf (s : Shown) : HashMap Int (String, String) = s.names
+
+-- `s`, showing each copy `origins` names as what it is a copy of.
+@pub fun withCopies (origins : HashMap Int Int) (s : Shown) : Shown =
+  V.foldl
+    (\(acc : Shown) c ->
+      match H.lookup c origins with
+      | None -> acc
+      | Just o ->
+          {
+            acc
+              | names =
+                (match H.lookup o acc.names with
+                 | Just n -> H.insert c n acc.names
+                 | None -> acc.names),
+            files =
+              (match H.lookup o acc.files with
+               | Just f -> H.insert c f acc.files
+               | None -> acc.files)
+          })
+    s
+    (H.keys origins)
+
+-- --- copies ----------------------------------------------------------------------
+--
+-- A unit's core is not all as it was written by the time it is lowered: a
+-- definition generic in a number's type is copied for each number type it is
+-- used at, and one that takes dictionaries for those it is given, each copy
+-- with binders of its own. A copy is made of the same source, and keeps
+-- where each of its terms was written. So what each of its binders is a copy
+-- of is found by where it was written: the definition whose body was written
+-- where the copy's was, and in it, the binder bound by a term written where
+-- the copy's was.
+
+-- Each binder of `core`'s definitions that are copies of `written`'s, and
+-- the binder of `written` it is a copy of: the copy's definition's own
+-- among them.
+@pub fun originsOf (written : CoreProgram) (core : CoreProgram) : HashMap Int Int =
+  let wa = coreArena written in
+  let ca = coreArena core in
+  let wdefs = coreFileDefs wa (coreRoot written) in
+  let own = H.fromVec (V.map (\d -> (coreDefId wa d, d)) wdefs) in
+  let bodies =
+    V.foldl
+      (\h d -> V.foldl (\g k -> H.insert k d g) h (layers wa (coreDefBody wa d) []))
+      H.empty
+      wdefs
+  in V.foldl
+       (\h d ->
+         if M.isSome (H.lookup (coreDefId ca d) own) then h
+         else
+           (match V.find (\k -> M.isSome (H.lookup k bodies)) (layers ca (coreDefBody ca d) []) with
+            | None -> h
+            | Just k ->
+                (match H.lookup k bodies with
+                 | Just original ->
+                     let theirs = H.fromVec (counted (bindersIn wa (coreDefBody wa original) [])) in
+                     V.foldl
+                       (\g x ->
+                         match H.lookup (fst x) theirs with
+                         | Just o -> H.insert (snd x) o g
+                         | None -> g)
+                       (H.insert (coreDefId ca d) (coreDefId wa original) h)
+                       (counted (bindersIn ca (coreDefBody ca d) []))
+                 | None -> h)))
+       H.empty
+       (coreFileDefs ca (coreRoot core))
+
+-- Each key made one of its own by how many times it came before: a `let`
+-- written with several bindings is several, all written at one place.
+fun counted (xs : [(String, Int)]) : [(String, Int)] =
+  snd
+    (V.foldl
+       (\acc x ->
+         match acc with
+         | (seen, out) ->
+             (let n = H.getOr 0 (fst x) seen in
+              (H.insert (fst x) (n + 1) seen, V.pushBack out ("${fst x}#${show n}", snd x))))
+       (H.empty, [])
+       xs)
+
+-- Where a term was written, and what it is, as a key.
+fun keyAt (tag : String) (m : Meta) : String = "${tag}${show (metaStart m)}-${show (metaEnd m)}"
+
+-- Where each of a definition's outer layers was written -- its abstraction
+-- over types, then each of its parameters -- outermost first: a copy for
+-- dictionaries takes fewer of them.
+fun layers (a : CoreArena) (t : CoreTerm) (acc : [String]) : [String] =
+  let here = V.pushBack acc (keyAt "b" (metaCoreTerm a t)) in
+  match viewCoreTerm a t with
+  | CoreTermView.TyLam r -> layers a r.body here
+  | CoreTermView.Lam r -> layers a r.body here
+  | _ -> here
+
+-- Each binder under `t`, with where the term that binds it was written.
+fun bindersIn (a : CoreArena) (t : CoreTerm) (acc : [(String, Int)]) : [(String, Int)] =
+  let go = \x h -> bindersIn a x h in
+  let all = \xs h -> V.foldl (\b x -> go x b) h xs in
+  match viewCoreTerm a t with
+  | CoreTermView.Lam r -> go r.body (V.pushBack acc (keyAt "l" (metaCoreTerm a t), r.param))
+  | CoreTermView.TyLam r -> go r.body acc
+  | CoreTermView.TyApp r -> go r.func acc
+  | CoreTermView.Let r ->
+      go r.body (go r.value (V.pushBack acc (keyAt "e" (metaCoreTerm a t), r.id)))
+  | CoreTermView.LetRec r ->
+      go
+        r.body
+        (V.foldl
+           (\h b ->
+             go
+               (coreBindValue a b)
+               (V.pushBack h (keyAt "r" (metaCoreTerm a (coreBindValue a b)), coreBindId a b)))
+           acc
+           r.binds)
+  | CoreTermView.App r -> go r.arg (go r.func acc)
+  | CoreTermView.If r -> all [r.cond, r.yes, r.no] acc
+  | CoreTermView.Tuple r -> all r.items acc
+  | CoreTermView.Array r -> all r.items acc
+  | CoreTermView.Ctor r -> all r.args acc
+  | CoreTermView.Prim r -> all r.args acc
+  | CoreTermView.Record r -> all (V.map (\f -> coreFieldValue a f) r.fields) acc
+  | CoreTermView.Proj r -> go r.tuple acc
+  | CoreTermView.Sel r -> go r.target acc
+  | CoreTermView.Extend r -> go r.value (go r.target acc)
+  | CoreTermView.Perform r -> go r.arg acc
+  | CoreTermView.Case r ->
+      V.foldl
+        (\h arm ->
+          let bound = patBinders a (coreArmPat a arm) h in
+          let guarded =
+            match coreArmGuard a arm with
+            | Just g -> go g bound
+            | None -> bound
+          in go (coreArmBody a arm) guarded)
+        (go r.scrutinee acc)
+        r.arms
+  | CoreTermView.Handle r ->
+      let body = go r.body acc in
+      let clauses =
+        V.foldl
+          (\h c ->
+            go
+              (coreClauseBody a c)
+              (V.pushBack h (keyAt "c" (metaCoreTerm a (coreClauseBody a c)), coreClauseParam a c)))
+          body
+          r.clauses
+      in (match (r.retId, r.ret) with
+          | (Just id, Just b) -> go b (V.pushBack clauses (keyAt "h" (metaCoreTerm a b), id))
+          | _ -> clauses)
+  | CoreTermView.Join r -> go r.body (go r.rhs acc)
+  | CoreTermView.Jump r -> all r.args acc
+  | _ -> acc
+
+fun patBinders (a : CoreArena) (p : CorePat) (acc : [(String, Int)]) : [(String, Int)] =
+  let all = \ps h -> V.foldl (\b q -> patBinders a q b) h ps in
+  match viewCorePat a p with
+  | CorePatView.PVar r -> V.pushBack acc (keyAt "v" (metaCorePat a p), r.id)
+  | CorePatView.PAs r -> patBinders a r.pat (V.pushBack acc (keyAt "a" (metaCorePat a p), r.id))
+  | CorePatView.PTuple r -> all r.items acc
+  | CorePatView.PArray r -> all r.items acc
+  | CorePatView.PCtor r -> all r.args acc
+  | CorePatView.PRecord r -> all (V.map (\f -> corePFieldPat a f) r.fields) acc
+  | _ -> acc
+
+-- What unit `pkg`, in `dir`, shows of `binders` as `inferred` typed them;
+-- `paths` is each file's path by the name a binder's site gives it.
+@pub fun shownOf
+    (pkg : String)
+    (dir : String)
+    (paths : [(String, String)])
+    (binders : [Binder])
+    (inferred : Inferred)
+    : Shown =
+  let byFile = H.fromVec paths in
+  let symbolOf =
+    \file ->
+      (let path = H.getOr file file byFile in "meadow:${pkg}/${quoted (relativeTo dir path)}")
+  in
+  let typing = typesIn inferred in
+  let classes = classesIn inferred in
+  let (names, files) =
+    V.foldl
+      (\acc id ->
+        match (acc, V.get binders id) with
+        | ((ns, fs), Just (b : Binder)) ->
+            (
+              if b.kind != "v" or S.isEmpty b.name then ns
+              else
+                H.insert
+                  id
+                  (b.name, M.unwrapOr "" (M.map (typeText classes) (H.lookup id typing)))
+                  ns,
+              match siteFile b.site with
+              | Just f -> if M.isSome (H.lookup f byFile) then H.insert id (symbolOf f) fs else fs
+              | None -> fs
+            )
+        | _ -> acc)
+      (H.empty, H.empty)
+      (V.range 0 (V.len binders))
+  in Shown {
+       sources = V.map (\p -> (symbolOf (fst p), Path.normalize (snd p))) paths,
+       files,
+       names
+     }
+
+-- The file a binder's site names: `src/Main.mw@120` is `src/Main.mw`. A
+-- binder declared nowhere has none.
+fun siteFile (site : String) : Maybe String =
+  match S.indexOf "@" site with
+  | Just k -> if k > 0 then Just (S.take site k) else None
+  | None -> None
+
+-- `path` as it is from `dir`, with `/` between its parts: a file of a
+-- package by where it is in it, the same on every machine.
+fun relativeTo (dir : String) (path : String) : String =
+  let slashed = \p -> S.join "/" (S.split "\\" p) in
+  let d = slashed (Path.normalize dir) in
+  let p = slashed (Path.normalize path) in
+  let prefix = if S.endsWith "/" d then d else "${d}/" in
+  if S.startsWith prefix p then S.drop p (stringByteLength prefix) else p
+
+-- A segment of a symbol, quoted as Cut quotes one.
+fun quoted (s : String) : String =
+  "\""
+    ++ S.join
+      ""
+      (V.map
+         (\c -> if c == '"' then "\\\"" else if c == '\\' then "\\\\" else C.toString c)
+         (S.chars s))
+    ++ "\""
+
+-- --- types -----------------------------------------------------------------------
+
+-- The kind of each type variable inference made that is not a plain one: a
+-- number's, or a fraction's, which the Rust compiler names `n` and `f`.
+@pub fun classesIn (i : Inferred) : HashMap Int VarKind =
+  V.foldl
+    (\h (g : Generalized) ->
+      V.foldl
+        (\h2 k ->
+          match (V.get g.scheme.quant k, V.get g.vars k) with
+          | (Just kind, Just var) ->
+              (match kind with
+               | VarKind.Plain -> h2
+               | _ -> H.insert var kind h2)
+          | _ -> h2)
+        h
+        (V.range 0 (V.len g.scheme.quant)))
+    (V.foldl
+       (\h n ->
+         match n with
+         | (id, frac) -> H.insert id (if frac then VarKind.Frac else VarKind.Num) h)
+       H.empty
+       i.numbers)
+    (H.values i.generics)
+
+-- A type as the Rust compiler writes it, each variable named by its kind.
+@pub fun typeText (classes : HashMap Int VarKind) (t : Type) : String =
+  withoutLoneEffect (fst (renderIn (namerOf classes) t))
+
+-- `Int -> Int ! e` as the Rust adapter writes it, `Int -> Int`: an effect that
+-- is only a variable says nothing.
+fun withoutLoneEffect (ty : String) : String =
+  match lastBang ty 0 (0 - 1) with
+  | k -> if k < 0 then ty else if isTypeVariable (S.drop ty (k + 3)) then S.take ty k else ty
+
+fun lastBang (ty : String) (from : Int) (found : Int) : Int =
+  match S.indexOfFrom " ! " ty from with
+  | Just i -> lastBang ty (i + 1) i
+  | None -> found
+
+-- `a`, `n1`: a type that is only a variable.
+@pub fun isTypeVariable (ty : String) : Bool =
+  match V.get (S.chars ty) 0 with
+  | Just c -> C.isLower c and V.all (\x -> C.isAlphaNum x) (S.chars ty)
+  | None -> False
+
+-- The type inference gave each name the unit's modules bind, by binder.
+@pub fun typesIn (i : Inferred) : HashMap Int Type =
+  V.foldl
+    (\h p ->
+      match p with
+      | TypedProgram a root -> V.foldl (\acc d -> typedDecl a d acc) h (typedModuleDecls a root))
+    H.empty
+    i.typed
+
+fun typedDecl (a : TypedArena) (d : TypedDecl) (acc : HashMap Int Type) : HashMap Int Type =
+  match viewTypedDecl a d with
+  | TypedDeclView.Bind r -> typedBind a r.bind acc
+  | TypedDeclView.Attributed r -> typedDecl a r.decl acc
+  | TypedDeclView.Trait r -> V.foldl (\t b -> typedBind a b t) acc r.defaults
+  | TypedDeclView.Impl r -> V.foldl (\t b -> typedBind a b t) acc r.methods
+  | _ -> acc
+
+fun typedBind (a : TypedArena) (b : TypedBind) (acc : HashMap Int Type) : HashMap Int Type =
+  match viewTypedBind a b with
+  | TypedBindView.Fun r -> typedExpr a r.body (V.foldl (\t p -> typedPat a p t) acc r.params)
+  | TypedBindView.Pat r -> typedExpr a r.value (typedPat a r.pat acc)
+
+fun typedPat (a : TypedArena) (p : TypedPat) (acc : HashMap Int Type) : HashMap Int Type =
+  let t = typTypedPat a p in
+  let each = \x qs -> V.foldl (\h q -> typedPat a q h) x qs in
+  match viewTypedPat a p with
+  | TypedPatView.Var r -> H.insert r.id t acc
+  | TypedPatView.As r -> typedPat a r.pat (H.insert r.id t acc)
+  | TypedPatView.Ann r -> typedPat a r.pat acc
+  | TypedPatView.Cons r -> each acc r.args
+  | TypedPatView.Tuple r -> each acc r.items
+  | TypedPatView.Array r -> each acc r.items
+  | TypedPatView.Vector r -> each acc r.items
+  | TypedPatView.List r -> each acc r.items
+  | TypedPatView.Record r -> V.foldl (\h f -> typedPat a (typedPatFieldPat a f) h) acc r.fields
+  | TypedPatView.View r -> typedPat a r.pat (typedExpr a r.fn acc)
+  | _ -> acc
+
+fun typedExpr (a : TypedArena) (e : TypedExpr) (acc : HashMap Int Type) : HashMap Int Type =
+  let each = \x es -> V.foldl (\t c -> typedExpr a c t) x es in
+  match viewTypedExpr a e with
+  | TypedExprView.Lam r -> typedExpr a r.body (V.foldl (\t p -> typedPat a p t) acc r.params)
+  | TypedExprView.App r -> each (typedExpr a r.func acc) r.args
+  | TypedExprView.Let r -> typedExpr a r.body (V.foldl (\t b -> typedBind a b t) acc r.binds)
+  | TypedExprView.If r -> typedExpr a r.no (typedExpr a r.yes (typedExpr a r.cond acc))
+  | TypedExprView.Match r ->
+      V.foldl
+        (\t arm ->
+          let withPat = typedPat a (typedArmPat a arm) t in
+          let withGuard =
+            match typedArmGuard a arm with
+            | Just g -> typedExpr a g withPat
+            | None -> withPat
+          in typedExpr a (typedArmBody a arm) withGuard)
+        (typedExpr a r.scrutinee acc)
+        r.arms
+  | TypedExprView.Tuple r -> each acc r.items
+  | TypedExprView.Array r -> each acc r.items
+  | TypedExprView.List r -> each acc r.items
+  | TypedExprView.Cons r -> each acc r.args
+  | TypedExprView.Record r ->
+      let fields = V.foldl (\t f -> typedExpr a (typedExprFieldValue a f) t) acc r.fields in
+      (match r.base with
+       | Just b -> typedExpr a b fields
+       | None -> fields)
+  | TypedExprView.Update r ->
+      V.foldl (\t f -> typedExpr a (typedExprFieldValue a f) t) (typedExpr a r.base acc) r.fields
+  | TypedExprView.Proj r -> typedExpr a r.target acc
+  | TypedExprView.Handle r ->
+      let body = typedExpr a r.body acc in
+      let arms =
+        V.foldl
+          (\t h -> typedExpr a (typedHArmBody a h) (typedPat a (typedHArmParam a h) t))
+          body
+          r.arms
+      in (match r.ret with
+          | Just x -> typedExpr a (typedRetBody a x) (typedPat a (typedRetPat a x) arms)
+          | None -> arms)
+  | _ -> acc

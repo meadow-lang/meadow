@@ -46,6 +46,67 @@ last release is under _Unreleased_.
   `examples/Euler` rebuilds in about 0.75 s where it took 1.6, and the
   prompt starts in 0.55 s where it took 1.4. What was built before is
   compiled again, since the compiler that built it is not this one.
+- MeadowBoot's debug adapter debugs on Glade, through `meadow-host`, where it
+  ran programs on MeadowBoot's CEK machine: the session is `meadow dap`'s own,
+  so it steps, stops and shows the stack, scopes (registers, handlers and the
+  heap among them) and values as `meadow dap` does, at Glade's speed. A debug
+  build of MeadowBoot's says where it was written for it to: its Cut has a
+  `source` for each file, a position on each term a step may stop before, and
+  what the source calls each binder and definition, the debug profile's new
+  `positions` option. A definition copied for a number type or for
+  dictionaries is shown as the one it was copied from, and a local function by
+  the name the Rust core gives it (`mainLocal1`). A debug build of the
+  standard library has them too, so a step goes into it. `meadow cut` takes
+  them off before it builds or runs a program. The CEK machine is still what a session runs on where the library
+  cannot be loaded, or where `MEADOWBOOT_DAP=cek` asks for it. The two
+  adapters agree on 961 of the differential test's 1220 answers, where they
+  agreed on 894 of 1235.
+- MeadowBoot's `build` and `run` act on the flags they used to accept and
+  ignore. `--types` and `--annotations` write what MeadowBoot's inference
+  found, as `meadow` writes it; `run --cek` runs the program on MeadowBoot's
+  CEK machine; `--no-prune` links every definition; `build --emit image`,
+  `bytecode`, `asm` and `exe` write what the back end makes of MeadowBoot's
+  program where `meadow` writes each; and `--backend vm`, `--gc`,
+  `--gc-stats`, `--profile-to`, `--sample-every`, `--sample-hz`, `--train`,
+  `--nursery` and `--leaks` reach the back end, as does `-O` for the JIT.
+  `--backend`, `--jit`, `--aot` and `--runtime` decide `@cfg(backend = …)`
+  as in `meadow`. What MeadowBoot does not act on yet -- `--emit expanded`,
+  a package's features, a workspace's members -- it says it does not.
+  `meadow cut`, which it hands a program to, takes `--backend`, `--gc`,
+  `--gc-stats`, `--profile-to`, `--sample-every`, `--sample-hz`, `--train`
+  and `--calls` for it, `--emit bytecode`, `asm` and `image`, and `-o` to
+  write what it emits to a file; and it runs the JIT at the `-O` it is
+  given, where it ran it at `-O2` whatever it was given.
+  `buildtools/meadow/tests/flags_differential.rs` sets each flag on both
+  compilers against each other.
+- MeadowBoot's prompt runs each entry where `meadow repl` runs one: on
+  Glade, with the JIT, in its own process through `meadow-host`, where it
+  used to run them on MeadowBoot's CEK machine. `fib 30` takes under a
+  millisecond, where it took minutes, and a program that starts threads runs.
+  As the Rust prompt does, it keeps what each entry was compiled to -- here
+  its object of Cut -- and runs an entry as a program of its own, of what its
+  value reaches of the standard library and the entries before it. `:vm`
+  runs it without the JIT, and `:cek` on MeadowBoot's CEK machine, which is
+  also what runs it where the library cannot be loaded. `meadow-host` has
+  two functions for it, `meadow_repl_run` and `meadow_repl_pages`. `:ir`
+  shows an entry or a definition in each IR, as `meadow repl`'s does: its
+  core, written as the Rust compiler writes core -- by `Core.prettyDefs`, as
+  the language server's `meadow/ir` writes it, where the prompt had a printer
+  of its own that wrote sized integers and undecided literals otherwise --
+  then its Cut, AxCut,
+  Glade's bytecode and machine code, and LLVM IR. A package in a symbol of
+  Cut may have a `:` in its name, as a prompt's entries do: `meadow:repl:3/d0`.
+  The two prompts agree on 257 of the differential test's 265 entries, where
+  they agreed on 240.
+- `meadow repl` no longer runs an `effect` entry's operation, which said
+  `program has no entry point`, and no longer shows a derived `impl`'s
+  dictionary and methods, `(#impl.Debug) : Debug Pair`, as an entry's
+  bindings or in `:module`: `@derive(Debug) data Pair = …` says `defined type`
+  as any other `data` does.
+- A program of Cut that handles no effect and performs an operation that is
+  not the runtime's fails where it performs it, `unhandled effect …`, as one
+  that handles others does. It used to be refused before it ran, though
+  the function that performs it may be one it never calls.
 - `x |> f` evaluates `x` first, and then `f`, as it is written, on every
   engine. It used to be exactly `f x`, which evaluates `f` first. Only a
   program in which working out what is piped into performs something can
@@ -100,6 +161,35 @@ last release is under _Unreleased_.
 
 ### Added
 
+- MeadowBoot runs tests itself, the standard library's too: `meadowboot test
+  --std` builds the library with `@cfg(test)` and runs its 385 tests, where
+  it handed them to the Rust `meadow` before. `--test-threads`, `--no-capture`
+  and `--cek` are acted on, as `meadow test` acts on them: each test is a run
+  of its own, so a runtime error fails that test alone and with its message,
+  what a test prints is kept and shown beside it if it fails, runs go side by
+  side, and `--cek` runs on MeadowBoot's CEK machine. `meadowboot dis` lists
+  what MeadowBoot built, through the back end's new `meadow cut --emit
+  bytecode` and `--emit asm`. And `meadowboot __precompile-std OUT` writes the
+  standard library as MeadowBoot compiles it -- its interface and its objects
+  of Cut, for each profile -- which a build takes in place of compiling the
+  library when it finds it (`MEADOWBOOT_PRECOMPILED_STD`, or `Std.mwstd`
+  beside the library). The Rust command of that name writes its own front
+  end's output, which MeadowBoot cannot read. These are steps in retiring the
+  Rust front end: nothing a test or a listing needs comes from it now. Tests
+  in `buildtools/meadow/tests/bootstrap.rs` hold `meadowboot test` to what
+  `meadow test` says, flag for flag and on the standard library.
+- Cut carries positions and names, for a debugger: `source S = "path"`
+  declares a file, `@S:a-b s` is a statement written at bytes `a` to `b` of
+  it, and `x: i64 @"count" "Int"`, `def S @"fact"` say what the source calls
+  a binder, with its type, and a definition. Every pass keeps them, the
+  lowering makes them AxCut's marks, and Glade's code generator writes the
+  same debug information from them as from the Rust core's. `meadow cut`
+  takes them off before it builds or runs a program, which then compiles to
+  the same bytecode and LLVM IR as without them. A program of Cut built for
+  debugging can be debugged on Glade: `Session::launch_cut`, and
+  `meadow-host`'s `meadow_debug`, a session another program holds open --
+  launch, breakpoints, run and step, the stack, scopes, locals and values,
+  JSON in and out. See `docs/CUT.md`, "Positions and names".
 - `MEADOWBOOT_TIMINGS=1` has MeadowBoot say how long each pass of each unit
   took -- parse, fixity, lower, rename, infer, elaborate, optimise, cut --
   for a build, a prompt entry and the language server's study of a package;
@@ -140,6 +230,32 @@ last release is under _Unreleased_.
   session and says by kind of request how far they agree; it is ignored until
   they do. Workspace symbols and `meadow/ir` are not answered yet, and
   `lsp --check` is still `meadow`'s.
+- MeadowBoot's language server answers workspace symbols, `meadow/ir` and
+  `lsp --check`. Workspace symbols are `meadow_find`'s search, ported
+  (`bootstrap/src/Find.mw`): by name, scored as the Rust server's `nucleo`
+  matcher scores it, or by type, priced as `meadow_find` prices a match, over
+  what each open package declares and what it depends on exports.
+  `meadow/ir` answers a definition as core, written as `meadow_core` writes
+  it (`Core.prettyDefs`, from `Compiler.studyCore`); Cut and AxCut are not
+  answered yet. `lsp --check PATH…` opens each `.mw` file under the paths in
+  the server and prints every error it would mark, with the Rust command's
+  output and exit status: it finds no errors in the sources CI and a release
+  check.
+- MeadowBoot has a debug adapter of its own: `dap` in MeadowBoot
+  (`bootstrap/src/Dap.mw`), declared with Lingua's `dap!`, launches a
+  program, stops at breakpoints and on entry, continues and steps in, over
+  and out, and answers the stack, scopes, variables and evaluation in the
+  shapes `meadow dap` answers them, with a failure stopping the program where
+  it failed. The program is built by MeadowBoot and run by its CEK machine,
+  which a debugger can now watch: it stops before each place the Rust core
+  marks with a position -- a call, a branch, a body, a `let` -- and keeps a
+  frame for each function body under way, so the stack reads as a call
+  stack. Names, places and types come from MeadowBoot's renaming and
+  inference. `buildtools/meadow/tests/dap_differential.rs` drives both
+  adapters through the same sessions and says by kind of request how far
+  they agree; it is ignored until they do. A launch's `entry`, the raw
+  machine's scopes and stepping into the standard library are not
+  MeadowBoot's yet.
 - A Silo program that runs out of stack on Windows says so: how deep it got,
   in a stack of what size -- the main thread's gigabyte, or a green thread's
   or a handler's 256 MiB -- and where in the executable. It used to end with
@@ -329,6 +445,16 @@ last release is under _Unreleased_.
 
 ### Fixed
 
+- Silo's leak check (`MEADOW_SILO_LEAKS`) no longer counts as left behind
+  the regions of `TVar`s that a worker was still letting go of when `main`
+  finished. A worker takes the list of `TVar`s nothing can reach and drops
+  their values one at a time; one that had taken it just before `main`'s
+  last await returned could still be dropping when the check counted, and
+  on a busy machine it reported regions live at exit that were freed a
+  moment later -- about one run in a hundred of a program that makes a
+  `TVar` per step on five threads. The check now waits for that worker to
+  finish, and a worker that finds another already letting go leaves it to
+  them.
 - MeadowBoot's language server forgets a document the editor closes. It
   went on compiling the document's package with the closed document's last
   text, saved or not, so the files still open kept the errors of an edit that

@@ -22,6 +22,8 @@ mod Inline
 mod Eta
 mod Exhaust
 mod Tests
+mod Testing
+mod Precompile
 mod Cek
 mod Syntax
 mod Parse
@@ -35,27 +37,35 @@ mod Scopes
 mod Tour
 mod Repl
 mod Lsp
+mod Find
+mod Dap
+mod Listing
 
 use Lingua (cli!)
 use MeadowBoot.Lex (lex, dump)
 use MeadowBoot.Repl (runPrompt)
-use MeadowBoot.Lsp (serveServer)
+use MeadowBoot.Lsp (serveServer, checkPaths)
+use MeadowBoot.Dap (debugAdapter)
 use MeadowBoot.Core (program, erase, linkedUnits, CoreProgram, coreFilePackage)
 use MeadowBoot.Expand (Call, readRound, writeAnswers, callText, seenAfter)
 use MeadowBoot.Scopes (Export)
-use Lingua.Make (unitImports, Given)
+use Lingua.Make (unitImports, unitSources, Given)
 use Std.Result.Result.*
 use MeadowBoot.Cek as Cek
-use MeadowBoot.Cek (Machine)
+use MeadowBoot.Cek (Machine, Value)
+use MeadowBoot.Listing (typesOf, annotationsOf)
+use MeadowBoot.Lower (Cfg)
 use MeadowBoot.Seq as Seq
 use MeadowBoot.Tests as Tests
+use MeadowBoot.Testing (Asked, runTests)
+use MeadowBoot.Precompile (precompileStd)
 use MeadowBoot.Parse (parsed, checked)
 use MeadowBoot.Fixity (chainsOf)
 use MeadowBoot.Unit (packageOf, absolute, packageName)
 use Std.Result as Res
 use MeadowBoot.Compiler (
   unitDatabase, buildUnits, givenUnits, setCompilerSource, compilerGrouped, compilerRenamed,
-  compilerInferred, compilerCore, compilerWhole, Interface, hostOs, hostArch
+  compilerInferred, compilerCore, compilerWhole, Interface, hostOs, hostArch, unitDatabaseFor
 )
 use Lingua.Make (linkDirIn)
 use Std.Path as Path
@@ -65,6 +75,7 @@ use Lingua.Diagnostic (Diagnostic, collect, whereAt, message)
 use Std.Collections.HashMap as H
 use Std.Collections.HashMap (HashMap)
 use Std.String as S
+use Std.Char as C
 use Std.Maybe as M
 use Std.Maybe.Maybe.*
 use Std.Collections.Vector as V
@@ -281,6 +292,7 @@ cli! {
           "Serve nothing: print every error the server would mark in each `.mw` file under these paths, and exit 1 if there is one"
           value
           "PATH"
+      more : [String] "More paths to check: `--check` takes every path after it, as `meadow`'s does"
     }
     | dap "Run the debug adapter, speaking the Debug Adapter Protocol over stdin and stdout" {}
     | fmt "Re-indent `.mw` sources in place" {
@@ -323,6 +335,12 @@ cli! {
             value
             "NAME"
         aot : Flag "On Glade, compile the bytecode to machine code ahead of time and run that"
+        backend
+          : Option
+            ("vm" | "jit" | "aot")
+            "How Glade runs the program: `vm`, the bytecode interpreter alone; `jit`, the default; or `aot`"
+            value
+            "BACKEND"
         optLevel : Option Int =
           2 "How hard an executable is optimised: 0, 1 or 2" short "O" value "LEVEL"
         noRun : Flag "Build what would be run -- the bytecode image, or the executable -- and stop"
@@ -335,16 +353,45 @@ cli! {
         emit
           : Option
             String
-            "Print what the program is made into, and run nothing: `inlined`, the Cut it is lowered from once its small definitions are inlined; `axcut`, the AxCut it is lowered to; or `llvm`, the LLVM IR a Silo build compiles"
+            "Print what the program is made into, and run nothing: `inlined`, the Cut it is lowered from once its small definitions are inlined; `axcut`, the AxCut it is lowered to; `llvm`, the LLVM IR a Silo build compiles; `bytecode`, Glade's image as text; `asm`, the machine code an `aot` build compiles it to; or `image`, the image itself, which `--output` must name a file for"
             value
             "WHAT"
+        output
+          : Option
+            String
+            "Write what `--emit` makes to this file, rather than printing it"
+            short
+            "o"
+            value
+            "FILE"
+        gcStats : Flag "After running on Glade, report what the garbage collector did"
+        gc : Option ("generational" | "copying") "Which collector Glade uses" value "GC"
+        profileTo
+          : Option
+            String
+            "Sample where the program spends itself on Glade, and write folded stacks to this file"
+            value
+            "FILE"
+        sampleEvery : Option Int "Block entries between samples, with `--profile-to`" value "N"
+        sampleHz : Option Int = 1000 "Samples a second, for the profile of time" value "HZ"
+        train
+          : Flag
+            "Run on the JIT and write what each call site was seen to enter to the file `--calls` names"
+        calls
+          : Option
+            String
+            "What a training run saw each call site enter: `--train` writes it, and an `aot` build on Glade is guided by it"
+            value
+            "FILE"
       }
     | clean
       "Remove what a build wrote: the package's `target` directory, with the images, executables and incremental cache in it"
       {
         path : Maybe String "The package, or a workspace, whose `target` to remove"
         profile : Option String "Only this profile's, rather than all of them" value "NAME"
-        cache : Flag "Remove other `meadow` builds' runtime libraries and compiled `Std` from `~/.meadow/lib`, rather than a package's `target`"
+        cache
+          : Flag
+            "Remove other `meadow` builds' runtime libraries and compiled `Std` from `~/.meadow/lib`, rather than a package's `target`"
         dryRun : Flag "Say what would be removed without removing it"
       }
     | update
@@ -422,7 +469,13 @@ cli! {
       }
 }
 
-fun main () = catch failed (\() -> match argsCli () with | (every, cli) -> run every cli)
+fun main () =
+  catch failed (\() ->
+    -- `__precompile-std`, the release's and no one else's, is no command
+    -- the command line lists, as the Rust `meadow` hides it.
+    match V.get (Proc.argv ()) 0 with
+    | Just "__precompile-std" -> finish (precompileStd (V.drop (Proc.argv ()) 1))
+    | _ -> (match argsCli () with | (every, cli) -> run every cli))
 
 -- A query read before it was set, or one that needs itself: a mistake of the
 -- compiler's rather than of what it read. It is said, and the run fails.
@@ -436,29 +489,32 @@ fun failure (e : QueryError k) : String =
 
 fun run (every : CliOptions) (cli : Cli) =
   match cli with
-  | Cli.Build r -> driven r.path r.build None
-  | Cli.Run r -> driven r.path r.build (Just r.args)
-  -- The standard library's own tests are `meadow`'s to run, for now.
-  | Cli.Test r if r.std -> handedOn ()
+  | Cli.Build r ->
+      drivenWith r.path r.build None {
+        nothingAsked | types = r.types,
+        annotations = r.annotations,
+        emit = r.emit,
+        members = membersAsked r.members
+      }
+  | Cli.Run r ->
+      drivenWith r.path r.build (Just r.args) {
+        nothingAsked | types = r.types,
+        cek = r.cek,
+        gcStats = r.gcStats,
+        profileTo = r.profileTo,
+        sampleEvery = r.sampleEvery,
+        sampleHz = r.sampleHz,
+        train = r.train,
+        gc = r.gc,
+        members = if M.isSome r.package then ["--package"] else []
+      }
+  -- The tests are MeadowBoot's to build and to run, the standard library's
+  -- too (`Testing`).
   | Cli.Test r ->
-      let said =
-        V.foldl
-          (\u flag -> writeError "meadowboot: `${flag}` is not acted on yet\n")
-          ()
-          (V.concat [
-             if M.isSome r.testThreads then ["--test-threads"] else [],
-             if r.noCapture then ["--no-capture"] else [],
-             if r.cek then ["--cek"] else []
-           ])
-      in driven
-           r.path
-           r.build
-           (Just
-              (V.concat [
-                 ["--test"],
-                 M.unwrapOr [] (M.map (\f -> [f]) r.filter),
-                 if r.exact then ["--exact"] else []
-               ]))
+      runTests
+        (testAsked r.build r.path r.filter r.exact r.std r.testThreads r.noCapture r.cek)
+        backEnd
+        (backEndProgram ())
   | Cli.Lex r -> finish (V.foldl (\ok p -> lexFile p and ok) True r.files)
   | Cli.Eval r -> finish (V.foldl (\ok p -> evalFile p and ok) True r.files)
   | Cli.Parse r -> finish (V.foldl (\ok p -> parseFile p and ok) True r.files)
@@ -478,12 +534,97 @@ fun run (every : CliOptions) (cli : Cli) =
   | Cli.Expand r -> finish (expandRound r.files)
   -- The prompt is MeadowBoot's (`Repl`).
   | Cli.Repl -> runPrompt ()
-  -- The language server is MeadowBoot's; `--check` is still `meadow`'s.
-  | Cli.Lsp r if V.isEmpty r.check -> serveServer ()
+  -- The language server is MeadowBoot's, and so is what it would mark.
+  | Cli.Lsp r -> if V.isEmpty r.check then serveServer () else exit (checkPaths (V.append r.check r.more))
+  -- And so is the debug adapter (`Dap`).
+  | Cli.Dap -> debugAdapter ()
   | Cli.Units r ->
       finish (V.foldl (\ok root -> buildUnits "debug" (told ()) root and ok) True r.roots)
+  -- `dis` is this compiler's build, listed by the back end.
+  | Cli.Dis r -> disassembled r.path r.asm r.build
   -- What is not MeadowBoot's yet is `meadow`'s, asked the same way.
   | _ -> handedOn ()
+
+-- What `meadow test` was asked, as `Testing` runs it: built as `build` would
+-- build it, run on Glade's JIT unless Silo, or Glade's code compiled ahead
+-- of time, or the CEK machine is asked for.
+fun testAsked
+    (b : CliBuild)
+    (path : Maybe String)
+    (filter : Maybe String)
+    (exact : Bool)
+    (std : Bool)
+    (threads : Maybe Int)
+    (noCapture : Bool)
+    (cek : Bool) =
+  let said =
+    V.foldl (\u flag -> writeError "meadowboot: `${flag}` is not acted on yet\n") () (unheeded b)
+  in
+  let threaded =
+    match b.threads with
+    | Just n -> Proc.setEnv ("MEADOW_THREADS", show n)
+    | None -> ()
+  in Asked {
+       path,
+       filter,
+       exact,
+       std,
+       threads,
+       noCapture,
+       cek,
+       profile = if b.release then "release" else "debug",
+       level = levelOf b,
+       pairs = pairsFor b,
+       flags = b.cfg,
+       runtime = M.unwrapOr "glade" b.runtime,
+       ahead = b.aot or b.backend == Just "aot"
+     }
+
+-- How hard a build optimises, as `driven` has it: what `-O` says, or the
+-- profile's, at most 2.
+fun levelOf (b : CliBuild) : Int =
+  let level = M.unwrapOr (if b.release then 2 else 1) b.optLevel in
+  if level > 2 then 2 else level
+
+-- What a build is told over its profile, as `driven` tells it.
+fun pairsFor (b : CliBuild) =
+  let goal = targetOf b.target in
+  V.concat [
+    [("opt", "O${show (levelOf b)}"), ("macros", "Glade")],
+    (if M.isSome b.target then [("os", goal.os), ("arch", goal.arch)] else []),
+    (if V.isEmpty b.cfg then [] else [("flags", S.join "," b.cfg)]),
+    (if b.strict then [("strict", "true")] else if b.lenient then [("strict", "false")] else []),
+    told ()
+  ]
+
+-- `dis`: the package at `path` built by this compiler, as `build` builds it,
+-- and the bytecode the back end makes of its Cut printed -- or, with `--asm`,
+-- the machine code Glade's ahead-of-time compiler makes of that, for this
+-- machine (`meadow cut --emit`).
+fun disassembled (path : Maybe String) (asm : Bool) (b : CliBuild) =
+  let place = absolute (M.unwrapOr "." path) in
+  let root = if S.endsWith ".mw" place then packageOf place else Just place in
+  let said =
+    V.foldl (\u flag -> writeError "meadowboot: `${flag}` is not acted on yet\n") () (unheeded b)
+  in match root with
+     | None -> (let u = writeError "meadowboot: `${place}` is in no package\n" in exit 1)
+     | Just r ->
+         let profile = if b.release then "release" else "debug" in
+         if not (buildUnits profile (pairsFor b) r) then exit 1
+         else
+           (let program = Path.join (linkDirIn r profile) "program.cut" in
+            match backEnd [
+              "cut",
+              program,
+              "--emit",
+              if asm then "asm" else "bytecode",
+              "-O",
+              show (levelOf b)
+            ] with
+            | Ok code -> exit code
+            | Err why ->
+                (let u = writeError "meadowboot: the back end could not be run: ${why}\n" in
+                 exit 1))
 
 -- The Rust compiler's `meadow`: where `MEADOW` says, the one beside this
 -- program -- as a release of it has them -- or the one on the path.
@@ -552,94 +693,404 @@ fun handedOn () =
 -- so that nobody takes a flag for honoured because it was accepted.
 fun unheeded (b : CliBuild) : [String] =
   V.concatMap (\x -> if fst x then [snd x] else []) [
-    (b.noPrune, "--no-prune"),
-    (M.isSome b.nursery, "--nursery"),
-    (b.leaks, "--leaks"),
     (M.isSome b.features, "--features"),
     (b.noDefaultFeatures, "--no-default-features"),
     (b.allFeatures, "--all-features")
   ]
 
+-- What `build` and `run` are asked besides how to build: what to print of
+-- the program (`Listing`), what to write in place of what a build writes,
+-- which workspace members to build, and how to run it.
+record BuildAsked = {
+  types : Bool,
+  annotations : Bool,
+  emit : [String],
+  members : [String],
+  cek : Bool,
+  gcStats : Bool,
+  profileTo : Maybe String,
+  sampleEvery : Maybe Int,
+  sampleHz : Int,
+  train : Bool,
+  gc : Maybe String
+}
+
+def nothingAsked : BuildAsked =
+  BuildAsked {
+    types = False,
+    annotations = False,
+    emit = [],
+    members = [],
+    cek = False,
+    gcStats = False,
+    profileTo = None,
+    sampleEvery = None,
+    sampleHz = 1000,
+    train = False,
+    gc = None
+  }
+
+-- Which of `-p`, `--workspace` and `--exclude` were given.
+fun membersAsked (m : CliMembers) : [String] =
+  V.concat [
+    if V.isEmpty m.package then [] else ["--package"],
+    if m.workspace then ["--workspace"] else [],
+    if V.isEmpty m.exclude then [] else ["--exclude"]
+  ]
+
+-- What a build may write in place of what it writes by default.
+def emitKinds : [String] = ["image", "bytecode", "asm", "exe", "expanded"]
+
 -- `build` and `run`: the package at `path` compiled to Cut by this compiler
 -- -- its macros run on Glade -- and that handed to the back end, `meadow
 -- cut`, to build, or to run with `args` where there are any to give.
 fun driven (path : Maybe String) (b : CliBuild) (args : Maybe [String]) =
+  drivenWith path b args nothingAsked
+
+-- The same, asked `asked` besides.
+fun drivenWith (path : Maybe String) (b : CliBuild) (args : Maybe [String]) (asked : BuildAsked) =
   -- `test` is a build with `@cfg(test)` holding, entered at what runs the
   -- tests (`Tests`), and what follows `--test` is that program's.
   let testing = M.unwrapOr False (M.map (\xs -> V.getOr "" xs 0 == "--test") args) in
   let theirs = if testing then V.drop (M.unwrapOr [] args) 1 else M.unwrapOr [] args in
   let place = absolute (M.unwrapOr "." path) in
   let root = if S.endsWith ".mw" place then packageOf place else Just place in
-  let said =
-    V.foldl (\u flag -> writeError "meadowboot: `${flag}` is not acted on yet\n") () (unheeded b)
-  in match root with
-     | None -> (let u = writeError "meadowboot: `${place}` is in no package\n" in exit 1)
-     | Just r ->
-         let profile = if b.release then "release" else "debug" in
-         let level = M.unwrapOr (if b.release then 2 else 1) b.optLevel in
-         let goal = targetOf b.target in
-         let pairs =
+  let wrongKinds = V.filter (\k -> not (V.elem k emitKinds)) asked.emit in
+  if not (V.isEmpty wrongKinds) then
+    (let u =
+       writeError
+         "error: invalid value '${V.getOr "" wrongKinds 0}' for '--emit <KIND>': expected image, bytecode, asm, exe or expanded\n"
+     in exit 2)
+  else
+    let said =
+      V.foldl
+        (\u flag -> writeError "meadowboot: `${flag}` is not acted on yet\n")
+        ()
+        (V.concat [
+           unheeded b,
+           asked.members,
+           if V.elem "expanded" asked.emit then ["--emit expanded"] else []
+         ])
+    in match root with
+       | None -> (let u = writeError "meadowboot: `${place}` is in no package\n" in exit 1)
+       | Just r ->
+           let profile = if b.release then "release" else "debug" in
+           let level = M.unwrapOr (if b.release then 2 else 1) b.optLevel in
+           let goal = targetOf b.target in
+           -- How Glade runs it, which `@cfg(backend = …)` asks: the backend
+           -- named, or the profile's -- `jit` for a debug build, `aot` for a
+           -- release one -- unless the runtime is Silo, which has none, or the
+           -- CEK machine runs it.
+           let backend =
+             (if b.runtime == Just "silo" then "silo"
+              else if asked.cek then "cek"
+              else
+                match b.backend with
+                | Just named -> named
+                | None -> if b.jit then "jit" else if b.aot or b.release then "aot" else "jit")
+           in
+           let opt = show (if level > 2 then 2 else level) in
+           let pairs =
+             V.concat [
+               [("opt", "O${opt}"), ("macros", "Glade"), ("backend", backend)],
+               (if M.isSome b.target then [("os", goal.os), ("arch", goal.arch)] else []),
+               (if V.isEmpty b.cfg then [] else [("flags", S.join "," b.cfg)]),
+               (if b.noPrune then [("prune", "false")] else []),
+               (if b.strict then [("strict", "true")]
+                else if b.lenient then [("strict", "false")]
+                else []),
+               (if testing then [("test", "true"), ("entry", Tests.runner)] else []),
+               told ()
+             ]
+           in
+           -- What the build's `@cfg`s were decided by, for what is shown of it.
+           let cfg =
+             Cfg {
+               os = goal.os,
+               arch = goal.arch,
+               profile,
+               backend,
+               opt,
+               test = False,
+               flags = b.cfg
+             }
+           in if not (buildUnits profile pairs r) then exit 1
+              else
+                let shown =
+                  (if asked.annotations then writeOutput (annotationsOf profile cfg r)
+                   else if asked.types then writeOutput (typesOf profile cfg r)
+                   else ())
+                in
+                let told = runtimeTold b in
+                if asked.cek and M.isSome args then cekRun profile cfg r asked.gcStats
+                else if not (V.isEmpty asked.emit) then emitted r profile level goal b asked.emit
+                else handedBack r profile level goal b args theirs asked
+
+-- What the runtime is told by the environment, which both runtimes read and
+-- a program Silo runs inherits: how many threads run the program, how large
+-- Glade's nursery is, and whether what the program left behind is reported.
+fun runtimeTold (b : CliBuild) =
+  let threaded =
+    match b.threads with
+    | Just n -> if n > 0 then Proc.setEnv ("MEADOW_THREADS", show n) else ()
+    | None -> ()
+  in
+  let nursery =
+    match b.nursery with
+    | None -> ()
+    | Just size ->
+        (match nurseryBytes size with
+         | Ok bytes -> Proc.setEnv ("MEADOW_GC_NURSERY", show (bytes / 8))
+         | Err why ->
+             (let u =
+                writeError "error: invalid value '${size}' for '--nursery <SIZE>': ${why}\n"
+              in exit 2))
+  in if b.leaks then Proc.setEnv ("MEADOW_SILO_LEAKS", "1") else ()
+
+-- `--nursery`'s size in bytes: `8M`, `512K`, `1G`, or bytes, from 256K to
+-- 1G -- `meadow`'s `nursery_size`.
+fun nurseryBytes (text : String) : Result String Int =
+  let t = S.trim text in
+  let digits = V.len (V.takeWhile C.isDigit (S.chars t)) in
+  let unit = S.toLower (S.trim (S.drop t digits)) in
+  let shift =
+    if unit == "" or unit == "b" then Just 0
+    else if V.elem unit ["k", "kb", "kib"] then Just 10
+    else if V.elem unit ["m", "mb", "mib"] then Just 20
+    else if V.elem unit ["g", "gb", "gib"] then Just 30
+    else None
+  in
+  let bad = "`${text}` is not a size: write `8M`, `512K`, `1G`, or bytes" in
+  match (shift, S.toInt (S.take t digits)) with
+  | (Just k, Just n) ->
+      if digits > 12 then Err bad
+      else
+        let bytes = n * pow2 k in
+        if bytes < 256 * 1024 or bytes > 1024 * 1024 * 1024 then
+          Err "a nursery of `${text}` is outside 256K to 1G, which is what it may be"
+        else Ok bytes
+  | _ -> Err bad
+
+fun pow2 (k : Int) : Int = if k <= 0 then 1 else 2 * pow2 (k - 1)
+
+-- The program at `r`, built, handed to the back end: built, or run with
+-- `theirs` where `args` asks for a run, as `asked` says to run it.
+fun handedBack
+    (r : String)
+    (profile : String)
+    (level : Int)
+    (goal : Goal)
+    (b : CliBuild)
+    (args : Maybe [String])
+    (theirs : [String])
+    (asked : BuildAsked) =
+  let program = Path.join (linkDirIn r profile) "program.cut" in
+  -- Training is the JIT watching, whatever the profile would run.
+  let ahead =
+    not asked.train
+      and (b.aot or b.backend == Just "aot" or (b.release and not b.jit and M.isNone b.backend))
+  in
+  -- A program that exports functions to C is a library of them, built
+  -- native, and not run: by Silo, unless `--runtime glade` asks for
+  -- Glade's.
+  let library =
+    match readToString program with
+    | Ok text -> S.contains "\nexport " text
+    | Err _ -> False
+  in
+  let libraryRuntime = M.unwrapOr "silo" b.runtime in
+  let aimed = match b.target with | Just t -> ["--target", t] | None -> [] in
+  -- What a training run saw, which an `aot` build is guided by: where
+  -- `meadow` keeps it.
+  let calls = ["--calls", callsOf r profile] in
+  let running =
+    V.concat [
+      (if asked.train then V.pushFront calls "--train" else []),
+      (if asked.gcStats then ["--gc-stats"] else []),
+      (match asked.gc with | Just g -> ["--gc", g] | None -> []),
+      (match asked.profileTo with
+       | Just to ->
            V.concat [
-             [("opt", "O${show (if level > 2 then 2 else level)}"), ("macros", "Glade")],
-             (if M.isSome b.target then [("os", goal.os), ("arch", goal.arch)] else []),
-             (if V.isEmpty b.cfg then [] else [("flags", S.join "," b.cfg)]),
-             (if b.strict then [("strict", "true")]
-              else if b.lenient then [("strict", "false")]
-              else []),
-             (if testing then [("test", "true"), ("entry", Tests.runner)] else []),
-             told ()
+             ["--profile-to", absolute to, "--sample-hz", show asked.sampleHz],
+             (match asked.sampleEvery with
+              | Just n -> ["--sample-every", show n]
+              | None -> [])
            ]
-         in if not (buildUnits profile pairs r) then exit 1
-            else
-              (let program = Path.join (linkDirIn r profile) "program.cut" in
-               let ahead =
-                 b.aot
-                   or b.backend == Just "aot"
-                   or (b.release and not b.jit and M.isNone b.backend)
-               in
-               let threaded =
-                 match b.threads with
-                 | Just n -> Proc.setEnv ("MEADOW_THREADS", show n)
-                 | None -> ()
-               in
-               -- A program that exports functions to C is a library of them,
-               -- built native, and not run: by Silo, unless `--runtime glade`
-               -- asks for Glade's.
-               let library =
-                 match readToString program with
-                 | Ok text -> S.contains "\nexport " text
-                 | Err _ -> False
-               in
-               let libraryRuntime = M.unwrapOr "silo" b.runtime in
-               let aimed = match b.target with | Just t -> ["--target", t] | None -> [] in
-               let back =
-                 if library then
-                   V.concat [
-                     ["cut", program, "--runtime", libraryRuntime, "-O", show level, "--no-run"],
-                     aimed
-                   ]
-                 else
-                   V.concat [
-                     ["cut", program, "--runtime", M.unwrapOr "glade" b.runtime, "-O", show level],
-                     (if ahead and b.runtime != Just "silo" then ["--aot"] else []),
-                     aimed,
-                     (if M.isNone args then ["--no-run"] else V.pushFront theirs "--")
-                   ]
-               in match backEnd back with
-                  | Ok 0 ->
-                      if not library then exit 0
-                      else
-                        (match placed r profile libraryRuntime goal with
-                         | Ok at -> (let u = writeError "      Copied ${at}\n" in exit 0)
-                         | Err why ->
-                             (let u =
-                                writeError
-                                  "meadowboot: what was built could not be put in place: ${why}\n"
-                              in exit 1))
-                  | Ok code -> exit code
-                  | Err why ->
-                      (let u = writeError "meadowboot: the back end could not be run: ${why}\n" in
-                       exit 1))
+       | None -> [])
+    ]
+  in
+  let back =
+    if library then
+      V.concat [["cut", program, "--runtime", libraryRuntime, "-O", show level, "--no-run"], aimed]
+    else
+      V.concat [
+        ["cut", program, "--runtime", M.unwrapOr "glade" b.runtime, "-O", show level],
+        (if ahead and b.runtime != Just "silo" then V.pushFront calls "--aot"
+         else if b.backend == Just "vm" and not asked.train then ["--backend", "vm"]
+         else []),
+        aimed,
+        (if M.isNone args then ["--no-run"] else V.concat [running, V.pushFront theirs "--"])
+      ]
+  in match backEnd back with
+     | Ok 0 ->
+         if not library then exit 0
+         else
+           (match placed r profile libraryRuntime goal with
+            | Ok at -> (let u = writeError "      Copied ${at}\n" in exit 0)
+            | Err why ->
+                (let u =
+                   writeError "meadowboot: what was built could not be put in place: ${why}\n"
+                 in exit 1))
+     | Ok code -> exit code
+     | Err why ->
+         (let u = writeError "meadowboot: the back end could not be run: ${why}\n" in exit 1)
+
+-- Where a training run of the package at `r` writes what it saw, and an
+-- `aot` build of it reads it: where `meadow` keeps it (`crate::pgo`).
+fun callsOf (r : String) (profile : String) : String =
+  Path.joinAll [r, "target", profile, "calls.pgo"]
+
+-- `build --emit`: in place of what a build writes, what `kinds` name, where
+-- `meadow` writes each -- the bytecode image and its text under
+-- `target/<profile>/bytecode`, the machine code as text and the executable
+-- under `target/<profile>/native` -- each made by the back end from the
+-- program this compiler made, so of MeadowBoot's program and not of the
+-- Rust compiler's.
+fun emitted
+    (r : String)
+    (profile : String)
+    (level : Int)
+    (goal : Goal)
+    (b : CliBuild)
+    (kinds : [String]) =
+  let program = Path.join (linkDirIn r profile) "program.cut" in
+  let name =
+    match readToString (Path.join r "Meadow.toml") with
+    | Ok text -> packageName text
+    | Err _ -> "program"
+  in
+  let runtime = M.unwrapOr "glade" b.runtime in
+  let aimed = match b.target with | Just t -> ["--target", t] | None -> [] in
+  let bytecode = Path.joinAll [r, "target", profile, "bytecode"] in
+  let made =
+    \what to more ->
+      match backEnd (V.concat [["cut", program, "--emit", what, "-o", to], more]) with
+      | Ok 0 -> Ok to
+      | Ok code -> Err "the back end ended with ${show code}"
+      | Err why -> Err why
+  in
+  let said = \word at -> (let u = writeError "${word}: ${at}\n" in Ok at) in
+  let one =
+    \k ->
+      if k == "image" then made "image" (Path.join bytecode "${name}.mbc") []
+      else if k == "bytecode" then
+        Res.andThen (said "bytecode") (made "bytecode" (Path.join bytecode "${name}.mbc.txt") [])
+      else if k == "asm" then
+        Res.andThen
+          (said "asm")
+          (made
+             "asm"
+             (Path.join (nativeDirOf r profile runtime goal) "${name}.s")
+             (V.concat [["-O", show level], aimed]))
+      else if k == "exe" then executable r profile level goal b name
+      else Ok ""
+  in
+  let done =
+    V.foldl
+      (\ok k ->
+        ok
+          and (match one k with
+           | Ok _ -> True
+           | Err why -> (let u = writeError "error: ${why}\n" in False)))
+      True
+      -- In the order `meadow` writes them, whatever the order asked.
+      (V.filter (\k -> V.elem k kinds) ["image", "bytecode", "asm", "exe"])
+  in exit (if done then 0 else 1)
+
+-- Where `meadow` puts what a native build of the package at `r` makes:
+-- `target/<profile>/native`, under the target's triple where that is not
+-- this machine, and Silo's beside Glade's, which is the default runtime's.
+fun nativeDirOf (r : String) (profile : String) (runtime : String) (goal : Goal) : String =
+  let under = if goal.host then "" else "/${goal.triple}" in
+  let beside = if runtime == "glade" then "" else "/silo" in
+  Path.join r "target/${profile}/native${under}${beside}"
+
+-- `--emit exe`: the executable, built by the back end beside the program --
+-- by Silo, or by Glade ahead of time, guided by what a training run saw --
+-- and copied to where `meadow` puts it.
+fun executable
+    (r : String)
+    (profile : String)
+    (level : Int)
+    (goal : Goal)
+    (b : CliBuild)
+    (name : String) =
+  let program = Path.join (linkDirIn r profile) "program.cut" in
+  let runtime = M.unwrapOr "glade" b.runtime in
+  let aimed = match b.target with | Just t -> ["--target", t] | None -> [] in
+  let back =
+    V.concat [
+      ["cut", program, "--runtime", runtime, "-O", show level, "--no-run"],
+      (if runtime == "glade" then ["--aot", "--calls", callsOf r profile] else []),
+      aimed
+    ]
+  in
+  let suffix = if goal.os == "windows" then ".exe" else "" in
+  match backEnd back with
+  | Ok 0 ->
+      let under = if goal.host then "" else "/${goal.triple}" in
+      let beside = if runtime == "glade" then "" else "/silo" in
+      let built =
+        Path.join
+          (Path.join (linkDirIn r profile) "target/release/native${under}${beside}")
+          "program${suffix}"
+      in
+      let dir = nativeDirOf r profile runtime goal in
+      let dest = Path.join dir "${name}${suffix}" in
+      (match createDirAll dir with
+       | Err why -> Err why
+       | Ok _ ->
+           (match copy (built, dest) with
+            | Ok _ -> (let u = writeError "  Executable ${dest}\n" in Ok dest)
+            | Err why -> Err why))
+  | Ok code -> Err "the back end ended with ${show code}"
+  | Err why -> Err why
+
+-- `run --cek`: the package at `r`, which the build compiled with
+-- `@cfg(backend = "cek")` holding, made one program of core with every unit
+-- it is made with, and its `main` run by this compiler's CEK machine
+-- (`Cek`) -- the specification of what a program means -- as `meadow run
+-- --cek` runs it on the Rust compiler's. The machine counts no collections,
+-- and `--gc-stats` says so.
+fun cekRun (profile : String) (cfg : Cfg) (r : String) (gcStats : Bool) =
+  let pkg =
+    match readToString (Path.join r "Meadow.toml") with
+    | Ok text -> packageName text
+    | Err _ -> "main"
+  in match cekOf profile (\(u : Given Interface) -> unitDatabaseFor (decidedFor cfg u) u) r with
+     | Err why -> (let u = writeError "error: ${why}\n" in exit 1)
+     | Ok l ->
+         (match placeOf l pkg [] "main" with
+          | None -> (let u = writeError "error: `${pkg}` has no `main` to run\n" in exit 1)
+          | Just f ->
+              let u = writeError "     Running `${pkg}::main` on the CEK machine\n" in
+              let ran = Cek.call l.machine f [Value.Unit] in
+              let g =
+                if gcStats then
+                  writeError "gc: the CEK machine reference-counts, so there is nothing to report\n"
+                else ()
+              in (match ran with
+                  | Ok _ -> exit 0
+                  | Err why -> (let w = writeError "${why}\n" in exit 1)))
+
+-- What a unit's `@cfg`s are decided by in the build `cfg` is of: the
+-- standard library is compiled for the platform alone (`pinnedOf`).
+fun decidedFor (cfg : Cfg) (u : Given Interface) : Cfg =
+  match V.find (\s -> S.endsWith "Meadow.toml" (fst s)) (unitSources u) with
+  | Just s ->
+      if packageName (snd s) == "Std" then { cfg | profile = "debug", backend = "jit", flags = [] }
+      else cfg
+  | None -> cfg
 
 -- What a native build is for: the system and the processor `@cfg` answers
 -- for, the Rust target triple `meadow` knows them by, and whether that is
@@ -1015,50 +1466,54 @@ fun cekRound (settled : Bool) (modules : [(String, [(String, String)], [Call])])
 -- program of core.
 fun loadCek (root : String) =
   if not (buildUnits "debug" [("macros", "Cek")] root) then Err "${root} did not build"
+  else cekOf "debug" unitDatabase root
+
+-- The units of the build at `root` as `profile` -- each read into the
+-- database `dbOf` makes of it -- as one program of core, loaded.
+fun cekOf (profile : String) dbOf (root : String) =
+  let made =
+    V.concatMap
+      (\dir ->
+        match givenUnits profile root dir with
+        | Ok u ->
+            (let db = dbOf u in
+             match (compilerWhole db 0, compilerInferred db 0) with
+             | (Just core, (_, exports, _, _)) -> [Ok (core, exports)]
+             | _ -> [Err "${dir} has no core"])
+        | Err why -> [Err "${dir}: ${why}"])
+      (unitsUnder profile root [root] [])
+  in
+  let missing = V.concatMap (\x -> match x with | Err why -> [why] | Ok _ -> []) made in
+  let units = V.concatMap (\x -> match x with | Ok y -> [y] | Err _ -> []) made in
+  if not (V.isEmpty missing) then Err (S.join "; " missing)
   else
-    let made =
-      V.concatMap
-        (\dir ->
-          match givenUnits "debug" root dir with
-          | Ok u ->
-              (let db = unitDatabase u in
-               match (compilerWhole db 0, compilerInferred db 0) with
-               | (Just core, (_, exports, _, _)) -> [Ok (core, exports)]
-               | _ -> [Err "${dir} has no core"])
-          | Err why -> [Err "${dir}: ${why}"])
-        (unitsUnder root [root] [])
-    in
-    let missing = V.concatMap (\x -> match x with | Err why -> [why] | Ok _ -> []) made in
-    let units = V.concatMap (\x -> match x with | Ok y -> [y] | Err _ -> []) made in
-    if not (V.isEmpty missing) then Err (S.join "; " missing)
-    else
-      match linkedUnits (V.map fst units) with
-      | (whole, table) ->
-          Ok
-            (Loaded {
-               machine = Cek.machine whole,
-               table,
-               units =
-                 V.map
-                   (\x ->
-                     match x with
-                     | (CoreProgram a file, exports) -> (coreFilePackage a file, exports))
-                   units
-             })
+    match linkedUnits (V.map fst units) with
+    | (whole, table) ->
+        Ok
+          (Loaded {
+             machine = Cek.machine whole,
+             table,
+             units =
+               V.map
+                 (\x ->
+                   match x with
+                   | (CoreProgram a file, exports) -> (coreFilePackage a file, exports))
+                 units
+           })
 
 -- Every unit the units `todo` of the build at `root` are made with, and
 -- they themselves, each once.
-fun unitsUnder (root : String) (todo : [String]) (seen : [String]) =
+fun unitsUnder (profile : String) (root : String) (todo : [String]) (seen : [String]) =
   match V.get todo 0 with
   | None -> seen
   | Just dir ->
-      if V.elem dir seen then unitsUnder root (V.drop todo 1) seen
+      if V.elem dir seen then unitsUnder profile root (V.drop todo 1) seen
       else
         let more =
-          (match givenUnits "debug" root dir with
+          (match givenUnits profile root dir with
            | Ok (u : Given Interface) -> V.map fst (unitImports u)
            | Err _ -> [])
-        in unitsUnder root (V.append (V.drop todo 1) more) (V.pushBack seen dir)
+        in unitsUnder profile root (V.append (V.drop todo 1) more) (V.pushBack seen dir)
 
 -- Where the value `name` of module `module` of package `pkg` is in the
 -- program.

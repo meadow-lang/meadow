@@ -746,9 +746,9 @@ fn a_val_that_performs_does_so_at_the_start_whether_or_not_it_is_read() {
     }
 }
 
-/// `meadow cut --emit` prints what a program is made into -- its AxCut, or
-/// the LLVM IR a Silo build compiles -- and runs nothing: what a front end's
-/// tools show of the back end's lowering.
+/// `meadow cut --emit` prints what a program is made into -- its AxCut, the
+/// LLVM IR a Silo build compiles, or its bytecode -- and runs nothing: what
+/// a front end's tools show of the back end's lowering.
 #[test]
 fn a_program_of_cut_is_printed_as_axcut_and_as_llvm() {
     let dir = scratch("cut-emit");
@@ -761,9 +761,20 @@ fn a_program_of_cut_is_printed_as_axcut_and_as_llvm() {
     assert!(ok, "{err}");
     assert!(out.contains("define "), "{out}");
     assert!(!out.contains("counting\n200002"), "nothing ran: {out}");
+    // The bytecode Glade runs, as `meadow dis` lists it.
+    let (ok, out, err) = meadow(&dir, &["cut", "count.cut", "--emit", "bytecode"]);
+    assert!(ok, "{err}");
+    assert!(
+        out.starts_with("; ") && out.contains(" instructions, "),
+        "{out}"
+    );
+    assert!(!out.contains("counting\n200002"), "nothing ran: {out}");
     let (ok, _, err) = meadow(&dir, &["cut", "count.cut", "--emit", "bytes"]);
     assert!(!ok);
-    assert!(err.contains("`axcut` or `llvm`"), "{err}");
+    assert!(
+        err.contains("`axcut`, `llvm`, `bytecode`, `asm` or `image`"),
+        "{err}"
+    );
 }
 
 #[test]

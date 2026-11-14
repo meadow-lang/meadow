@@ -202,6 +202,7 @@ fn walk(s: &Statement, can: &Can, kinds: &[(String, Kind)], out: &mut Vec<(HashS
             consumer(&h.cont, can, kinds, out);
             out.push((handled, can.clone()));
         }
+        Statement::At(_, s) => walk(s, can, kinds, out),
         Statement::Error(_) => {}
     }
 }
