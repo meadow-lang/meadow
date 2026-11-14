@@ -1,24 +1,32 @@
--- `test`: a package's `@test` functions, run by a program of the package's
--- own, which is what `meadow test` runs (`buildtools/meadow/src/test.rs`).
+-- `test`: a package's `@test` functions, compiled into a program of the
+-- package's own, which `Testing` runs as `meadow test` runs them
+-- (`buildtools/meadow/src/test.rs`).
 --
 -- A build with `test` set -- which only the package being tested is, never
 -- what it depends on -- reads each of its modules with a little more at the
 -- end than the file says: the module's tests, by name, in a list another
--- module may ask for, and in the root module a function that runs every
--- one. Nothing is written to disk, and nothing a test is or names changes:
--- a test may be private to its module, since the list is the module's own;
--- and it is compiled as everything else is, by this compiler.
+-- module may ask for, and in the root module every test of the package in
+-- one list, numbered, and what runs one of them. Nothing is written to disk,
+-- and nothing a test is or names changes: a test may be private to its
+-- module, since the list is the module's own; and it is compiled as
+-- everything else is, by this compiler.
 --
 -- A test is `@test fun name () = …`, run with `()`. It fails by performing
--- `Std.Test.fail` -- which `assert` and `assertEq` do -- and the run goes
--- on to the next. Each is said as it finishes, `test Module.name ... ok`,
--- and at the end what failed and why, then `test result: ok. 3 passed; 0
--- failed`, as `meadow test` says it. What a test is given after `--` is a
--- filter of names, `--exact` for a whole name.
+-- `Std.Test.fail` -- which `assert` and `assertEq` do -- or by stopping
+-- where the program would stop, at a runtime error. The program runs one
+-- test, the one its arguments number, and writes how it went to the file
+-- they name: `ok`, or `FAILED` and why on the lines after, the message
+-- shown as the runtime shows an unhandled `fail`. That each test is a run of
+-- its own is what keeps one that stops from stopping the others, and what
+-- it prints apart from what they print, as the Rust runner's tests are runs
+-- of their own. The CEK machine, which answers no file, asks the root
+-- module's `meadowTestsOneQ` and `meadowTestsKeptQ` instead, which answer
+-- the message as it was failed with, as the Rust CEK machine says it.
 --
--- Not yet as `meadow test` has it: tests are run one at a time, what they
--- print is not kept to be shown beside a failure, and a test that stops the
--- program -- a runtime error -- stops the run.
+-- What is written is written with names the module itself is given -- every
+-- one through a `use` of its own, nothing of the prelude's -- so that the
+-- standard library's root, which has no prelude, runs its tests the same
+-- way: `meadow test --std`.
 
 use Std.Collections.Vector as V
 use Std.String as S
@@ -78,7 +86,16 @@ fun listed (path : [String]) (names : [String]) : String =
   -- Each is run for what it does, not what it answers: a test that answers
   -- something is a test all the same, and a list holds one type.
   let entry = \n -> "(\"${qualified n}\", \\() -> (let r = ${n} () in ()))" in
-  "\n\n@pub def meadowTestsHereQ = [${S.join ", " (V.map entry names)}]\n"
+  -- Each in front of the next, `::`, which needs nothing in scope: a list of
+  -- one in brackets would be a `Vector`.
+  let listed = S.join "" (V.map (\n -> "${entry n} :: ") names) in
+  "\n\n@pub def ${listName path} = ${listed}Nil\n"
+
+-- What the list of the module at `path`'s tests is called: a name of its own,
+-- since a module another declares `@pub mod` passes what it exports on to
+-- that one, and a list it holds goes too. It is a `List`, which needs
+-- nothing in scope to be written, as a `Vector` does.
+fun listName (path : [String]) : String = "meadowTestsHere${S.join "" path}Q"
 
 -- The package's sources, `pkg`'s at `dir`, each module with its tests listed
 -- at its end and the root with what runs them.
@@ -108,6 +125,30 @@ fun listed (path : [String]) (names : [String]) : String =
          | None -> s)
        sources
 
+-- The names of the package's tests, as `meadow test` says them, numbered as
+-- the root module numbers them: the root module's first, then each other
+-- module's, in the order of `sources`.
+@pub fun testNames (dir : String) (sources : [(String, String)]) : [String] =
+  let modules =
+    V.concatMap
+      (\s ->
+        match moduleOf dir (fst s) with
+        | Just path -> [(path, testsIn (snd s))]
+        | None -> [])
+      sources
+  in
+  let named = \path -> \n -> if V.isEmpty path then n else "${S.join "." path}.${n}" in
+  let roots = V.filter (\m -> V.isEmpty (fst m)) modules in
+  let others = V.filter (\m -> not (V.isEmpty (fst m))) modules in
+  V.concatMap (\m -> V.map (named (fst m)) (snd m)) (V.append roots others)
+
+-- What the CEK machine asks of the root module: test `i` run, whether it
+-- failed and why; and the same with what it wrote kept, the pair and the
+-- text.
+@pub def oneTest : String = "meadowTestsOneQ"
+
+@pub def keptTest : String = "meadowTestsKeptQ"
+
 -- What the root module runs its tests and the other modules' with.
 fun runs (pkg : String) (others : [[String]]) : String =
   let uses =
@@ -117,46 +158,34 @@ fun runs (pkg : String) (others : [[String]]) : String =
   in
   let lists =
     V.append
-      ["meadowTestsHereQ"]
-      (V.map (\i -> "MeadowTests${show i}Q.meadowTestsHereQ") (V.range 0 (V.len others)))
+      ["MeadowTestsVQ.fromList meadowTestsHereQ"]
+      (V.map
+         (\i -> "MeadowTestsVQ.fromList MeadowTests${show i}Q.${listName (V.getOr [] others i)}")
+         (V.range 0 (V.len others)))
   in S.join "" [
        "\nuse Std.Test as MeadowTestsTQ\n",
        "use Std.Collections.Vector as MeadowTestsVQ\n",
        "use Std.String as MeadowTestsSQ\n",
        "use Std.Process as MeadowTestsPQ\n",
+       "use Std.Fs as MeadowTestsFQ\n",
+       "use Std.Console as MeadowTestsCQ\n",
+       "use Std.Maybe as MeadowTestsMQ\n",
        S.join "" uses,
-       "\n@pub fun meadowTestsMainQ () : () ! Eff =\n",
+       "\n@pub def meadowTestsAllQ = MeadowTestsVQ.concat (MeadowTestsVQ.fromList (",
+       S.join "" (V.map (\l -> "(${l}) :: ") lists),
+       "Nil))\n",
+       "\n@pub fun meadowTestsOneQ (i : Int) =\n",
+       "  match MeadowTestsVQ.getOr (\"\", \\() -> ()) meadowTestsAllQ i with\n",
+       "  | (_, t) ->\n",
+       "      (match MeadowTestsTQ.failure t with\n",
+       "       | (failed, why) -> (failed, why))\n",
+       "\n@pub fun meadowTestsKeptQ (i : Int) = MeadowTestsCQ.withOutput (\\() -> meadowTestsOneQ i)\n",
+       "\n@pub fun meadowTestsMainQ () =\n",
        "  let asked = MeadowTestsPQ.argv () in\n",
-       "  let exact = MeadowTestsVQ.elem \"--exact\" asked in\n",
-       "  let filter = MeadowTestsVQ.get (MeadowTestsVQ.filter (\\a -> a != \"--exact\") asked) 0 in\n",
-       "  let cases = MeadowTestsVQ.filter (\\c -> meadowTestsWantedQ exact filter (fst c)) (MeadowTestsVQ.concat [",
-       S.join ", " lists,
-       "]) in\n",
-       "  let n = MeadowTestsVQ.len cases in\n",
-       "  let u = println \"running \${show n} test\${if n == 1 then \"\" else \"s\"}\" in\n",
-       "  let failed =\n",
-       "    MeadowTestsVQ.concatMap\n",
-       "      (\\c ->\n",
-       "        match c with\n",
-       "        | (name, t) ->\n",
-       "            (match MeadowTestsTQ.failure t with\n",
-       "             | (True, why) -> (let w = println \"test \${name} ... FAILED\" in [(name, why)])\n",
-       "             | (False, _) -> (let w = println \"test \${name} ... ok\" in [])))\n",
-       "      cases\n",
-       "  in\n",
-       "  let v =\n",
-       "    if MeadowTestsVQ.isEmpty failed then ()\n",
-       "    else\n",
-       "      (let a = println \"\" in\n",
-       "       let b = println \"failures:\" in\n",
-       "       let c = println \"\" in\n",
-       "       MeadowTestsVQ.foldl (\\z f -> (let x = println \"---- \${fst f} ----\" in let y = println (show (snd f)) in println \"\")) () failed)\n",
-       "  in\n",
-       "  let w = println \"\" in\n",
-       "  let x = println \"test result: \${if MeadowTestsVQ.isEmpty failed then \"ok\" else \"FAILED\"}. \${show (n - MeadowTestsVQ.len failed)} passed; \${show (MeadowTestsVQ.len failed)} failed\" in\n",
-       "  if MeadowTestsVQ.isEmpty failed then () else MeadowTestsPQ.exit 1\n",
-       "\nfun meadowTestsWantedQ exact filter name =\n",
-       "  match filter with\n",
-       "  | None -> True\n",
-       "  | Just f -> if exact then name == f else MeadowTestsSQ.contains f name\n"
+       "  let i = MeadowTestsMQ.unwrapOr (0 - 1) (MeadowTestsSQ.toInt (MeadowTestsVQ.getOr \"\" asked 1)) in\n",
+       "  match meadowTestsOneQ i with\n",
+       "  | (failed, why) ->\n",
+       "      (let told = if failed then MeadowTestsSQ.concat \"FAILED\\n\" (show why) else \"ok\" in\n",
+       "       let w = MeadowTestsFQ.writeString (MeadowTestsVQ.getOr \"\" asked 0, told) in\n",
+       "       ())\n"
      ]

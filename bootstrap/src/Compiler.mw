@@ -63,7 +63,8 @@ use MeadowBoot.Dictionaries (emptySummary)
 use MeadowBoot.Types
 use MeadowBoot.Core (CoreProgram, joinedUnits)
 use MeadowBoot.Solve (TypeEnv, noTypes, Entry)
-use Std.Macro (Reflect)
+use Std.Macro (Reflect, fromDatum)
+use Lingua.Query (jsonDatum)
 use Std.Json as J
 use Std.Json (Json)
 use Std.Exn (toResult)
@@ -1529,6 +1530,15 @@ fun modulePath (isStd : Bool) (src : String) (path : String) : [String] =
     (readKept (M.unwrapOr "" (Res.toMaybe (readToString (Path.join (unitOut u) "macros.kept")))))
     (V.map snd (unitImports u))
 
+-- The same as the CEK machine runs it, on this machine, `@cfg(test)` holding
+-- where `test` says and `flags` turned on: for `meadow test --cek`.
+@pub fun cekDatabase (u : Given Interface) (test : Bool) (flags : [String]) =
+  unitDatabaseFor
+    (Cfg {
+       os = hostOs, arch = hostArch, profile = "debug", backend = "cek", opt = "1", test, flags
+     })
+    u
+
 -- The same, with `kept` for what its macros answered, and `imported` for
 -- the interfaces of the units it depends on.
 fun unitDatabaseWith
@@ -1883,13 +1893,15 @@ fun cfgOf (o : UnitsOptions) : Cfg =
 -- compiled for the platform alone, as `meadow_compiler::Cfg::platform` has
 -- it, so one compile of it serves every program on that platform; and
 -- `@cfg(test)` holds only in the unit the build was asked for, so a library
--- whose tests stopped compiling does not break what depends on it.
+-- whose tests stopped compiling does not break what depends on it. The
+-- standard library is that unit only when it is built by itself, which is
+-- how `meadow test --std` runs its tests.
 fun pinnedOf (root : String) (dir : String) (manifest : String) (profile : String)
     : [(String, String)] =
+  let notAsked = if dir != root then [("test", "false")] else [] in
   if packageName manifest == "Std" then
-    [("kind", "Debug"), ("backend", "jit"), ("test", "false"), ("flags", "")]
-  else if dir != root then [("test", "false")]
-  else []
+    V.append [("kind", "Debug"), ("backend", "jit"), ("flags", "")] notAsked
+  else notAsked
 
 -- Whether a build at these options copies small functions to where they are
 -- called: `meadow_rt`'s `OptLevel::inlines`, which is O2's, and here O3's
@@ -1909,13 +1921,147 @@ fun compileUnit (o : UnitsOptions) (u : Given Interface) =
   -- `MEADOWBOOT_TIMINGS`: how long each pass took, the unit named by its
   -- package.
   let clk = T.clock (unitName u) in
-  let r =
-    match toResult (\() -> compiling o u clk) with
-    | Ok r -> r
-    | Err why -> Err "${show why}\n"
-  in
+  let r = compiled o u clk in
   let said = T.report clk in
   r
+
+-- The unit's interface: the precompiled library's, if it is one and its
+-- compile is what `o` asks for, or else compiled.
+fun compiled (o : UnitsOptions) (u : Given Interface) (clk : Clock) =
+  match precompiledFor o u with
+  | Just i -> Ok i
+  | None ->
+      (match toResult (\() -> compiling o u clk) with
+       | Ok (Ok i) ->
+           -- What the standard library was compiled as, kept beside what it
+           -- made, for `meadow __precompile-std` to name it by.
+           let w =
+             (if i.package == "Std" then
+                writeString (Path.join (unitOut u) stdKeyFile, stdKeyOf o u)
+              else Ok ())
+           in Ok i
+       | Ok r -> r
+       | Err why -> Err "${show why}\n")
+
+-- --- the standard library, compiled ahead of time ----------------------------
+--
+-- The standard library is the same for every program, so a release of
+-- MeadowBoot can carry it compiled, as a release of the Rust `meadow` carries
+-- its own (`buildtools/meadow/src/stdlib.rs`): `meadow __precompile-std OUT`
+-- writes it, and a build that finds it -- `Std.mwstd` beside the library's
+-- sources, or where `MEADOWBOOT_PRECOMPILED_STD` says (`Unit.precompiledStd`)
+-- -- takes the library's interface and objects from it in place of compiling
+-- it. What the Rust one keeps is its own front end's output, which nothing of
+-- MeadowBoot's reads; this is MeadowBoot's: the unit's interface, as the
+-- build keeps every unit's, and its objects of Cut, which the back end links
+-- as it links any unit's.
+--
+-- It is the precompiled library only for the build that would have made it:
+-- each compile in it is named by everything compiling depends on -- the
+-- options (`keyOf`) and the library's sources (`stdKeyOf`) -- and the file
+-- by the compiler that wrote it, this program's size (`MEADOWBOOT_SELF`), so
+-- a MeadowBoot built from other sources does not take another's objects.
+
+-- How a precompiled library is laid out: one made another way is no match.
+def stdLayout : Int = 1
+
+-- Where a compile of the standard library says what it was compiled as.
+@pub def stdKeyFile : String = "Std.key"
+
+-- What a unit's compile depends on of its options: each that the build's
+-- `compile` is keyed by, which `entry`, the link's, is not.
+fun keyOf (o : UnitsOptions) : String =
+  S.join "," [
+    show o.opt,
+    show o.dictionaries,
+    show o.kind,
+    o.os,
+    o.arch,
+    o.backend,
+    show o.test,
+    S.join ";" o.flags,
+    show o.macros,
+    show o.whole,
+    show o.strict,
+    show o.checked
+  ]
+
+-- The options, and the unit's sources -- by their paths in it, so that where
+-- the library is installed does not matter -- that a compile of it was of.
+fun stdKeyOf (o : UnitsOptions) (u : Given Interface) : String =
+  let dir = Path.normalize (unitDir u) in
+  let mine =
+    V.concatMap
+      (\s ->
+        (let p = Path.normalize (fst s) in
+         if S.endsWith ".mw" p or S.endsWith "Meadow.toml" p then [(relativeTo dir p, snd s)]
+         else []))
+      (unitSources u)
+  in "${keyOf o}\n${show (hash mine)}"
+
+-- The standard library's interface, its objects written where it may write,
+-- if a precompiled library among its sources is the compile `o` asks for.
+fun precompiledFor (o : UnitsOptions) (u : Given Interface)
+    : Maybe Interface ! { Fs, Process | e } =
+  match V.find (\s -> S.endsWith ".mwstd" (fst s)) (unitSources u) with
+  | None -> None
+  | Just (_, text) ->
+      let key = stdKeyOf o u in
+      let self = M.unwrapOr "" (getEnv "MEADOWBOOT_SELF") in
+      match Mc.readWire text 0 with
+      | Just (Wire.Node "meadowboot-std" parts, _) ->
+          (match (V.get parts 0, V.get parts 1) with
+           | (Just (Wire.Whole layout), Just (Wire.Text compiler)) if layout == stdLayout
+               and compiler == self
+               and not (S.isEmpty self) ->
+               (match V.find
+                  (\w -> match w with | Wire.Node k _ -> k == key | _ -> False)
+                  (V.drop parts 2) with
+                | Just (Wire.Node _ held) ->
+                    (match V.get held 0 with
+                     | Just (Wire.Text interface) -> placed u interface (V.drop held 1)
+                     | _ -> None)
+                | _ -> None)
+           | _ -> None)
+      | _ -> None
+
+-- The interface read, and each object written into the unit's directory:
+-- nothing, if either cannot be.
+fun placed (u : Given Interface) (interface : String) (files : [Wire])
+    : Maybe Interface ! { Fs | e } =
+  let read =
+    M.andThen
+      (\d -> Res.toMaybe (fromDatum d))
+      (M.andThen jsonDatum (Res.toMaybe (J.parse interface)))
+  in match read with
+     | None -> None
+     | Just (i : Interface) ->
+         let written =
+           V.all
+             (\w ->
+               match w with
+               | Wire.Node name held ->
+                   (match V.get held 0 with
+                    | Just (Wire.Text content) ->
+                        Res.isOk (writeString (Path.join (unitOut u) name, content))
+                    | _ -> False)
+               | _ -> False)
+             files
+         in if written then Just i else None
+
+-- A compile of the standard library as a precompiled library keeps it: its
+-- interface, as the build kept it, and each file its compile wrote, by name.
+@pub fun precompiledVariant (key : String) (interface : String) (files : [(String, String)])
+    : Wire =
+  Wire.Node
+    key
+    (V.pushFront (V.map (\f -> Wire.Node (fst f) [Wire.Text (snd f)]) files) (Wire.Text interface))
+
+-- The precompiled library: `compiler` the program that compiled it, and each
+-- compile a variant.
+@pub fun precompiledStd (compiler : String) (variants : [Wire]) : String =
+  Mc.writeWire
+    (Wire.Node "meadowboot-std" (V.append [Wire.Whole stdLayout, Wire.Text compiler] variants))
 
 -- A unit as a person would name it: its package's name, or where it is.
 fun unitName (u : Given Interface) : String =

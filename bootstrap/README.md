@@ -445,6 +445,52 @@ MEADOWBOOT_EXE=bootstrap/target/release/native/silo/MeadowBoot.exe \
   cargo test --release -p meadow --test repl_differential -- --ignored
 ```
 
+## Tests
+
+`meadow test` is MeadowBoot's (`src/Testing.mw`), the standard library's
+tests (`--std`) too, so that no test needs the Rust front end to be run. The
+package is built with `@cfg(test)` holding in it, and each module is read
+with its tests listed at its end (`src/Tests.mw`); `--std` builds the
+standard library by itself the same way. The back end makes the program
+ready once -- its bytecode kept, or an executable linked -- and each test is
+then a run of it of its own, as each of the Rust runner's tests is a run of
+its own: a test stopped by a runtime error fails alone, with that error, and
+what a test prints is kept to be shown beside it if it fails. Runs go side
+by side, `--test-threads` of them, and `--no-capture` lets what they print
+through. `--cek` runs the tests on MeadowBoot's CEK machine, in its own
+process and one after another, since the machine's cells cannot cross to
+another thread.
+
+What is said is what `meadow test` says, and
+`meadowboot_test_says_what_meadow_test_says` and
+`meadowboot_runs_the_standard_library_s_tests` in `tests/bootstrap.rs` hold
+the two to it, flag for flag and on the standard library's 385 tests. Where
+they may differ is order: tests run side by side are said as they finish,
+and failures in the order the tests are declared, which each compiler
+counts in its own order of modules.
+
+`dis` is MeadowBoot's build too, listed by the back end: `meadow cut --emit
+bytecode`, or `--emit asm` for `dis --asm`.
+
+### The standard library, compiled ahead of time
+
+A release of the Rust `meadow` carries the standard library compiled, so
+that no build compiles it (`__precompile-std`, `buildtools/meadow/src/stdlib.rs`).
+What it carries is its own front end's output, a serialised
+`CompiledPackage`, which nothing of MeadowBoot's reads. MeadowBoot's
+`__precompile-std OUT [--target TARGET]` writes its own: for the `debug` and
+the `release` profile, the library's unit as a build keeps it -- its
+interface, and its objects of Cut, which the back end links into a program
+as it links any unit's. A build finds it where `MEADOWBOOT_PRECOMPILED_STD`
+says, or as `Std.mwstd` beside the library's sources, as a release would lay
+it out, and takes the compile its options ask for in place of compiling the
+library. Each compile in the file is named by the options and the library's
+sources, the file by the size of the MeadowBoot that wrote it, so another
+compiler's, or one for other options, is not taken: the library is compiled
+as before. The file is one of the library's sources to the build, read
+each time it plans; its 34 MB cost a warm build about a third of a second,
+and save a cold one the library's compile, two to three seconds.
+
 ## The debugger
 
 `meadow dap` is MeadowBoot's as well: `src/Dap.mw`, a debug adapter declared

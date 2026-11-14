@@ -11,7 +11,7 @@
 -- The manifests are read as far as `meadow` writes them: sections, `key =
 -- "text"`, and inline tables of those, `Name = { path = "../x" }`.
 
-use Std.Fs (Fs, readToString, readDir, isDir, exists)
+use Std.Fs (Fs, FileMeta, readToString, readDir, isDir, exists, metadata)
 use Std.Process (Process, getEnv, setEnv, currentExe)
 use Std.Path as Path
 use Std.Collections.Vector as V
@@ -59,7 +59,32 @@ fun fromShell (p : String) : String =
 -- What a unit is compiled from: its manifest, which names its package, and
 -- its sources.
 @pub fun unitFilesOf (dir : String) : [String] ! { Fs, Process | e } =
-  V.concat [[manifestOf dir], sourcesOf dir, expansionsOf dir]
+  V.concat [[manifestOf dir], sourcesOf dir, expansionsOf dir, precompiledOf dir]
+
+-- The standard library compiled ahead of time, for the unit that is the
+-- standard library, if there is one (`Compiler.precompiledFor`): where
+-- `MEADOWBOOT_PRECOMPILED_STD` says, or `Std.mwstd` beside its sources, as a
+-- release lays them out. Which compiler is reading it is said here, where the
+-- program's own file may be looked at, as `MEADOWBOOT_SELF`: its size, which
+-- is what the file is named by.
+fun precompiledOf (dir : String) : [String] ! { Fs, Process | e } =
+  match stdDir () with
+  | Just s if Path.normalize (absolute dir) == Path.normalize s ->
+      let p =
+        (match getEnv "MEADOWBOOT_PRECOMPILED_STD" with
+         -- Said to be nothing, there is none: what `meadow __precompile-std`
+         -- builds with.
+         | Just given -> if S.isEmpty given then "" else absolute given
+         | None -> M.unwrapOr "" (M.map (\up -> Path.join up "Std.mwstd") (Path.parent s)))
+      in if S.isEmpty p or not (exists p) or isDir p then []
+         else (let u = setEnv ("MEADOWBOOT_SELF", selfSize ()) in [Path.normalize p])
+  | _ -> []
+
+-- This program's size, as `meadow __precompile-std` names what it wrote by.
+@pub fun selfSize () : String ! { Fs, Process | e } =
+  match metadata (currentExe ()) with
+  | Ok (m : FileMeta) -> show m.len
+  | Err _ -> ""
 
 -- What the Rust compiler's macros expanded to in the unit at `dir`, if that
 -- was written down: `Pkg.json` where `MEADOWBOOT_EXPANSIONS` says. MeadowBoot
