@@ -167,6 +167,50 @@ fun under (dir : String) : [String] ! { Fs | e } =
             if isDir beside then Just (absolute beside) else None)
        | None -> None)
 
+-- The Rust compiler's `meadow`, as a program, for what MeadowBoot hands it
+-- (`Main.backEnd`) and the formatter the language server runs: where
+-- `MEADOW` says; `meadow-rust` beside this program, which is what an
+-- installed release names it, MeadowBoot being `meadow` there; `meadow`
+-- beside this program, as a release's archive and a checkout's bundle have
+-- it, unless that is this program; and otherwise the one on the path --
+-- `meadow-rust` where this program is itself called `meadow`, so that
+-- MeadowBoot never hands a command to itself.
+@pub fun rustMeadow () : String ! { Fs, Process | e } =
+  match getEnv "MEADOW" with
+  | Just m -> m
+  | None ->
+      let self = currentExe () in
+      let itself = Path.fileStem self == "meadow" in
+      let onPath = if itself then "meadow-rust" else "meadow" in
+      match Path.parent self with
+      | None -> onPath
+      | Just dir ->
+          (match rustFallback () with
+           | Just renamed -> renamed
+           | None ->
+               let beside = Path.join dir "meadow${exeSuffix self}" in
+               if not itself and exists beside then beside else onPath)
+
+-- The Rust front end an installed release ships beside MeadowBoot, as
+-- `meadow-rust`, for the one release that carries both: a command
+-- MeadowBoot cannot do in full yet is handed to it whole
+-- (`Main.handedWhole`). Nothing where `MEADOW` names a `meadow` to use
+-- instead, and nothing in a checkout, which has none.
+@pub fun rustFallback () : Maybe String ! { Fs, Process | e } =
+  if M.isSome (getEnv "MEADOW") then None
+  else
+    let self = currentExe () in
+    match Path.parent self with
+    | None -> None
+    | Just dir ->
+        let renamed = Path.join dir "meadow-rust${exeSuffix self}" in
+        if exists renamed then Just renamed else None
+
+-- What a program's file name ends with on this system, as `path`, a
+-- program, has it: `.exe` on Windows, nothing elsewhere.
+fun exeSuffix (path : String) : String =
+  if S.endsWith ".exe" path or S.endsWith ".EXE" path then ".exe" else ""
+
 -- Where dependency `e` of the unit at `dir` is.
 fun locate (root : String) (dir : String) (e : Entry) : Result String String ! { Fs, Process | f } =
   match (field "path" e.value, field "git" e.value) with

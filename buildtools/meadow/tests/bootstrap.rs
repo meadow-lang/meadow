@@ -4055,14 +4055,39 @@ fn a_command_takes_what_meadow_s_takes() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     // And the version is said the same way. Its number, that is: which
     // channel a `meadow` is -- `-dev` from a checkout, nothing for a release
-    // -- is decided where it is built, which MeadowBoot is not told.
-    let number = |s: &str, name: &str| {
-        let rest = s.trim().trim_start_matches(name).trim().to_string();
+    // -- is decided where it is built, which MeadowBoot is not told, and asks
+    // of the back end where one is beside it (the next test). The name is
+    // `meadowboot`'s own, or the back end's.
+    let number = |s: &str| {
+        let rest = s.split_whitespace().nth(1).unwrap_or("").to_string();
         rest.split(['-', ' ']).next().unwrap_or("").to_string()
     };
     let said = help_of(&boot, &["--version"]);
     let theirs = help_of(&meadow_exe, &["--version"]);
-    assert_eq!(number(&said, "meadowboot"), number(&theirs, "meadow"));
+    assert_eq!(number(&said), number(&theirs));
+}
+
+/// With the back end beside it, as a release ships them, MeadowBoot's
+/// `--version` is the back end's: the release's channel, and a nightly's day
+/// and commit, which the Rust `meadow` is built to say and MeadowBoot is not
+/// told.
+#[test]
+fn meadowboot_says_the_version_its_back_end_was_built_to() {
+    let stdout = |c: &mut Command| {
+        let out = c.output().expect("the program runs");
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let theirs = stdout(Command::new(meadow()).arg("--version"));
+    for flag in ["--version", "-V"] {
+        let said = stdout(
+            Command::new(meadowboot_exe())
+                .arg(flag)
+                .env("MEADOW_HOST", meadow_host())
+                .env_remove("MEADOW"),
+        );
+        assert_eq!(said, theirs, "{flag}");
+    }
 }
 
 /// What MeadowBoot's `lower` says of the program `source`, on either stream:

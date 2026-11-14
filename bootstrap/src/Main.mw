@@ -61,7 +61,7 @@ use MeadowBoot.Testing (Asked, runTests)
 use MeadowBoot.Precompile (precompileStd)
 use MeadowBoot.Parse (parsed, checked)
 use MeadowBoot.Fixity (chainsOf)
-use MeadowBoot.Unit (packageOf, absolute, packageName)
+use MeadowBoot.Unit (packageOf, absolute, packageName, rustMeadow, rustFallback)
 use Std.Result as Res
 use MeadowBoot.Compiler (
   unitDatabase, buildUnits, givenUnits, setCompilerSource, compilerGrouped, compilerRenamed,
@@ -475,7 +475,24 @@ fun main () =
     -- the command line lists, as the Rust `meadow` hides it.
     match V.get (Proc.argv ()) 0 with
     | Just "__precompile-std" -> finish (precompileStd (V.drop (Proc.argv ()) 1))
-    | _ -> (match argsCli () with | (every, cli) -> run every cli))
+    | Just "--version" -> versionSaid ()
+    | Just "-V" -> versionSaid ()
+    | _ -> parsedAndRun ())
+
+fun parsedAndRun () = match argsCli () with | (every, cli) -> run every cli
+
+-- `--version`: the toolchain's, as the release that built it says it -- its
+-- channel, and a nightly's day and commit, which `buildtools/meadow/build.rs`
+-- builds into the Rust `meadow` and nothing tells MeadowBoot -- asked of the
+-- back end shipped beside this program, built from the same commit by the
+-- same job. With none beside it, as in a checkout, this program's own number.
+fun versionSaid () =
+  match hostLibrary () with
+  | None -> parsedAndRun ()
+  | Just lib ->
+      (match hosted lib ["--version"] with
+       | Ok code -> exit code
+       | Err _ -> parsedAndRun ())
 
 -- A query read before it was set, or one that needs itself: a mistake of the
 -- compiler's rather than of what it read. It is said, and the run fails.
@@ -511,10 +528,11 @@ fun run (every : CliOptions) (cli : Cli) =
   -- The tests are MeadowBoot's to build and to run, the standard library's
   -- too (`Testing`).
   | Cli.Test r ->
-      runTests
-        (testAsked r.build r.path r.filter r.exact r.std r.testThreads r.noCapture r.cek)
-        backEnd
-        (backEndProgram ())
+      unlessUnacted (unheeded r.build) (\() ->
+        runTests
+          (testAsked r.build r.path r.filter r.exact r.std r.testThreads r.noCapture r.cek)
+          backEnd
+          (backEndProgram ()))
   | Cli.Lex r -> finish (V.foldl (\ok p -> lexFile p and ok) True r.files)
   | Cli.Eval r -> finish (V.foldl (\ok p -> evalFile p and ok) True r.files)
   | Cli.Parse r -> finish (V.foldl (\ok p -> parseFile p and ok) True r.files)
@@ -541,7 +559,7 @@ fun run (every : CliOptions) (cli : Cli) =
   | Cli.Units r ->
       finish (V.foldl (\ok root -> buildUnits "debug" (told ()) root and ok) True r.roots)
   -- `dis` is this compiler's build, listed by the back end.
-  | Cli.Dis r -> disassembled r.path r.asm r.build
+  | Cli.Dis r -> unlessUnacted (unheeded r.build) (\() -> disassembled r.path r.asm r.build)
   -- What is not MeadowBoot's yet is `meadow`'s, asked the same way.
   | _ -> handedOn ()
 
@@ -607,7 +625,7 @@ fun disassembled (path : Maybe String) (asm : Bool) (b : CliBuild) =
   let said =
     V.foldl (\u flag -> writeError "meadowboot: `${flag}` is not acted on yet\n") () (unheeded b)
   in match root with
-     | None -> (let u = writeError "meadowboot: `${place}` is in no package\n" in exit 1)
+     | None -> inNoPackage place
      | Just r ->
          let profile = if b.release then "release" else "debug" in
          if not (buildUnits profile (pairsFor b) r) then exit 1
@@ -626,17 +644,8 @@ fun disassembled (path : Maybe String) (asm : Bool) (b : CliBuild) =
                 (let u = writeError "meadowboot: the back end could not be run: ${why}\n" in
                  exit 1))
 
--- The Rust compiler's `meadow`: where `MEADOW` says, the one beside this
--- program -- as a release of it has them -- or the one on the path.
-fun meadow () =
-  match getEnv "MEADOW" with
-  | Just m -> m
-  | None ->
-      (let named = if hostOs == "windows" then "meadow.exe" else "meadow" in
-       match Path.parent (Proc.currentExe ()) with
-       | Just dir ->
-           (let beside = Path.join dir named in if exists beside then beside else "meadow")
-       | None -> "meadow")
+-- The Rust compiler's `meadow`, as a program: `Unit.rustMeadow`.
+fun meadow () = rustMeadow ()
 
 -- The Rust `meadow` as a library to load into this process, `meadow-host`:
 -- where `MEADOW_HOST` says, or beside this program, as a release has it.
@@ -688,6 +697,35 @@ fun handedOn () =
   match backEnd (Proc.argv ()) with
   | Ok code -> exit code
   | Err why -> (let u = writeError "meadowboot: `meadow` could not be run: ${why}\n" in exit 1)
+
+-- `go`, unless this command asks for what MeadowBoot does not act on yet,
+-- `unacted` -- a package's features, a workspace's members, `--emit
+-- expanded` -- and the Rust front end ships beside it as its fallback
+-- (`Unit.rustFallback`): then that runs the command line, whole, so that
+-- what was asked is done rather than said to be ignored. Only the release
+-- that ships both has it; once MeadowBoot acts on all of `unacted`, or the
+-- fallback is no longer shipped, this is `go ()`.
+fun unlessUnacted (unacted : [String]) go =
+  match (V.get unacted 0, rustFallback ()) with
+  | (Just first, Just rust) -> handedToRust rust "`${first}` is not acted on yet"
+  | _ -> go ()
+
+-- `place`, a file in no package, built or run: MeadowBoot builds packages
+-- only, and the Rust front end, where it ships beside MeadowBoot, builds the
+-- file as a package of its own (`unlessUnacted`). Without it, that is an
+-- error.
+fun inNoPackage (place : String) =
+  match rustFallback () with
+  | Just rust -> handedToRust rust "`${place}` is in no package"
+  | None -> (let u = writeError "meadowboot: `${place}` is in no package\n" in exit 1)
+
+-- This command line, run whole by the Rust front end at `rust`, which says
+-- why: its answer is this program's.
+fun handedToRust (rust : String) (why : String) =
+  let u = writeError "meadowboot: ${why}: the Rust front end, `meadow-rust`, runs this\n" in
+  match Proc.runInherit rust (Proc.argv ()) with
+  | Ok code -> exit code
+  | Err e -> (let v = writeError "meadowboot: `${rust}` could not be run: ${e}\n" in exit 1)
 
 -- What `meadow` is told that MeadowBoot's build does not act on yet: said,
 -- so that nobody takes a flag for honoured because it was accepted.
@@ -762,69 +800,81 @@ fun drivenWith (path : Maybe String) (b : CliBuild) (args : Maybe [String]) (ask
          "error: invalid value '${V.getOr "" wrongKinds 0}' for '--emit <KIND>': expected image, bytecode, asm, exe or expanded\n"
      in exit 2)
   else
-    let said =
-      V.foldl
-        (\u flag -> writeError "meadowboot: `${flag}` is not acted on yet\n")
-        ()
-        (V.concat [
-           unheeded b,
-           asked.members,
-           if V.elem "expanded" asked.emit then ["--emit expanded"] else []
-         ])
-    in match root with
-       | None -> (let u = writeError "meadowboot: `${place}` is in no package\n" in exit 1)
-       | Just r ->
-           let profile = if b.release then "release" else "debug" in
-           let level = M.unwrapOr (if b.release then 2 else 1) b.optLevel in
-           let goal = targetOf b.target in
-           -- How Glade runs it, which `@cfg(backend = …)` asks: the backend
-           -- named, or the profile's -- `jit` for a debug build, `aot` for a
-           -- release one -- unless the runtime is Silo, which has none, or the
-           -- CEK machine runs it.
-           let backend =
-             (if b.runtime == Just "silo" then "silo"
-              else if asked.cek then "cek"
-              else
-                match b.backend with
-                | Just named -> named
-                | None -> if b.jit then "jit" else if b.aot or b.release then "aot" else "jit")
-           in
-           let opt = show (if level > 2 then 2 else level) in
-           let pairs =
-             V.concat [
-               [("opt", "O${opt}"), ("macros", "Glade"), ("backend", backend)],
-               (if M.isSome b.target then [("os", goal.os), ("arch", goal.arch)] else []),
-               (if V.isEmpty b.cfg then [] else [("flags", S.join "," b.cfg)]),
-               (if b.noPrune then [("prune", "false")] else []),
-               (if b.strict then [("strict", "true")]
-                else if b.lenient then [("strict", "false")]
-                else []),
-               (if testing then [("test", "true"), ("entry", Tests.runner)] else []),
-               told ()
-             ]
-           in
-           -- What the build's `@cfg`s were decided by, for what is shown of it.
-           let cfg =
-             Cfg {
-               os = goal.os,
-               arch = goal.arch,
-               profile,
-               backend,
-               opt,
-               test = False,
-               flags = b.cfg
-             }
-           in if not (buildUnits profile pairs r) then exit 1
-              else
-                let shown =
-                  (if asked.annotations then writeOutput (annotationsOf profile cfg r)
-                   else if asked.types then writeOutput (typesOf profile cfg r)
-                   else ())
-                in
-                let told = runtimeTold b in
-                if asked.cek and M.isSome args then cekRun profile cfg r asked.gcStats
-                else if not (V.isEmpty asked.emit) then emitted r profile level goal b asked.emit
-                else handedBack r profile level goal b args theirs asked
+    let unacted =
+      V.concat [
+        unheeded b,
+        asked.members,
+        if V.elem "expanded" asked.emit then ["--emit expanded"] else []
+      ]
+    in unlessUnacted unacted (\() -> builtOrRun root place b args theirs asked testing unacted)
+
+-- `drivenWith`, once what it was asked is MeadowBoot's to do: what of it
+-- MeadowBoot does not act on yet, `unacted`, is said.
+fun builtOrRun
+    (root : Maybe String)
+    (place : String)
+    (b : CliBuild)
+    (args : Maybe [String])
+    (theirs : [String])
+    (asked : BuildAsked)
+    (testing : Bool)
+    (unacted : [String]) =
+  let said =
+    V.foldl (\u flag -> writeError "meadowboot: `${flag}` is not acted on yet\n") () unacted
+  in match root with
+     | None -> inNoPackage place
+     | Just r ->
+         let profile = if b.release then "release" else "debug" in
+         let level = M.unwrapOr (if b.release then 2 else 1) b.optLevel in
+         let goal = targetOf b.target in
+         -- How Glade runs it, which `@cfg(backend = …)` asks: the backend
+         -- named, or the profile's -- `jit` for a debug build, `aot` for a
+         -- release one -- unless the runtime is Silo, which has none, or the
+         -- CEK machine runs it.
+         let backend =
+           (if b.runtime == Just "silo" then "silo"
+            else if asked.cek then "cek"
+            else
+              match b.backend with
+              | Just named -> named
+              | None -> if b.jit then "jit" else if b.aot or b.release then "aot" else "jit")
+         in
+         let opt = show (if level > 2 then 2 else level) in
+         let pairs =
+           V.concat [
+             [("opt", "O${opt}"), ("macros", "Glade"), ("backend", backend)],
+             (if M.isSome b.target then [("os", goal.os), ("arch", goal.arch)] else []),
+             (if V.isEmpty b.cfg then [] else [("flags", S.join "," b.cfg)]),
+             (if b.noPrune then [("prune", "false")] else []),
+             (if b.strict then [("strict", "true")]
+              else if b.lenient then [("strict", "false")]
+              else []),
+             (if testing then [("test", "true"), ("entry", Tests.runner)] else []),
+             told ()
+           ]
+         in
+         -- What the build's `@cfg`s were decided by, for what is shown of it.
+         let cfg =
+           Cfg {
+             os = goal.os,
+             arch = goal.arch,
+             profile,
+             backend,
+             opt,
+             test = False,
+             flags = b.cfg
+           }
+         in if not (buildUnits profile pairs r) then exit 1
+            else
+              let shown =
+                (if asked.annotations then writeOutput (annotationsOf profile cfg r)
+                 else if asked.types then writeOutput (typesOf profile cfg r)
+                 else ())
+              in
+              let told = runtimeTold b in
+              if asked.cek and M.isSome args then cekRun profile cfg r asked.gcStats
+              else if not (V.isEmpty asked.emit) then emitted r profile level goal b asked.emit
+              else handedBack r profile level goal b args theirs asked
 
 -- What the runtime is told by the environment, which both runtimes read and
 -- a program Silo runs inherits: how many threads run the program, how large

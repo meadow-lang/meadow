@@ -70,7 +70,7 @@ use Std.Process as Proc
 use Std.Exn (toResult)
 use Std.Sort (sortOn, sortBy)
 use Std.Ordering (Ordering)
-use MeadowBoot.Unit (stdDir, sourcesOf)
+use MeadowBoot.Unit (stdDir, sourcesOf, rustMeadow)
 use MeadowBoot.Types (
   Arena, newArena, fresh, freshQuantifiers, substBound, snapshot, rollback, unify, func
 )
@@ -1349,18 +1349,8 @@ fun scopeOf (v : View) : ([String], [String]) =
 
 -- --- formatting ----------------------------------------------------------------
 
--- The Rust compiler's `meadow`: where `MEADOW` says, the one beside this
--- program, or the one on the path.
-fun meadowExe () =
-  match getEnv "MEADOW" with
-  | Just m -> m
-  | None ->
-      (match Path.parent (Proc.currentExe ()) with
-       | Just dir ->
-           (let beside = Path.join dir "meadow.exe" in
-            if exists beside then beside
-            else (let unix = Path.join dir "meadow" in if exists unix then unix else "meadow"))
-       | None -> "meadow")
+-- The Rust compiler's `meadow`, as `Unit.rustMeadow` finds it.
+fun meadowExe () = rustMeadow ()
 
 -- The document set out by `meadow fmt`, which MeadowBoot's formatter is not
 -- ready to stand for yet, as one edit from the first line that changes to

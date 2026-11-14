@@ -25,7 +25,7 @@ use Std.Maybe as M
 use Std.Maybe.Maybe.*
 use Std.Result as Res
 use Std.Result.Result.*
-use Std.Fs (readToString, writeString, readDir, createDirAll, removeDirAll, isDir)
+use Std.Fs (readToString, writeString, readDir, createDirAll, removeDirAll, isDir, exists)
 use Std.Console (writeError)
 use Std.Process (getEnv, setEnv, currentPid)
 
@@ -91,8 +91,14 @@ fun variantOf (home : String) (profile : String) (pairs : [(String, String)]) =
   else
     let kept = Path.joinAll [home, "target", profile] in
     let units = Path.join kept "units" in
+    -- The unit that wrote what the library was compiled as. Its directory
+    -- is named for its path from `home`'s, which is `Std-` and a hash only
+    -- where the library is not under the same directory as `home` -- a
+    -- release's laid out in the temporary directory is.
     let named =
-      V.find (\n -> S.startsWith "Std-" n) (M.unwrapOr [] (Res.toMaybe (readDir units)))
+      V.find
+        (\n -> exists (Path.joinAll [units, n, stdKeyFile]))
+        (M.unwrapOr [] (Res.toMaybe (readDir units)))
     in match named with
        | None -> Err "the build as `${profile}` kept no standard library"
        | Just name ->
