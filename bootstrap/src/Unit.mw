@@ -11,8 +11,11 @@
 -- The manifests are read as far as `meadow` writes them: sections, `key =
 -- "text"`, and inline tables of those, `Name = { path = "../x" }`.
 
-use Std.Fs (Fs, FileMeta, readToString, readDir, isDir, exists, metadata)
-use Std.Process (Process, getEnv, setEnv, currentExe)
+use Std.Fs (
+  Fs, FileMeta, readToString, readBytes, writeString, rename, removeFile, readDir, isDir, exists,
+  metadata
+)
+use Std.Process (Process, getEnv, setEnv, currentExe, currentPid)
 use Std.Path as Path
 use Std.Collections.Vector as V
 use Std.String as S
@@ -65,8 +68,8 @@ fun fromShell (p : String) : String =
 -- standard library, if there is one (`Compiler.precompiledFor`): where
 -- `MEADOWBOOT_PRECOMPILED_STD` says, or `Std.mwstd` beside its sources, as a
 -- release lays them out. Which compiler is reading it is said here, where the
--- program's own file may be looked at, as `MEADOWBOOT_SELF`: its size, which
--- is what the file is named by.
+-- program's own file may be looked at, as `MEADOWBOOT_SELF` (`selfKey`),
+-- which is what the file is named by.
 fun precompiledOf (dir : String) : [String] ! { Fs, Process | e } =
   match stdDir () with
   | Just s if Path.normalize (absolute dir) == Path.normalize s ->
@@ -77,14 +80,73 @@ fun precompiledOf (dir : String) : [String] ! { Fs, Process | e } =
          | Just given -> if S.isEmpty given then "" else absolute given
          | None -> M.unwrapOr "" (M.map (\up -> Path.join up "Std.mwstd") (Path.parent s)))
       in if S.isEmpty p or not (exists p) or isDir p then []
-         else (let u = setEnv ("MEADOWBOOT_SELF", selfSize ()) in [Path.normalize p])
+         else (let u = selfKey () in [Path.normalize p])
   | _ -> []
 
--- This program's size, as `meadow __precompile-std` names what it wrote by.
-@pub fun selfSize () : String ! { Fs, Process | e } =
-  match metadata (currentExe ()) with
-  | Ok (m : FileMeta) -> show m.len
+-- This program, as `meadow __precompile-std` names what it wrote by: its
+-- size and a hash of its bytes, so that two compilers are told apart by what
+-- they are, and a copy of one is still it. Where the program cannot be read
+-- it is nothing, which names no precompiled library. It is also said as
+-- `MEADOWBOOT_SELF`, for the compile to read (`Compiler.precompiledFor`).
+--
+-- Reading and hashing the program takes a second or two, which a prompt
+-- cannot wait for each time it starts, so it is done once for each build of
+-- the program: what it came to is kept with the program's path, size and
+-- the time it was last written -- in a file in the temporary directory, for
+-- the runs after this one, and in the environment, for this run and the
+-- runs it starts. Either is taken only while the program is still that.
+@pub fun selfKey () : String ! { Fs, Process | e } =
+  let exe = currentExe () in
+  let key =
+    (match metadata exe with
+     | Err _ -> ""
+     | Ok (m : FileMeta) ->
+         let stamp = "${exe}|${show m.len}|${show m.modified}" in
+         let k =
+           (match (getEnv "MEADOWBOOT_SELF_STAMP", getEnv "MEADOWBOOT_SELF") with
+            | (Just was, Just k) if was == stamp and not (S.isEmpty k) -> k
+            | _ ->
+                let kept = selfKeyFile exe in
+                let said =
+                  (match readToString kept with
+                   | Ok t -> S.lines t
+                   | Err _ -> [])
+                in if V.getOr "" said 0 == stamp and not (S.isEmpty (V.getOr "" said 1)) then
+                     V.getOr "" said 1
+                   else hashedSelf exe stamp m.len kept)
+         in
+         let u = setEnv ("MEADOWBOOT_SELF_STAMP", stamp) in
+         k)
+  in
+  let u = setEnv ("MEADOWBOOT_SELF", key) in
+  key
+
+-- The program at `exe` hashed -- as hexadecimal text, which the runtime
+-- hashes many times faster than an array -- and what it came to kept at
+-- `kept` for the next run: written beside it and moved there, so that no run
+-- reads it half written.
+fun hashedSelf (exe : String) (stamp : String) (len : Int) (kept : String)
+    : String ! { Fs, Process | e } =
+  match readBytes exe with
   | Err _ -> ""
+  | Ok bytes ->
+      let k = "${show len}-${show (hash (bytesToHex bytes))}" in
+      let part = "${kept}.${show (currentPid ())}" in
+      let w =
+        (match writeString (part, "${stamp}\n${k}\n") with
+         | Ok _ ->
+             (match rename (part, kept) with
+              | Ok _ -> ()
+              | Err _ -> (let r = removeFile part in ()))
+         | Err _ -> ())
+      in k
+
+-- Where what the program at `exe` hashes to is kept: a file in the
+-- temporary directory, named by where the program is.
+fun selfKeyFile (exe : String) : String ! { Process | e } =
+  let tmp =
+    M.unwrapOr (M.unwrapOr (M.unwrapOr "/tmp" (getEnv "TMPDIR")) (getEnv "TMP")) (getEnv "TEMP")
+  in Path.join tmp "meadowboot-self-${show (hash exe)}.key"
 
 -- What the Rust compiler's macros expanded to in the unit at `dir`, if that
 -- was written down: `Pkg.json` where `MEADOWBOOT_EXPANSIONS` says. MeadowBoot
