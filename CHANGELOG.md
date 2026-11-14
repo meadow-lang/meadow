@@ -26,6 +26,15 @@ last release is under _Unreleased_.
 
 ### Changed
 
+- A release, and a nightly, is published only once MeadowBoot has built
+  itself on each platform it is released for: `release.yml` calls
+  `meadowboot.yml`, whose self-build compiles MeadowBoot with the MeadowBoot
+  it built and that again, to the same Cut. MeadowBoot is to be the compiler,
+  and one that cannot compile itself is not a release, however the rest of
+  the suite goes. Its archives go on the release with `meadow`'s, where a
+  version's tag used to start `meadowboot.yml` on its own and wait for the
+  release to attach them to. The experimental targets (Intel macOS, ARM
+  Linux) still do not hold one up.
 - MeadowBoot writes a packed interface in about 350 ms where it took 540
   (the standard library's), and a build's inference no longer writes the
   infer test's dump of every scheme or the language server's type of every

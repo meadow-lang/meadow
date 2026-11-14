@@ -313,8 +313,16 @@ jobs:
           path: vsix/*.vsix
           if-no-files-found: error
 
+  # MeadowBoot for each platform, and MeadowBoot building itself with what it
+  # built: `meadowboot.yml`. A release, or a nightly, that it fails on is not
+  # published -- `release` needs it, and so does `nightly.yml`'s `publish`,
+  # which needs this whole workflow. Its archives are artifacts of this run,
+  # and go on the release with the rest.
+  meadowboot:
+    uses: ./.github/workflows/meadowboot.yml
+
   release:
-    needs: [build, extension]
+    needs: [build, extension, meadowboot]
     runs-on: ubuntu-latest
     # Only a tag push publishes. A manual run still builds every target and
     # leaves the archives as workflow artifacts, which is what you want when
