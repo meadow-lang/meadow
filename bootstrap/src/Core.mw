@@ -652,3 +652,283 @@ fun f32Of (bits : Int) : Float =
 
 fun scaled (x : Float) (e : Int) : Float =
   if e > 0 then scaled (x * 2.0) (e - 1) else if e < 0 then scaled (x * 0.5) (e + 1) else x
+
+-- --- as the Rust compiler prints it -------------------------------------------
+--
+-- `meadow_core::Program::pretty`, of the definitions `ids` of a program:
+-- each `v0 : forall a. T` and `v0 = term`, every binder renumbered `v0, v1,
+-- …` and every type variable lettered `a, b, …` in the order they are first
+-- written, so that what is printed says nothing of how a compiler happened
+-- to number them. What the language server shows of a definition as core
+-- (`meadow/ir`), as the Rust server shows it.
+
+record Printer = {
+  names : Ref (HashMap Int String),
+  tyvars : Ref (HashMap Int String)
+}
+
+@pub fun prettyDefs (p : CoreProgram) (ids : [Int]) =
+  let a = coreArena p in
+  let pr = Printer { names = newRef H.empty, tyvars = newRef H.empty } in
+  S.concatAll
+    (V.concatMap
+       (\d ->
+         if not (V.elem (coreDefId a d) ids) then []
+         else
+           (let v = pVar pr (coreDefId a d) in
+            let poly = pPoly pr a (coreDefBody a d) in
+            let first = "${v} : ${poly}\n" in
+            [first, "${v} = ${pTerm pr a (coreDefBody a d)}\n"]))
+       (coreFileDefs a (coreRoot p)))
+
+fun pVar (pr : Printer) (id : Int) =
+  match H.lookup id (getRef pr.names) with
+  | Just s -> s
+  | None ->
+      (let s = "v${show (H.size (getRef pr.names))}" in
+       let u = setRef pr.names (H.insert id s (getRef pr.names)) in
+       s)
+
+-- A rigid type variable's name: `a`, `b`, … then `a1`, `b1`.
+fun pTyvar (pr : Printer) (id : Int) =
+  match H.lookup id (getRef pr.tyvars) with
+  | Just s -> s
+  | None ->
+      (let n = H.size (getRef pr.tyvars) in
+       let letter = C.toString (C.fromCode (97 + n % 26)) in
+       let s = if n < 26 then letter else "${letter}${show (n / 26)}" in
+       let u = setRef pr.tyvars (H.insert id s (getRef pr.tyvars)) in
+       s)
+
+-- What a definition's type is said to be: its type, under the variables it
+-- is generic in.
+fun pPoly (pr : Printer) (a : CoreArena) (t : CoreTerm) =
+  match viewCoreTerm a t with
+  | CoreTermView.TyLam r ->
+      (let names = V.map (\v -> pTyvar pr v) (V.append r.vars r.nums) in
+       if V.isEmpty names then pTy pr (tyCoreTerm a r.body)
+       else (let body = pTy pr (tyCoreTerm a r.body) in "forall ${S.join " " names}. ${body}"))
+  | _ -> pTy pr (tyCoreTerm a t)
+
+fun pTy (pr : Printer) (t : Type) =
+  match t with
+  | Var v -> pTyvar pr v
+  | Bound i -> "?${show i}"
+  | RowEmpty -> "{}"
+  | Error -> "{error}"
+  | Con n args ->
+      if V.isEmpty args then spelling n
+      else (let parts = V.map (\x -> pTy pr x) args in "(${spelling n} ${S.join " " parts})")
+  | Fun args ret eff ->
+      (let parts = V.map (\x -> pTy pr x) args in
+       let r = pTy pr ret in
+       let e =
+         match eff with
+         | RowEmpty -> ""
+         | other -> " ! ${pTy pr other}"
+       in "(${S.join " " parts} -> ${r}${e})")
+  | Tuple items -> (let parts = V.map (\x -> pTy pr x) items in "(${S.join ", " parts})")
+  | Record row -> pRow pr row []
+  | RowExtend _ _ _ -> pRow pr t []
+
+-- A row, a record's or an effect's: `{x : Int}`, `{Console, Mut | e}`. A
+-- label that carries nothing is written alone.
+fun pRow (pr : Printer) (t : Type) (parts : [String]) =
+  match t with
+  | RowExtend label field rest ->
+      (let part =
+         match field with
+         | Tuple items -> if V.isEmpty items then label else "${label} : ${pTy pr field}"
+         | _ -> "${label} : ${pTy pr field}"
+       in pRow pr rest (V.pushBack parts part))
+  | RowEmpty -> "{${S.join ", " parts}}"
+  | tail ->
+      (let rest = pTy pr tail in
+       if V.isEmpty parts then "{| ${rest}}" else "{${S.join ", " parts} | ${rest}}")
+
+-- A literal; one of a number type not yet decided is marked `?`.
+fun pLit (a : CoreArena) (l : CoreLit) (ty : Type) : String =
+  let open =
+    match ty with
+    | Var _ -> True
+    | Bound _ -> True
+    | _ -> False
+  in
+  let mark = if open then "?" else "" in
+  match viewCoreLit a l with
+  | CoreLitView.LInt r -> "${show r.value}${mark}"
+  | CoreLitView.LBig r -> show r.value
+  | CoreLitView.LF64 r -> "${floatText r.value}${mark}"
+  | CoreLitView.LF32 r -> "${floatText r.value}f32"
+  | CoreLitView.LWord r -> "${show (wordValue r.ty r.bits)}${wordName r.ty}"
+  | CoreLitView.LStr r -> quoted r.text "\""
+  | CoreLitView.LChar r -> quoted (C.toString (C.fromCode r.code)) "'"
+  | CoreLitView.LBool r -> if r.value then "true" else "false"
+  | CoreLitView.LUnit _ -> "()"
+
+fun floatText (x : Float) : String =
+  let s = show x in
+  if S.contains "." s or S.contains "e" s or S.contains "N" s or S.contains "n" s then s
+  else "${s}.0"
+
+fun wordName (ty : String) : String =
+  if S.startsWith "U" ty then "UInt${S.drop ty 1}" else "Int${S.drop ty 1}"
+
+fun wordValue (ty : String) (bits : Int) : Int =
+  let width = M.unwrapOr 64 (S.toInt (S.drop ty 1)) in
+  if S.startsWith "U" ty or width >= 64 then bits
+  else
+    (let top = 1 << (width - 1) in
+     let masked = bitAnd bits ((1 << width) - 1) in
+     if bitAnd masked top != 0 then masked - (1 << width) else masked)
+
+-- Text as Rust's `{:?}` writes it, between `q`s.
+fun quoted (s : String) (q : String) : String =
+  let body =
+    S.concatAll
+      (V.map
+         (\c ->
+           if c == '\\' then "\\\\"
+           else if c == '\n' then "\\n"
+           else if c == '\r' then "\\r"
+           else if c == '\t' then "\\t"
+           else if C.code c == 0 then "\\0"
+           else if C.toString c == q then "\\${q}"
+           else C.toString c)
+         (S.chars s))
+  in "${q}${body}${q}"
+
+-- An effect's name without the path to it: `Process` of `Std/Process`.
+fun bareName (name : String) : String =
+  M.unwrapOr name (V.last (S.split "." (M.unwrapOr name (V.last (S.split "/" name)))))
+
+-- A constructor as core writes it: its type's name and its own, `Maybe.Just`.
+fun ctorSpelling (name : String) : String =
+  let parts = S.split "." name in
+  let n = V.len parts in
+  if n >= 2 then "${V.getOr "" parts (n - 2)}.${V.getOr "" parts (n - 1)}" else name
+
+fun pTerm (pr : Printer) (a : CoreArena) (t : CoreTerm) =
+  match viewCoreTerm a t with
+  | CoreTermView.Var r -> pVar pr r.id
+  | CoreTermView.Const r -> pLit a r.lit (tyCoreTerm a t)
+  | CoreTermView.Lam r ->
+      (let v = pVar pr r.param in
+       let ty = pTy pr r.paramTy in
+       "(\\(${v} : ${ty}). ${pTerm pr a r.body})")
+  | CoreTermView.TyLam r ->
+      (let names = V.map (\v -> pTyvar pr v) (V.append r.vars r.nums) in
+       "(/\\${S.join " " names}. ${pTerm pr a r.body})")
+  | CoreTermView.TyApp r ->
+      (let f = pTerm pr a r.func in
+       let tys = V.map (\x -> "@${pTy pr x}") (V.append r.tys r.nums) in
+       "(${f} ${S.join " " tys})")
+  | CoreTermView.App r -> (let f = pTerm pr a r.func in "(${f} ${pTerm pr a r.arg})")
+  | CoreTermView.Let r ->
+      (let v = pVar pr r.id in
+       let p = pPoly pr a r.value in
+       let value = pTerm pr a r.value in
+       "(let ${v} : ${p} = ${value} in ${pTerm pr a r.body})")
+  | CoreTermView.LetRec r ->
+      (let parts =
+         V.map
+           (\b ->
+             (let v = pVar pr (coreBindId a b) in
+              let p = pPoly pr a (coreBindValue a b) in
+              "${v} : ${p} = ${pTerm pr a (coreBindValue a b)}"))
+           r.binds
+       in "(letrec ${S.join "; " parts} in ${pTerm pr a r.body})")
+  | CoreTermView.If r ->
+      (let c = pTerm pr a r.cond in
+       let y = pTerm pr a r.yes in
+       "(if ${c} ${y} ${pTerm pr a r.no})")
+  | CoreTermView.Tuple r -> "(tup ${pTerms pr a r.items})"
+  | CoreTermView.Proj r -> "(${pTerm pr a r.tuple}.${show r.index})"
+  -- What is named, and so numbered, first is as the Rust printer has it:
+  -- an array's type before its items, a constructor's before its
+  -- arguments, a `case`'s arms before what it looks at, a handler's
+  -- clauses before what it handles.
+  | CoreTermView.Array r ->
+      (let elem =
+         match tyCoreTerm a t with
+         | Con _ args -> V.getOr Error args 0
+         | other -> other
+       in
+       let ty = pTy pr elem in
+       let items = pTerms pr a r.items in
+       "#[${items} : ${ty}]")
+  | CoreTermView.Record r ->
+      (let parts =
+         V.map (\f -> "${coreFieldLabel a f} = ${pTerm pr a (coreFieldValue a f)}") r.fields
+       in "{ ${S.join ", " parts} }")
+  | CoreTermView.Sel r -> "(${pTerm pr a r.target}.${r.label})"
+  | CoreTermView.Extend r ->
+      (let target = pTerm pr a r.target in "(${target} with ${r.label} = ${pTerm pr a r.value})")
+  | CoreTermView.Ctor r ->
+      (let ty = pTy pr (tyCoreTerm a t) in
+       let args = pTerms pr a r.args in
+       "(${ctorSpelling r.name} ${args} : ${ty})")
+  | CoreTermView.Case r ->
+      (let parts =
+         V.map
+           (\arm ->
+             (let p = pPat pr a (coreArmPat a arm) in
+              match coreArmGuard a arm with
+              | Just g ->
+                  (let gs = pTerm pr a g in
+                   let body = pTerm pr a (coreArmBody a arm) in
+                   "${p} if ${gs} -> ${body}")
+              | None -> (let body = pTerm pr a (coreArmBody a arm) in "${p} -> ${body}")))
+           r.arms
+       in
+       let s = pTerm pr a r.scrutinee in
+       "(case ${s} of ${S.join "; " parts})")
+  | CoreTermView.Prim r -> "(${r.op} ${pTerms pr a r.args})"
+  | CoreTermView.Perform r -> "(perform ${bareName r.eff}.${r.op} ${pTerm pr a r.arg})"
+  | CoreTermView.Handle r ->
+      (let clauses =
+         V.map
+           (\c ->
+             (let p = pVar pr (coreClauseParam a c) in
+              let k = pVar pr (coreClauseResume a c) in
+              let cb = pTerm pr a (coreClauseBody a c) in
+              "${bareName (coreClauseEff a c)}.${coreClauseOp a c} ${p} ${k} -> ${cb}"))
+           r.clauses
+       in
+       let ret =
+         match (r.retId, r.ret) with
+         | (Just v, Just b) ->
+             (let x = pVar pr v in
+              let rb = pTerm pr a b in
+              ["return ${x} -> ${rb}"])
+         | _ -> []
+       in
+       let body = pTerm pr a r.body in
+       "(handle ${body} with { ${S.join "; " (V.append clauses ret)} })")
+  | CoreTermView.Join r ->
+      (let j = pVar pr r.id in
+       let ps = V.map (\v -> "(${pVar pr v} : ?)") r.params in
+       let rhs = pTerm pr a r.rhs in
+       "(join ${j} ${S.join " " ps} = ${rhs} in ${pTerm pr a r.body})")
+  | CoreTermView.Jump r -> (let j = pVar pr r.id in "(jump ${j} ${pTerms pr a r.args})")
+  | CoreTermView.Ill _ -> "<error>"
+
+fun pTerms (pr : Printer) (a : CoreArena) (ts : [CoreTerm]) =
+  S.join " " (V.map (\x -> pTerm pr a x) ts)
+
+fun pPat (pr : Printer) (a : CoreArena) (p : CorePat) =
+  match viewCorePat a p with
+  | CorePatView.PWild _ -> "_"
+  | CorePatView.PVar r -> pVar pr r.id
+  | CorePatView.PAs r -> (let v = pVar pr r.id in "${v}@${pPat pr a r.pat}")
+  | CorePatView.PLit r -> pLit a r.lit (tyCorePat a p)
+  | CorePatView.PTuple r -> "(tup ${pPats pr a r.items})"
+  | CorePatView.PArray r -> "#[${pPats pr a r.items}]"
+  | CorePatView.PCtor r -> "(${ctorSpelling r.name} ${pPats pr a r.args})"
+  | CorePatView.PRecord r ->
+      (let parts =
+         V.map (\f -> "${corePFieldLabel a f} = ${pPat pr a (corePFieldPat a f)}") r.fields
+       in "{ ${S.join ", " parts} }")
+
+fun pPats (pr : Printer) (a : CoreArena) (ps : [CorePat]) =
+  S.join " " (V.map (\x -> pPat pr a x) ps)

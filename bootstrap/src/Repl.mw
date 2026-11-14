@@ -59,9 +59,10 @@ use MeadowBoot.Types (Scheme, Type, VarKind, showScheme)
 use MeadowBoot.Elab (DataSig, defSymbol)
 use MeadowBoot.Solve (Entry)
 use MeadowBoot.Seq as Seq
-use MeadowBoot.Core (CoreProgram, linkedUnits)
+use MeadowBoot.Core (
+  CoreProgram, linkedUnits, prettyDefs, coreArena, coreRoot, coreFileDefs, coreDefId
+)
 use MeadowBoot.Cek as Cek
-use MeadowBoot.CoreShow as CoreShow
 use MeadowBoot.Unit (stdDir)
 use MeadowBoot.Tour (Step, steps)
 use Std.Collections.Vector as V
@@ -1509,11 +1510,15 @@ fun declaredIn (text : String) : [String] =
     (S.lines text)
 
 -- `:ir core`'s page: the definitions shown, as this compiler's core has
--- them.
+-- them, written as `meadow_core` writes its own (`Core.prettyDefs`, which
+-- the language server's `meadow/ir` writes core with too).
 fun corePage (s : Session) (shown : Shown) =
   let core = if shown.pkg == "Std" then stdCoreOf s else shown.core in
   match core with
-  | Just c -> CoreShow.shownDefs c (M.unwrapOr (CoreShow.defIds c) shown.binders)
+  | Just c ->
+      (let a = coreArena c in
+       let every = V.map (\d -> coreDefId a d) (coreFileDefs a (coreRoot c)) in
+       prettyDefs c (M.unwrapOr every shown.binders))
   | None -> "-- there is no core to show\n"
 
 def irForms : [String] = ["core", "cut", "axcut", "bytecode", "native", "llvm"]
