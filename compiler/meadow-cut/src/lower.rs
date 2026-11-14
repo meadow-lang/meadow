@@ -129,6 +129,12 @@ pub struct Map {
     /// computes its top-level values, is no definition's.
     pub blocks: HashMap<Label, Symbol>,
     pub names: HashMap<Name, Origin>,
+    /// What the source calls the names that are its variables, where the
+    /// front end said ([`crate::Shown`]): what a debugger shows them by.
+    pub shown: HashMap<Name, crate::Shown>,
+    /// What the source calls the definition each block is, where the front
+    /// end said ([`Def::shown`]).
+    pub titles: HashMap<Label, String>,
 }
 
 /// Where a name of the AxCut came from.
@@ -207,18 +213,43 @@ pub fn optimized(p: &Program) -> Program {
     }
 }
 
+/// [`executable_mapped`], for a debugger to step through: made better only
+/// as far as the program it steps is still the one written -- its generic
+/// definitions copied for their representations and its calls under a
+/// constructor made tail calls, as a debug build of Meadow's has them, but
+/// nothing inlined, since a call inlined is not a call to step into
+/// (`meadow_rt::OptLevel::inlines`). Its positions and shown names are kept,
+/// and say where it stops and what it shows.
+pub fn debuggable(p: &Program) -> R<Lowered> {
+    crate::any::check(p)?;
+    let copied = if std::env::var_os("MEADOW_CUT_GENERIC").is_none() {
+        crate::specialize::program(p)
+    } else {
+        p.clone()
+    };
+    let rewritten = if std::env::var("MEADOW_CUT_TRMC").as_deref() == Ok("0") {
+        copied
+    } else {
+        crate::trmc::program(&copied)
+    };
+    lowered_from(&rewritten, true)
+}
+
 fn lowered(p: &Program, prints: bool) -> R<Lowered> {
     // As written, and once inlined, which brings objects into sight of the
     // calls of their methods: see `crate::any`.
     crate::any::check(p)?;
-    let copied;
-    let p = if prints {
-        copied = optimized(p);
+    if prints {
+        let copied = optimized(p);
         crate::any::check(&copied)?;
-        &copied
+        lowered_from(&copied, prints)
     } else {
-        p
-    };
+        lowered_from(p, prints)
+    }
+}
+
+/// `p`, made as good as it is to be made, lowered.
+fn lowered_from(p: &Program, prints: bool) -> R<Lowered> {
     let mut lazy = lazily(p);
     started(p, &mut lazy);
     let whole = p;
@@ -252,7 +283,7 @@ fn lowered(p: &Program, prints: bool) -> R<Lowered> {
     l.declare(p)?;
     for (i, v) in whole.vals.iter().enumerate() {
         l.vals.insert(v.symbol.clone(), (i as i64, l.rep(&v.rep)?));
-        if let Statement::Cut(x, Consumer::Halt) = &v.body
+        if let Statement::Cut(x, Consumer::Halt) = v.body.bare()
             && matches!(
                 x,
                 Producer::Int(_)
@@ -279,6 +310,9 @@ fn lowered(p: &Program, prints: bool) -> R<Lowered> {
         let of = forced(&d.symbol);
         l.current = Some(of.clone());
         l.map.blocks.insert(Label(i as u32), of);
+        if let Some(title) = &d.shown {
+            l.map.titles.insert(Label(i as u32), title.clone());
+        }
         l.kinds = d.effect_vars.clone();
         l.frames = l.graded(d.row.as_ref());
         let mut sc = Scope::default();
@@ -301,6 +335,7 @@ fn lowered(p: &Program, prints: bool) -> R<Lowered> {
             l.out.reps.insert(n, rep);
             sc.bind(&b.name, n);
             l.called(n, &b.name);
+            l.shows(n, b);
         }
         for k in &d.conts {
             let n = l.fresh(ax::Rep::Ref);
@@ -514,6 +549,14 @@ impl Lower {
         let origin = self.map.names.entry(n).or_default();
         if !origin.vars.iter().any(|v| v == name) {
             origin.vars.push(name.to_string());
+        }
+    }
+
+    /// `n` is what `b` binds: the name it is shown by, if it has one and
+    /// `n` has none yet.
+    fn shows(&mut self, n: Name, b: &Binder) {
+        if let Some(shown) = &b.shown {
+            self.map.shown.entry(n).or_insert_with(|| shown.clone());
         }
     }
 
@@ -890,6 +933,7 @@ impl Lower {
                 let v = self.atom(p, &mut sc, &mut steps)?;
                 sc.vars.insert(b.name.clone(), v);
                 self.called(v, &b.name);
+                self.shows(v, b);
                 self.statement(rest, &sc)?
             }
             Statement::Call(f, args, conts) => {
@@ -996,6 +1040,15 @@ impl Lower {
                 lowered
             }
             Statement::Error(msg) => S::Error(Box::leak(msg.clone().into_boxed_str())),
+            // What a debugger stops at, and shows: see `meadow_core::Term::Loc`,
+            // which the Rust front end writes where it is.
+            Statement::At(at, inner) => {
+                let loc = meadow_rt::Loc {
+                    source: at.source,
+                    span: meadow_span::Span::new(at.start, at.end),
+                };
+                S::Mark(loc, Box::new(self.statement(inner, &sc)?))
+            }
             Statement::Perform(op, args, c) => self.perform(op, args, c, &mut sc, &mut steps)?,
             Statement::Handle(h) => self.handle(h, &mut sc, &mut steps)?,
         };
@@ -1537,6 +1590,7 @@ impl Lower {
                 let n = self.fresh(self.rep(&b.rep)?);
                 inner.bind(&b.name, n);
                 self.called(n, &b.name);
+                self.shows(n, b);
             }
             for k in conts {
                 let n = self.fresh(ax::Rep::Ref);
@@ -1585,6 +1639,7 @@ impl Lower {
         }
         let value = self.fresh(self.rep(&x.rep)?);
         self.called(value, &x.name);
+        self.shows(value, x);
         let now = self.fresh(ax::Rep::Ref);
         self.called(now, k);
         let mut inner = Scope {
@@ -1803,6 +1858,7 @@ impl Lower {
                 let mut inner = sc.clone();
                 inner.vars.insert(b.name.clone(), v);
                 self.called(v, &b.name);
+                self.shows(v, b);
                 self.statement(s, &inner)
             }
             Consumer::Case(arms) => self.switch(v, arms, sc),
@@ -1863,6 +1919,7 @@ impl Lower {
                 let n = self.fresh(self.rep(&f.rep)?);
                 inner.bind(&f.name, n);
                 self.called(n, &f.name);
+                self.shows(n, f);
             }
             inner.env.extend(sc.env.iter().copied());
             let body = self.statement(&arm.body, &inner)?;
@@ -2048,6 +2105,7 @@ impl Lower {
                         let n = self.fresh(self.rep(&b.rep)?);
                         inner.bind(&b.name, n);
                         self.called(n, &b.name);
+                        self.shows(n, b);
                     }
                     for k in &m.conts {
                         let n = self.fresh(ax::Rep::Ref);
@@ -2296,6 +2354,7 @@ impl Free {
                 self.under(&[&h.body_cont], |f| f.statement(&h.body));
                 self.consumer(&h.cont);
             }
+            Statement::At(_, s) => self.statement(s),
             Statement::Error(_) => {}
         }
     }
@@ -2385,6 +2444,7 @@ fn tail_of(s: &Statement, [r, k]: [&str; 2]) -> Option<Statement> {
         Statement::Let(b, p, rest) if !binds(&b.name) && clear(std::slice::from_ref(p)) => Some(
             Statement::Let(b.clone(), p.clone(), Box::new(tail_of(rest, [r, k])?)),
         ),
+        Statement::At(at, inner) => Some(Statement::At(*at, Box::new(tail_of(inner, [r, k])?))),
         Statement::Error(e) => Some(Statement::Error(e.clone())),
         _ => None,
     }
@@ -2443,6 +2503,7 @@ fn methods_of(s: &Statement, out: &mut HashSet<String>) {
             methods_of(&h.body, out);
             consumer(&h.cont, out);
         }
+        Statement::At(_, s) => methods_of(s, out),
         Statement::Error(_) => {}
     }
 }
@@ -2508,17 +2569,11 @@ fn forced(def: &Symbol) -> Symbol {
 fn lazily(p: &Program) -> Program {
     let mut out = p.clone();
     out.vals.clear();
-    let unit = |name: &str| Binder {
-        name: name.to_string(),
-        rep: Rep::Unit,
-    };
+    let unit = |name: &str| Binder::new(name, Rep::Unit);
     for (i, v) in p.vals.iter().enumerate() {
         let place = || Producer::Int(i as i64);
         let k = || Consumer::Var("#k".to_string());
-        let made = Binder {
-            name: "#made".to_string(),
-            rep: v.rep.clone(),
-        };
+        let made = Binder::new("#made", v.rep.clone());
         let kept = Statement::Prim(
             "globalSet".to_string(),
             vec![place(), Producer::Var(made.name.clone())],
@@ -2535,10 +2590,7 @@ fn lazily(p: &Program) -> Program {
             "globalGet".to_string(),
             vec![place()],
             vec![Consumer::MuTilde(
-                Binder {
-                    name: "#had".to_string(),
-                    rep: v.rep.clone(),
-                },
+                Binder::new("#had", v.rep.clone()),
                 Box::new(Statement::Cut(Producer::Var("#had".to_string()), k())),
             )],
         );
@@ -2546,9 +2598,10 @@ fn lazily(p: &Program) -> Program {
         // holds nothing, so making it is one object, where asking whether a
         // place is filled and reading it are two calls into the runtime --
         // and a program mentions its functions far more than its values.
-        if let Statement::Cut(Producer::Cocase(methods), Consumer::Halt) = &v.body {
+        if let Statement::Cut(Producer::Cocase(methods), Consumer::Halt) = v.body.bare() {
             out.defs.push(Def {
                 symbol: forcing(&v.symbol),
+                shown: v.shown.clone(),
                 rep_vars: Vec::new(),
                 effect_vars: Vec::new(),
                 params: Vec::new(),
@@ -2562,10 +2615,7 @@ fn lazily(p: &Program) -> Program {
             "globalReady".to_string(),
             vec![place()],
             vec![Consumer::MuTilde(
-                Binder {
-                    name: "#ready".to_string(),
-                    rep: Rep::Bool,
-                },
+                Binder::new("#ready", Rep::Bool),
                 Box::new(Statement::Prim(
                     "if".to_string(),
                     vec![Producer::Var("#ready".to_string())],
@@ -2579,6 +2629,7 @@ fn lazily(p: &Program) -> Program {
         );
         out.defs.push(Def {
             symbol: forcing(&v.symbol),
+            shown: v.shown.clone(),
             rep_vars: Vec::new(),
             effect_vars: Vec::new(),
             params: Vec::new(),
@@ -2621,10 +2672,7 @@ fn started(whole: &Program, lazy: &mut Program) {
         vec![Consumer::Var("#k".to_string())],
     );
     for (symbol, rep) in performing.into_iter().rev() {
-        let made = Binder {
-            name: "#made".to_string(),
-            rep,
-        };
+        let made = Binder::new("#made", rep);
         body = Statement::Call(
             forcing(&symbol),
             Vec::new(),
@@ -2634,6 +2682,7 @@ fn started(whole: &Program, lazy: &mut Program) {
     let symbol = entry.child("#values");
     lazy.defs.push(Def {
         symbol: symbol.clone(),
+        shown: None,
         rep_vars: Vec::new(),
         effect_vars: Vec::new(),
         params: Vec::new(),
@@ -2723,6 +2772,7 @@ fn rehalted(s: &Statement) -> Statement {
         Statement::Perform(op, xs, k) => {
             Statement::Perform(op.clone(), xs.iter().map(p).collect(), c(k))
         }
+        Statement::At(at, inner) => Statement::At(*at, Box::new(rehalted(inner))),
         Statement::Error(_) => s.clone(),
     }
 }

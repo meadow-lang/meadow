@@ -73,6 +73,7 @@ fn statement<'a>(s: &'a Statement, called: &mut Vec<&'a Symbol>) -> bool {
         }
         Statement::Let(_, p, rest) => producer(p, called) && statement(rest, called),
         Statement::Handle(_) | Statement::Perform(..) => false,
+        Statement::At(_, s) => statement(s, called),
         Statement::Error(_) => true,
     }
 }

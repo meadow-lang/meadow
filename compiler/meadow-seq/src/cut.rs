@@ -125,6 +125,7 @@ pub fn to_cut_in(program: &core::Program, outside: &HashMap<Var, Outside>) -> Lo
         l.current = Some(symbol.clone());
         vals.push(Val {
             symbol,
+            shown: None,
             rep: rep_of(&d.poly.ty),
             body: l.term(&d.term, Consumer::Halt),
         });
@@ -164,6 +165,7 @@ pub fn to_cut_in(program: &core::Program, outside: &HashMap<Var, Outside>) -> Lo
             entry: None,
             answer: meadow_cut::Answer::None,
             exports: Vec::new(),
+            sources: Vec::new(),
             datas,
             roles: Vec::new(),
             natives: Vec::new(),
@@ -198,10 +200,7 @@ fn var(v: Var) -> String {
 }
 
 fn binder(name: &str, rep: Rep) -> Binder {
-    Binder {
-        name: name.to_string(),
-        rep,
-    }
+    Binder::new(name, rep)
 }
 
 fn give(p: Producer, c: Consumer) -> Statement {
@@ -620,6 +619,7 @@ impl Lower<'_> {
                 .collect();
             self.lifted.push(Def {
                 symbol: symbol.clone(),
+                shown: None,
                 rep_vars: Vec::new(),
                 effect_vars: Vec::new(),
                 params,
