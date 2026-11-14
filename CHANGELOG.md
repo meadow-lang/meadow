@@ -126,6 +126,23 @@ last release is under _Unreleased_.
 
 ### Added
 
+- MeadowBoot runs tests itself, the standard library's too: `meadowboot test
+  --std` builds the library with `@cfg(test)` and runs its 385 tests, where
+  it handed them to the Rust `meadow` before. `--test-threads`, `--no-capture`
+  and `--cek` are acted on, as `meadow test` acts on them: each test is a run
+  of its own, so a runtime error fails that test alone and with its message,
+  what a test prints is kept and shown beside it if it fails, runs go side by
+  side, and `--cek` runs on MeadowBoot's CEK machine. `meadowboot dis` lists
+  what MeadowBoot built, through the back end's new `meadow cut --emit
+  bytecode` and `--emit asm`. And `meadowboot __precompile-std OUT` writes the
+  standard library as MeadowBoot compiles it -- its interface and its objects
+  of Cut, for each profile -- which a build takes in place of compiling the
+  library when it finds it (`MEADOWBOOT_PRECOMPILED_STD`, or `Std.mwstd`
+  beside the library). The Rust command of that name writes its own front
+  end's output, which MeadowBoot cannot read. These are steps in retiring the
+  Rust front end: nothing a test or a listing needs comes from it now. Tests
+  in `buildtools/meadow/tests/bootstrap.rs` hold `meadowboot test` to what
+  `meadow test` says, flag for flag and on the standard library.
 - Cut carries positions and names, for a debugger: `source S = "path"`
   declares a file, `@S:a-b s` is a statement written at bytes `a` to `b` of
   it, and `x: i64 @"count" "Int"`, `def S @"fact"` say what the source calls

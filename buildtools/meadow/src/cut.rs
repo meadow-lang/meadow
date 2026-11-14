@@ -49,7 +49,8 @@ pub fn emitted(path: &Path, what: &str) -> Result<String, String> {
 /// [`emitted`], and what a build's `--emit` names besides: `bytecode`, the
 /// image Glade runs as text -- as `meadow build --emit bytecode` writes it --
 /// and `asm`, the machine code an `aot` build compiles it to at `opt`, for
-/// `target` or this machine.
+/// `target` or this machine. These two are also what `meadow dis` prints, for
+/// a front end that compiles to Cut to print them.
 pub fn emitted_for(
     path: &Path,
     what: &str,
