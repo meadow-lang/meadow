@@ -3906,13 +3906,7 @@ fn exports_are_called_from_c(runtime: &str, hosts: &[&[&str]]) {
         String::from_utf8_lossy(&built.stdout),
         String::from_utf8_lossy(&built.stderr)
     );
-    // What calls it is a Meadow program through `Std.Ffi`, which is unstable:
-    // a stable `meadow` -- a release's -- refuses it, so there the library
-    // being built is all there is to check.
-    if std::env::var("MEADOW_CHANNEL").as_deref() == Ok("stable") {
-        let _ = std::fs::remove_dir_all(&root);
-        return;
-    }
+    // What calls it is a Meadow program, through `Std.Ffi`.
     let host = root.join("Host");
     std::fs::create_dir_all(host.join("src")).expect("a package directory");
     std::fs::write(
@@ -3923,7 +3917,7 @@ fn exports_are_called_from_c(runtime: &str, hosts: &[&[&str]]) {
     std::fs::write(
         host.join("src").join("Main.mw"),
         format!(
-            "@!feature(ffi)\n\nuse Std.Ffi as Ffi\nuse Std.Ffi (Arg)\nuse Std.Result as R\n\n\
+            "use Std.Ffi as Ffi\nuse Std.Ffi (Arg)\nuse Std.Result as R\n\n\
              fun call name args = match Ffi.open {path:?} with\n  \
              | Err why -> Err why\n  \
              | Ok l -> (match Ffi.function l name with | Err why -> Err why | Ok f -> Ok f)\n\n\

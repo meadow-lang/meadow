@@ -102,12 +102,9 @@ jobs:
         run: cargo build --release -p meadow -p meadow-host
 
       # MeadowBoot's dependencies (Lingua, Scythe) are fetched by git. It
-      # calls `meadow-host` through `Std.Ffi`, which `MEADOW_BOOTSTRAP` lets
-      # whichever channel this `meadow` is take.
+      # calls `meadow-host` through `Std.Ffi`.
       - name: Build MeadowBoot
         shell: bash
-        env:
-          MEADOW_BOOTSTRAP: "1"
         run: |
           meadow=buildtools/target/release/meadow
           [ -f "$meadow.exe" ] && meadow="$meadow.exe"

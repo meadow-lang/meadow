@@ -1,9 +1,6 @@
 -- Std.Ffi: calling C.
 --
--- Unstable: a package that uses it says `@!feature(ffi)` at the top of its
--- root module, and a stable `meadow` does not accept it.
---
---   @!feature(ffi)
+-- Stable since 0.5.0: a package uses it on every channel, without asking.
 --
 --   use Std.Ffi as Ffi
 --   use Std.Ffi (Arg)

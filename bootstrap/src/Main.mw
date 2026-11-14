@@ -7,8 +7,6 @@
 -- What MeadowBoot does not do itself is the Rust `meadow`'s, called in this
 -- process through `Std.Ffi`: see `hosted`.
 
-@!feature(ffi)
-
 mod Lex
 mod Derive
 mod Macros
