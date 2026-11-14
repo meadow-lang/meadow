@@ -102,6 +102,13 @@ jobs:
             bash scripts/check.sh
           fi
 
+  # The Rust `meadow` on its own, for every target. What is published of it is
+  # `meadowup` and, for a target MeadowBoot is not built for -- ARM Windows,
+  # where Silo's stack switching does not build, and Android -- the archive,
+  # which is then the release for that target as every release before was.
+  # Where MeadowBoot is built, `meadowboot`'s archive is published in its
+  # place (see `assets`), and this one only where that leg failed, as an
+  # experimental one may.
   build:
     name: ${{ matrix.target }}
     needs: checks
@@ -316,13 +323,73 @@ jobs:
   # MeadowBoot for each platform, and MeadowBoot building itself with what it
   # built: `meadowboot.yml`. A release, or a nightly, that it fails on is not
   # published -- `release` needs it, and so does `nightly.yml`'s `publish`,
-  # which needs this whole workflow. Its archives are artifacts of this run,
-  # and go on the release with the rest.
+  # which needs this whole workflow. Its archives are the toolchain the
+  # release ships for each target it builds: `assets`. Told what this build
+  # is, which a called workflow is not told by this one's `env`.
   meadowboot:
     uses: ./.github/workflows/meadowboot.yml
+    with:
+      channel: ${{ inputs.channel || (github.ref_type == 'tag' && 'stable') || 'dev' }}
+      date: ${{ inputs.date }}
+      commit: ${{ inputs.commit }}
+
+  # What is published, in one artifact: `meadowup` for each target, the
+  # extensions, and for each target its toolchain -- MeadowBoot's archive
+  # where it was built, which replaces the Rust `meadow`'s of the same name,
+  # and the Rust `meadow`'s alone where it was not. The names are those every
+  # release has had, so that the installers' `/releases/latest/download/...`
+  # finds them. `release` publishes this, and so does `nightly.yml`; a manual
+  # run leaves it to look at.
+  #
+  # Once the Rust front end is no longer shipped beside MeadowBoot, a target
+  # with no MeadowBoot has no toolchain, and this is where that shows.
+  assets:
+    needs: [build, extension, meadowboot]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: meadow-*
+          path: assets
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: vsix
+          path: assets
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: meadowboot-*
+          path: toolchains
+          merge-multiple: true
+      - name: Each target's toolchain
+        shell: bash
+        run: |
+          shopt -s nullglob
+          for t in toolchains/meadow-*; do
+            cp -f "$t" assets/
+            echo "$(basename "$t"): MeadowBoot"
+          done
+          # ARM Windows and Android have no MeadowBoot; any other target
+          # without one lost an experimental leg of `meadowboot`.
+          for a in assets/meadow-*.tar.gz assets/meadow-*.zip; do
+            name=$(basename "$a")
+            [ -e "toolchains/$name" ] && continue
+            case "$name" in
+              meadow-aarch64-pc-windows-msvc.zip | meadow-aarch64-linux-android.tar.gz)
+                echo "$name: the Rust meadow alone" ;;
+              *) echo "::warning::$name is the Rust meadow alone: MeadowBoot did not build for it" ;;
+            esac
+          done
+          ls -l assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: assets
+          path: assets/*
+          if-no-files-found: error
 
   release:
-    needs: [build, extension, meadowboot]
+    needs: [assets]
     runs-on: ubuntu-latest
     # Only a tag push publishes. A manual run still builds every target and
     # leaves the archives as workflow artifacts, which is what you want when
@@ -333,8 +400,8 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
+          name: assets
           path: artifacts
-          merge-multiple: true
 
       # A version is published once. A tag that already has a release was
       # moved, and what people installed under that number would no longer be
@@ -370,6 +437,16 @@ jobs:
             Then `meadow` starts the REPL and `meadow run <path>` builds and runs
             a package, while `meadowup update` brings the toolchain forward --
             the two split the way `cargo` and `rustup` do.
+
+            **`meadow` is MeadowBoot**, the compiler written in Meadow, on every
+            target but ARM Windows and Android, which keep the Rust compiler.
+            The Rust compiler is installed beside it as `meadow-rust`, for this
+            release only: MeadowBoot hands it what it does not do in full yet
+            (`--features`, a workspace's `-p` and `--workspace`, `--emit
+            expanded`), and you can run it yourself where the two differ.
+            Already installed? `meadowup update` from an older release puts the
+            new `meadowup` in place with the Rust compiler alone; run
+            `meadowup update` once more for the whole toolchain.
 
             **VS Code** — download **`meadow-<version>.vsix`** below and install it
             with *Extensions: Install from VSIX…*, or:

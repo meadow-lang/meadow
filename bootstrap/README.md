@@ -356,6 +356,41 @@ runs an entry's program of Cut on Glade and hands back what it answered, and
 `RUSTC_BOOTSTRAP` does rustc. A build from a checkout, or a nightly, needs
 nothing.
 
+## Shipped as `meadow`
+
+A release installs MeadowBoot as `meadow`, in `~/.meadow/bin` with what it
+finds beside itself: `meadow-host`, `lib/Std` and `lib/Std.mwstd`, the phone
+runtimes in `lib/<triple>/`, and the Rust compiler as `meadow-rust`
+(`installer/src/toolchain.rs`; `.github/workflows/meadowboot.yml` builds the
+archive). In the archive itself MeadowBoot is `MeadowBoot` and the Rust
+compiler `meadow`, which is what a `meadowup` from before installs on its
+own.
+
+The Rust `meadow` a program is run as, where one is (`Unit.rustMeadow`), is
+where `MEADOW` says; then `meadow-rust` beside MeadowBoot; then `meadow`
+beside it, as a checkout's bundle has it, unless that is MeadowBoot itself;
+then the one on the path -- `meadow-rust` there when MeadowBoot is itself
+called `meadow`, so that it never hands a command to itself. The language
+server's formatting runs that one, `meadow fmt`.
+
+`meadow --version` is the back end's: MeadowBoot asks `meadow-host` beside it
+(`versionSaid`), which `buildtools/meadow/build.rs` built to say the release's
+channel and, for a nightly, its day and commit. Nothing builds those into
+MeadowBoot, and the two are built from one commit by one job. With no
+library beside it, as in a checkout, it says its own number.
+
+`meadow-rust` is shipped for one release, as the front end to fall back on,
+and what falls back to it is kept to two functions in `Main.mw`, to delete
+with it: `unlessUnacted`, which hands it a `build`, `run`, `test` or `dis`
+asked for what MeadowBoot does not act on yet -- `--features` and its kin,
+`-p`, `--workspace` and `--exclude`, `--emit expanded` -- and `inNoPackage`,
+which hands it a `.mw` file in no package. Each says on standard error that
+it did. Without `meadow-rust` beside it, as in a checkout, MeadowBoot builds
+what it can and says what it did not act on, as before. A manifest's
+`[profile.*]` is not among them: MeadowBoot builds a package that has one
+without taking its settings -- `runtime = "silo"` there is Glade's build --
+and `meadow-rust build` is the build that takes them.
+
 ## What `build` and `run` are told
 
 MeadowBoot's `build` and `run` take `meadow`'s flags, and each one does
