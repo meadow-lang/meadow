@@ -85,7 +85,9 @@ fun packed out seen (d : Datum) =
        V.all (\x -> packed out seen x) xs)
   | Datum.Code _ -> False
 
-fun byte out (b : Int) = let i = Buf.push out (toUInt8 b) in ()
+-- A byte is written as the byte it is, never converted from a number: a
+-- conversion is a call into the runtime, and a datum is millions of bytes.
+fun byte out (b : UInt8) = let i = Buf.push out b in ()
 
 -- `n` in base ten, and `;`.
 fun number out (n : Int) =
@@ -95,7 +97,21 @@ fun number out (n : Int) =
 
 fun digits out (n : Int) =
   let u = (if n >= 10 then digits out (n / 10) else ()) in
-  byte out (48 + n % 10)
+  byte out (digitByte (n % 10))
+
+-- The byte that writes digit `d`.
+fun digitByte (d : Int) : UInt8 =
+  match d with
+  | 0 -> 48
+  | 1 -> 49
+  | 2 -> 50
+  | 3 -> 51
+  | 4 -> 52
+  | 5 -> 53
+  | 6 -> 54
+  | 7 -> 55
+  | 8 -> 56
+  | _ -> 57
 
 -- A string: by its number, if it was written before; else in full.
 fun text out seen (s : String) =
@@ -109,7 +125,7 @@ fun text out seen (s : String) =
        let w = digitsThen out n 58 in
        bytesOf out s 0 n)
 
-fun digitsThen out (n : Int) (after : Int) = let u = digits out n in byte out after
+fun digitsThen out (n : Int) (after : UInt8) = let u = digits out n in byte out after
 
 fun bytesOf out (s : String) (i : Int) (n : Int) =
   if i >= n then () else (let u = Buf.push out (stringByteAt s i) in bytesOf out s (i + 1) n)

@@ -26,6 +26,17 @@ last release is under _Unreleased_.
 
 ### Changed
 
+- MeadowBoot writes a packed interface in about 350 ms where it took 540
+  (the standard library's), and a build's inference no longer writes the
+  infer test's dump of every scheme or the language server's type of every
+  binder. `MEADOWBOOT_TIMINGS` times inference's parts as well:
+  `infer.bindings`, `infer.impls`, `infer.written` and the rest.
+- MeadowBoot's language server answers an edit with its diagnostics in about
+  120 ms where it took 300 (`examples/MiniML`): the package is studied with a
+  database given only the fixities of what it imports, which is all its
+  queries read -- copying the standard library's whole interface into it
+  took longer than the study -- and its files are parsed, grouped and
+  lowered side by side.
 - MeadowBoot keeps a unit's interface packed into one string
   (`bootstrap/src/Packed.mw`) where it was the JSON of a `Datum`, an object
   for each record and an array element for each number. The standard
