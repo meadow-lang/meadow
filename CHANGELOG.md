@@ -363,6 +363,16 @@ last release is under _Unreleased_.
 
 ### Fixed
 
+- Silo's leak check (`MEADOW_SILO_LEAKS`) no longer counts as left behind
+  the regions of `TVar`s that a worker was still letting go of when `main`
+  finished. A worker takes the list of `TVar`s nothing can reach and drops
+  their values one at a time; one that had taken it just before `main`'s
+  last await returned could still be dropping when the check counted, and
+  on a busy machine it reported regions live at exit that were freed a
+  moment later -- about one run in a hundred of a program that makes a
+  `TVar` per step on five threads. The check now waits for that worker to
+  finish, and a worker that finds another already letting go leaves it to
+  them.
 - MeadowBoot's language server forgets a document the editor closes. It
   went on compiling the document's package with the closed document's last
   text, saved or not, so the files still open kept the errors of an edit that
