@@ -259,11 +259,16 @@ impl Size (Box a) where Size a {\n  fun size b = match b with | Box.Box x -> 1 +
 fun (<+>) a b = a + b\n\n\
 fun main () = println (show (twice (Box.Box (3 <+> 4))))\n";
 
-/// A program that allocates enough to be collected and sampled.
-const BUSY: &str = "fun build (n : Int) (acc : List Int) : List Int = if n == 0 then acc else build (n - 1) (n :: acc)\n\n\
+/// A program that allocates enough to be collected and sampled, `rounds`
+/// times over.
+fn busy(rounds: u32) -> String {
+    format!(
+        "fun build (n : Int) (acc : List Int) : List Int = if n == 0 then acc else build (n - 1) (n :: acc)\n\n\
 fun total (xs : List Int) (acc : Int) : Int = match xs with | [;] -> acc | x :: rest -> total rest (acc + x)\n\n\
 fun rounds (k : Int) (acc : Int) : Int = if k == 0 then acc else rounds (k - 1) (acc + total (build 2000 [;]) 0)\n\n\
-fun main () = println (show (rounds 300 0))\n";
+fun main () = println (show (rounds {rounds} 0))\n"
+    )
+}
 
 /// `build --types` and `run --types` write the type of every value each
 /// package of the build exports, as `meadow` writes them -- `@pub` ones in
@@ -365,7 +370,11 @@ fn a_program_run_on_the_cek_machine_says_what_meadow_s_says() {
 /// `meadow`'s does, and reports what it does but for the numbers.
 #[test]
 fn what_a_run_is_told_reaches_the_back_end_as_meadow_s_does() {
-    let p = pair("Busy", &[("Main.mw", BUSY)]);
+    let short = pair("Busy", &[("Main.mw", &busy(300))]);
+    // A sampler of time ticks as often as the system's timer lets it (every
+    // 15.6 ms on Windows, whatever `--sample-hz` asks), and a JIT runs the
+    // short program in less: it has to run long enough to be sampled at all.
+    let long = pair("Timed", &[("Main.mw", &busy(3000))]);
     let profile = |side: &Path, name: &str| side.join(name).display().to_string();
     let cases: Vec<Vec<String>> = vec![
         vec!["--gc-stats".into()],
@@ -388,6 +397,11 @@ fn what_a_run_is_told_reaches_the_back_end_as_meadow_s_does() {
         ],
     ];
     for case in &cases {
+        let p = if case.iter().any(|a| a == "--sample-hz") {
+            &long
+        } else {
+            &short
+        };
         let on = |side: &Path| -> Vec<String> {
             case.iter()
                 .map(|a| {
@@ -448,7 +462,7 @@ fn what_a_run_is_told_reaches_the_back_end_as_meadow_s_does() {
 /// `aot` build of that profile is guided by it, saying so.
 #[test]
 fn a_training_run_guides_the_aot_build_after_it_as_meadow_s_does() {
-    let p = pair("Trained", &[("Main.mw", BUSY)]);
+    let p = pair("Trained", &[("Main.mw", &busy(300))]);
     let theirs = p.rust("run", &["--release", "--train"]);
     let ours = p.boot("run", &["--release", "--train"]);
     assert_eq!(theirs.code, Some(0), "{theirs}");
