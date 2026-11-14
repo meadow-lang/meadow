@@ -352,3 +352,32 @@ fn a_long_list_is_built_and_mapped() {
     assert_eq!(twins(&after), ["map", "upto"]);
     assert_eq!(machine(&after), "1500001500000");
 }
+
+/// A program written to be debugged has a position on its statements, and
+/// a context under one is a context all the same: `map` gets its twin.
+#[test]
+fn a_context_under_a_position_is_still_one() {
+    let text = "cut 0
+source t:Main/\"src/Main.mw\" = \"/t/src/Main.mw\"
+
+data t:Main/L { Nil; Cons(i64, ptr) }
+
+def t:Main/map (f: ptr @\"f\" \"Int -> Int\", xs: ptr @\"xs\" \"List Int\"; k: ptr) =
+  @t:Main/\"src/Main.mw\":10-40 <xs | case { t:Main/L.Nil => @t:Main/\"src/Main.mw\":20-23 <t:Main/L.Nil | k>;
+               t:Main/L.Cons(x: i64 @\"x\" \"Int\", r: ptr @\"rest\" \"List Int\") =>
+                 @t:Main/\"src/Main.mw\":30-40 <f | apply(x; μ̃ y: i64. @t:Main/\"src/Main.mw\":35-40 t:Main/map(f, r; μ̃ ys: ptr. @t:Main/\"src/Main.mw\":30-34 <t:Main/L.Cons(y, ys) | k>))> }>
+";
+    let p = parse(text).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(p.sources.len(), 1);
+    let rewritten = meadow_cut::trmc::program(&p);
+    assert!(
+        rewritten
+            .defs
+            .iter()
+            .any(|d| d.symbol == meadow_cut::trmc::twin(&p.defs[0].symbol)),
+        "map has a twin:\n{}",
+        print::program(&rewritten)
+    );
+    let shown = print::program(&rewritten);
+    assert_eq!(parse(&shown).unwrap(), rewritten, "read back:\n{shown}");
+}

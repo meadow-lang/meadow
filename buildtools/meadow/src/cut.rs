@@ -8,11 +8,20 @@ use std::path::{Path, PathBuf};
 use crate::aot;
 use crate::profile::Profile;
 
+/// The program in the file at `path`, as it is run: read, and what is there
+/// only for a debugger taken off (`meadow_cut::strip`) -- so that a build of
+/// a program written to be debugged compiles to what it would have without.
+fn read_to_run(path: &Path) -> Result<meadow_cut::Program, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut program = meadow_cut::parse(&text).map_err(|e| format!("{}:{e}", path.display()))?;
+    meadow_cut::strip::program(&mut program);
+    Ok(program)
+}
+
 /// The program in the file at `path`, lowered to run: read, and refused with
 /// why where it does not read or is not lowered yet.
 pub fn lowered(path: &Path) -> Result<meadow_seq::Program, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let program = meadow_cut::parse(&text).map_err(|e| format!("{}:{e}", path.display()))?;
+    let program = read_to_run(path)?;
     let lowered =
         meadow_cut::lower::executable(&program).map_err(|e| format!("{}: {e}", path.display()))?;
     // `MEADOW_DUMP_AXCUT=1`: every definition's AxCut on stderr, as a build
@@ -60,10 +69,7 @@ pub fn emitted_for(
             out = crate::listing::asm(&image(path)?, arch, opt);
         }
         "inlined" => {
-            let text =
-                std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-            let program =
-                meadow_cut::parse(&text).map_err(|e| format!("{}:{e}", path.display()))?;
+            let program = read_to_run(path)?;
             out = meadow_cut::print::program(&meadow_cut::lower::optimized(&program));
         }
         "axcut" => {
@@ -286,6 +292,10 @@ pub fn answered(
     let start = std::time::Instant::now();
     let image = meadow_cut::parse(text)
         .map_err(|e| format!("the entry's program does not read: {e}"))
+        .map(|mut program| {
+            meadow_cut::strip::program(&mut program);
+            program
+        })
         // Made better first, as `meadow cut` makes a program it runs.
         .and_then(|program| meadow_cut::lower::lower(&meadow_cut::lower::optimized(&program)))
         .and_then(|lowered| meadow_codegen::compile(&lowered).map_err(|e| e.msg));

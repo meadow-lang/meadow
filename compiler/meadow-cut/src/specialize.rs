@@ -85,6 +85,7 @@ pub fn program(p: &Program) -> Program {
         };
         out.defs.push(Def {
             symbol: name,
+            shown: d.shown.clone(),
             rep_vars: Vec::new(),
             effect_vars: d.effect_vars.clone(),
             params: d.params.iter().map(|b| known.binder(b)).collect(),
@@ -152,8 +153,8 @@ impl Known {
 
     fn binder(&self, b: &Binder) -> Binder {
         Binder {
-            name: b.name.clone(),
             rep: self.rep(&b.rep),
+            ..b.clone()
         }
     }
 }
@@ -247,6 +248,7 @@ impl Cx<'_> {
                 self.consumer(c, k),
             ),
             Statement::Error(m) => Statement::Error(m.clone()),
+            Statement::At(at, s) => Statement::At(*at, Box::new(self.statement(s, k))),
         }
     }
 
@@ -408,6 +410,7 @@ fn calls<'a>(s: &'a Statement, out: &mut Vec<&'a Symbol>) {
             args.iter().for_each(|a| calls_in(a, out));
             calls_of(c, out);
         }
+        Statement::At(_, s) => calls(s, out),
         Statement::Error(_) => {}
     }
 }

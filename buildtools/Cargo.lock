@@ -1067,6 +1067,7 @@ dependencies = [
  "meadow-axcut",
  "meadow-intern",
  "meadow-rt",
+ "meadow-span",
 ]
 
 [[package]]

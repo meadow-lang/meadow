@@ -12,6 +12,7 @@
 //! const char *meadow_host_version(void);   // "0.5.0-dev", as `meadow --version`
 //! const char *meadow_repl_run(const char *request);    // an entry of a prompt, run
 //! const char *meadow_repl_pages(const char *request);  // an entry, in each IR
+//! const char *meadow_debug(const char *request);       // a debugging session
 //! ```
 //!
 //! `args` is the command line after the program's name, as MeadowBoot's
@@ -148,6 +149,29 @@ pub unsafe extern "C" fn meadow_repl_pages(request: *const c_char) -> *const c_c
             )
         }
     };
+    kept(answer.to_string())
+}
+
+/// One request of a debugging session MeadowBoot's debug adapter holds open
+/// (`meadow::dap::hosted`): a program of Cut built for debugging, launched
+/// on Glade, then breakpoints set, run and stepped, and its stack, scopes
+/// and values asked for. The request and the answer are JSON, as that
+/// module says: `{ "do": "launch", "program": "<path>" }`, `{ "do": "run",
+/// "budget": 20000 }`, and so on, each answered `{ "error": "<why>" }` where
+/// it cannot be. The session lasts from one call to the next, until another
+/// launch or `{ "do": "end" }`. The answer lasts as `meadow_repl_run`'s does.
+///
+/// # Safety
+///
+/// `request` is null or a NUL-terminated string that lasts the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meadow_debug(request: *const c_char) -> *const c_char {
+    // SAFETY: as the caller promises.
+    let answer = match unsafe { request_of(request) } {
+        Err(why) => serde_json::json!({ "error": why }),
+        Ok(r) => meadow::dap::hosted::request(&r),
+    };
+    let _ = std::io::stdout().flush();
     kept(answer.to_string())
 }
 

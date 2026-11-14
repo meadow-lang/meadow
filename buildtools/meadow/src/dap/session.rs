@@ -56,7 +56,7 @@ pub struct SourceFile {
 }
 
 impl SourceFile {
-    fn new(path: Option<PathBuf>, name: String, content: InternedString) -> SourceFile {
+    pub fn new(path: Option<PathBuf>, name: String, content: InternedString) -> SourceFile {
         let mut line_starts = vec![0];
         for (i, b) in content.bytes().enumerate() {
             if b == b'\n' {
@@ -91,9 +91,9 @@ impl SourceFile {
 
 /// A name a person wrote, as a register or a capture holds it.
 #[derive(Debug, Clone)]
-struct VarInfo {
-    name: String,
-    ty: String,
+pub struct VarInfo {
+    pub name: String,
+    pub ty: String,
 }
 
 /// Why the program is not running.
@@ -176,6 +176,11 @@ pub struct Session {
     vm: Vm<'static>,
     pub files: HashMap<u32, SourceFile>,
     vars: HashMap<u32, VarInfo>,
+    /// What the source calls each definition, by the name the image has
+    /// for it, where the two differ: a program of Cut names its
+    /// definitions by symbols (`meadow:App/d12f`), which a stack shows by
+    /// what their source called them.
+    titles: HashMap<InternedString, String>,
     /// `boundary[pc]`: the first instruction of a source position.
     boundary: Vec<bool>,
     /// `breakpoint[pc]`: stop before running it.
@@ -296,22 +301,86 @@ impl Session {
         Session::new(image, &linked.packages)
     }
 
+    /// A program of Cut (`docs/CUT.md`) built for debugging, read from the
+    /// file at `path` and stood at its entry point, not yet run: what a
+    /// front end that hands the back end Cut -- MeadowBoot -- debugs on Glade.
+    ///
+    /// Where it stops and what it shows is what the program says: its
+    /// positions (`@S:a-b s`) are where a step may stop, the files they are
+    /// in its `source`s, and its binders' and definitions' shown names
+    /// (`@"count" "Int"`) what the stack and the locals are called. It is
+    /// lowered as a debug build is (`meadow_cut::lower::debuggable`): with
+    /// nothing inlined, and all of that kept.
+    pub fn launch_cut(path: &Path) -> Result<Session, LaunchError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot open {}: {e}", path_display(path)))?;
+        let program =
+            meadow_cut::parse(&text).map_err(|e| format!("{}:{e}", path_display(path)))?;
+        if program.entry.is_none() {
+            return Err(format!("{} has no entry to run", path_display(path)));
+        }
+        let lowered = meadow_cut::lower::debuggable(&program)
+            .map_err(|e| format!("the back end cannot compile this program: {e}"))?;
+        let image = meadow_codegen::compile_with_debug_info(&lowered.program).map_err(|e| e.msg)?;
+        // A file read now is the file the positions were taken in, as far
+        // as anything here can tell: one changed since shows the wrong lines,
+        // as it would to `meadow dap`.
+        let files = program
+            .sources
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let path = PathBuf::from(&s.path);
+                let content = std::fs::read_to_string(&path).unwrap_or_default();
+                let path = path.is_file().then_some(path);
+                (
+                    i as u32,
+                    SourceFile::new(path, s.path.clone(), InternedString::from(content.as_str())),
+                )
+            })
+            .collect();
+        let vars = lowered
+            .map
+            .shown
+            .iter()
+            .map(|(n, s)| {
+                (
+                    n.0,
+                    VarInfo {
+                        name: s.name.clone(),
+                        ty: s.ty.clone(),
+                    },
+                )
+            })
+            .collect();
+        let titles = lowered
+            .program
+            .defs
+            .iter()
+            .filter_map(|d| Some((d.name, lowered.map.titles.get(&d.label)?.clone())))
+            .collect();
+        Session::from_parts(image, files, vars, titles)
+    }
+
+    /// Stand at the first boundary, as a launch for a debugger that stops
+    /// there or runs on wants: a breakpoint there still counts when it runs
+    /// on, since it has not been stopped at yet. What it came to, if it
+    /// finished or failed before any boundary.
+    pub fn stand_at_entry(&mut self) -> Option<Stop> {
+        let stop = self.stop_at_entry();
+        self.has_stopped = false;
+        match stop {
+            Some(Stop::Entry) | None => None,
+            other => other,
+        }
+    }
+
     /// A session over an image that was compiled with debug information, with
     /// `packages` saying where its sources are and what its names are.
     pub fn new(
         image: Program,
         packages: &[meadow_compiler::CompiledPackage],
     ) -> Result<Session, LaunchError> {
-        // One program per session, and a session per process in practice: the
-        // machine borrows its image for as long as it runs, and leaking one
-        // image per launch is simpler than a self-referential struct.
-        let image: &'static Program = Box::leak(Box::new(image));
-        let debug: &'static DebugInfo = image
-            .debug
-            .as_deref()
-            .ok_or("the program was compiled without debug information")?;
-        let entry = image.entry.ok_or("the program has no entry point")?;
-
         let std_root = crate::stdlib::extract_sources();
         let mut files = HashMap::new();
         let mut vars = HashMap::new();
@@ -333,6 +402,27 @@ impl Session {
                 collect_names(&m.hir, &m.source.content, &pkg.types, &mut vars);
             }
         }
+        Session::from_parts(image, files, vars, HashMap::new())
+    }
+
+    /// A session over an image compiled with debug information, given its
+    /// source files by their ids, what each name is called and its type, and
+    /// what each definition is called where the image does not say.
+    pub fn from_parts(
+        image: Program,
+        files: HashMap<u32, SourceFile>,
+        mut vars: HashMap<u32, VarInfo>,
+        titles: HashMap<InternedString, String>,
+    ) -> Result<Session, LaunchError> {
+        // One program per session, and a session per process in practice: the
+        // machine borrows its image for as long as it runs, and leaking one
+        // image per launch is simpler than a self-referential struct.
+        let image: &'static Program = Box::leak(Box::new(image));
+        let debug: &'static DebugInfo = image
+            .debug
+            .as_deref()
+            .ok_or("the program was compiled without debug information")?;
+        let entry = image.entry.ok_or("the program has no entry point")?;
         // A specialized copy's variables go by the names of the originals.
         for (copy, original) in &debug.origins {
             if let Some(info) = vars.get(original).cloned() {
@@ -374,6 +464,7 @@ impl Session {
             vm,
             files,
             vars,
+            titles,
             boundary,
             breakpoint: vec![false; n],
             output,
@@ -701,7 +792,7 @@ impl Session {
             name: self
                 .debug
                 .region(pc)
-                .map_or("?".to_string(), |r| display_name(&r.name)),
+                .map_or("?".to_string(), |r| self.display_name(r.name)),
             loc: self.debug.loc(pc).or_else(|| self.nearest_loc(pc)),
             vars: env
                 .iter()
@@ -719,7 +810,7 @@ impl Session {
                 .filter_map(|i| region.params.get(i).map(|p| (*p, heap.field(a, i))))
                 .collect();
             out.push(Frame {
-                name: display_name(&region.name),
+                name: self.display_name(region.name),
                 // Where it is waiting: the call that made the continuation.
                 loc: region.origin.or_else(|| self.nearest_loc(region.entry)),
                 vars,
@@ -727,6 +818,14 @@ impl Session {
             k = self.parent_return(k.expect("walked above"));
         }
         out
+    }
+
+    /// What a frame of the definition the image calls `name` is shown as.
+    fn display_name(&self, name: InternedString) -> String {
+        match self.titles.get(&name) {
+            Some(title) => title.clone(),
+            None => display_name(&name),
+        }
     }
 
     /// The operations the handlers in scope answer, innermost first: the
@@ -1062,7 +1161,7 @@ impl Session {
                 let entry = self.entry_of(heap, a);
                 let name = entry
                     .and_then(|pc| self.debug.region_at(pc))
-                    .map(|r| r.name.to_string());
+                    .map(|r| self.display_name(r.name));
                 match name {
                     Some(name) => out.push_str(&format!("<function in {name}>")),
                     None => out.push_str("<function>"),

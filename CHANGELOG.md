@@ -143,6 +143,18 @@ last release is under _Unreleased_.
   Rust front end: nothing a test or a listing needs comes from it now. Tests
   in `buildtools/meadow/tests/bootstrap.rs` hold `meadowboot test` to what
   `meadow test` says, flag for flag and on the standard library.
+- Cut carries positions and names, for a debugger: `source S = "path"`
+  declares a file, `@S:a-b s` is a statement written at bytes `a` to `b` of
+  it, and `x: i64 @"count" "Int"`, `def S @"fact"` say what the source calls
+  a binder, with its type, and a definition. Every pass keeps them, the
+  lowering makes them AxCut's marks, and Glade's code generator writes the
+  same debug information from them as from the Rust core's. `meadow cut`
+  takes them off before it builds or runs a program, which then compiles to
+  the same bytecode and LLVM IR as without them. A program of Cut built for
+  debugging can be debugged on Glade: `Session::launch_cut`, and
+  `meadow-host`'s `meadow_debug`, a session another program holds open --
+  launch, breakpoints, run and step, the stack, scopes, locals and values,
+  JSON in and out. See `docs/CUT.md`, "Positions and names".
 - `MEADOWBOOT_TIMINGS=1` has MeadowBoot say how long each pass of each unit
   took -- parse, fixity, lower, rename, infer, elaborate, optimise, cut --
   for a build, a prompt entry and the language server's study of a package;

@@ -157,7 +157,7 @@ impl<'p> Checker<'p> {
             Producer::Cocase(ms) => Some(ms),
             Producer::Var(x) => sc.objects.get(x).copied(),
             // `μ q. <cocase {..} | q>`: the object itself.
-            Producer::Mu(q, s) => match &**s {
+            Producer::Mu(q, s) => match s.bare() {
                 Statement::Cut(Producer::Cocase(ms), Consumer::Var(k)) if k == q => Some(ms),
                 _ => None,
             },
@@ -264,6 +264,7 @@ impl<'p> Checker<'p> {
                 }
                 self.consumer(c, sc, at)
             }
+            Statement::At(_, s) => self.stmt(s, sc, at),
             Statement::Error(_) => Ok(()),
         }
     }

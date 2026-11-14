@@ -66,7 +66,12 @@ pub fn pages(
 /// core is the front end's own, and is its to show.
 pub fn cut_pages(text: &str, own: &[String], opt: OptLevel, only: Option<&str>) -> Vec<Page> {
     let wanted = |form: &str| only.is_none_or(|o| o == form);
-    let program = match meadow_cut::parse(text) {
+    // What is shown is what is compiled: a program written to be debugged
+    // is compiled without its positions, as `meadow cut` compiles it.
+    let program = match meadow_cut::parse(text).map(|mut p| {
+        meadow_cut::strip::program(&mut p);
+        p
+    }) {
         Ok(p) => p,
         Err(e) => {
             return vec![Page {
