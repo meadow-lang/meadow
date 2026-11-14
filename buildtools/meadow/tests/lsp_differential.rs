@@ -972,35 +972,52 @@ fn progress(line: &str) {
 /// MeadowBoot's server answers every request as `meadow lsp` answers it.
 ///
 /// Not yet, so it is ignored: run it with `--ignored` to see how far. On
-/// 2026-11-09, over `examples`, `benches` and `glade` at every name, the two
-/// agreed on 15897 of 16331 answers:
+/// 2026-11-13, over `examples`, `benches` and `glade` at every name, the two
+/// agreed on 16003 of 16331 answers:
 ///
 /// ```text
-/// completion       712 / 1013    hover           4610 / 4624
+/// completion       744 / 1013    hover           4616 / 4624
 /// definition      4620 / 4624    initialize        13 / 13
-/// diagnostics       45 / 45      ir                 0 / 47
+/// diagnostics       45 / 45      ir                 1 / 47
 /// formatting        19 / 19      lenses            19 / 19
 /// hints             18 / 19      prepareRename   4624 / 4624
 /// protocol          52 / 52      rename          1148 / 1148
-/// symbols            0 / 65      tokens            17 / 19
+/// symbols           65 / 65      tokens            19 / 19
 /// ```
 ///
 /// and over `lib` and `bootstrap` at every tenth name, completing at every
-/// fifth place (`MEADOW_LSP_EVERY=10 MEADOW_LSP_COMPLETE=5`), on 53792 of
-/// 56548: definition 15423 / 15995, hover 14740 / 15995, prepareRename
-/// 15897 / 15995, rename 6713 / 6878, tokens 81 / 133, hints 105 / 133,
-/// lenses 132 / 133, formatting 133 / 133, completion 371 / 676, diagnostics
-/// 124 / 151. Most of the difference there is inside macro calls -- `lang!`,
-/// `database!` -- whose expansions the two compilers type and place
-/// differently.
+/// fifth place (`MEADOW_LSP_EVERY=10 MEADOW_LSP_COMPLETE=5`), on 56173 of
+/// 58724: definition 16120 / 16625, hover 15380 / 16625, prepareRename
+/// 16525 / 16625, rename 6972 / 7133, tokens 116 / 134, hints 106 / 134,
+/// lenses 133 / 134, formatting 134 / 134, completion 403 / 699,
+/// diagnostics 125 / 152, ir 74 / 239, symbols 40 / 45, initialize 9 / 9,
+/// protocol 36 / 36. Most of the difference there is inside macro calls.
 ///
-/// What is left is of two kinds. MeadowBoot does not answer workspace
-/// symbols (`meadow_find`'s search) or `meadow/ir` yet, and its completion
-/// lacks what an `impl` and a default method export (`#impl.Trait`). And the
-/// two compilers differ in a few answers: a `runSt`'s type at a use, what a
-/// derive mentions, and, of a rename, which names a field is read through
-/// (MeadowBoot tells a field from its syntax, the Rust server by its
-/// namespace).
+/// Every request is answered; what is left differs for one of these
+/// reasons, each where the two compilers, or the two servers, part:
+///
+/// - `meadow/ir`: MeadowBoot answers core only, and its core carries no
+///   effects -- nothing after its `Elab` needs them -- where the Rust core
+///   quantifies each definition over its effect variables and applies it to
+///   them (`forall a. Int -> Int ! a`, `(f @a)`). A definition with no
+///   effect in its type is written the same. Cut and AxCut are not answered.
+/// - Completion: most of the rest is the Rust server offering what no
+///   program can write, the compiler's own names for an `impl`'s dictionary
+///   and a trait's default method (`#impl.Debug`, `#default.PartialEq.!=`).
+///   MeadowBoot offers neither. After `Type.` in a pattern it offers the
+///   type's constructors, where the Rust server offers nothing.
+/// - A module of the standard library open in the editor is analysed by
+///   the Rust server as a package of its own, named for the module, so what
+///   is in scope there, and what completion offers, is that module's.
+///   MeadowBoot reads it as part of `Std`. Workspace symbols are listed as
+///   the Rust server lists them there (`Collections.Vector.Collections.Vector`).
+/// - Inside macro calls -- `lang!`, `database!`, `syntax!` -- the two
+///   compilers type and place what an expansion wrote differently.
+/// - And a few answers of the compilers' own: a `runSt`'s type at a use;
+///   a record built by its type's name, `Point { x = … }`, whose labels
+///   MeadowBoot reads as the type's fields and the Rust server as a
+///   record's; a local function's number type the Rust server defaults to
+///   `Int` in an inlay hint.
 #[test]
 #[ignore = "MeadowBoot's server does not agree with meadow lsp yet: see the doc comment"]
 fn meadowboot_s_language_server_answers_as_meadow_lsp_answers() {

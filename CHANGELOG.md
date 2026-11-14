@@ -26,6 +26,24 @@ last release is under _Unreleased_.
 
 ### Changed
 
+- MeadowBoot's `build` and `run` act on the flags they used to accept and
+  ignore. `--types` and `--annotations` write what MeadowBoot's inference
+  found, as `meadow` writes it; `run --cek` runs the program on MeadowBoot's
+  CEK machine; `--no-prune` links every definition; `build --emit image`,
+  `bytecode`, `asm` and `exe` write what the back end makes of MeadowBoot's
+  program where `meadow` writes each; and `--backend vm`, `--gc`,
+  `--gc-stats`, `--profile-to`, `--sample-every`, `--sample-hz`, `--train`,
+  `--nursery` and `--leaks` reach the back end, as does `-O` for the JIT.
+  `--backend`, `--jit`, `--aot` and `--runtime` decide `@cfg(backend = …)`
+  as in `meadow`. What MeadowBoot does not act on yet -- `--emit expanded`,
+  a package's features, a workspace's members -- it says it does not.
+  `meadow cut`, which it hands a program to, takes `--backend`, `--gc`,
+  `--gc-stats`, `--profile-to`, `--sample-every`, `--sample-hz`, `--train`
+  and `--calls` for it, `--emit bytecode`, `asm` and `image`, and `-o` to
+  write what it emits to a file; and it runs the JIT at the `-O` it is
+  given, where it ran it at `-O2` whatever it was given.
+  `buildtools/meadow/tests/flags_differential.rs` sets each flag on both
+  compilers against each other.
 - MeadowBoot's prompt runs each entry where `meadow repl` runs one: on
   Glade, with the JIT, in its own process through `meadow-host`, where it
   used to run them on MeadowBoot's CEK machine. `fib 30` takes under a
@@ -37,7 +55,10 @@ last release is under _Unreleased_.
   also what runs it where the library cannot be loaded. `meadow-host` has
   two functions for it, `meadow_repl_run` and `meadow_repl_pages`. `:ir`
   shows an entry or a definition in each IR, as `meadow repl`'s does: its
-  core, written as the Rust compiler writes core, then its Cut, AxCut,
+  core, written as the Rust compiler writes core -- by `Core.prettyDefs`, as
+  the language server's `meadow/ir` writes it, where the prompt had a printer
+  of its own that wrote sized integers and undecided literals otherwise --
+  then its Cut, AxCut,
   Glade's bytecode and machine code, and LLVM IR. A package in a symbol of
   Cut may have a `:` in its name, as a prompt's entries do: `meadow:repl:3/d0`.
   The two prompts agree on 257 of the differential test's 265 entries, where
@@ -162,6 +183,17 @@ last release is under _Unreleased_.
   session and says by kind of request how far they agree; it is ignored until
   they do. Workspace symbols and `meadow/ir` are not answered yet, and
   `lsp --check` is still `meadow`'s.
+- MeadowBoot's language server answers workspace symbols, `meadow/ir` and
+  `lsp --check`. Workspace symbols are `meadow_find`'s search, ported
+  (`bootstrap/src/Find.mw`): by name, scored as the Rust server's `nucleo`
+  matcher scores it, or by type, priced as `meadow_find` prices a match, over
+  what each open package declares and what it depends on exports.
+  `meadow/ir` answers a definition as core, written as `meadow_core` writes
+  it (`Core.prettyDefs`, from `Compiler.studyCore`); Cut and AxCut are not
+  answered yet. `lsp --check PATH…` opens each `.mw` file under the paths in
+  the server and prints every error it would mark, with the Rust command's
+  output and exit status: it finds no errors in the sources CI and a release
+  check.
 - MeadowBoot has a debug adapter of its own: `dap` in MeadowBoot
   (`bootstrap/src/Dap.mw`), declared with Lingua's `dap!`, launches a
   program, stops at breakpoints and on entry, continues and steps in, over

@@ -1340,7 +1340,14 @@ pub fn runtimes(target: Target) -> Result<Vec<PathBuf>, String> {
             candidates.push(built.join(profile).join(lib));
         }
     }
-    let found: Vec<PathBuf> = candidates.into_iter().filter(|p| p.is_file()).collect();
+    // Without the `\\?\` a path to this build can come with -- the library
+    // `meadow-host` is, loaded by such a path -- which the MSVC linker does
+    // not read: it takes `\\?\D:\…\meadow_glade.lib` for `\\meadow_glade.lib`.
+    let found: Vec<PathBuf> = candidates
+        .into_iter()
+        .filter(|p| p.is_file())
+        .map(|p| PathBuf::from(crate::dap::session::plain_path(&p.to_string_lossy())))
+        .collect();
     if !found.is_empty() {
         return Ok(found);
     }

@@ -328,8 +328,13 @@ enum Cmd {
         runtime: String,
         /// On Glade, compile the bytecode to machine code ahead of time and
         /// run that executable, rather than interpreting it.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "backend")]
         aot: bool,
+        /// How Glade runs the program: `vm` (the bytecode interpreter alone),
+        /// `jit` (the default: what runs often is compiled as it goes) or
+        /// `aot` (`--aot`).
+        #[arg(long, value_name = "BACKEND", value_parser = backend)]
+        backend: Option<Backend>,
         /// How hard an executable is optimised: 0, 1 or 2.
         #[arg(
             short = 'O',
@@ -350,10 +355,40 @@ enum Cmd {
         /// Print what the program is made into, and run nothing: `inlined`,
         /// the Cut it is lowered from once its small definitions are inlined;
         /// `axcut`, the AxCut it is lowered to; `llvm`, the LLVM IR a Silo
-        /// build compiles; `bytecode`, what Glade runs; or `asm`, the machine
-        /// code Glade compiles it to ahead of time.
+        /// build compiles; `bytecode`, Glade's image as text; `asm`, the
+        /// machine code an `aot` build compiles that image to; or `image`,
+        /// the image itself, which `--output` must name a file for.
         #[arg(long, value_name = "WHAT")]
         emit: Option<String>,
+        /// Write what `--emit` makes to this file, rather than printing it.
+        #[arg(short = 'o', long = "output", value_name = "FILE", requires = "emit")]
+        output: Option<PathBuf>,
+        /// After running on Glade, report what the garbage collector did.
+        #[arg(long)]
+        gc_stats: bool,
+        /// Which collector Glade uses: `generational` or `copying`.
+        #[arg(long, value_parser = ["generational", "copying"])]
+        gc: Option<String>,
+        /// Sample where the program spends itself on Glade, and write folded
+        /// stacks to this file.
+        #[arg(long, value_name = "FILE")]
+        profile_to: Option<PathBuf>,
+        /// Block entries between samples, with `--profile-to`: a profile of
+        /// work rather than of time.
+        #[arg(long, value_name = "N")]
+        sample_every: Option<u64>,
+        /// Samples a second, for the profile of time.
+        #[arg(long, value_name = "HZ", default_value_t = meadow_glade::profile::HZ)]
+        sample_hz: u64,
+        /// Run on the JIT and write what each call site was seen to enter to
+        /// the file `--calls` names.
+        #[arg(long, requires = "calls")]
+        train: bool,
+        /// What a training run saw each call site enter: `--train` writes it,
+        /// and an `aot` build on Glade is guided by it where it is there and
+        /// of the same image.
+        #[arg(long, value_name = "FILE")]
+        calls: Option<PathBuf>,
         /// What the program is given, after `--`: what its `argv` answers.
         #[arg(last = true, value_name = "ARGS")]
         args: Vec<String>,
@@ -1167,10 +1202,19 @@ fn command(cli: Cli) {
             file,
             runtime,
             aot: ahead,
+            backend,
             opt,
             no_run,
             target,
             emit,
+            output,
+            gc_stats,
+            gc,
+            profile_to,
+            sample_every,
+            sample_hz,
+            train,
+            calls,
             args,
         }) => {
             let target = match target.as_deref().map(aot::Target::named).transpose() {
@@ -1187,27 +1231,69 @@ fn command(cli: Cli) {
                 1 => meadow_compiler::OptLevel::O1,
                 _ => meadow_compiler::OptLevel::O2,
             };
-            let ran = match aot::Runtime::named(&runtime) {
-                _ if emit.is_some() => {
-                    crate::cut::emitted(&file, emit.as_deref().unwrap_or_default(), opt).map(
-                        |text| {
-                            print!("{text}");
-                            0
+            let ahead = ahead || backend == Some(Backend::Aot);
+            if let Some(gc) = gc {
+                meadow_glade::heap::configure(meadow_glade::heap::GcConfig {
+                    collector: match gc.as_str() {
+                        "copying" => meadow_glade::heap::Collector::Copying,
+                        _ => meadow_glade::heap::Collector::Generational,
+                    },
+                    ..meadow_glade::heap::GcConfig::from_env()
+                });
+            }
+            // How a run on Glade's bytecode goes: on the JIT unless the
+            // interpreter alone was asked for, as `meadow run` runs.
+            let how = crate::cut::GladeRun {
+                engine: match backend {
+                    Some(Backend::Vm) => Engine::Vm,
+                    _ => Engine::Jit,
+                },
+                opt,
+                gc_stats,
+                sampling: profile_to.map(|to| {
+                    (
+                        to,
+                        meadow_glade::sched::Sampling {
+                            every: sample_every,
+                            hz: sample_hz,
+                            depth: meadow_glade::profile::DEPTH,
                         },
                     )
+                }),
+                train: if train { calls.clone() } else { None },
+            };
+            let ran = match aot::Runtime::named(&runtime) {
+                // The image itself, which is not text to print.
+                _ if emit.as_deref() == Some("image") => match &output {
+                    Some(to) => crate::cut::image_bytes(&file)
+                        .and_then(|bytes| artifacts::write_bytes(to, &bytes))
+                        .map(|()| 0),
+                    None => {
+                        Err("`--emit image` is written to the file `--output` names".to_string())
+                    }
+                },
+                _ if emit.is_some() => {
+                    crate::cut::emitted_for(&file, emit.as_deref().unwrap_or_default(), opt, target)
+                        .and_then(|text| match &output {
+                            Some(to) => artifacts::write_text(to, &text).map(|()| 0),
+                            None => {
+                                print!("{text}");
+                                Ok(0)
+                            }
+                        })
                 }
                 // A library of what it exports to C is built ahead of time,
                 // whatever else was asked, and there is nothing to run.
                 Some(aot::Runtime::Glade)
                     if crate::cut::is_library(&file) && !target.is_some_and(|t| !t.is_host()) =>
                 {
-                    crate::cut::build_for_glade(&file, opt).map(|lib| {
+                    crate::cut::build_for_glade(&file, opt, calls.as_deref()).map(|lib| {
                         crate::status::status("Built", lib.display().to_string());
                         0
                     })
                 }
                 Some(aot::Runtime::Glade) if no_run && ahead => {
-                    crate::cut::build_for_glade(&file, opt).map(|_| 0)
+                    crate::cut::build_for_glade(&file, opt, calls.as_deref()).map(|_| 0)
                 }
                 Some(aot::Runtime::Glade) if no_run => {
                     crate::cut::kept_for_glade(&file).map(|()| 0)
@@ -1222,19 +1308,21 @@ fn command(cli: Cli) {
                     "Glade builds for this system only: build for another with `--runtime silo`"
                         .to_string(),
                 ),
-                Some(aot::Runtime::Glade) if ahead => crate::cut::build_for_glade(&file, opt)
-                    .and_then(|exe| {
+                // Training is the JIT watching, whatever the backend.
+                Some(aot::Runtime::Glade) if ahead && !train => {
+                    crate::cut::build_for_glade(&file, opt, calls.as_deref()).and_then(|exe| {
                         std::process::Command::new(&exe)
                             .args(&args)
                             .status()
                             .map(|s| crate::status::exit_code(&exe, s))
                             .map_err(|e| format!("{}: {e}", exe.display()))
-                    }),
+                    })
+                }
                 Some(aot::Runtime::Glade) => {
                     // The process is `meadow`, not the program: what the
                     // program was given is what followed `--`.
                     meadow_compiler::core::args::set(args);
-                    crate::cut::run_on_glade(&file).map(|()| 0)
+                    crate::cut::run_on_glade(&file, &how).map(|()| 0)
                 }
                 Some(aot::Runtime::Silo) => {
                     crate::cut::build_for_silo(&file, opt, target).and_then(|exe| {

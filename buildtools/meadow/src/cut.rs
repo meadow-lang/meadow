@@ -29,17 +29,36 @@ pub fn lowered(path: &Path) -> Result<meadow_seq::Program, String> {
 /// Cut it is lowered from once its small definitions are inlined
 /// (`meadow_cut::inline`) and its calls under a constructor made tail calls
 /// (`meadow_cut::trmc`); `axcut`, each definition it is lowered to, under
-/// a line naming it; `llvm`, the LLVM IR a Silo build of it for this
-/// machine compiles -- each unit, after the first, under a line naming it;
-/// `bytecode`, the bytecode Glade runs; or `asm`, the machine code Glade's
-/// code compiled ahead of time is, at `opt`. The last two are what `meadow
-/// dis` prints, for a front end that compiles to Cut to print them. A view of
-/// the back end's, for a front end's tools to show: its form is not a
-/// contract (`docs/CUT.md`).
-pub fn emitted(path: &Path, what: &str, opt: meadow_compiler::OptLevel) -> Result<String, String> {
+/// a line naming it; or `llvm`, the LLVM IR a Silo build of it for this
+/// machine compiles -- each unit, after the first, under a line naming it. A
+/// view of the back end's, for a front end's tools to show: its form is not
+/// a contract (`docs/CUT.md`).
+pub fn emitted(path: &Path, what: &str) -> Result<String, String> {
+    emitted_for(path, what, meadow_compiler::OptLevel::O2, None)
+}
+
+/// [`emitted`], and what a build's `--emit` names besides: `bytecode`, the
+/// image Glade runs as text -- as `meadow build --emit bytecode` writes it --
+/// and `asm`, the machine code an `aot` build compiles it to at `opt`, for
+/// `target` or this machine. These two are also what `meadow dis` prints, for
+/// a front end that compiles to Cut to print them.
+pub fn emitted_for(
+    path: &Path,
+    what: &str,
+    opt: meadow_compiler::OptLevel,
+    target: Option<aot::Target>,
+) -> Result<String, String> {
     use std::fmt::Write;
     let mut out = String::new();
     match what {
+        "bytecode" => out = crate::listing::bytecode(&image(path)?),
+        "asm" => {
+            let arch = match target {
+                Some(t) => t.arch,
+                None => aot::Target::host()?.arch,
+            };
+            out = crate::listing::asm(&image(path)?, arch, opt);
+        }
         "inlined" => {
             let text =
                 std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -66,19 +85,20 @@ pub fn emitted(path: &Path, what: &str, opt: meadow_compiler::OptLevel) -> Resul
                 out.push_str(&u.text);
             }
         }
-        "bytecode" => out = crate::listing::bytecode(&image(path)?),
-        "asm" => {
-            let arch = aot::Target::host()?.arch;
-            out = crate::listing::asm(&image(path)?, arch, opt);
-        }
         other => {
             return Err(format!(
                 "`{other}` is not what `meadow cut --emit` prints: `inlined`, `axcut`, `llvm`, \
-                 `bytecode` or `asm`"
+                 `bytecode`, `asm` or `image`"
             ));
         }
     }
     Ok(out)
+}
+
+/// The program's bytecode image, encoded: what `--emit image` writes, and
+/// what `meadow exec` and `meadow link` take.
+pub fn image_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    Ok(meadow_bytecode::image::encode(&image(path)?))
 }
 
 /// The program's bytecode image, kept beside the file, under `target`, for
@@ -162,28 +182,90 @@ pub fn kept_for_glade(path: &Path) -> Result<(), String> {
     image(path).map(|_| ())
 }
 
+/// How a program is run on Glade, past what it is: as `meadow run` is told
+/// with its flags.
+pub struct GladeRun {
+    /// The interpreter alone, or with the JIT compiling what runs often.
+    pub engine: crate::runtime::Engine,
+    /// How hard the JIT optimises.
+    pub opt: meadow_compiler::OptLevel,
+    /// Report what the collector did, after: `--gc-stats`.
+    pub gc_stats: bool,
+    /// Sample the run and write folded stacks here: `--profile-to`.
+    pub sampling: Option<(PathBuf, meadow_glade::sched::Sampling)>,
+    /// Write what the JIT saw each call site enter here: `--train`.
+    pub train: Option<PathBuf>,
+}
+
 /// Run it on Glade: compiled to bytecode, which is interpreted, and what
-/// runs often compiled to machine code as it goes -- as `meadow run` does.
-/// Where there is no JIT for the machine, it is interpreted throughout.
-pub fn run_on_glade(path: &Path) -> Result<(), String> {
+/// runs often compiled to machine code as it goes -- as `meadow run` does --
+/// or, on [`Engine::Vm`](crate::runtime::Engine::Vm), interpreted
+/// throughout, as it is where there is no JIT for the machine. What `how`
+/// asks for besides is said as `meadow run` says it.
+pub fn run_on_glade(path: &Path, how: &GladeRun) -> Result<(), String> {
+    use crate::runtime::Engine;
+    if let Some((to, sampling)) = &how.sampling {
+        // Frames are named by the debug info, which the kept image has none
+        // of: one is compiled with it, the same instructions beside it.
+        let image = meadow_codegen::compile_with_debug_info(&lowered(path)?).map_err(|e| e.msg)?;
+        let jit = native(&image, how.engine, how.opt);
+        let (result, profile, _) =
+            crate::runtime::run_image_sampled(&image, jit.as_ref(), *sampling);
+        match profile {
+            None => eprintln!("profile: nothing was sampled"),
+            Some(p) => {
+                eprintln!("{}", crate::samples::summary(&p));
+                let folded = crate::samples::folded(&p, &image);
+                match std::fs::write(to, folded) {
+                    Ok(()) => crate::status::status("Profile", to.display().to_string()),
+                    Err(e) => eprintln!("profile: {}: {e}", to.display()),
+                }
+            }
+        }
+        return result.map(|_| ());
+    }
     let image = image(path)?;
-    let entry = image.entry.ok_or("the program has no entry")?;
-    let jit = meadow_glade::jit::Native::jit(
-        &image,
-        meadow_glade::jit::Native::threshold_from_env(),
-        meadow_compiler::OptLevel::O2,
-    )
-    .ok();
-    meadow_glade::sched::run_native(
-        &image,
-        jit.as_ref(),
-        entry,
-        u64::MAX,
-        meadow_glade::sched::workers(),
-    )
-    .result
-    .map(|_| ())
-    .map_err(|e| e.msg)
+    // Training is the JIT watching, whatever else was asked.
+    let engine = if how.train.is_some() {
+        Engine::Jit
+    } else {
+        how.engine
+    };
+    let jit = native(&image, engine, how.opt);
+    let (result, stats) = crate::runtime::run_image_with_stats(&image, jit.as_ref());
+    if let Some(to) = &how.train {
+        let Some(jit) = &jit else {
+            return Err("training needs the JIT, and there is none here".to_string());
+        };
+        let calls = jit.calls();
+        match crate::pgo::write(to, &image, &calls) {
+            Ok(()) => crate::status::status(
+                "Trained",
+                format!(
+                    "{} call sites, in {}",
+                    calls.len(),
+                    crate::dap::session::plain_path(&to.display().to_string())
+                ),
+            ),
+            Err(e) => eprintln!("error: {e}"),
+        }
+    }
+    if how.gc_stats
+        && let Some(stats) = stats
+    {
+        eprintln!("{stats}");
+    }
+    result.map(|_| ())
+}
+
+/// The JIT for `image` on `engine`, at `opt` -- none on the interpreter,
+/// and none where this machine has no JIT, where it is interpreted.
+fn native(
+    image: &meadow_bytecode::Program,
+    engine: crate::runtime::Engine,
+    opt: meadow_compiler::OptLevel,
+) -> Option<meadow_glade::jit::Native<'_>> {
+    crate::runtime::native(image, engine, opt).ok().flatten()
 }
 
 /// An entry of a prompt run as `meadow repl` runs one of its own: `text`, a
@@ -273,8 +355,14 @@ pub fn is_library(path: &Path) -> bool {
 /// Build it for Glade ahead of time -- its bytecode compiled to machine
 /// code, linked with the `meadow_glade` runtime -- beside the file, under
 /// `target`, and answer where the executable is: or, for a program that
-/// exports functions to C, the library of them.
-pub fn build_for_glade(path: &Path, opt: meadow_compiler::OptLevel) -> Result<PathBuf, String> {
+/// exports functions to C, the library of them. Its calls are guided by
+/// what a training run saw, where `calls` names a profile of this image
+/// (`crate::pgo`).
+pub fn build_for_glade(
+    path: &Path,
+    opt: meadow_compiler::OptLevel,
+    calls: Option<&Path>,
+) -> Result<PathBuf, String> {
     let root = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -285,6 +373,27 @@ pub fn build_for_glade(path: &Path, opt: meadow_compiler::OptLevel) -> Result<Pa
         .ok_or("a file with a name")?;
     let program = lowered(path)?;
     let image = meadow_codegen::compile(&program).map_err(|e| e.msg)?;
+    let shown = |at: &Path| crate::dap::session::plain_path(&at.display().to_string());
+    let calls = match calls {
+        None => Default::default(),
+        Some(at) => match crate::pgo::read(at, &image)? {
+            crate::pgo::Found::Calls(calls) => {
+                crate::status::status("Guided", format!("by {}", shown(at)));
+                calls
+            }
+            crate::pgo::Found::Stale => {
+                crate::status::note(
+                    "Unguided",
+                    format!(
+                        "{} is of an older build; `meadow run --train` makes a new one",
+                        shown(at)
+                    ),
+                );
+                Default::default()
+            }
+            crate::pgo::Found::None => Default::default(),
+        },
+    };
     if !program.exports.is_empty() {
         return aot::build_library(
             root,
@@ -294,7 +403,7 @@ pub fn build_for_glade(path: &Path, opt: meadow_compiler::OptLevel) -> Result<Pa
             &image,
             &aot::glade_exports(&program.exports)?,
             aot::Target::host()?,
-            &Default::default(),
+            &calls,
         );
     }
     aot::build(
@@ -304,7 +413,7 @@ pub fn build_for_glade(path: &Path, opt: meadow_compiler::OptLevel) -> Result<Pa
         name,
         &image,
         aot::Target::host()?,
-        &Default::default(),
+        &calls,
     )
 }
 

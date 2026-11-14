@@ -187,20 +187,42 @@ A document in no package is studied as a package of its own, as the Rust
 server analyses one alone. Formatting is `meadow fmt`'s until MeadowBoot's
 formatter is ready.
 
+Workspace symbols -- the editor's own picker over every declaration, by name
+or by type -- are `meadow_find`'s search, ported as `src/Find.mw`. What is
+searched is read off each open package's study and what each unit it imports
+exports: every type, trait and effect and its constructors, every value a
+dependency exports and every top-level value of the package itself, each a
+value listed as its signature. A name is matched as the Rust server's
+`nucleo` matcher scores it, step for step, so that the same query finds the
+same declarations in the same order; a type, as Hoogle does, by unifying it
+with each signature and pricing what that took.
+
+`meadow/ir` answers a definition as core: the package's core as `Elab` makes
+it (`Compiler.studyCore`), written as `meadow_core` writes its own
+(`Core.prettyDefs`), every binder and type variable renumbered in the order
+it is first written. The two cores are the same program but for effects:
+MeadowBoot's core carries no effect types, since nothing after `Elab` needs
+them, where the Rust core quantifies each definition over its effect
+variables and applies it to them. Cut and AxCut are not answered yet.
+
+`meadow lsp --check PATH…` is the server too, run over files rather than
+an editor: each `.mw` file under the paths opened in turn, as an editor opens
+it, and every error the server would mark printed where it is, then `no
+errors in N files` or how many there were, with the exit status saying which.
+It is what CI and a release run over every source in the repository, so a
+file the editor would mark fails the build whichever compiler is `meadow`.
+
 `buildtools/meadow/tests/lsp_differential.rs` starts both servers and sends
 them the same session: every file of a package opened, then hover, go to
 definition and prepare rename at every name, a rename of each name, semantic
 tokens, inlay hints, code lenses, formatting, completion after each `|>` and
 `.` and inside names, `meadow/ir`, workspace symbols, an edit and its undoing,
 and a close. It reports agreement by kind of request, and is ignored until
-the two agree. Where they cannot yet, the reason is one of three: MeadowBoot
-has not ported it (workspace symbols, `meadow/ir`); Lingua's `lsp!` cannot say
-it (diagnostics without `relatedInformation`, `initialize` without
-`positionEncoding` and `serverInfo`); or the two compilers' answers differ,
-which is what the test is for. A refusal, a file changed on the disk and a
-document closed, which it once could not say either, it now does: a closed
-document's text stops standing for its file (`closed`), and the package goes
-back to what is on the disk.
+the two agree; its doc comment says how far they do, and why the rest
+differs. A refusal, a file changed on the disk and a document closed, which
+Lingua's `lsp!` once could not say, it now does: a closed document's text
+stops standing for its file (`closed`), and the package goes back to what is
+on the disk.
 
 ## Running
 
@@ -305,6 +327,59 @@ runs an entry's program of Cut on Glade and hands back what it answered, and
 `RUSTC_BOOTSTRAP` does rustc. A build from a checkout, or a nightly, needs
 nothing.
 
+## What `build` and `run` are told
+
+MeadowBoot's `build` and `run` take `meadow`'s flags, and each one does
+what it does there. A flag accepted and quietly ignored would be worse than
+one refused: whoever moved from `meadow` to MeadowBoot would take the run
+for the one they asked for. So what MeadowBoot does not act on yet it says
+it does not, on standard error -- ``meadowboot: `--features` is not acted on
+yet`` -- and builds as though the flag were not there.
+
+What a flag asks about the program is the front end's, and MeadowBoot's own
+passes answer it (`src/Listing.mw`, and `drivenWith` in `src/Main.mw`):
+
+- `--types` writes the type of every value each package of the build
+  exports, but the standard library's, then the program's entry, as
+  `meadow`'s `LinkedProgram::dump` writes them: from MeadowBoot's inference,
+  each unit studied again as the language server studies it, its `@cfg`s
+  decided as the build decided them. `--annotations` adds the type of every
+  node, each package's numbered from nought, the standard library's first.
+  A node is numbered as MeadowBoot's typed tree has it -- each expression and
+  pattern -- where the Rust compiler numbers every node of its own tree, so
+  the numbers, and the count `--types` gives of them, are each compiler's
+  own.
+- `run --cek` builds with `@cfg(backend = "cek")` holding and runs `main` on
+  MeadowBoot's CEK machine, every unit's core linked into one program, as
+  the debugger runs one. With `--gc-stats` it says, as `meadow` does, that
+  the machine has no collector to report on.
+- `--no-prune` links every definition of every unit rather than what the
+  entry reaches (the build's `prune` option).
+- `--runtime`, `--backend`, `--jit` and `--aot` decide what
+  `@cfg(backend = …)` holds of, as they do in `meadow`.
+
+What a flag asks about running the program is the back end's, and it is
+handed to `meadow cut` with the program: `--backend vm`, the interpreter
+without the JIT; `--gc` and `--gc-stats`; `--profile-to`, `--sample-every`
+and `--sample-hz`; and `--train`, which writes what the JIT saw to
+`target/<profile>/calls.pgo`, which an `aot` build of that profile is then
+guided by (`meadow cut --calls`). `-j`, `--nursery` and `--leaks` the
+runtimes read from the environment, which MeadowBoot sets as `meadow` does.
+`build --emit image,bytecode,asm,exe` asks `meadow cut --emit` for each, and
+writes it where `meadow` writes it under `target/<profile>`. The image, the
+code and the executable are of MeadowBoot's program, so they are not the
+Rust compiler's byte for byte, and a profile names its frames by the
+symbols of the program's Cut.
+
+What MeadowBoot does not act on yet: `--emit expanded`, which needs each
+macro call written down as MeadowBoot expands it; a package's features
+(`--features`, `--no-default-features`, `--all-features`); and a
+workspace's members (`-p`, `--workspace`, `--exclude`).
+`buildtools/meadow/tests/flags_differential.rs` runs each flag on both
+compilers and compares what they say -- what the front end says as it is,
+and what the back end makes by its shape -- and checks that MeadowBoot says
+which it does not act on.
+
 ## The prompt
 
 `meadow` with no command is the prompt, and MeadowBoot's is its own
@@ -351,9 +426,9 @@ prints reaches the prompt. `:tour` takes the Rust prompt's tour, which
 
 `:ir` shows an entry, or the definition a name means, in each IR, a page
 each, as `meadow repl`'s does: its core as MeadowBoot made it, written as
-the Rust compiler writes core (`src/CoreShow.mw`); and then what
-`meadow_repl_pages` says the back end makes of the Cut it is linked into --
-the Cut itself, AxCut, Glade's bytecode and the machine code its JIT
+the Rust compiler writes core (`Core.prettyDefs`, which the language
+server's `meadow/ir` writes with too); and then what `meadow_repl_pages`
+says the back end makes of the Cut it is linked into -- the Cut itself, AxCut, Glade's bytecode and the machine code its JIT
 compiles, and the LLVM IR a Silo build would. They are MeadowBoot's IRs, not
 the Rust compiler's: a definition's symbol is its binder (`meadow:repl:3/d7`),
 where the Rust compiler's is its name (`meadow:repl-3/x`).

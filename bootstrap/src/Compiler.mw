@@ -409,6 +409,22 @@ fun studying db (homes : [String]) (clk : Clock) =
            imported
          }
 
+-- A studied unit's core, as `Elab` makes it before anything makes it better:
+-- every definition, dictionaries and types as arguments, with no entry.
+-- What a tool shows of a definition as core -- the language server's
+-- `meadow/ir`, as `meadow_core::Program::pretty` writes it (`Core.prettyDefs`)
+-- -- and the core the unit's Cut is lowered from.
+@pub fun studyCore (s : Study) : Maybe CoreProgram =
+  let pkg =
+    M.unwrapOr "" (M.andThen (\x -> V.get (S.split "/" (fileOf (snd x))) 0) (V.get s.sources 0))
+  in
+  let theirs =
+    V.map
+      (\(i : Interface) ->
+        Imported { package = i.package, exports = i.exports, types = i.types, linked = i.linked })
+      s.imported
+  in M.map (\x -> match x with | (p, _, _, _) -> p) (unitCore pkg s.renamed s.inferred theirs None)
+
 -- The unit at `dir` checked and lowered, its types inferred once: what it
 -- exports, each with its scheme; whether it says; what it knows about
 -- types; and, entered at its `entry` if it is to have one -- or `None`, for
@@ -1021,7 +1037,7 @@ fun linkAt
      | Ok read ->
          -- Only what the entry reaches is part of the program
          -- (`meadow_core::prune`): every definition it mentions,
-         -- and those they do.
+         -- and those they do -- unless the build keeps every one.
          (let mentions =
             V.foldl
               (\h o ->
@@ -1042,6 +1058,7 @@ fun linkAt
               exports
           in
           let kept = reach mentions (V.pushFront exported (defSymbol pkg entered)) H.empty in
+          let everything = not o.prune in
           let texts =
             V.concatMap
               (\o ->
@@ -1056,7 +1073,8 @@ fun linkAt
                           (\k ->
                             match V.get parts k with
                             | Just (symbol, _, _, _) ->
-                                if M.isSome (H.lookup symbol kept) then [V.getOr "" pieces (k + 1)]
+                                if everything or M.isSome (H.lookup symbol kept) then
+                                  [V.getOr "" pieces (k + 1)]
                                 else []
                             | None -> [])
                           (V.range 0 (V.len parts)))
@@ -1482,16 +1500,23 @@ fun modulePath (isStd : Bool) (src : String) (path : String) : [String] =
     (readKept (M.unwrapOr "" (Res.toMaybe (readToString (Path.join (unitOut u) "macros.kept")))))
     (V.map snd (unitImports u))
 
+-- The same, its `@cfg`s decided by `cfg`: as the build that compiled it
+-- decided them, rather than as the commands that show a unit do.
+@pub fun unitDatabaseFor (cfg : Cfg) (u : Given Interface) =
+  unitDatabaseWith
+    u
+    cfg
+    (readKept (M.unwrapOr "" (Res.toMaybe (readToString (Path.join (unitOut u) "macros.kept")))))
+    (V.map snd (unitImports u))
+
 -- The same as the CEK machine runs it, on this machine, `@cfg(test)` holding
 -- where `test` says and `flags` turned on: for `meadow test --cek`.
 @pub fun cekDatabase (u : Given Interface) (test : Bool) (flags : [String]) =
-  unitDatabaseWith
-    u
+  unitDatabaseFor
     (Cfg {
        os = hostOs, arch = hostArch, profile = "debug", backend = "cek", opt = "1", test, flags
      })
-    (readKept (M.unwrapOr "" (Res.toMaybe (readToString (Path.join (unitOut u) "macros.kept")))))
-    (V.map snd (unitImports u))
+    u
 
 -- The same, with `kept` for what its macros answered, and `imported` for
 -- the interfaces of the units it depends on.
@@ -1788,6 +1813,11 @@ make! {
       entry : Maybe String =
         None
           "a value at the root the program answers, in place of `result` or of running `main`"
+          for
+          link
+      prune : Bool =
+        True
+          "keep only what the entry reaches, as `meadow` does unless `--no-prune` says to keep every definition"
           for
           link
     }
