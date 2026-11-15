@@ -1,0 +1,362 @@
+-- Channel: which channel this `meadow` is, and what that lets a package ask
+-- of it -- `buildtools/meadow/src/channel.rs`, ported.
+--
+-- A **stable** `meadow` is a release whose version does not move, and accepts
+-- only what the language promises to keep. A **nightly** one is `master` on
+-- some day, and accepts features that are still unsettled, each asked for at
+-- the top of the package's root module, as `#![feature(…)]` is at the top of
+-- a crate's: `@!feature(name)`. A build from a checkout is **dev**, and takes
+-- what nightly takes. And a project can say which `meadow` it is built with,
+-- a channel or a version, in a `meadow-toolchain` file beside its manifest or
+-- above it.
+--
+-- The channel is decided where the back end is built: the release workflows
+-- build it into `meadow-host` (`buildtools/meadow/build.rs`), and nothing
+-- builds it into MeadowBoot. So it is asked of the library beside this
+-- program, built from the same commit by the same job, which `--version`
+-- says too. With none beside it, as in a checkout, this is a build from a
+-- checkout: dev, at this program's own number.
+--
+-- What is gated, and what is settled, is the Rust compiler's word for word:
+-- whichever compiler a release runs as `meadow` refuses and allows the same.
+
+use MeadowBoot.Syntax
+use MeadowBoot.Syntax.Surface.*
+use Lingua.Red as R
+use Lingua.Red (Syntax)
+use Lingua.Red.Syntax.*
+use Lingua.Green as G
+use Lingua.Green (Green)
+use Std.Fs (Fs, readToString, exists)
+use Std.Process (Process, getEnv)
+use Std.Process as Proc
+use Std.Ffi as Ffi
+use Std.Path as Path
+use Std.Collections.Vector as V
+use Std.String as S
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+use Std.Result.Result.*
+
+-- The features that are not settled: each one's name in `@!feature(…)`, and
+-- what it is. There are none just now.
+@pub def unstable : [(String, String)] = []
+
+-- The features that were unstable once and are settled now: each one's name
+-- and the release that settled it. A package that still asks for one builds
+-- on every channel, and is told that the line can go.
+@pub def stabilised : [(String, String)] = [("ffi", "0.5.0")]
+
+-- The file beside a `Meadow.toml`, or above it, that says which toolchain the
+-- project is built with: a channel, or a version.
+@pub def toolchainFile : String = "meadow-toolchain"
+
+-- What this program says it is with no back end beside it: what `Main`'s
+-- `cli!` says `--version` is.
+def ownVersion : String = "0.5.0-dev"
+
+-- --- the back end ---------------------------------------------------------------
+
+-- What the library is called, on the system this program was built for.
+@cfg(os = "windows")
+def hostNamed : String = "meadow_host.dll"
+
+@cfg(os = "macos")
+def hostNamed : String = "libmeadow_host.dylib"
+
+@cfg(os = "linux")
+def hostNamed : String = "libmeadow_host.so"
+
+@cfg(os = "android")
+def hostNamed : String = "libmeadow_host.so"
+
+-- `meadow-host`, the Rust `meadow` as a library: where `MEADOW_HOST` says, or
+-- beside this program, as a release has it. `MEADOW` naming a program asks
+-- for that program instead, and so there is none.
+@pub fun hostLibrary () : Maybe String ! { Fs, Process | e } =
+  match getEnv "MEADOW_HOST" with
+  | Just h -> Just h
+  | None ->
+      if M.isSome (getEnv "MEADOW") then None
+      else
+        (match Path.parent (Proc.currentExe ()) with
+         | Just dir ->
+             (let beside = Path.join dir hostNamed in if exists beside then Just beside else None)
+         | None -> None)
+
+-- What `meadow --version` says after the name, as the back end was built to
+-- say it -- `0.5.0`, `0.5.0-nightly (2026-11-14 70292e8)`, `0.5.0-dev` -- or
+-- this program's own, with no back end to ask.
+@pub fun version () : String ! { Fs, Process | e } =
+  match hostLibrary () with
+  | None -> ownVersion
+  | Just lib ->
+      (match Ffi.open lib with
+       | Err _ -> ownVersion
+       | Ok loaded ->
+           (match Ffi.function loaded "meadow_host_version" with
+            | Err _ -> ownVersion
+            | Ok f ->
+                (match Ffi.callString f [] with
+                 | Ok v -> v
+                 | Err _ -> ownVersion)))
+
+-- The channel a version is of: `stable`, `nightly` or `dev`.
+@pub fun channelOf (v : String) : String =
+  if S.contains "-nightly" v then "nightly"
+  else if S.contains "-" v or S.contains " " v then "dev"
+  else "stable"
+
+-- The version alone, as a manifest has it: `0.5.0`.
+@pub fun numberOf (v : String) : String =
+  let t = S.trim v in
+  let cut =
+    \sep s ->
+      match S.indexOf sep s with
+      | Just at -> stringSlice s 0 at
+      | None -> s
+  in cut " " (cut "-" t)
+
+-- --- features ---------------------------------------------------------------------
+
+-- What is wrong with a package asking for `feature` on `channel`, if
+-- anything. A feature that is settled is not wrong to ask for, on any
+-- channel: `featureSettled` says what such a package is told instead.
+@pub fun featureProblem (feature : String) (channel : String) : Maybe String =
+  problemAmong unstable feature channel
+
+-- `featureProblem`, with `among` for the features that are not settled: so
+-- that what is said of one can be tested while there is none.
+@pub fun problemAmong (among : [(String, String)]) (feature : String) (channel : String)
+    : Maybe String =
+  if M.isSome (featureSettled feature) then None
+  else if not (V.any (\x -> fst x == feature) among) then
+    (let has =
+       if V.isEmpty among then "it has no unstable features"
+       else "the ones it has are ${S.join ", " (V.map (\x -> "`${fst x}`") among)}"
+     in Just "`${feature}` is not a feature this `meadow` knows: ${has}")
+  else if channel == "stable" then
+    Just
+      "the feature `${feature}` is unstable, and this is a stable `meadow`: a nightly one accepts it (`meadowup default nightly`, then `meadowup update`)"
+  else None
+
+-- The warning for a package that asks for `feature` when it is settled: that
+-- it needs asking for no longer. `None` for any other feature.
+@pub fun featureSettled (feature : String) : Maybe String =
+  M.map
+    (\x ->
+      "the feature `${fst x}` is stable since ${snd x}, and is not asked for any more: `@!feature(${fst x})` can go")
+    (V.find (\x -> fst x == feature) stabilised)
+
+-- What a module's attributes, `@!…` before anything in it, say is wrong, and
+-- what they are warned of: the module `file` (as diagnostics name it), whose
+-- `text` was parsed as `tree`, the root module of its package if `root`.
+-- What is wrong is each `file:line:column: why`; a warning, `file: why`. The
+-- channel is asked for only where it decides something.
+@pub fun attributesSaid (file : String) (text : String) (root : Bool) (tree : Green Surface)
+    : ([String], [String]) ! { Fs, Process | e } =
+  V.foldl
+    (\acc a -> attributeSaid file text root acc a)
+    ([], [])
+    (childrenOf NodeInnerAttr (R.root tree))
+
+-- `said`, with what attribute `a` says besides.
+fun attributeSaid
+    (file : String)
+    (text : String)
+    (root : Bool)
+    (said : ([String], [String]))
+    (a : Syntax Surface)
+    : ([String], [String]) ! { Fs, Process | e } =
+  let (name, at) = firstToken (must NodeAttrName a) in
+  let (wrong, warned) = said in
+  if name != "feature" then
+    (
+      V.pushBack
+        wrong
+        "${file}:${placeIn text at}: `@!${name}` is not an attribute a module has: `@!feature(…)` is the one there is",
+      warned
+    )
+  else if not root then
+    (
+      V.pushBack
+        wrong
+        "${file}:${placeIn text at}: `@!feature(…)` is the package's to say: it goes at the top of the root module",
+      warned
+    )
+  else V.foldl (\acc m -> featureSaid file text acc m) said (metasOf a)
+
+-- `said`, with what asking for the feature `m` names says besides.
+fun featureSaid (file : String) (text : String) (said : ([String], [String])) (m : Syntax Surface)
+    : ([String], [String]) ! { Fs, Process | e } =
+  let (feature, at) = metaName m in
+  let (wrong, warned) = said in
+  let asks = V.any (\x -> fst x == feature) unstable in
+  let channel = if asks then channelOf (version ()) else "dev" in
+  match featureProblem feature channel with
+  | Just why -> (V.pushBack wrong "${file}:${placeIn text at}: ${why}", warned)
+  | None ->
+      (match featureSettled feature with
+       | Just why -> (wrong, V.pushBack warned "${file}: ${why}")
+       | None -> (wrong, warned))
+
+-- The metas of an attribute's arguments, `(a, b = "c")`.
+fun metasOf (a : Syntax Surface) : [Syntax Surface] =
+  match childOf NodeAttrArgs a with
+  | Just args -> childrenOf NodeMeta args
+  | None -> []
+
+-- What a meta is called, and where: its name, or the text it is.
+fun metaName (m : Syntax Surface) : (String, Int) =
+  match childOf NodeSeg m with
+  | Just seg -> firstToken seg
+  | None -> (match firstToken m with | (t, at) -> (unquoted t, at))
+
+fun unquoted (s : String) : String =
+  if stringByteLength s >= 2 and S.startsWith "\"" s and S.endsWith "\"" s then
+    stringSlice s 1 (stringByteLength s - 1)
+  else s
+
+fun childOf (k : Surface) (s : Syntax Surface) : Maybe (Syntax Surface) =
+  R.childWhere (\g c -> G.kindAt g c == k) s
+
+fun childrenOf (k : Surface) (s : Syntax Surface) : [Syntax Surface] =
+  R.childrenWhere (\g c -> G.kindAt g c == k) s
+
+fun must (k : Surface) (s : Syntax Surface) : Syntax Surface = M.unwrapOr s (childOf k s)
+
+-- The first token under `s`, however deep, and where it starts.
+fun firstToken (s : Syntax Surface) : (String, Int) =
+  match s with
+  | Syntax g i ->
+      (match V.find
+         (\j -> G.isTokenAt g j and G.kindAt g j != Unknown)
+         (V.range i (G.after g i)) with
+       | Just j -> (G.textAt g j, G.startAt g j)
+       | None -> ("", G.startAt g i))
+
+-- The line and column of byte `offset` of `text`, from one.
+fun placeIn (text : String) (offset : Int) : String =
+  if offset > stringByteLength text then "@${show offset}"
+  else
+    (let before = S.split "\n" (stringSlice text 0 offset) in
+     let line = V.getOr "" before (V.len before - 1) in
+     "${show (V.len before)}:${show (stringByteLength line + 1)}")
+
+-- --- the toolchain a project asks for ------------------------------------------------
+
+-- What is wrong with building here, when the project's toolchain file asks
+-- for something this `meadow` is not: `wanted` is the file's one word, and
+-- this `meadow` is `number` on `channel`.
+@pub fun toolchainProblem (wanted : String) (channel : String) (number : String) : Maybe String =
+  let w = S.trim wanted in
+  let bare = withoutVs w in
+  let named = w == "stable" or w == "nightly" in
+  -- A build from a checkout stands in for either channel: it is what the
+  -- person working on Meadow has.
+  let fits =
+    if S.isEmpty w then True else if named then channel == w or channel == "dev" else bare == number
+  in if fits then None
+     else
+       let have = if channel == "stable" then number else "${number} (${channel})" in
+       let get =
+         if named then "`meadowup default ${w}`, then `meadowup update`"
+         else "`meadowup install ${bare}`"
+       in Just
+            "this project is built with meadow ${w}, as its `${toolchainFile}` says, and this is meadow ${have}: ${get}"
+
+-- `text` without the `v`s it starts with: `v0.2.0` is `0.2.0`.
+fun withoutVs (text : String) : String =
+  if S.startsWith "v" text then withoutVs (stringSlice text 1 (stringByteLength text)) else text
+
+-- `toolchainProblem` for the project at `root`, read from its toolchain file
+-- when it has one: the nearest at or above it, as `rust-toolchain` is found,
+-- so that a workspace's covers its members. A comment line starts with `#`.
+@pub fun checkToolchain (root : String) : Maybe String ! { Fs, Process | e } =
+  let rec up dir =
+    match dir with
+    | None -> None
+    | Just d ->
+        (match readToString (Path.join d toolchainFile) with
+         | Ok text -> Just text
+         | Err _ -> up (Path.parent d))
+  in match up (Just root) with
+     | None -> None
+     | Just text ->
+         (match V.find
+            (\l -> not (S.isEmpty l) and not (S.startsWith "#" l))
+            (V.map S.trim (S.lines text)) with
+          | None -> None
+          | Just wanted ->
+              (let v = version () in toolchainProblem wanted (channelOf v) (numberOf v)))
+
+-- --- tests -------------------------------------------------------------------
+
+use Std.Test (assertEq)
+
+@test fun aFeatureNobodyKnowsIsSaidSoOnEveryChannel () =
+  V.foldl
+    (\u channel ->
+      let a =
+        assertEq
+          (featureProblem "warp" channel)
+          (Just "`warp` is not a feature this `meadow` knows: it has no unstable features")
+          channel
+      in assertEq
+           (problemAmong [("warp", "going faster")] "weft" channel)
+           (Just "`weft` is not a feature this `meadow` knows: the ones it has are `warp`")
+           channel)
+    ()
+    ["stable", "nightly", "dev"]
+
+@test fun anUnstableFeatureIsRefusedOnStableAndNowhereElse () =
+  let warp = [("warp", "going faster")] in
+  let a =
+    assertEq
+      (M.map (\s -> S.contains "meadowup default nightly" s) (problemAmong warp "warp" "stable"))
+      (Just True)
+      "stable"
+  in
+  let b = assertEq (problemAmong warp "warp" "nightly") None "nightly" in
+  assertEq (problemAmong warp "warp" "dev") None "dev"
+
+@test fun aSettledFeatureIsTakenOnEveryChannelAndSaidToBeSettled () =
+  let a =
+    V.foldl (\u c -> assertEq (featureProblem "ffi" c) None c) () ["stable", "nightly", "dev"]
+  in
+  let b =
+    assertEq
+      (M.map (\s -> S.contains "`@!feature(ffi)` can go" s) (featureSettled "ffi"))
+      (Just True)
+      "ffi"
+  in assertEq (featureSettled "warp") None "warp"
+
+@test fun aToolchainFileNamesAChannelOrAVersion () =
+  let a = assertEq (toolchainProblem "stable" "stable" "0.2.0") None "stable" in
+  let b = assertEq (toolchainProblem "nightly" "nightly" "0.3.0") None "nightly" in
+  let c = assertEq (toolchainProblem "0.2.0" "stable" "0.2.0") None "a version" in
+  let d = assertEq (toolchainProblem "v0.2.0" "stable" "0.2.0") None "a `v`" in
+  let e = assertEq (toolchainProblem "" "stable" "0.2.0") None "nothing" in
+  let f =
+    assertEq
+      (toolchainProblem "nightly" "stable" "0.2.0")
+      (Just
+         "this project is built with meadow nightly, as its `meadow-toolchain` says, and this is meadow 0.2.0: `meadowup default nightly`, then `meadowup update`")
+      "nightly on stable"
+  in assertEq
+       (toolchainProblem "0.3.0" "stable" "0.2.0")
+       (Just
+          "this project is built with meadow 0.3.0, as its `meadow-toolchain` says, and this is meadow 0.2.0: `meadowup install 0.3.0`")
+       "another version"
+
+@test fun aBuildFromACheckoutStandsInForAChannelButNotAVersion () =
+  let a = assertEq (toolchainProblem "stable" "dev" "0.3.0") None "stable" in
+  let b = assertEq (toolchainProblem "nightly" "dev" "0.3.0") None "nightly" in
+  assertEq (M.isSome (toolchainProblem "0.2.0" "dev" "0.3.0")) True "a version"
+
+@test fun aVersionSaysItsChannelAndNumber () =
+  let a = assertEq (channelOf "0.5.0") "stable" "stable" in
+  let b = assertEq (channelOf "0.5.0-nightly (2026-11-14 70292e8)") "nightly" "nightly" in
+  let c = assertEq (channelOf "0.5.0-dev") "dev" "dev" in
+  let d = assertEq (numberOf "0.5.0-nightly (2026-11-14 70292e8)") "0.5.0" "nightly's" in
+  assertEq (numberOf "0.5.0") "0.5.0" "stable's"

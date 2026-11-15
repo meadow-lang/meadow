@@ -64,6 +64,7 @@ use MeadowBoot.Core (
 )
 use MeadowBoot.Cek as Cek
 use MeadowBoot.Unit (stdDir)
+use MeadowBoot.Channel (hostLibrary)
 use MeadowBoot.Tour (Step, steps)
 use Std.Collections.Vector as V
 use Std.Collections.HashMap as H
@@ -857,24 +858,6 @@ fun hostIn (lib : String) =
       match (Ffi.function loaded "meadow_repl_run", Ffi.function loaded "meadow_repl_pages") with
       | (Ok run, Ok pages) -> Just (Host { run, pages })
       | _ -> None
-
--- `meadow-host`, where the rest of MeadowBoot looks for it (`Main.hostLibrary`):
--- where `MEADOW_HOST` says, or beside this program, unless `MEADOW` names a
--- program to run instead.
-@pub fun hostLibrary () =
-  match getEnv "MEADOW_HOST" with
-  | Just h -> Just h
-  | None ->
-      if M.isSome (getEnv "MEADOW") then None
-      else
-        (let named =
-           if hostOs == "windows" then "meadow_host.dll"
-           else if hostOs == "macos" then "libmeadow_host.dylib"
-           else "libmeadow_host.so"
-         in match Path.parent (Proc.currentExe ()) with
-            | Just dir ->
-                (let beside = Path.join dir named in if exists beside then Just beside else None)
-            | None -> None)
 
 -- The standard library's object, read back from where its build wrote it
 -- the first time it is wanted, with what each definition mentions.

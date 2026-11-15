@@ -384,10 +384,40 @@ asked for what MeadowBoot does not act on yet -- `--features` and its kin,
 `-p`, `--workspace` and `--exclude`, `--emit expanded` -- and `inNoPackage`,
 which hands it a `.mw` file in no package. Each says on standard error that
 it did. Without `meadow-rust` beside it, as in a checkout, MeadowBoot builds
-what it can and says what it did not act on, as before. A manifest's
-`[profile.*]` is not among them: MeadowBoot builds a package that has one
-without taking its settings -- `runtime = "silo"` there is Glade's build --
-and `meadow-rust build` is the build that takes them.
+what it can and says what it did not act on, as before.
+
+### What a package asks of the `meadow` that builds it
+
+Three things a package says about how it is built are MeadowBoot's to act
+on as `meadow` acts on them, since whoever moves from one to the other would
+otherwise get another build than the one their project asks for.
+
+- **Its profile's settings.** `[profile.debug]` and `[profile.release]` in
+  `Meadow.toml` -- its workspace's, where it is in one -- are taken between
+  the profile's own settings and the command line's, as `meadow`'s
+  `Resolved::resolve` layers them (`withProfile` in `Main.mw`,
+  `Unit.profileIn`): `opt-level`, `strictness`, `runtime`, `backend` (and
+  `aot`, `jit`), `cfg`, which adds to `--cfg`, `prune`, `target`, `threads`,
+  `nursery`, `leaks`, `cycles`, which the native build reads as
+  `MEADOW_CYCLES`, and `profile = true`, which samples a run on Glade's
+  interpreter or JIT into `target/<profile>/profile.folded`. A value a
+  setting does not take says nothing, as an unknown key does. MeadowBoot's
+  own manifest builds it on Silo for `--release` by `runtime = "silo"`.
+- **Its toolchain.** A `meadow-toolchain` file at or above the package names
+  a channel or a version, and a `meadow` that is not it refuses to build the
+  package, saying how to get that one (`Channel.checkToolchain`).
+- **Its unstable features.** `@!feature(…)` at the top of the root module
+  asks for a feature that is not settled, which a stable `meadow` refuses; an
+  attribute no module has, a feature asked for elsewhere, and one this
+  `meadow` does not know are refused on every channel, and a settled one --
+  `ffi` -- builds, with a warning that the line can go
+  (`Channel.attributesSaid`, from `Compiler.compiling`). The lists of what is
+  unstable and what is settled are `buildtools/meadow/src/channel.rs`'s.
+
+The channel and the version are the back end's, as `--version` is: asked of
+`meadow-host` beside MeadowBoot (`meadow_host_version`), and with none beside
+it, as in a checkout, MeadowBoot's own number on the `dev` channel.
+`flags_differential.rs` holds each to what `meadow` does.
 
 ## What `build` and `run` are told
 

@@ -38,6 +38,7 @@ mod Lsp
 mod Find
 mod Dap
 mod Listing
+mod Channel
 
 use Lingua (cli!)
 use MeadowBoot.Lex (lex, dump)
@@ -59,7 +60,10 @@ use MeadowBoot.Testing (Asked, runTests)
 use MeadowBoot.Precompile (precompileStd)
 use MeadowBoot.Parse (parsed, checked)
 use MeadowBoot.Fixity (chainsOf)
-use MeadowBoot.Unit (packageOf, absolute, packageName, rustMeadow, rustFallback)
+use MeadowBoot.Unit (
+  packageOf, absolute, packageName, rustMeadow, rustFallback, profileManifest, profileIn
+)
+use MeadowBoot.Channel (hostLibrary, checkToolchain)
 use Std.Result as Res
 use MeadowBoot.Compiler (
   unitDatabase, buildUnits, givenUnits, setCompilerSource, compilerGrouped, compilerRenamed,
@@ -505,18 +509,19 @@ fun failure (e : QueryError k) : String =
 fun run (every : CliOptions) (cli : Cli) =
   match cli with
   | Cli.Build r ->
-      drivenWith r.path r.build None {
+      drivenWith r.path (prepared r.path r.build) None {
         nothingAsked | types = r.types,
         annotations = r.annotations,
         emit = r.emit,
         members = membersAsked r.members
       }
   | Cli.Run r ->
-      drivenWith r.path r.build (Just r.args) {
+      let b = prepared r.path r.build in
+      drivenWith r.path b (Just r.args) {
         nothingAsked | types = r.types,
         cek = r.cek,
         gcStats = r.gcStats,
-        profileTo = r.profileTo,
+        profileTo = M.orElse (if r.cek then None else sampledTo r.path b) r.profileTo,
         sampleEvery = r.sampleEvery,
         sampleHz = r.sampleHz,
         train = r.train,
@@ -528,7 +533,15 @@ fun run (every : CliOptions) (cli : Cli) =
   | Cli.Test r ->
       unlessUnacted (unheeded r.build) (\() ->
         runTests
-          (testAsked r.build r.path r.filter r.exact r.std r.testThreads r.noCapture r.cek)
+          (testAsked
+             (prepared r.path r.build)
+             r.path
+             r.filter
+             r.exact
+             r.std
+             r.testThreads
+             r.noCapture
+             r.cek)
           backEnd
           (backEndProgram ()))
   | Cli.Lex r -> finish (V.foldl (\ok p -> lexFile p and ok) True r.files)
@@ -551,13 +564,15 @@ fun run (every : CliOptions) (cli : Cli) =
   -- The prompt is MeadowBoot's (`Repl`).
   | Cli.Repl -> runPrompt ()
   -- The language server is MeadowBoot's, and so is what it would mark.
-  | Cli.Lsp r -> if V.isEmpty r.check then serveServer () else exit (checkPaths (V.append r.check r.more))
+  | Cli.Lsp r ->
+      if V.isEmpty r.check then serveServer () else exit (checkPaths (V.append r.check r.more))
   -- And so is the debug adapter (`Dap`).
   | Cli.Dap -> debugAdapter ()
   | Cli.Units r ->
       finish (V.foldl (\ok root -> buildUnits "debug" (told ()) root and ok) True r.roots)
   -- `dis` is this compiler's build, listed by the back end.
-  | Cli.Dis r -> unlessUnacted (unheeded r.build) (\() -> disassembled r.path r.asm r.build)
+  | Cli.Dis r ->
+      unlessUnacted (unheeded r.build) (\() -> disassembled r.path r.asm (prepared r.path r.build))
   -- What is not MeadowBoot's yet is `meadow`'s, asked the same way.
   | _ -> handedOn ()
 
@@ -645,23 +660,95 @@ fun disassembled (path : Maybe String) (asm : Bool) (b : CliBuild) =
 -- The Rust compiler's `meadow`, as a program: `Unit.rustMeadow`.
 fun meadow () = rustMeadow ()
 
--- The Rust `meadow` as a library to load into this process, `meadow-host`:
--- where `MEADOW_HOST` says, or beside this program, as a release has it.
--- `MEADOW` naming a program asks for that program instead.
-fun hostLibrary () =
-  match getEnv "MEADOW_HOST" with
-  | Just h -> Just h
+-- What `build`, `run`, `test` and `dis` are told, `b`, with what the package
+-- at `path` asks of a build: refused here, as `meadow` refuses it, where its
+-- `meadow-toolchain` names another `meadow` than this (`Channel`); and the
+-- settings of the profile built with that its manifest's `[profile.<name>]`
+-- gives, wherever the command line says nothing of them (`withProfile`).
+fun prepared (path : Maybe String) (b : CliBuild) =
+  let written = M.unwrapOr "." path in
+  let place = absolute written in
+  let dir = if S.endsWith ".mw" place then M.unwrapOr place (Path.parent place) else place in
+  match checkToolchain dir with
+  | Just why ->
+      (let u = writeError "error: ${written}: ${why}\n" in
+       let v = exit 1 in
+       b)
   | None ->
-      if M.isSome (getEnv "MEADOW") then None
-      else
-        (let named =
-           if hostOs == "windows" then "meadow_host.dll"
-           else if hostOs == "macos" then "libmeadow_host.dylib"
-           else "libmeadow_host.so"
-         in match Path.parent (Proc.currentExe ()) with
-            | Just dir ->
-                (let beside = Path.join dir named in if exists beside then Just beside else None)
-            | None -> None)
+      (match (if S.endsWith ".mw" place then packageOf place else Just place) with
+       | Just r -> withProfile r b
+       | None -> b)
+
+-- `b`, with what the `[profile.<name>]` of the package at `r` says of the
+-- profile `b` builds with, as `meadow` layers them (`profile.rs`,
+-- `Resolved::resolve`): the profile's own settings, then the manifest's,
+-- then the command line's. A manifest's `cfg` adds to the command line's
+-- flags; `leaks` and `prune` only turn on what the command line can turn on.
+-- How a Silo program finds its cycles has no flag, and is said to the
+-- native build as `meadow` says it, by `MEADOW_CYCLES`, where that does not
+-- already say. A run that the manifest asks to be profiled is sampled into
+-- `target/<profile>/profile.folded`, where `run` sends it (`sampledTo`).
+fun withProfile (r : String) (b : CliBuild) =
+  let name = if b.release then "release" else "debug" in
+  match profileManifest r with
+  | None -> b
+  | Just text ->
+      let p = profileIn text name in
+      let runtime = M.orElse p.runtime b.runtime in
+      let silo = runtime == Just "silo" in
+      let warned =
+        (if silo and M.isSome p.backend then
+           writeError
+             "warning: `[profile.${name}]` picks Silo, which is always compiled ahead of time; its `backend` is Glade's, and is ignored\n"
+         else ())
+      in
+      let named = M.isSome b.backend or b.jit or b.aot in
+      let cycles =
+        (match (p.cycles, getEnv "MEADOW_CYCLES") with
+         | (Just c, None) -> Proc.setEnv ("MEADOW_CYCLES", c)
+         | _ -> ())
+      in
+      let strictness = if b.strict or b.lenient then None else p.strictness in
+      {
+        b | optLevel = M.orElse p.opt b.optLevel,
+        strict = b.strict or strictness == Just "strict",
+        lenient = b.lenient or strictness == Just "lenient",
+        runtime = runtime,
+        backend = if named or silo then b.backend else p.backend,
+        cfg = V.append (flagsOf (M.unwrapOr "" p.cfg)) b.cfg,
+        noPrune = b.noPrune or p.prune == Just False,
+        target = M.orElse p.target b.target,
+        threads = M.orElse p.threads b.threads,
+        nursery = M.orElse (M.keepIf (\size -> Res.isOk (nurseryBytes size)) p.nursery) b.nursery,
+        leaks = b.leaks or p.leaks == Just True
+      }
+
+-- The flags a manifest's `cfg = "fast, feature=gpu"` turns on.
+fun flagsOf (text : String) : [String] =
+  V.concatMap (\f -> (let t = S.trim f in if S.isEmpty t then [] else [t])) (S.split "," text)
+
+-- Where a run of the package at `path` as `b` is sampled to when its
+-- manifest's profile says `profile = true` and the command line says
+-- nowhere, as `meadow` samples it: beside the build, and only where the
+-- program runs on Glade's interpreter or its JIT, which is what samples it.
+fun sampledTo (path : Maybe String) (b : CliBuild) =
+  let place = absolute (M.unwrapOr "." path) in
+  let name = if b.release then "release" else "debug" in
+  let ahead =
+    b.runtime == Just "silo"
+      or b.aot
+      or b.backend == Just "aot"
+      or (b.release and not b.jit and M.isNone b.backend)
+  in match (if S.endsWith ".mw" place then packageOf place else Just place) with
+     | None -> None
+     | Just r ->
+         (match profileManifest r with
+          | None -> None
+          | Just text ->
+              (let p = profileIn text name in
+               if p.profile == Just True and not ahead then
+                 Just (Path.joinAll [r, "target", name, "profile.folded"])
+               else None))
 
 -- `args` run by the Rust `meadow`: in this process, through its library,
 -- where there is one, and as a program of its own where not. What it ends

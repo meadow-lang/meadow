@@ -53,7 +53,9 @@ build() {
     timed=(/usr/bin/time -l)
   fi
   echo "== stage $2 builds MeadowBoot"
-  if ! ${timed[@]+"${timed[@]}"} "$3" build --release --runtime silo --offline "$work/$1/MeadowBoot" \
+  # Silo is what MeadowBoot's manifest asks of a release build
+  # (`[profile.release]`), and each stage takes it from there.
+  if ! ${timed[@]+"${timed[@]}"} "$3" build --release --offline "$work/$1/MeadowBoot" \
     > "$work/$1.log" 2>&1; then
     tail -n 40 "$work/$1.log"
     echo "stage $2 failed to build MeadowBoot"
