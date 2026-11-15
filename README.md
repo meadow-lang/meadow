@@ -42,7 +42,29 @@ which wants a C compiler — `pkg install clang`.
 Either way you get `meadow` and `meadowup` in `~/.meadow/bin`, added to your
 `PATH` — open a new terminal and run `meadow`.
 
-The two split the way Rust's do:
+`meadow` is MeadowBoot, the Meadow compiler written in Meadow
+([`bootstrap/`](bootstrap/README.md)), on Linux, macOS and x86-64 Windows. On
+ARM Windows and Android, which MeadowBoot is not built for yet, it is the Rust
+compiler, as in every release before. Beside MeadowBoot in `~/.meadow/bin` are
+what it finds next to its own executable, and so has to have there:
+`meadow-host`, the Rust back end as a library it loads; `lib/`, the standard
+library's sources, `Std.mwstd`, the standard library compiled ahead of time,
+and Silo's runtime for each phone; and the Rust compiler again, as
+`meadow-rust`. `bin` is the toolchain's directory rather than a link into
+another one so that the `meadow` on your `PATH` is MeadowBoot's own executable
+— a link on macOS would leave MeadowBoot looking beside the link — and the
+`PATH` stays what it was. `~/.meadow/lib` is the Rust compiler's cache, and an
+update never touches it.
+
+`meadow-rust` is the fallback for this one release: the release after it ships
+MeadowBoot alone. MeadowBoot hands it the commands it does not act on in full
+yet — `--features` and its kin, a workspace's `-p`, `--workspace` and
+`--exclude`, `--emit expanded`, and a `.mw` file in no package — and says so
+when it does. Where the two compilers differ in anything else — MeadowBoot
+does not take a manifest's `[profile.*]` settings yet, for one — `meadow-rust`
+takes the same commands as `meadow`: `meadow-rust build`, `meadow-rust run`.
+
+`meadow` and `meadowup` split the way Rust's tools do:
 
 |            |                                                                            |
 | ---------- | -------------------------------------------------------------------------- |
@@ -105,7 +127,16 @@ build has the same version number as the release it followed, and
 
 `meadowup install --from <dir>` installs binaries from a directory instead of
 downloading them. `install.sh` uses it, and it also installs an unpacked
-archive with no network access at all.
+archive with no network access at all: a release's, which holds MeadowBoot
+and everything beside it, or a directory holding only `meadow` and
+`meadowup`, as `install.sh` builds them.
+
+A `meadowup` from before MeadowBoot shipped installs only the file called
+`meadow`, so a release's archive calls the Rust compiler that and MeadowBoot
+`MeadowBoot`: an old `meadowup update` installs the Rust compiler, which works
+on its own, and the new `meadowup`. Run `meadowup update` once more for
+MeadowBoot — the new one sees that the last install was not of the whole
+toolchain, and installs it again.
 
 `MEADOW_HOME` overrides the install directory for both.
 </details>
@@ -750,12 +781,19 @@ To cut a release:
    git tag v0.2.0 && git push origin v0.2.0
    ```
 
-   `.github/workflows/release.yml` runs the checks again, cross-builds for
-   Linux, macOS and Windows (x86-64 and arm64) and attaches the archives the
-   installers look for. It refuses a tag that already has a release.
-   It publishes nothing unless MeadowBoot, built on each platform, has
-   built itself there too (`meadowboot.yml`, which it calls); MeadowBoot's
-   archives go on the release with the rest.
+   `.github/workflows/release.yml` runs the checks again, cross-builds the
+   Rust compiler for Linux, macOS and Windows (x86-64 and arm64) and Android,
+   and attaches the archives the installers look for. It refuses a tag that
+   already has a release. It publishes nothing unless MeadowBoot, built on
+   each platform, has built itself there too (`meadowboot.yml`, which it
+   calls). Where MeadowBoot is built, its archive is the release's
+   `meadow-<target>` — MeadowBoot, `meadow-host`, the Rust compiler,
+   `meadowup` and `lib/`, installed and smoke-tested there as `meadowup`
+   installs it — and the Rust compiler's own archive is published only for
+   ARM Windows and Android, or for a target whose experimental MeadowBoot
+   build failed. `meadow --version` from MeadowBoot is what the Rust back end
+   beside it was built to say, so `meadowboot.yml` is given the channel, the
+   day and the commit, as `release.yml`'s own builds are.
 
 4. Set the next minor version in the manifests on `master`, so that the
    nightlies after a release are builds of the version they are working

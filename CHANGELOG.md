@@ -26,6 +26,32 @@ last release is under _Unreleased_.
 
 ### Changed
 
+- `meadow` is MeadowBoot, the compiler written in Meadow, on Linux, macOS and
+  x86-64 Windows. It is what the language is to be built with, and it has
+  passed the same differential tests as the Rust compiler, built itself to
+  the same Cut, and answered the language server's checks over every source
+  in the repository; what remains is for people to use it. The release's
+  archive for each of those targets holds MeadowBoot with what it finds
+  beside its executable -- `meadow-host`, `lib/Std`, its standard library
+  compiled ahead of time (`lib/Std.mwstd`), the phone runtimes -- and the
+  Rust compiler, which `meadowup` installs as `meadow-rust` beside it, all in
+  `~/.meadow/bin`. `meadow-rust` is the fallback for this release only:
+  MeadowBoot hands it a `build`, `run`, `test` or `dis` asked for what
+  MeadowBoot does not act on yet (`--features` and its kin, `-p`,
+  `--workspace`, `--exclude`, `--emit expanded`), and a `.mw` file in no
+  package, and says so; anything else that differs, such as a manifest's
+  `[profile.*]` settings, which MeadowBoot does not take yet, is
+  `meadow-rust build` away. The next release ships MeadowBoot alone. ARM
+  Windows and Android, which MeadowBoot is not built for, keep the Rust
+  compiler as `meadow`. `meadow --version` says the release's channel, day
+  and commit, as the Rust compiler did: MeadowBoot asks the back end beside
+  it, which is built to say them.
+- `meadowup` installs a release's whole toolchain, not only `meadow`, and
+  takes away what a toolchain left that the one it installs does not have.
+  A `meadowup` from before installs only the archive's `meadow`, which is
+  the Rust compiler, so an update from an older release takes two
+  `meadowup update`s: the first brings the new `meadowup`, which then sees
+  that the last install was not whole and installs it again.
 - A release, and a nightly, is published only once MeadowBoot has built
   itself on each platform it is released for: `release.yml` calls
   `meadowboot.yml`, whose self-build compiles MeadowBoot with the MeadowBoot

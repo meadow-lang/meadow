@@ -1,13 +1,21 @@
 # Build MeadowBoot -- the Meadow compiler written in Meadow -- for every
-# platform it runs on, and attach an archive of it to the release of the tag
-# pushed. Each archive holds MeadowBoot; `meadow-host`, the library of the
-# back end it calls in its own process, and the `meadow` it hands to where it
-# cannot load that (both built from the same commit); and the standard
-# library's sources, which it compiles: MeadowBoot finds the rest beside
-# itself. It holds too Silo's
-# runtime for each phone its system builds for, in `lib/<triple>/`, where that
-# `meadow` looks for a target's: Android's on every desktop, and iOS's on a
+# platform it runs on, as the toolchain a release ships: the archive
+# `meadow-<target>` that `meadowup` installs. Each archive holds MeadowBoot;
+# `meadow-host`, the library of the back end it calls in its own process, and
+# the Rust `meadow` (both built from the same commit, the standard library
+# compiled into them); `meadowup`; and in `lib/`, the standard library's
+# sources, which MeadowBoot compiles, and `Std.mwstd`, which it takes instead
+# where it can: MeadowBoot finds the rest beside itself. It holds too Silo's
+# runtime for each phone its system builds for, in `lib/<triple>/`, where the
+# back end looks for a target's: Android's on every desktop, and iOS's on a
 # Mac. A build for one needs only the NDK, or Xcode, beside the archive.
+#
+# In the archive MeadowBoot is `MeadowBoot` and the Rust compiler `meadow`,
+# so that a `meadowup` from before this layout, which installs the file
+# called `meadow` and nothing else, installs a compiler that works on its
+# own. `meadowup` from this one on installs the lot, MeadowBoot as `meadow`
+# and the Rust compiler as `meadow-rust`, its fallback front end:
+# `installer/src/toolchain.rs`.
 #
 # Cut one by pushing a tag, which is pushed once and does not move:
 #
@@ -33,6 +41,30 @@ on:
     tags: ["meadowboot-v*"]
   workflow_dispatch:
   workflow_call:
+    # What the caller is building, as `release.yml` takes it: the toolchain
+    # says it with `meadow --version`, which MeadowBoot asks of the back end
+    # built here.
+    inputs:
+      channel:
+        description: "`stable`, `nightly` or `dev`: what the build says it is"
+        type: string
+        default: "dev"
+      date:
+        description: "The day a nightly is built, as its version says it"
+        type: string
+        default: ""
+      commit:
+        description: "The commit a nightly is built from, short"
+        type: string
+        default: ""
+
+# What `buildtools/meadow/build.rs` reads to decide the channel. A workflow
+# that calls this one does not pass on its own environment, only its inputs;
+# run on its own tags, or by hand, it is a build like one from a checkout.
+env:
+  MEADOW_CHANNEL: ${{ inputs.channel || 'dev' }}
+  MEADOW_BUILD_DATE: ${{ inputs.date }}
+  MEADOW_COMMIT: ${{ inputs.commit }}
 
 permissions:
   contents: write
@@ -99,11 +131,32 @@ jobs:
         shell: bash
         run: clang --version
 
+      # The Rust compiler's standard library, compiled ahead of time and built
+      # into the `meadow` and `meadow-host` below, as `release.yml` builds it
+      # into the `meadow` it ships alone: the `meadow` in the archive is the
+      # one a `meadowup` from before MeadowBoot installs, on its own, and
+      # `meadow-rust` once installed.
+      - name: Precompile the Rust compiler's Std
+        working-directory: buildtools
+        shell: bash
+        run: |
+          MEADOW_EMBED_RUNTIME=0 cargo build --release -p meadow
+          host="target/release/meadow"
+          [ -f "$host.exe" ] && host="$host.exe"
+          "$host" __precompile-std "$RUNNER_TEMP/std.bin" --target ${{ matrix.target }}
+          echo "MEADOW_PRECOMPILED_STD=$RUNNER_TEMP/std.bin" >> "$GITHUB_ENV"
+
       # And `meadow-host`, the same `meadow` as a library, which MeadowBoot
       # loads to run the back end in its own process.
       - name: Build meadow
         working-directory: buildtools
         run: cargo build --release -p meadow -p meadow-host
+
+      # `meadowup`, which goes in the archive so that an update replaces it
+      # with the toolchain: see `release.yml`.
+      - name: Build meadowup
+        working-directory: installer
+        run: cargo build --release
 
       # MeadowBoot's dependencies (Lingua, Scythe) are fetched by git. It
       # calls `meadow-host` through `Std.Ffi`.
@@ -119,19 +172,29 @@ jobs:
         run: |
           exe=""
           [ "$RUNNER_OS" = "Windows" ] && exe=".exe"
-          dir="meadowboot-${{ matrix.target }}"
+          # Named as `release.yml` names the archive of each target, which is
+          # what the installers fetch.
+          dir="meadow-${{ matrix.target }}"
           mkdir -p "$dir/lib/Std"
           case "$RUNNER_OS" in
             Windows) host="meadow_host.dll" ;;
             macOS) host="libmeadow_host.dylib" ;;
             *) host="libmeadow_host.so" ;;
           esac
-          cp "bootstrap/target/release/native/silo/MeadowBoot$exe" "buildtools/target/release/meadow$exe" "buildtools/target/release/$host" "$dir/"
+          cp "bootstrap/target/release/native/silo/MeadowBoot$exe" "buildtools/target/release/meadow$exe" "buildtools/target/release/$host" "installer/target/release/meadowup$exe" "$dir/"
           cp lib/Std/Meadow.toml "$dir/lib/Std/"
           cp -r lib/Std/src "$dir/lib/Std/"
           # A library keeps the symbols it exports: `strip -x` drops only the
           # local ones.
           if [ "$RUNNER_OS" != "Windows" ]; then strip "$dir/MeadowBoot" "$dir/meadow"; strip -x "$dir/$host"; fi
+          # MeadowBoot's standard library compiled, beside its sources, so
+          # that no build compiles it. Written by the very MeadowBoot that is
+          # shipped, after `strip` and after anything else that would change
+          # its bytes: the file is named by the MeadowBoot that wrote it, and
+          # any other takes it for another compiler's and compiles the library
+          # itself. `meadowup` copies the executable as it is, renaming it.
+          env -u MEADOW -u MEADOWBOOT_STD "$dir/MeadowBoot$exe" __precompile-std "$dir/lib/Std.mwstd"
+          ls -l "$dir" "$dir/lib"
           echo "BUNDLE=$dir" >> "$GITHUB_ENV"
 
       # Silo's runtime for each phone, built from this commit as the `meadow`
@@ -181,6 +244,65 @@ jobs:
             ls "Lib/target/release/native/$t/silo/"
           done
 
+      # The archive as `meadowup` installs it, into a home of its own, asked
+      # what `release.yml` asks of the `meadow` it ships alone -- its version;
+      # a program run from an empty home, which compiles nothing of the Rust
+      # compiler's Std; `init`, which MeadowBoot hands to the Rust back end,
+      # and the package built to a native executable; and every source in
+      # the repository, through the language server -- and then what this
+      # release has besides: what MeadowBoot does not act on yet goes to the
+      # Rust front end installed beside it, and the install updates and comes
+      # out again.
+      - name: Smoke test, installed
+        shell: bash
+        run: |
+          exe=""
+          [ "$RUNNER_OS" = "Windows" ] && exe=".exe"
+          unset MEADOW MEADOWBOOT_STD MEADOW_HOST
+          home="$RUNNER_TEMP/installed"
+          MEADOW_HOME="$home" "$BUNDLE/meadowup$exe" install --from "$BUNDLE" --no-modify-path
+          bin="$home/bin/meadow$exe"
+          # The version the Rust compiler beside it was built to say: the
+          # channel, and a nightly's day and commit.
+          said=$("$bin" --version)
+          echo "$said"
+          [ "$said" = "$("$home/bin/meadow-rust$exe" --version)" ]
+          # A file in no package is the Rust front end's still: MeadowBoot
+          # builds packages.
+          echo 'fun main () = println (show (6 * 7))' > "$RUNNER_TEMP/smoke.mw"
+          MEADOW_HOME="$RUNNER_TEMP/fresh-home" "$bin" run "$RUNNER_TEMP/smoke.mw" | tail -1 | grep -qx '42'
+          if [ -d "$RUNNER_TEMP/fresh-home/lib/std" ]; then
+            echo "Std was compiled: the precompiled one is not built in" >&2
+            exit 1
+          fi
+          "$bin" init "$RUNNER_TEMP/smokepkg"
+          # Its first build takes the standard library from `lib/Std.mwstd`:
+          # a compile of it times its passes, and one taken from the file
+          # does not. One that compiles it is a `Std.mwstd` this MeadowBoot
+          # does not take as its own.
+          (cd "$RUNNER_TEMP/smokepkg" && MEADOWBOOT_TIMINGS=1 "$bin" build . > "$RUNNER_TEMP/timings.txt" 2>&1) || { cat "$RUNNER_TEMP/timings.txt"; exit 1; }
+          grep -q '^timings Std:' "$RUNNER_TEMP/timings.txt"
+          if awk '/^timings /{std = ($2 == "Std:")} std && /^  parse /' "$RUNNER_TEMP/timings.txt" | grep -q .; then
+            cat "$RUNNER_TEMP/timings.txt"
+            echo "Std was compiled: the installed meadow did not take lib/Std.mwstd" >&2
+            exit 1
+          fi
+          (cd "$RUNNER_TEMP/smokepkg" && "$bin" run --release --aot . | tail -1 | grep -q 'Hello, world!')
+          (cd "$RUNNER_TEMP/smokepkg" && "$bin" run --all-features . 2>&1 | tee "$RUNNER_TEMP/fallback.txt" | tail -1 | grep -q 'Hello, world!')
+          grep -q 'meadow-rust' "$RUNNER_TEMP/fallback.txt"
+          # The archive's sources, as an editor on this machine gets them.
+          cd "$GITHUB_WORKSPACE"
+          # A loop, not `mapfile`: macOS ships bash 3.2, which has none.
+          sources=()
+          while IFS= read -r f; do sources+=("$f"); done < <(git ls-files '*.mw' | grep -v -e '^bootstrap/tests/lex/' -e '^bootstrap/tests/parse/' -e '^bootstrap/tests/rename/Cfg/')
+          MEADOW_HOME="$RUNNER_TEMP/lsp-home" "$bin" lsp --check "${sources[@]}"
+          # An update over it, and out again -- by the archive's `meadowup`:
+          # Windows does not let the one in the home delete itself.
+          MEADOW_HOME="$home" "$BUNDLE/meadowup$exe" update --from "$BUNDLE" --no-modify-path
+          MEADOW_HOME="$home" "$home/bin/meadowup$exe" show
+          MEADOW_HOME="$home" "$BUNDLE/meadowup$exe" uninstall --no-modify-path
+          [ ! -e "$home" ]
+
       # A zip whose paths use forward slashes, which every unzip reads:
       # 7-Zip's.
       - name: Archive
@@ -194,9 +316,11 @@ jobs:
             echo "ARCHIVE=$BUNDLE.tar.gz" >> "$GITHUB_ENV"
           fi
 
+      # Under a name of its own: `release.yml`'s Rust `meadow` of the same
+      # target is an artifact named for its archive, which this one replaces.
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.BUNDLE }}
+          name: meadowboot-${{ matrix.target }}
           path: ${{ env.ARCHIVE }}
 
       # MeadowBoot compiled by itself (stage 2), and stage 2 compiling
@@ -235,6 +359,6 @@ jobs:
           if ! gh release view "$TAG" -R "$REPO" > /dev/null 2>&1; then
             gh release create "$TAG" -R "$REPO" --verify-tag --prerelease --latest=false \
               --title "MeadowBoot ${TAG#meadowboot-v}" \
-              --notes "MeadowBoot built from ${GITHUB_SHA::7}: each archive holds MeadowBoot, a \`meadow\` from the same commit, and \`lib/Std\`. Native builds need \`clang\` on \`PATH\`."
+              --notes "MeadowBoot built from ${GITHUB_SHA::7}: each archive holds MeadowBoot, a \`meadow\` from the same commit, \`meadowup\` and \`lib/\`; \`meadowup install --from <the unpacked archive>\` installs it. Native builds need \`clang\` on \`PATH\`."
           fi
           gh release upload "$TAG" -R "$REPO" dist/* --clobber

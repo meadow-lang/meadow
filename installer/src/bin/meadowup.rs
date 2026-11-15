@@ -19,8 +19,11 @@
 //! ```
 //!
 //! Everything lives under `$MEADOW_HOME` (`~/.meadow`), and `bin` inside it is
-//! what joins the `PATH`.
+//! what joins the `PATH`. A release of MeadowBoot is installed whole in
+//! `bin`, MeadowBoot as `meadow` and the Rust compiler as `meadow-rust` beside
+//! it: see `meadowup::toolchain` for the layout and why.
 
+use meadowup::toolchain::{self, Archive};
 use meadowup::ui::{self, bold};
 use meadowup::{
     Channel, NIGHTLY_TAG, Provenance, bin_dir, exe_name, home, path, release, up_name, version_of,
@@ -232,8 +235,11 @@ fn install(args: &Args, updating: bool) -> Result<(), String> {
                     .is_some_and(|commit| have.contains(commit)),
                 None => number(have) == wanted,
             };
-            // Already this version: say so rather than downloading it again.
+            // Already this version: say so rather than downloading it again --
+            // unless an older meadowup installed it, which may have left the
+            // Rust compiler alone where the release's toolchain belongs.
             if !args.force
+                && meadowup::recorded_whole(&args.home)
                 && let Some(have) = &before
                 && same(have)
             {
@@ -268,38 +274,37 @@ fn install(args: &Args, updating: bool) -> Result<(), String> {
 
     std::fs::create_dir_all(&bin).map_err(|e| format!("could not make {}: {e}", bin.display()))?;
 
-    // Each component the toolchain has, and where it goes. A release carries
-    // both; leaving meadowup behind would strand the machine on a version that
-    // cannot update itself.
-    let put = |component: &str, file: &str, dest: &Path| -> Result<bool, String> {
-        let Some(found) = release::find(&unpacked, file) else {
-            return Ok(false);
-        };
-        let len = std::fs::metadata(&found).map(|m| m.len()).unwrap_or(0);
-        ui::info(format!(
-            "installing component '{}' ({})",
-            bold(component),
-            ui::size(len)
-        ));
-        let backup = meadowup::displace(dest);
-        std::fs::copy(&found, dest)
-            .map_err(|e| format!("could not write {}: {e}", dest.display()))?;
-        make_runnable(dest);
-        // The displaced image may still be locked by a running process, in
-        // which case leaving it is right and the next install clears it.
-        if let Some(backup) = backup {
-            let _ = std::fs::remove_file(backup);
-        }
-        Ok(true)
-    };
-
-    if !put("meadow", exe_name(), &meadow)? {
+    // The toolchain: MeadowBoot as `meadow` and what it finds beside itself,
+    // or, from an older release or for a target MeadowBoot is not built for,
+    // the Rust `meadow` alone (`meadowup::toolchain`).
+    let Some(archive) = Archive::read(&unpacked) else {
         return Err(format!(
             "{} holds no {}, so there is nothing to install",
             unpacked.display(),
             exe_name()
         ));
+    };
+    for (component, len) in toolchain::install(&archive, &bin)? {
+        ui::info(format!(
+            "installed component '{}' ({})",
+            bold(component),
+            ui::size(len)
+        ));
     }
+    // meadowup too: a release carries it, and leaving it behind would strand
+    // the machine on a version that cannot update itself.
+    let put = |component: &str, file: &str, dest: &Path| -> Result<bool, String> {
+        let Some(found) = release::find(&unpacked, file) else {
+            return Ok(false);
+        };
+        let len = toolchain::place(&found, dest)?;
+        ui::info(format!(
+            "installed component '{}' ({})",
+            bold(component),
+            ui::size(len)
+        ));
+        Ok(true)
+    };
     // meadowup itself. The release's copy is preferred over the running one --
     // it is the one being installed, and on an update it is the newer. A
     // release that predates meadowup carries none, and then the program that is
@@ -380,13 +385,7 @@ fn install_self(bin: &Path) -> Result<(), String> {
     if std::fs::canonicalize(&running).ok() == std::fs::canonicalize(&dest).ok() {
         return Ok(());
     }
-    let backup = meadowup::displace(&dest);
-    std::fs::copy(&running, &dest)
-        .map_err(|e| format!("could not write {}: {e}", dest.display()))?;
-    make_runnable(&dest);
-    if let Some(backup) = backup {
-        let _ = std::fs::remove_file(backup);
-    }
+    toolchain::place(&running, &dest)?;
     ui::info(format!("installing component '{}'", bold("meadowup")));
     Ok(())
 }
@@ -411,15 +410,28 @@ fn show(args: &Args) -> Result<(), String> {
     println!();
     println!("{}", bold("installed components"));
     println!("--------------------");
-    for (component, file) in [("meadow", exe_name()), ("meadowup", up_name())] {
-        let at = bin.join(file);
+    for (component, file) in components() {
+        let at = bin.join(&file);
         match version_of(&at) {
+            Some(v) if component == "meadow-rust" => println!("{v} (the Rust front end, {file})"),
             Some(v) => println!("{v}"),
             None if at.exists() => println!("{component} (would not say its version)"),
+            None if component == "meadow-rust" => {}
             None => println!("{component} (not installed)"),
         }
     }
     Ok(())
+}
+
+/// What an install puts in `bin` that says its version: `meadow`; the Rust
+/// front end beside MeadowBoot, where a release of MeadowBoot was installed;
+/// and meadowup.
+fn components() -> [(&'static str, String); 3] {
+    [
+        ("meadow", exe_name().to_string()),
+        ("meadow-rust", toolchain::rust_name()),
+        ("meadowup", up_name().to_string()),
+    ]
 }
 
 fn which(args: &Args) -> Result<(), String> {
@@ -448,7 +460,7 @@ fn uninstall(args: &Args) -> Result<(), String> {
             Err(e) => ui::warn(format!("could not update PATH: {e}")),
         }
     }
-    for (component, file) in [("meadow", exe_name()), ("meadowup", up_name())] {
+    for (component, file) in components() {
         if bin_dir(&args.home).join(file).exists() {
             ui::info(format!("removing component '{}'", bold(component)));
         }
@@ -462,21 +474,6 @@ fn uninstall(args: &Args) -> Result<(), String> {
     println!("Open a new shell for the PATH change to take.");
     Ok(())
 }
-
-/// Mark a freshly written binary executable, which matters everywhere but
-/// Windows.
-#[cfg(unix)]
-fn make_runnable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(meta) = std::fs::metadata(path) {
-        let mut perms = meta.permissions();
-        perms.set_mode(perms.mode() | 0o755);
-        let _ = std::fs::set_permissions(path, perms);
-    }
-}
-
-#[cfg(not(unix))]
-fn make_runnable(_path: &Path) {}
 
 fn help() {
     println!(

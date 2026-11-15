@@ -70,10 +70,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # What `release.yml` put together to publish: each target's toolchain,
+      # `meadowup`, and the extensions.
       - uses: actions/download-artifact@v4
         with:
+          name: assets
           path: artifacts
-          merge-multiple: true
 
       # The tag moves to what was built, and the release under it is replaced:
       # the one already there goes first, so nothing of yesterday's is left
