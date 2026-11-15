@@ -17,6 +17,12 @@
 //! What MeadowBoot does not act on yet it says it does not, on standard
 //! error, and that is checked too.
 //!
+//! What a package says of how it is built is held to the same: the
+//! settings of its manifest's `[profile.<name>]`, between the profile's own
+//! and the command line's; the `meadow` its `meadow-toolchain` asks for; and
+//! the unstable features its root module asks for with `@!feature(…)`, which
+//! a stable `meadow` refuses.
+//!
 //! `MEADOWBOOT_EXE` runs a MeadowBoot already built, and `MEADOWBOOT_HOST`
 //! names the `meadow-host` library it hands its programs to.
 
@@ -174,21 +180,39 @@ impl Pair {
     /// `meadow COMMAND ARGS… PACKAGE`.
     fn rust(&self, command: &str, args: &[&str]) -> Said {
         said(
-            Command::new(meadow())
-                .arg(command)
-                .args(args)
+            untold(Command::new(meadow()).arg(command).args(args))
                 .arg(self.rust_root())
                 .output()
                 .expect("meadow runs"),
         )
     }
 
+    /// `text` added to both packages' manifests.
+    fn manifest(&self, text: &str) {
+        for root in [self.rust_root(), self.boot_root()] {
+            let path = root.join("Meadow.toml");
+            let had = std::fs::read_to_string(&path).expect("a manifest");
+            std::fs::write(&path, format!("{had}{text}")).expect("a manifest");
+        }
+    }
+
+    /// `text` written to `name` in each package's directory -- or, `above`,
+    /// in the directory the package is in.
+    fn beside(&self, name: &str, text: &str, above: bool) {
+        for root in [self.rust_root(), self.boot_root()] {
+            let dir = if above {
+                root.parent().expect("a directory above").to_path_buf()
+            } else {
+                root
+            };
+            std::fs::write(dir.join(name), text).expect("a file beside the package");
+        }
+    }
+
     /// `meadowboot COMMAND ARGS… PACKAGE`, the back end loaded into it.
     fn boot(&self, command: &str, args: &[&str]) -> Said {
         said(
-            Command::new(meadowboot_exe())
-                .arg(command)
-                .args(args)
+            untold(Command::new(meadowboot_exe()).arg(command).args(args))
                 .arg(self.boot_root())
                 .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
                 .env("MEADOW_HOST", meadow_host())
@@ -199,6 +223,20 @@ impl Pair {
                 .expect("MeadowBoot runs"),
         )
     }
+}
+
+/// `c`, without what the runtimes would read from the environment of the
+/// test: what a package's profile tells them is what is compared.
+fn untold(c: &mut Command) -> &mut Command {
+    for name in [
+        "MEADOW_THREADS",
+        "MEADOW_GC_NURSERY",
+        "MEADOW_SILO_LEAKS",
+        "MEADOW_CYCLES",
+    ] {
+        c.env_remove(name);
+    }
+    c
 }
 
 /// What `--types` printed: from the first package's line to the entry's.
@@ -620,4 +658,251 @@ fn what_meadowboot_does_not_act_on_yet_it_says_it_does_not() {
             "{command} {args:?}: {ours}"
         );
     }
+}
+
+/// A program that says what it was built as: by the `@cfg`s the build
+/// decided -- how it runs, a flag, how hard it was optimised -- and by what
+/// the runtime was told in the environment.
+const PROFILED: &str = "use Std.Process (getEnv)\n\n\
+@cfg(backend = \"silo\")\ndef how = \"silo\"\n\n\
+@cfg(backend = \"jit\")\ndef how = \"jit\"\n\n\
+@cfg(backend = \"vm\")\ndef how = \"vm\"\n\n\
+@cfg(backend = \"aot\")\ndef how = \"aot\"\n\n\
+@cfg(fast)\ndef pace = \"fast\"\n\n\
+@cfg(not(fast))\ndef pace = \"slow\"\n\n\
+@cfg(opt_level = \"0\")\ndef level = \"O0\"\n\n\
+@cfg(opt_level = \"1\")\ndef level = \"O1\"\n\n\
+@cfg(opt_level = \"2\")\ndef level = \"O2\"\n\n\
+fun told (name : String) = match getEnv name with | Just v -> v | None -> \"-\"\n\n\
+fun main () =\n  println \"${how} ${pace} ${level} threads=${told \"MEADOW_THREADS\"} \
+nursery=${told \"MEADOW_GC_NURSERY\"} leaks=${told \"MEADOW_SILO_LEAKS\"} \
+cycles=${told \"MEADOW_CYCLES\"}\"\n";
+
+/// The line `PROFILED` prints.
+fn profiled_line(s: &Said) -> String {
+    s.out
+        .lines()
+        .find(|l| l.contains(" threads="))
+        .unwrap_or_else(|| panic!("no line of the program's:\n{s}"))
+        .to_string()
+}
+
+/// A manifest's `[profile.<name>]` is taken by a build of that profile,
+/// over the profile's own settings and under the command line's, as
+/// `meadow` takes it: how the program runs (`runtime`, `backend`, `jit`,
+/// `aot`), how hard it is optimised (`opt-level`), the flags `@cfg` holds of
+/// (`cfg`, beside the command line's), and what the runtime is told
+/// (`threads`, `nursery`, `leaks`, `cycles`). `runtime = "silo"` is a build
+/// on Silo, which it was not before.
+#[test]
+fn a_profile_s_settings_are_taken_as_meadow_takes_them() {
+    let cases: &[(&str, &str, &[&str])] = &[
+        (
+            "Silo",
+            "[profile.debug]\nruntime = \"silo\"\nthreads = 2\nleaks = true\ncycles = \"trial\"\n\
+             cfg = \"fast\"\nopt-level = 0\n",
+            &[],
+        ),
+        // The command line over the manifest: `--runtime` and `-O` say
+        // otherwise, and `--cfg` adds to its flags.
+        (
+            "Flagged",
+            "[profile.debug]\nruntime = \"silo\"\nthreads = 2\ncfg = \"fast\"\nopt-level = 0\n",
+            &["--runtime", "glade", "-O", "2", "--cfg", "other", "-j", "3"],
+        ),
+        (
+            "Interpreted",
+            "[profile.debug]\nbackend = \"vm\"\nnursery = \"8M\"\n",
+            &[],
+        ),
+        // Another profile's section says nothing of this one.
+        (
+            "Released",
+            "[profile.debug]\nruntime = \"silo\"\n\n[profile.release]\njit = true\nopt-level = \"O1\"\n",
+            &["--release"],
+        ),
+        // A value a setting does not take says nothing.
+        (
+            "Unknown",
+            "[profile.debug]\nruntime = \"llvm\"\nnursery = \"huge\"\nthreads = 0\nfuture = 1\n",
+            &[],
+        ),
+    ];
+    for (name, profile, args) in cases {
+        let p = pair(name, &[("Main.mw", PROFILED)]);
+        p.manifest(&format!("\n{profile}"));
+        let theirs = p.rust("run", args);
+        let ours = p.boot("run", args);
+        assert_eq!(theirs.code, Some(0), "{name}: {theirs}");
+        assert_eq!(ours.code, Some(0), "{name}: {ours}");
+        assert_eq!(
+            profiled_line(&ours),
+            profiled_line(&theirs),
+            "{name}:\n{ours}\n{theirs}"
+        );
+    }
+}
+
+/// `strictness` in a profile decides whether a `match` that misses a value
+/// stops the build, unless `--strict` or `--lenient` says; a profile that
+/// picks Silo and names a `backend` is warned that Silo has none; and
+/// `profile = true` samples a run into `target/<profile>/profile.folded`.
+#[test]
+fn a_profile_s_strictness_warning_and_sampling_are_meadow_s() {
+    let partial = "data Shade = Light | Dark\n\nfun name s = match s with | Shade.Light -> \"light\"\n\n\
+                   fun main () = println (name Shade.Light)\n";
+    let p = pair("Strict", &[("Main.mw", partial)]);
+    p.manifest("\n[profile.debug]\nstrictness = \"strict\"\n");
+    for (args, builds) in [(&[][..], false), (&["--lenient"][..], true)] {
+        let theirs = p.rust("build", args);
+        let ours = p.boot("build", args);
+        assert_eq!(theirs.code == Some(0), builds, "{args:?}: {theirs}");
+        assert_eq!(ours.code == Some(0), builds, "{args:?}: {ours}");
+    }
+
+    let p = pair("Warned", &[("Main.mw", PROFILED)]);
+    p.manifest("\n[profile.debug]\nruntime = \"silo\"\nbackend = \"vm\"\n");
+    let theirs = p.rust("run", &[]);
+    let ours = p.boot("run", &[]);
+    assert_eq!(ours.code, Some(0), "{ours}");
+    assert_eq!(
+        profiled_line(&ours),
+        profiled_line(&theirs),
+        "{ours}\n{theirs}"
+    );
+    let warning = |s: &Said| {
+        s.err
+            .lines()
+            .find(|l| l.contains("picks Silo"))
+            .map(str::to_string)
+    };
+    assert!(warning(&theirs).is_some(), "{theirs}");
+    assert_eq!(warning(&ours), warning(&theirs), "{ours}");
+
+    let p = pair("Sampled", &[("Main.mw", &busy(3000))]);
+    p.manifest("\n[profile.debug]\nprofile = true\n");
+    for (side, said) in [
+        (p.rust_root(), p.rust("run", &[])),
+        (p.boot_root(), p.boot("run", &[])),
+    ] {
+        assert_eq!(said.code, Some(0), "{said}");
+        let text = std::fs::read_to_string(side.join("target/debug/profile.folded"))
+            .unwrap_or_else(|e| panic!("no profile beside {}: {e}\n{said}", side.display()));
+        assert!(!text.is_empty(), "an empty profile:\n{said}");
+    }
+}
+
+/// A `meadow-toolchain` file at or above a project names the `meadow` it is
+/// built with -- a channel, or a version -- and a `meadow` that is not it
+/// refuses to build it, saying which it is and how to get the other. The
+/// first line that is not empty or a comment is what it says.
+#[test]
+fn a_toolchain_file_is_honoured_as_meadow_honours_it() {
+    let p = pair(
+        "Pinned",
+        &[("Main.mw", "fun main () = println \"pinned\"\n")],
+    );
+    let number = meadow::channel::NUMBER;
+    let channel = meadow::channel::CHANNEL;
+    let said = |s: &Said| {
+        s.err.lines().find_map(|l| {
+            l.split_once(": this project")
+                .map(|(_, why)| why.to_string())
+        })
+    };
+    let cases = [
+        (
+            "# the release this was written for\n\n  0.0.1  \n".to_string(),
+            false,
+        ),
+        (format!("v{number}\n"), false),
+        ("nightly\n".to_string(), false),
+        ("stable\n".to_string(), false),
+        ("0.0.1\n".to_string(), true),
+    ];
+    for (text, above) in &cases {
+        let wanted = text
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with('#'))
+            .expect("a line");
+        let builds = meadow::channel::toolchain_problem(wanted, channel, number).is_none();
+        p.beside("meadow-toolchain", text, *above);
+        let theirs = p.rust("run", &[]);
+        let ours = p.boot("run", &[]);
+        assert_eq!(theirs.code == Some(0), builds, "{text:?}: {theirs}");
+        assert_eq!(ours.code == Some(0), builds, "{text:?}: {ours}");
+        assert_eq!(said(&ours), said(&theirs), "{text:?}:\n{ours}\n{theirs}");
+        if builds {
+            assert!(ours.out.ends_with("pinned\n"), "{text:?}: {ours}");
+        }
+        for root in [p.rust_root(), p.boot_root()] {
+            let dir = if *above {
+                root.parent().expect("above").to_path_buf()
+            } else {
+                root
+            };
+            let _ = std::fs::remove_file(dir.join("meadow-toolchain"));
+        }
+    }
+}
+
+/// A package asks for an unstable feature with `@!feature(…)` at the top of
+/// its root module, and a `meadow` that does not have it, or has it only on
+/// another channel, refuses: as `meadow` refuses an attribute no module has,
+/// a feature asked for elsewhere than the root module, and a feature it does
+/// not know, each said where it is written. A feature that is settled, as
+/// `ffi` is, builds on every channel, and the package is told the line can go.
+#[test]
+fn a_feature_is_refused_or_taken_as_meadow_refuses_or_takes_it() {
+    let asked = pair(
+        "Asked",
+        &[
+            (
+                "Main.mw",
+                "@!feature(ffi, warp)\n@!pub\n\nmod Other\n\nfun main () = println \"asked\"\n",
+            ),
+            ("Other.mw", "@!feature(ffi)\n\n@pub def two = 2\n"),
+        ],
+    );
+    let theirs = asked.rust("build", &[]);
+    let ours = asked.boot("build", &[]);
+    assert_eq!(theirs.code, Some(1), "{theirs}");
+    assert_ne!(ours.code, Some(0), "{ours}");
+    let everything = |s: &Said| format!("{}{}", s.out, s.err);
+    let refused: Vec<&str> = theirs
+        .err
+        .lines()
+        .filter_map(|l| l.strip_prefix("Error: "))
+        .collect();
+    assert_eq!(refused.len(), 3, "{theirs}");
+    for why in &refused {
+        assert!(everything(&ours).contains(why), "`{why}`:\n{ours}");
+    }
+    for at in ["Main.mw:1:16", "Main.mw:2:3", "Other.mw:1:3"] {
+        assert!(everything(&theirs).contains(at), "{at}: {theirs}");
+        assert!(everything(&ours).contains(at), "{at}: {ours}");
+    }
+
+    let settled = pair(
+        "Settled",
+        &[(
+            "Main.mw",
+            "@!feature(ffi)\n\nfun main () = println \"settled\"\n",
+        )],
+    );
+    let warned = |s: &Said| -> Vec<String> {
+        s.err
+            .lines()
+            .filter(|l| l.starts_with("warning:"))
+            .filter_map(|l| l.split_once("Main.mw: ").map(|(_, why)| why.to_string()))
+            .collect()
+    };
+    let theirs = settled.rust("run", &[]);
+    let ours = settled.boot("run", &[]);
+    assert_eq!(theirs.code, Some(0), "{theirs}");
+    assert_eq!(ours.code, Some(0), "{ours}");
+    assert!(ours.out.ends_with("settled\n"), "{ours}");
+    assert_eq!(warned(&theirs).len(), 1, "{theirs}");
+    assert_eq!(warned(&ours), warned(&theirs), "{ours}\n{theirs}");
 }

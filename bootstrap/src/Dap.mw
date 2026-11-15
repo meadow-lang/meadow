@@ -52,7 +52,7 @@
 use Lingua (dap!)
 use Lingua.Dap (Frame, Scope, Variable, Mode, Stop)
 use Lingua.Make (linkDirIn)
-use MeadowBoot.Repl (hostLibrary)
+use MeadowBoot.Channel (hostLibrary)
 use Std.Ffi as Ffi
 use Std.Ffi (Arg, Function)
 use Std.Json as J

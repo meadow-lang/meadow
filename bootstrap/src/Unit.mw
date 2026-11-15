@@ -23,6 +23,7 @@ use Std.Sort (sort)
 use Std.Maybe as M
 use Std.Maybe.Maybe.*
 use Std.Result.Result.*
+use Std.Result as Res
 
 -- `path` without Windows' `\\?\`, which asks for a path to be taken exactly as
 -- written and which nothing here needs.
@@ -495,6 +496,163 @@ fun unquoted (s : String) : String =
     stringSlice s 1 (stringByteLength s - 1)
   else s
 
+-- --- profiles ------------------------------------------------------------------
+
+-- What a manifest's `[profile.<name>]` says, as `meadow` reads it
+-- (`buildtools/meadow/src/package.rs`, `parse_manifest`): each setting a
+-- build of that profile takes over the profile's own, and the command line
+-- over that. A value that is not one the setting takes says nothing, as an
+-- unknown key does: a manifest written for a later `meadow` still builds.
+@pub record ProfileSays = {
+  -- `opt-level`: 0, 1 or 2.
+  opt : Maybe Int,
+  -- `strictness`: `strict` or `lenient`.
+  strictness : Maybe String,
+  -- `backend`, or `aot = true` or `jit = true`: how Glade runs the program.
+  backend : Maybe String,
+  -- `runtime`: `glade` or `silo`.
+  runtime : Maybe String,
+  -- `threads`, as `-j` says.
+  threads : Maybe Int,
+  -- `nursery`, as `--nursery` writes it, read where it is used.
+  nursery : Maybe String,
+  -- `leaks = true`, as `--leaks`.
+  leaks : Maybe Bool,
+  -- `target`, as `--target` says.
+  target : Maybe String,
+  -- `cycles`: how a Silo program finds its cycles, `trial` or `tracing`.
+  cycles : Maybe String,
+  -- `cfg`: flags for `@cfg(…)` to hold of, with commas between.
+  cfg : Maybe String,
+  -- `prune = false`, as `--no-prune`.
+  prune : Maybe Bool,
+  -- `profile = true`: a run is sampled, and its folded stacks written beside
+  -- the build.
+  profile : Maybe Bool
+}
+
+@pub def nothingSaid : ProfileSays =
+  ProfileSays {
+    opt = None, strictness = None, backend = None, runtime = None, threads = None, nursery = None,
+    leaks = None, target = None, cycles = None, cfg = None, prune = None, profile = None
+  }
+
+-- What the manifest `text` says of profile `name`.
+@pub fun profileIn (text : String) (name : String) : ProfileSays =
+  V.foldl
+    (\p (e : Entry) ->
+      if e.section != "profile.${name}" then p
+      else
+        match e.value with
+        | Text v -> profileSaid p e.key v
+        | Other v -> profileSaid p e.key v
+        | Table _ -> p)
+    nothingSaid
+    (readToml text)
+
+-- `p`, with `key = v` read into it. A later line says it again over an
+-- earlier one, even with a value it does not take.
+fun profileSaid (p : ProfileSays) (key : String) (v : String) : ProfileSays =
+  if key == "opt-level" or key == "opt_level" then { p | opt = optLevelOf v }
+  else if key == "strictness" then
+    { p | strictness = if V.elem (S.trim v) ["strict", "lenient"] then Just (S.trim v) else None }
+  else if key == "backend" then
+    {
+      p
+        | backend =
+          if v == "native" then Just "aot"
+          else if V.elem v ["vm", "jit", "aot"] then Just v
+          else None
+    }
+  else if key == "aot" and v == "true" then { p | backend = Just "aot" }
+  else if key == "jit" and v == "true" then { p | backend = Just "jit" }
+  else if key == "runtime" then
+    { p | runtime = if v == "glade" or v == "silo" then Just v else None }
+  else if key == "threads" then
+    {
+      p
+        | threads =
+          match S.toInt v with
+          | Just n -> if n > 0 then Just n else None
+          | None -> None
+    }
+  else if key == "nursery" then { p | nursery = Just v }
+  else if key == "leaks" then { p | leaks = boolOf v }
+  else if key == "target" then { p | target = Just v }
+  else if key == "cycles" then
+    { p | cycles = if v == "trial" or v == "tracing" then Just v else None }
+  else if key == "cfg" then { p | cfg = Just v }
+  else if key == "prune" then { p | prune = boolOf v }
+  else if key == "profile" then { p | profile = boolOf v }
+  else p
+
+-- An optimisation level as `-O` takes one: `2`, `O2`, `o2`.
+fun optLevelOf (v : String) : Maybe Int =
+  let rec bare t = if S.startsWith "O" t or S.startsWith "o" t then bare (S.drop t 1) else t in
+  match bare (S.trim v) with
+  | "0" -> Just 0
+  | "1" -> Just 1
+  | "2" -> Just 2
+  | _ -> None
+
+fun boolOf (v : String) : Maybe Bool =
+  if v == "true" then Just True else if v == "false" then Just False else None
+
+-- The manifest whose profiles a build of the package at `root` takes: its
+-- workspace's, where it is in one -- every member builds with the same
+-- profiles -- unless the workspace leaves it out, and otherwise its own.
+-- The workspace is the nearest directory at or above the package whose
+-- manifest has a `[workspace]`.
+@pub fun profileManifest (root : String) : Maybe String ! { Fs, Process | e } =
+  let own = Res.toMaybe (readToString (Path.join root "Meadow.toml")) in
+  let rec up dir =
+    match dir with
+    | None -> own
+    | Just d ->
+        (match readToString (Path.join d "Meadow.toml") with
+         | Ok text ->
+             (if not (declaresWorkspace text) then up (Path.parent d)
+              else if leftOut (absolute d) (absolute root) text then own
+              else Just text)
+         | Err _ -> up (Path.parent d))
+  in up (Just root)
+
+fun declaresWorkspace (text : String) : Bool =
+  V.any
+    (\l ->
+      V.elem (S.trim (uncommented l)) [
+        "[workspace]",
+        "[workspace.package]",
+        "[workspace.dependencies]"
+      ])
+    (S.lines text)
+
+-- Whether the workspace at `ws`, whose manifest is `text`, leaves the
+-- package at `pkg` out: its `exclude` names it, or a directory it is under.
+fun leftOut (ws : String) (pkg : String) (text : String) : Bool =
+  pkg != ws
+    and V.any
+      (\(e : Entry) ->
+        e.section == "workspace"
+          and e.key == "exclude"
+          and V.any
+            (\x ->
+              let dir = Path.normalize (Path.join ws x) in
+              pkg == dir or S.startsWith (dir ++ "/") pkg)
+            (texts e.value))
+      (readToml text)
+
+-- The texts of an array written on one line, `["a", "b"]`.
+fun texts (v : TomlValue) : [String] =
+  match v with
+  | Other t ->
+      if S.startsWith "[" t and S.endsWith "]" t then
+        V.concatMap
+          (\x -> (let u = unquoted (S.trim x) in if S.isEmpty u then [] else [u]))
+          (S.split "," (stringSlice t 1 (stringByteLength t - 1)))
+      else []
+  | _ -> []
+
 -- --- tests -------------------------------------------------------------------
 
 use Std.Test (assertEq)
@@ -526,3 +684,31 @@ use Std.Test (assertEq)
   let a =
     assertEq (repoName "https://github.com/meadow-lang/Scythe.git") "Scythe" "without `.git`"
   in assertEq (repoName "https://github.com/someone/meadow-json/") "meadow-json" "without the slash"
+
+@test fun aProfileSaysWhatItsSectionSays () =
+  let p =
+    profileIn
+      "[package]\nname = \"P\"\n\n[profile.debug]\nruntime = \"glade\"\n\n[profile.release]\nruntime = \"silo\" # native\nopt-level = 1\nthreads = 4\nprune = false\ncfg = \"fast, feature=gpu\"\naot = true\nstrictness = \"lenient\"\n"
+      "release"
+  in
+  let a = assertEq p.runtime (Just "silo") "runtime" in
+  let b = assertEq p.opt (Just 1) "opt-level" in
+  let c = assertEq p.threads (Just 4) "threads" in
+  let d = assertEq p.prune (Just False) "prune" in
+  let e = assertEq p.cfg (Just "fast, feature=gpu") "cfg" in
+  let f = assertEq p.backend (Just "aot") "aot" in
+  let g = assertEq p.strictness (Just "lenient") "strictness" in
+  let other = profileIn "[profile.release]\nopt-level = \"O2\"\n" "debug" in
+  let h = assertEq other.opt None "another profile's" in
+  let o = profileIn "[profile.release]\nopt-level = \"O2\"\n" "release" in
+  assertEq o.opt (Just 2) "`O2`"
+
+@test fun aValueASettingDoesNotTakeSaysNothing () =
+  let p =
+    profileIn
+      "[profile.debug]\nopt-level = 2\nopt-level = 7\nruntime = \"llvm\"\nthreads = 0\n"
+      "debug"
+  in
+  let a = assertEq p.opt None "the last says it" in
+  let b = assertEq p.runtime None "no such runtime" in
+  assertEq p.threads None "no threads"

@@ -18,7 +18,7 @@ use Std.Fs (Fs, readToString, writeString)
 use Std.Time (monotonic)
 use Std.Thread (parMap)
 use Std.Console (writeError)
-use Std.Process (getEnv)
+use Std.Process (Process, getEnv)
 use MeadowBoot.Types.Type.*
 use Lingua.Green (Green)
 use Lingua.Red as R
@@ -26,6 +26,7 @@ use Lingua.Diagnostic (Diagnostic, collect, renderAll, whereAt, message)
 use Lingua.Lang (metaStart)
 use MeadowBoot.Syntax
 use MeadowBoot.Parse (checkedTree)
+use MeadowBoot.Channel (attributesSaid)
 use MeadowBoot.Fixity (Fixity, Grouped, declare, grouped)
 use MeadowBoot.Unit (dependenciesOf, unitFilesOf, manifestOf, packageName, dependencyNames)
 use MeadowBoot.Lower (lowered, loweredWith, Request, Cfg, shownCfg)
@@ -2260,14 +2261,17 @@ fun compiling (o : UnitsOptions) (u : Given Interface) (clk : Clock) =
   let files = V.map fst sources in
   let parsed = compilerParsedEach db files in
   let m1 = mark "parsed" in
+  -- What does not parse, and what a module's attributes ask that it may not.
   let failed =
-    V.concatMap
-      (\i ->
-        match (V.get sources i, V.get parsed i) with
-        | (Just (path, _), Just (Err errs)) ->
-            ["${path}: ${S.join "; " (V.map (\e -> "${snd e} at byte ${show (fst e)}") errs)}\n"]
-        | _ -> [])
-      (V.range 0 (V.len sources))
+    V.append
+      (V.concatMap
+         (\i ->
+           match (V.get sources i, V.get parsed i) with
+           | (Just (path, _), Just (Err errs)) ->
+               ["${path}: ${S.join "; " (V.map (\e -> "${snd e} at byte ${show (fst e)}") errs)}\n"]
+           | _ -> [])
+         (V.range 0 (V.len sources)))
+      (attributesOf u sources parsed)
   in if not (V.isEmpty failed) then Err (S.join "" failed)
      else
        let groups = compilerGroupedEach db files in
@@ -2456,6 +2460,34 @@ fun compiling (o : UnitsOptions) (u : Given Interface) (clk : Clock) =
                         macros = macrosOf (unitDir u) pkg asts,
                         bindings
                       })
+
+-- What the attributes of the unit's modules, `@!feature(…)` and the rest,
+-- say is wrong, each a line, as the Rust compiler refuses them: an attribute
+-- a module has not, a feature asked for anywhere but the root module, and one
+-- this `meadow` does not have, or has only on a channel that is not this one
+-- (`Channel`). A feature that is settled is said to be, on standard error,
+-- and the unit compiles.
+fun attributesOf
+    (u : Given Interface)
+    (sources : [(String, String)])
+    (parsed : [Result [(Int, String)] (Green Surface)])
+    : [String] ! { Fs, Process | e } =
+  let manifest =
+    M.unwrapOr "" (M.map snd (V.find (\s -> S.endsWith "Meadow.toml" (fst s)) (unitSources u)))
+  in
+  let pkg = packageName manifest in
+  let src = Path.join (unitDir u) "src" in
+  V.concatMap
+    (\i ->
+      match (V.get sources i, V.get parsed i) with
+      | (Just (path, text), Just (Ok tree)) ->
+          (let root = V.isEmpty (modulePath (pkg == "Std") src path) in
+           let file = "${pkg}/${relativeTo (unitDir u) path}" in
+           let (wrong, warned) = attributesSaid file text root tree in
+           let said = V.foldl (\w why -> writeError "warning: ${why}\n") () warned in
+           V.map (\why -> "${why}\n") wrong)
+      | _ -> [])
+    (V.range 0 (V.len sources))
 
 -- --- procedural macros ---------------------------------------------------------
 
