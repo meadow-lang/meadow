@@ -753,6 +753,9 @@ To cut a release:
    `.github/workflows/release.yml` runs the checks again, cross-builds for
    Linux, macOS and Windows (x86-64 and arm64) and attaches the archives the
    installers look for. It refuses a tag that already has a release.
+   It publishes nothing unless MeadowBoot, built on each platform, has
+   built itself there too (`meadowboot.yml`, which it calls); MeadowBoot's
+   archives go on the release with the rest.
 
 4. Set the next minor version in the manifests on `master`, so that the
    nightlies after a release are builds of the version they are working
