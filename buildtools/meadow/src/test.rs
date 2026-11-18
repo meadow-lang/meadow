@@ -224,12 +224,13 @@ pub fn run(opts: &Options) -> Result<bool, String> {
 }
 
 /// Whether `path` names something the build system would recognise: a single
-/// `.mw` file, or a directory with a manifest or a `src/`.
+/// `.mw` file, or a directory with a manifest. A `src/` without one is not a
+/// package (see [`crate::package::package_root`]).
 fn is_package(path: &Path) -> bool {
     if path.extension().is_some_and(|e| e == "mw") {
         return true;
     }
-    path.join("Meadow.toml").is_file() || path.join("src").is_dir()
+    crate::package::manifest_path(path).is_some()
 }
 
 /// Link a set of packages without building from disk — used by the integration

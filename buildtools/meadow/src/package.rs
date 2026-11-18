@@ -17,8 +17,10 @@
 //! ```
 //!
 //! `[package]` name/version may also be given at the top level, and the legacy
-//! file name `Meadow.pkg` is still accepted. Without a manifest the directory (or
-//! single `.mw` file) is a standalone package named after its stem. The embedded
+//! file name `Meadow.pkg` is still accepted. A single `.mw` file needs no
+//! manifest: it is a standalone package named after its stem. A directory that
+//! has none is not a package a command builds -- a command given one builds the
+//! package above it, or refuses (see [`package_root`]). The embedded
 //! `Std` package (see [`crate::stdlib`]) is always an implicit dependency and
 //! never needs to be listed.
 //!
@@ -1079,15 +1081,17 @@ impl Manifest {
         }
     }
 
-    /// The manifest governing `path`, which may be a package directory or a
-    /// single `.mw` file inside one.
+    /// The manifest governing `path`, which may be a package directory, a
+    /// directory inside one (whose manifest is the nearest above it, as
+    /// [`package_root`] finds the package a build of it builds), or a single
+    /// `.mw` file inside one.
     ///
-    /// Unreadable or missing is not an error here: a package need not have a
+    /// Unreadable or missing is not an error here: a lone `.mw` file has no
     /// manifest at all, and a build should not be stopped by one it could not
     /// read when everything it says is optional anyway.
     pub fn find(path: &Path) -> Option<Manifest> {
         let dir = if path.is_dir() {
-            path.to_path_buf()
+            package_root(path).ok()?
         } else {
             path.parent()?.to_path_buf()
         };
@@ -1120,6 +1124,33 @@ pub fn enclosing_root(file: &Path) -> Option<PathBuf> {
             return dir.parent().map(Path::to_path_buf);
         }
         dir = dir.parent()?;
+    }
+}
+
+/// What a command given `path` builds: `path` itself when it is a `.mw` file
+/// or a directory with a manifest, and otherwise the nearest directory above
+/// it that has one -- the package, or workspace, it is inside -- as Cargo
+/// finds a `Cargo.toml`.
+///
+/// A directory with no manifest at or above it is an error. Built as a
+/// package of its own it would be named after the directory, and would sweep
+/// in every `.mw` file below it, other packages' included. A lone `.mw` file
+/// is still a package (`meadow run hello.mw`). A path that does not exist is
+/// handed back as it is, for the build to say so rather than build whatever
+/// is above it.
+pub fn package_root(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_dir() || manifest_path(path).is_some() {
+        return Ok(path.to_path_buf());
+    }
+    let full = canonical(&std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()));
+    match full.ancestors().find(|d| manifest_path(d).is_some()) {
+        Some(root) => Ok(root.to_path_buf()),
+        None => Err(format!(
+            "could not find `Meadow.toml` in {} or any directory above it: a package \
+             is a directory with a `Meadow.toml` (`meadow init` writes one), or a \
+             single `.mw` file",
+            crate::workspace::shown(&full)
+        )),
     }
 }
 

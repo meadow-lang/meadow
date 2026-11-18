@@ -486,6 +486,18 @@ last release is under _Unreleased_.
 
 ### Fixed
 
+- `meadow build`, `run`, `test` and `dis` in a directory with no
+  `Meadow.toml` no longer take it for a package. They took one named after
+  the directory (`.`, given `.`) and swept every `.mw` file below it into
+  it, another package's included, so building at the top of a repository
+  that holds a few packages failed with "module files and directories must
+  be PascalCase" for paths that were never one package's modules. A
+  directory inside a package or a workspace now means that package or
+  workspace, as Cargo finds a `Cargo.toml` -- `meadow run` in `pkg/src`
+  builds `pkg` into `pkg/target` -- and a directory with no manifest at or
+  above it is refused, saying so. A single `.mw` file is still a package of
+  its own: `meadow run hello.mw` is as it was.
+
 - A precompiled standard library made by MeadowBoot (`Std.mwstd`) can be
   shipped. A debug build says where each file of the program is, and the
   library's files were said where they were on the machine that precompiled
