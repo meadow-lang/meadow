@@ -282,8 +282,11 @@ impl Selection {
     ///
     /// Without `-p` or `--workspace`, `path` means itself -- unless it is a
     /// workspace's root, where it means `default-members`, or else the root
-    /// package, or else (in a virtual workspace) every member.
+    /// package, or else (in a virtual workspace) every member. A directory
+    /// with no manifest of its own means the package or workspace above it
+    /// (see [`crate::package::package_root`]), and is an error outside one.
     pub fn select(&self, path: &Path) -> Result<Selected, String> {
+        let path = &crate::package::package_root(path)?;
         let workspace = Workspace::find(path)?;
         let Some(ws) = workspace else {
             if self.workspace {

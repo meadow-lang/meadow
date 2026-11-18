@@ -199,6 +199,12 @@ fn what_a_command_selects() {
         dirs(&Selection::default(), &root.join("app")),
         [root.join("app")]
     );
+    // Below a member, the member; below the root in no member, the root.
+    assert_eq!(
+        dirs(&Selection::default(), &root.join("app/src")),
+        [root.join("app")]
+    );
+    assert_eq!(dirs(&Selection::default(), &root.join("libs")).len(), 3);
 
     // `-p` from anywhere, `--workspace` less `--exclude`.
     let p = Selection {
@@ -244,6 +250,59 @@ fn what_a_command_selects() {
         ),
     );
     assert_eq!(dirs(&Selection::default(), &root), [root.join("app")]);
+    // And so does a directory under it that is in no member.
+    assert_eq!(
+        dirs(&Selection::default(), &root.join("libs")),
+        [root.join("app")]
+    );
+}
+
+/// A directory with no `Meadow.toml` at or above it is not a package: built
+/// as one it was named `.`, and swept every `.mw` file below it -- another
+/// package's included -- into itself. Below a manifest, it means that
+/// package, as Cargo finds a `Cargo.toml`; a lone `.mw` file is still a
+/// package of its own.
+#[test]
+fn a_directory_with_no_manifest_is_not_a_package() {
+    let loose = scratch("loose");
+    write(
+        &loose.join("pkg/Meadow.toml"),
+        "[package]\nname = \"Pkg\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        &loose.join("pkg/src/Main.mw"),
+        "fun main () = println \"hi\"\n",
+    );
+    write(&loose.join("hello.mw"), "fun main () = println \"hello\"\n");
+
+    let err = Selection::default().select(&loose).unwrap_err();
+    assert!(err.contains("could not find `Meadow.toml`"), "{err}");
+    for args in [&["build"][..], &["build", "."], &["run"], &["test"]] {
+        let (ok, said) = meadow(&loose, args);
+        assert!(!ok, "`meadow {}` built something: {said}", args.join(" "));
+        assert!(
+            said.contains("could not find `Meadow.toml`") && !said.contains("PascalCase"),
+            "`meadow {}`: {said}",
+            args.join(" ")
+        );
+    }
+
+    // Inside the package, the package.
+    let dirs = Selection::default()
+        .select(&loose.join("pkg/src"))
+        .unwrap()
+        .paths;
+    assert_eq!(dirs, [loose.join("pkg")]);
+    let (ok, said) = meadow(&loose.join("pkg/src"), &["run"]);
+    assert!(ok && said.contains("Pkg") && said.contains("hi"), "{said}");
+    assert!(
+        !loose.join("pkg/src/target").exists(),
+        "built into the package's own target"
+    );
+
+    // A file is a package of its own.
+    let (ok, said) = meadow(&loose, &["run", "hello.mw"]);
+    assert!(ok && said.contains("hello"), "{said}");
 }
 
 #[test]
