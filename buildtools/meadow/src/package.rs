@@ -568,16 +568,21 @@ pub struct Policy {
     pub update: bool,
 }
 
-static POLICY: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
+static POLICY: std::sync::RwLock<Option<Policy>> = std::sync::RwLock::new(None);
 
-/// Say how this run resolves. Only the first call counts, which is the one the
-/// command line makes before any work starts.
+/// Say how this run resolves: the command line says it before any work
+/// starts. Each command line says it afresh, because in `meadow-host` one
+/// process runs many -- MeadowBoot hands it `__resolve --offline` and then the
+/// back end's commands, and what one was told is not the next one's.
 pub fn set_policy(p: Policy) {
-    let _ = POLICY.set(p);
+    *POLICY.write().unwrap_or_else(|e| e.into_inner()) = Some(p);
 }
 
 pub fn policy() -> Policy {
-    POLICY.get().copied().unwrap_or_default()
+    POLICY
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_default()
 }
 
 impl Resolver {

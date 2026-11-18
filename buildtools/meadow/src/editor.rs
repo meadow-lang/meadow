@@ -166,8 +166,9 @@ fn first_fetch(root: &std::path::Path) -> bool {
 
 /// Resolve `root`'s dependencies as a build does -- fetching what is not
 /// cached -- and write the lockfile, as a build does, so that the next build
-/// uses what the editor pinned.
-fn fetch(root: &std::path::Path) -> Result<crate::package::PackageGraph, String> {
+/// uses what the editor pinned. Also `meadow __resolve --as quiet`, which is
+/// how MeadowBoot's language server and debug adapter ask for the same.
+pub(crate) fn fetch(root: &std::path::Path) -> Result<crate::package::PackageGraph, String> {
     let mut resolver = crate::package::Resolver::for_entry(root);
     let graph =
         crate::package::PackageGraph::build_all_with(&[root], &mut resolver).map_err(|d| d.msg)?;

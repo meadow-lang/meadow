@@ -486,6 +486,18 @@ last release is under _Unreleased_.
 
 ### Fixed
 
+- `meadow build`, `run`, `test` and `dis` fetch a package's git dependencies
+  and write `Meadow.lock` again, now that `meadow` is MeadowBoot. MeadowBoot
+  read git dependencies from the cache the Rust compiler fills, and on an
+  installed toolchain nothing filled it, so every package with a git
+  dependency failed with "has not been fetched". MeadowBoot now has the back
+  end it loads resolve the package first, as the Rust compiler's build does:
+  the same cache, the same `Meadow.lock`, the same `Updating` lines, and
+  `--offline` and `--locked` honoured. A package whose dependencies are all
+  paths asks nothing of it. `meadow lsp --check`, the language server with
+  `--fetch`, and the debug adapter fetch as the Rust compiler's do, and a
+  package in a workspace reads the lock at the workspace's root, where it is
+  written.
 - A precompiled standard library made by MeadowBoot (`Std.mwstd`) can be
   shipped. A debug build says where each file of the program is, and the
   library's files were said where they were on the machine that precompiled
