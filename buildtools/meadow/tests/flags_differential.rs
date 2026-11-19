@@ -179,12 +179,18 @@ impl Pair {
 
     /// `meadow COMMAND ARGS… PACKAGE`.
     fn rust(&self, command: &str, args: &[&str]) -> Said {
-        said(
-            untold(Command::new(meadow()).arg(command).args(args))
-                .arg(self.rust_root())
-                .output()
-                .expect("meadow runs"),
-        )
+        self.rust_in(None, command, args)
+    }
+
+    /// The same, with `MEADOW_HOME` -- where fetched dependencies are kept --
+    /// at `home`, where one is given.
+    fn rust_in(&self, home: Option<&Path>, command: &str, args: &[&str]) -> Said {
+        let mut c = Command::new(meadow());
+        untold(c.arg(command).args(args)).arg(self.rust_root());
+        if let Some(home) = home {
+            c.env("MEADOW_HOME", home);
+        }
+        said(c.output().expect("meadow runs"))
     }
 
     /// `text` added to both packages' manifests.
@@ -211,17 +217,25 @@ impl Pair {
 
     /// `meadowboot COMMAND ARGS… PACKAGE`, the back end loaded into it.
     fn boot(&self, command: &str, args: &[&str]) -> Said {
-        said(
-            untold(Command::new(meadowboot_exe()).arg(command).args(args))
-                .arg(self.boot_root())
-                .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
-                .env("MEADOW_HOST", meadow_host())
-                .env_remove("MEADOW")
-                .env_remove("MEADOWBOOT_EXPANSIONS")
-                .env_remove("MEADOWBOOT_SET")
-                .output()
-                .expect("MeadowBoot runs"),
-        )
+        self.boot_in(None, command, args)
+    }
+
+    /// The same, with `MEADOW_HOME` at `home`, where one is given.
+    fn boot_in(&self, home: Option<&Path>, command: &str, args: &[&str]) -> Said {
+        let mut c = Command::new(meadowboot_exe());
+        untold(c.arg(command).args(args))
+            .arg(self.boot_root())
+            .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+            .env("MEADOW_HOST", meadow_host())
+            .env_remove("MEADOW")
+            .env_remove("MEADOWBOOT_EXPANSIONS")
+            .env_remove("MEADOWBOOT_SET")
+            .env_remove("MEADOWBOOT_LOCK")
+            .env_remove("MEADOWBOOT_FETCH");
+        if let Some(home) = home {
+            c.env("MEADOW_HOME", home);
+        }
+        said(c.output().expect("MeadowBoot runs"))
     }
 }
 
@@ -905,4 +919,175 @@ fn a_feature_is_refused_or_taken_as_meadow_refuses_or_takes_it() {
     assert!(ours.out.ends_with("settled\n"), "{ours}");
     assert_eq!(warned(&theirs).len(), 1, "{theirs}");
     assert_eq!(warned(&ours), warned(&theirs), "{ours}\n{theirs}");
+}
+
+fn git(args: &[&str]) -> bool {
+    Command::new("git")
+        .args(args)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// A package in a git repository of its own, one commit tagged `v1.0.0`,
+/// for a package to depend on with no network -- or `None` with no `git`.
+fn greet_repo() -> Option<meadow_scratch::Scratch> {
+    let dir = meadow_scratch::scratch!("flags-greet-{}", std::process::id());
+    std::fs::create_dir_all(dir.join("src")).ok()?;
+    std::fs::write(
+        dir.join("Meadow.toml"),
+        "[package]\nname = \"Greet\"\nversion = \"0.1.0\"\n",
+    )
+    .ok()?;
+    std::fs::write(dir.join("src/Lib.mw"), "@pub def greeting = \"hi\"\n").ok()?;
+    let d = dir.display().to_string();
+    let ok = git(&["init", "--quiet", "-b", "main", &d])
+        && git(&["-C", &d, "add", "-A"])
+        && git(&[
+            "-C",
+            &d,
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--quiet",
+            "-m",
+            "first",
+        ])
+        && git(&["-C", &d, "tag", "v1.0.0"]);
+    ok.then_some(dir)
+}
+
+/// Every file under `dir`, as paths from it, sorted: what a cache holds.
+fn files_under(dir: &Path) -> Vec<String> {
+    fn walk(at: &Path, from: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(at) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, from, out);
+            } else if let Ok(rest) = p.strip_prefix(from) {
+                out.push(rest.display().to_string().replace('\\', "/"));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+/// The lines of standard error that say why dependencies could not be
+/// resolved, with the package each compiler was given left out: what is
+/// compared of a failure.
+fn refusal(s: &Said, root: &Path) -> Vec<String> {
+    let root = root.display().to_string();
+    s.err
+        .lines()
+        .filter(|l| l.starts_with("Error: ") || l.starts_with("error: ") || l.starts_with("Run "))
+        .map(|l| l.replace(&root, "<package>"))
+        .collect()
+}
+
+/// A package with a git dependency, built from an empty `MEADOW_HOME` as an
+/// installed toolchain on a new machine builds it: MeadowBoot has it fetched
+/// as `meadow` fetches it -- by the back end, which drives git -- into the
+/// same place in the cache, saying the same, and writes the same
+/// `Meadow.lock`. With that lock a build fetches nothing, and `--offline`
+/// and `--locked` hold a build to it as `meadow`'s do. The dependency is a
+/// repository made here, so no network is needed.
+#[test]
+fn a_git_dependency_is_fetched_and_locked_as_meadow_does() {
+    let Some(repo) = greet_repo() else {
+        eprintln!("skipped: no usable git");
+        return;
+    };
+    let url = repo.display().to_string().replace('\\', "/");
+    let p = pair(
+        "Greeter",
+        &[(
+            "Main.mw",
+            "use Greet (greeting)\nuse Std.Test (assertEq)\n\n\
+             fun main () = println greeting\n\n\
+             @test fun greets () = assertEq greeting \"hi\" \"the greeting\"\n",
+        )],
+    );
+    p.manifest(&format!(
+        "\n[dependencies]\nGreet = {{ git = \"{url}\", tag = \"v1.0.0\" }}\n"
+    ));
+    let lock = |root: PathBuf| std::fs::read_to_string(root.join("Meadow.lock")).ok();
+    let homes = |what: &str| {
+        (
+            meadow_scratch::scratch!("flags-home-rust-{what}-{}", std::process::id()),
+            meadow_scratch::scratch!("flags-home-boot-{what}-{}", std::process::id()),
+        )
+    };
+    let checkouts = |home: &Path| files_under(&home.join("git").join("checkouts"));
+    let fetched = format!("Updating git repository `{url}`");
+
+    // No lock, and nothing in either cache: `--locked` refuses to write one,
+    // and `--offline` to fetch.
+    let (rust_home, boot_home) = homes("none");
+    for flag in ["--locked", "--offline"] {
+        let theirs = p.rust_in(Some(&rust_home), "run", &[flag]);
+        let ours = p.boot_in(Some(&boot_home), "run", &[flag]);
+        assert_eq!(theirs.code, Some(1), "{flag}: {theirs}");
+        assert_eq!(ours.code, theirs.code, "{flag}: {ours}");
+        assert_eq!(
+            refusal(&ours, &p.boot_root()),
+            refusal(&theirs, &p.rust_root()),
+            "{flag}:\n{ours}\n{theirs}"
+        );
+        assert_eq!(lock(p.boot_root()), None, "{flag}: {ours}");
+    }
+
+    // Fetched, said, and pinned, by `run` and by `test`, each from a cache of
+    // its own; then, with the lock and in that cache, fetched no more, and
+    // built `--locked --offline`.
+    for command in ["run", "test"] {
+        for root in [p.rust_root(), p.boot_root()] {
+            let _ = std::fs::remove_file(root.join("Meadow.lock"));
+        }
+        let (rust_home, boot_home) = homes(command);
+        let theirs = p.rust_in(Some(&rust_home), command, &[]);
+        let ours = p.boot_in(Some(&boot_home), command, &[]);
+        assert_eq!(theirs.code, Some(0), "{command}: {theirs}");
+        assert_eq!(ours.code, Some(0), "{command}: {ours}");
+        assert!(theirs.err.contains(&fetched), "{command}: {theirs}");
+        assert!(ours.err.contains(&fetched), "{command}: {ours}");
+        if command == "run" {
+            assert!(ours.out.ends_with("hi\n"), "{ours}");
+        } else {
+            assert!(ours.out.contains("greets"), "{ours}");
+        }
+        let written = lock(p.rust_root()).expect("meadow writes a lock");
+        assert_eq!(lock(p.boot_root()).as_ref(), Some(&written), "{command}");
+        assert!(!checkouts(&rust_home).is_empty(), "{command}: {theirs}");
+        assert_eq!(checkouts(&boot_home), checkouts(&rust_home), "{command}");
+        let ours = p.boot_in(Some(&boot_home), command, &["--locked", "--offline"]);
+        assert_eq!(ours.code, Some(0), "{command} again: {ours}");
+        assert!(!ours.err.contains(&fetched), "{command} again: {ours}");
+        assert_eq!(lock(p.boot_root()), Some(written), "{command} again");
+    }
+
+    // With the lock and an empty cache: `--offline` refuses, saying what it
+    // would have had to fetch, and without it the pinned commit is fetched.
+    let (rust_home, boot_home) = homes("locked");
+    let theirs = p.rust_in(Some(&rust_home), "run", &["--offline"]);
+    let ours = p.boot_in(Some(&boot_home), "run", &["--offline"]);
+    assert_eq!(theirs.code, Some(1), "{theirs}");
+    assert_eq!(ours.code, theirs.code, "{ours}");
+    assert_eq!(
+        refusal(&ours, &p.boot_root()),
+        refusal(&theirs, &p.rust_root()),
+        "\n{ours}\n{theirs}"
+    );
+    let written = lock(p.boot_root());
+    let ours = p.boot_in(Some(&boot_home), "run", &["--locked"]);
+    assert_eq!(ours.code, Some(0), "{ours}");
+    assert!(ours.err.contains(&fetched), "{ours}");
+    assert_eq!(lock(p.boot_root()), written, "the lock is kept");
 }

@@ -461,6 +461,19 @@ enum Cmd {
         #[arg(long)]
         target: Option<String>,
     },
+    /// Resolve a package's dependencies as a build would -- fetching, and
+    /// writing `Meadow.lock` -- and build nothing. Hidden: MeadowBoot asks
+    /// for it before it builds a package with a git dependency.
+    #[command(name = "__resolve", hide = true)]
+    Resolve {
+        /// Package directory (or a single `.mw` file).
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Which command's way to report a failure in: `build` (also `run`'s),
+        /// `test`, `dis`, or `quiet`.
+        #[arg(long = "as", value_enum, default_value = "build")]
+        report: Report,
+    },
 }
 
 /// `-p`, `--workspace` and `--exclude` -- which members of a workspace a
@@ -806,13 +819,13 @@ where
         .spawn(move || command(Cli::parse_from(args)))
         .expect("the main thread starts");
     // A panic has said what it was already; the exit status is Rust's own.
-    match run.join() {
-        Ok(()) => 0,
-        Err(_) => 101,
-    }
+    run.join().unwrap_or(101)
 }
 
-fn command(cli: Cli) {
+/// `cli` run, and the status it ends with where it does not end the process
+/// itself: 0, but for `__resolve`, whose failure MeadowBoot reports and so
+/// must outlive.
+fn command(cli: Cli) -> i32 {
     // Said once, before anything resolves a dependency.
     crate::package::set_policy(crate::package::Policy {
         net: if cli.offline {
@@ -827,10 +840,23 @@ fn command(cli: Cli) {
     // terminal is not ours to write to: the REPL's, and an editor's, whose
     // language server and debugger would pour it into an output panel on every
     // keystroke.
-    if !matches!(&cli.cmd, None | Some(Cmd::Lsp { .. }) | Some(Cmd::Dap)) {
+    // Said by each command line, since `meadow-host` runs many in one process.
+    // `__resolve --as quiet` is the language server's and the debugger's.
+    if matches!(
+        &cli.cmd,
+        None | Some(Cmd::Lsp { .. })
+            | Some(Cmd::Dap)
+            | Some(Cmd::Resolve {
+                report: Report::Quiet,
+                ..
+            })
+    ) {
+        crate::status::disable();
+    } else {
         crate::status::enable();
     }
     match cli.cmd {
+        Some(Cmd::Resolve { path, report }) => return resolve_only(&path, report),
         // No subcommand → interactive REPL.
         None => repl::Session::new().run(),
         Some(Cmd::Build {
@@ -1458,6 +1484,59 @@ fn command(cli: Cli) {
             std::process::exit(1);
         }
     }
+    0
+}
+
+/// How `__resolve` reports a dependency it could not resolve: as the command
+/// MeadowBoot is running would have, had the Rust compiler run it.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Report {
+    /// As `build` and `run`: the diagnostic, then `could not compile`.
+    Build,
+    /// As `test`: the diagnostic, then `could not build the package`.
+    Test,
+    /// As `dis`: the file and the message.
+    Dis,
+    /// Not at all, and nothing said while fetching: as the language server
+    /// and the debugger fetch.
+    Quiet,
+}
+
+/// `meadow __resolve`: the package at `path` resolved as a build of it
+/// resolves -- what it depends on found, a git dependency fetched where it is
+/// not in the cache, `Meadow.lock` written, all as `--offline` and `--locked`
+/// allow and saying what a build says -- and nothing built. MeadowBoot runs
+/// this through `meadow-host` before it reads a package's dependencies, which
+/// it then finds where this put them: git stays the Rust compiler's to drive.
+fn resolve_only(path: &std::path::Path, report: Report) -> i32 {
+    if report == Report::Quiet {
+        let root = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            crate::package::enclosing_root(path).unwrap_or_else(|| path.to_path_buf())
+        };
+        return match crate::editor::fetch(&root) {
+            Ok(_) => 0,
+            Err(_) => 1,
+        };
+    }
+    let selected = select(&Selection::default(), path);
+    let paths: Vec<&std::path::Path> = selected.paths.iter().map(|p| p.as_path()).collect();
+    let Err(d) = pipeline::resolve(&paths) else {
+        return 0;
+    };
+    match report {
+        Report::Build | Report::Quiet => {
+            status::diagnostic(&d);
+            could_not_compile(&shown(paths.first().copied().unwrap_or(path)), 1);
+        }
+        Report::Test => {
+            status::diagnostic(&d);
+            eprintln!("error: could not build the package");
+        }
+        Report::Dis => eprintln!("{}: {}", d.filename, d.msg),
+    }
+    1
 }
 
 /// A path as a person would write it: without Windows' `\?\` prefix.
