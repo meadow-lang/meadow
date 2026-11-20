@@ -987,6 +987,21 @@ It avoids two dependent checkers, and it keeps the logics in step (K, `Int`,
 `Div`, the rule on rows in types). (c) is attractive later. Grades stay out
 of Meadow's meta level unless `Mem` needs them.
 
+(b) is not only moving files, because `front/`'s kernel is graded
+throughout. `Value.Pi` and `Core.Pi` each carry two grades as terms, one
+for run-time use and one for type-level use (as in graded type theory).
+Grades are polynomial normal forms that unification solves, and
+`Usage.mw`, `Grade.mw` and the effect rows share that machinery. So (b)
+comes in two forms:
+
+- **(b1)** Meadow's meta level runs the graded kernel with every grade fixed
+  at ω. This is cheaper, and keeps the two logics in step.
+- **(b2)** The kernel is parameterised over a grade algebra. This is cleaner,
+  but it means a real refactor of `Value`, `Unify` and `Check`.
+
+(b1) is the place to start; (b2) can follow if `Mem` brings grades into
+Meadow.
+
 ### Q9. Partial primitives in the shared fragment
 
 - **(a)** Definitions using `/`, `%`, out-of-bounds indexing or a partial
