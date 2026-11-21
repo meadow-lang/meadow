@@ -1,8 +1,7 @@
 # Two-level Meadow
 
-_A roadmap, not a spec. Draft 3. L0 is built; nothing after it is. Syntax in
-it is a sketch. The choices taken on earlier drafts are in
-[Decisions](#decisions); what is still open is listed after them._
+_A roadmap, not a spec. Draft 4. L0 is built; nothing after it is. Syntax in
+it is a sketch. The choices taken so far are in [Decisions](#decisions)._
 
 Meadow is an ML: Hindley–Milner inference with let-generalisation, traits,
 effect rows, general recursion, and control over how values are represented.
@@ -201,8 +200,8 @@ as it is.
 A kernel parameterised over its grade algebra can follow if `Mem` brings more
 grades to Meadow.
 
-**How the extraction is done** is a proposal, for the user and Idyll's session
-to agree (it is L1's first part):
+**How the extraction is done** (decided; it is L1's first part, done by
+Idyll's session in Idyll's repository):
 
 1. **Refactor inside Idyll's repository** until the kernel modules import
    nothing from `Elab` or from Lingua. That means the span type, the
@@ -264,9 +263,6 @@ definition that did not ask to be total.
 
 ### Erased dependent functions at run time
 
-_Recommended. Whether Meadow takes it is still open: see
-[Still open](#still-open)._
-
 Meadow's run-time level gets opt-in erased dependent functions through
 Strata's kernel, limited to grades 0 and ω. The full grade algebra,
 linearity, Low\*-style extraction and the verification stack stay Idyll's.
@@ -292,7 +288,7 @@ linearity, Low\*-style extraction and the verification stack stay Idyll's.
   run-time definition at grade 0, about the run-time `reverse` itself. No copy
   is involved, so nothing about the compiler has to be trusted to make it
   apply.
-- **Grade 0 is written `@0` on a binder** (suggested; still open). Idyll's
+- **Grade 0 is written `@0` on a binder.** Idyll's
   `[r]` cannot be used because Meadow's lists are written `[a; b]`. `@0`
   clashes with nothing in Idyll.
 - **A binder that writes nothing is ω**, Idyll's `[]`: unrestricted, as every
@@ -309,7 +305,8 @@ old spelling is kept for one release, with a warning.
 Compile-time code is total and pure. Two compiler-provided effects are
 proposed for it, `Fail` (an error at a place, which ends the computation) and
 `Expand` (compile-time bindings, as macros have today). Both terminate, so
-neither is `Div`. Whether they are effects or ordinary values is still open.
+neither is `Div`. They are effects, with total handlers in the compiler, so
+generators stay direct-style, as Meadow code is.
 Compile-time code never performs `Fs`, `Time` or `Random`, so its answers stay
 cacheable.
 
@@ -750,8 +747,13 @@ Meadow:
   session (see [Strata](#strata-the-kernel));
 - **Cut**, whose changes are reviewed by both front ends.
 
-How a Meadow package and an Idyll package use each other is still open. Today
-they can meet only through Cut's exported symbols, with no shared data types.
+For now a Meadow package and an Idyll package meet only through Cut's exported
+symbols, with no shared data types. The goal is interfaces that carry Strata
+types, so that either language calls the other with checked types; grades and
+dependencies are checked at the border, or erased there with a run-time
+check. The border format has to be designed for size: Idyll's interfaces
+carry normal forms, which once made its Std's export 18 MB until it was
+trimmed.
 Idyll's repository is Idyll's. Nothing here edits it.
 
 ### The `Mem` effect
@@ -841,8 +843,8 @@ _Tested by_:
 
 _Proves_: the elaborator can be replaced without changing anything.
 
-- **First, the extraction** ([Strata](#strata-the-kernel)), if the user
-  and Idyll's session agree to it. The kernel modules are refactored inside
+- **First, the extraction** ([Strata](#strata-the-kernel)), by Idyll's
+  session. The kernel modules are refactored inside
   Idyll's repository until they import nothing from `Elab` or Lingua, with
   Idyll's Rust compiler and `front/` in parity at each step. They are then
   moved into `Strata/` verbatim, and `front/` depends on Strata by revision.
@@ -1223,7 +1225,7 @@ _Done when_: every shared function in Std passes.
 
 ## Decisions
 
-Taken on drafts 1 and 2.
+Taken on drafts 1 to 3. The last six rows are the recommendations of draft 3, accepted as they stood.
 
 | | decision |
 | --- | --- |
@@ -1235,53 +1237,20 @@ Taken on drafts 1 and 2.
 | **Q5** logic | `Type : Type` while prototyping, then a predicative hierarchy with level inference before proofs are relied on; Axiom K kept. |
 | **Q6** `Mem` regions | Abstract erased index variables (rank-2, as `runSt`) for identity and lifetime; compile-time values for static sizes and layouts; the ghost heap only in proof-carrying modules, as Idyll designs it; Meadow adopts Idyll's `Mem` rather than designing its own. |
 | **Q7** strategy | Debug uses dictionaries (with O1's known-dictionary reads), release specialises; `@specialise` and `@dictionaries`; `traits = "dictionaries" \| "specialise"`. |
-| **Q8** sharing with Idyll | (b), the shared kernel, starting with (b1): Idyll's graded kernel with grades fixed at ω. Run-time erased dependent functions, if taken, use 0 as well, a subset of the same algebra, so they need no parameterised kernel (b2). |
+| **Q8** sharing with Idyll | (b), the shared kernel, starting with (b1): Idyll's graded kernel with grades fixed at ω. Run-time erased dependent functions use 0 as well, a subset of the same algebra, so they need no parameterised kernel (b2). |
 | **Q9** partial primitives | Not shared at first (they perform `Div`); checked forms taking a proof come later. |
 | **Q10** shared membership | Inferred, with `@shared` to assert it and an error at a compile-time use of a definition that left the fragment. |
 | **Q11** laws outside the fragment | Assumed and listed as trusted, and generated as property tests. |
 | **Q12** trait objects | `dyn Trait` in L5; general existentials (`exists a. C a => T a`, packed by checking, opened with an escape check, never inferred from use, boxed at run time, a Σ at compile time) in L5b; existentials over indices in L7. |
 | **Macros** | Custom syntax stays, as a layer before elaboration (Lean 4's model): declarative rules and procedural `@compTime` extensions over tokens and syntax trees, hygienic and position-preserving, total; elaborator-aware extensions later. L8 is macros and syntax extensions, tested with a small C-like DSL, starting with an inventory of what passes the checker as it is. |
 | **Priority** | Agents are expected to be the main authors: run-time dependent functions and proof tooling come first, then the rest of verification, then staging, macros and syntax extensions. Machine-readable diagnostics, fast incremental checking, readable specifications and an inventory of trusted assumptions are priorities. The invariants (same types, self-build reproduces its Cut) hold throughout; L5 may run in parallel. |
+| **Extraction** | As proposed: Idyll's session refactors the kernel modules inside Idyll's repository until they import nothing from `Elab` or Lingua, with its Rust compiler and `front/` in parity at each step; they then move into `Strata/` verbatim and `front/` depends on Strata by revision. |
+| **Parity rule** | A Strata change that touches the kernel keeps Idyll's parity suite green, or comes with Idyll's matching change. |
+| **Run-time dependency** | (a): opt-in erased dependent functions at run time through Strata's kernel, grades 0 and ω only, with the rules listed under [Erased dependent functions at run time](#erased-dependent-functions-at-run-time). |
+| **Grade-0 syntax** | `@0` on a binder: `(@0 ok : i < n)`, `Buffer @0 n`. |
+| **Interop with Idyll** | Exported symbols only for now, as today; interfaces carrying Strata types, checked at the border, as the goal. |
+| **`Fail` and `Expand`** | Effects at compile time, with total handlers in the compiler. |
 
 ## Still open
 
-1. **Erased dependent functions at run time.**
-   - **(a)** Meadow's run-time level gets opt-in erased dependent functions
-     through Strata's kernel, limited to grades 0 and ω.
-   - **(b)** Proofs about run-time values only through indices and
-     correct-by-construction code.
-
-   **Recommendation: (a)**, with these rules:
-   - a signature is required exactly where code opts in;
-   - inferred code calling a dependent function is an ordinary call, with
-     implicits solved by unification;
-   - an index is an erased run-time value by default, and a compile-time value
-     lifts into it, never back;
-   - usage is checked only on definitions that write a grade;
-   - proofs about run-time functions live at run time, erased.
-
-   The full grade algebra, linearity, extraction and the verification stack
-   stay Idyll's. L3 and much after it assume (a).
-2. **How grade 0 is written.**
-   - **(a)** `@0` on a binder: `(@0 ok : i < n)`, `Buffer @0 n`.
-   - **(b)** Idris's `(0 ok : i < n)`.
-   - **(c)** Idyll's `[0]`, which clashes with Meadow's list literals.
-
-   **Recommendation: (a)**, since it reads as Meadow's other attributes.
-3. **How Meadow and Idyll packages use each other over Cut.**
-   - **(a)** Only exported symbols with no shared data types, as today.
-   - **(b)** Shared declarations for data types both define the same way
-     through Strata (`List`, `Maybe`).
-   - **(c)** Interfaces carrying Strata types, so that either language calls
-     the other with checked types. Grades and dependencies are checked at the
-     border, or erased there with a run-time check.
-
-   **Recommendation: (a) now, (c) as the goal.** Idyll's session agrees. The
-   border format has to be designed for size: Idyll's interfaces carry normal
-   forms, which once made its Std's export 18 MB until it was trimmed.
-4. **`Fail` and `Expand` at compile time.**
-   - **(a)** As effects, with total handlers in the compiler.
-   - **(b)** As ordinary values, with a generator returning a result.
-
-   **Recommendation: (a)**, since it keeps generators direct-style, as Meadow
-   code is.
+Nothing the next milestone depends on. Questions that come up later go here.
