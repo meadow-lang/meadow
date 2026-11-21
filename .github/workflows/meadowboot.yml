@@ -248,11 +248,12 @@ jobs:
       # what `release.yml` asks of the `meadow` it ships alone -- its version;
       # a program run from an empty home, which compiles nothing of the Rust
       # compiler's Std; `init`, which MeadowBoot hands to the Rust back end,
-      # and the package built to a native executable; and every source in
-      # the repository, through the language server -- and then what this
-      # release has besides: what MeadowBoot does not act on yet goes to the
-      # Rust front end installed beside it, and the install updates and comes
-      # out again.
+      # and the package built to a native executable; a package with a git
+      # dependency tested from an empty home, which has it fetched; and every
+      # source in the repository, through the language server -- and then
+      # what this release has besides: what MeadowBoot does not act on yet
+      # goes to the Rust front end installed beside it, and the install
+      # updates and comes out again.
       - name: Smoke test, installed
         shell: bash
         run: |
@@ -290,6 +291,26 @@ jobs:
           (cd "$RUNNER_TEMP/smokepkg" && "$bin" run --release --aot . | tail -1 | grep -q 'Hello, world!')
           (cd "$RUNNER_TEMP/smokepkg" && "$bin" run --all-features . 2>&1 | tee "$RUNNER_TEMP/fallback.txt" | tail -1 | grep -q 'Hello, world!')
           grep -q 'meadow-rust' "$RUNNER_TEMP/fallback.txt"
+          # A package with a git dependency, tested from an empty home, as on a
+          # machine that has never built it: MeadowBoot reads git dependencies
+          # from the cache, and has the back end it loads fetch them and
+          # write `Meadow.lock` first. Then, with the lock, the same again
+          # without the network. The dependency is a repository made here.
+          dep="$RUNNER_TEMP/Greet"
+          pkg="$RUNNER_TEMP/Greeter"
+          mkdir -p "$dep/src" "$pkg/src"
+          printf '[package]\nname = "Greet"\nversion = "0.1.0"\n' > "$dep/Meadow.toml"
+          printf '@pub def greeting = "hi"\n' > "$dep/src/Lib.mw"
+          git -C "$dep" init -q -b main
+          git -C "$dep" add -A
+          git -C "$dep" -c user.email=ci@example.com -c user.name=ci commit -qm first
+          url=$(printf '%s' "$dep" | tr '\\' '/')
+          printf '[package]\nname = "Greeter"\nversion = "0.1.0"\n\n[dependencies]\nGreet = { git = "%s" }\n' "$url" > "$pkg/Meadow.toml"
+          printf 'use Greet (greeting)\nuse Std.Test (assertEq)\n\nfun main () = println greeting\n\n@test fun greets () = assertEq greeting "hi" "the greeting"\n' > "$pkg/src/Main.mw"
+          (cd "$pkg" && MEADOW_HOME="$RUNNER_TEMP/git-home" "$bin" test . 2>&1 | tee "$RUNNER_TEMP/git-test.txt")
+          grep -q 'Updating git repository' "$RUNNER_TEMP/git-test.txt"
+          grep -q 'name = "Greet"' "$pkg/Meadow.lock"
+          (cd "$pkg" && MEADOW_HOME="$RUNNER_TEMP/git-home" "$bin" test --locked --offline .)
           # The archive's sources, as an editor on this machine gets them.
           cd "$GITHUB_WORKSPACE"
           # A loop, not `mapfile`: macOS ships bash 3.2, which has none.

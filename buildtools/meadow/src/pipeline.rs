@@ -288,6 +288,15 @@ pub fn build_together(entries: &[&Path], opts: Options) -> (BuildOutput, Vec<Int
     (out, names)
 }
 
+/// What a build of `entries` does before it compiles anything, and nothing
+/// after: the packages found, their git dependencies fetched where they are
+/// not in the cache, and `Meadow.lock` written -- or why that could not be
+/// done. `meadow __resolve`, which MeadowBoot asks for before it reads what
+/// a package depends on, so that the two compilers fetch and pin alike.
+pub fn resolve(entries: &[&Path]) -> Result<(), Diagnostic> {
+    discover(entries).map(|_| ())
+}
+
 /// The graph of `entries` and everything they depend on -- or why there is
 /// none.
 fn discover(entries: &[&Path]) -> Result<PackageGraph, Diagnostic> {

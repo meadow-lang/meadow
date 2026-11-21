@@ -61,7 +61,7 @@ use MeadowBoot.Precompile (precompileStd)
 use MeadowBoot.Parse (parsed, checked)
 use MeadowBoot.Fixity (chainsOf)
 use MeadowBoot.Unit (
-  packageOf, absolute, packageName, rustMeadow, rustFallback, profileManifest, profileIn
+  packageOf, absolute, packageName, rustMeadow, rustFallback, profileManifest, profileIn, fetches
 )
 use MeadowBoot.Channel (hostLibrary, checkToolchain)
 use Std.Result as Res
@@ -507,18 +507,21 @@ fun failure (e : QueryError k) : String =
   | QueryError.Interrupted -> "meadowboot: it was told to stop\n"
 
 fun run (every : CliOptions) (cli : Cli) =
+  let resolving = resolveFlags every in
   match cli with
   | Cli.Build r ->
       drivenWith r.path (prepared r.path r.build) None {
         nothingAsked | types = r.types,
         annotations = r.annotations,
         emit = r.emit,
-        members = membersAsked r.members
+        members = membersAsked r.members,
+        resolving = resolving
       }
   | Cli.Run r ->
       let b = prepared r.path r.build in
       drivenWith r.path b (Just r.args) {
-        nothingAsked | types = r.types,
+        nothingAsked | resolving = resolving,
+        types = r.types,
         cek = r.cek,
         gcStats = r.gcStats,
         profileTo = M.orElse (if r.cek then None else sampledTo r.path b) r.profileTo,
@@ -532,18 +535,19 @@ fun run (every : CliOptions) (cli : Cli) =
   -- too (`Testing`).
   | Cli.Test r ->
       unlessUnacted (unheeded r.build) (\() ->
-        runTests
-          (testAsked
-             (prepared r.path r.build)
-             r.path
-             r.filter
-             r.exact
-             r.std
-             r.testThreads
-             r.noCapture
-             r.cek)
-          backEnd
-          (backEndProgram ()))
+        let asked =
+          testAsked
+            (prepared r.path r.build)
+            r.path
+            r.filter
+            r.exact
+            r.std
+            r.testThreads
+            r.noCapture
+            r.cek
+        in
+        let fetched = resolvedFor resolving "test" r.path in
+        runTests asked backEnd (backEndProgram ()))
   | Cli.Lex r -> finish (V.foldl (\ok p -> lexFile p and ok) True r.files)
   | Cli.Eval r -> finish (V.foldl (\ok p -> evalFile p and ok) True r.files)
   | Cli.Parse r -> finish (V.foldl (\ok p -> parseFile p and ok) True r.files)
@@ -564,15 +568,20 @@ fun run (every : CliOptions) (cli : Cli) =
   -- The prompt is MeadowBoot's (`Repl`).
   | Cli.Repl -> runPrompt ()
   -- The language server is MeadowBoot's, and so is what it would mark.
+  -- What a package depends on is fetched as `meadow lsp` fetches it: for
+  -- `--check`, and for the server where `--fetch` says so.
   | Cli.Lsp r ->
+      let fetching = fetchingTold resolving (r.fetch or not (V.isEmpty r.check)) in
       if V.isEmpty r.check then serveServer () else exit (checkPaths (V.append r.check r.more))
-  -- And so is the debug adapter (`Dap`).
-  | Cli.Dap -> debugAdapter ()
-  | Cli.Units r ->
-      finish (V.foldl (\ok root -> buildUnits "debug" (told ()) root and ok) True r.roots)
+  -- And so is the debug adapter (`Dap`), whose builds fetch as a build does.
+  | Cli.Dap ->
+      let fetching = fetchingTold resolving True in
+      debugAdapter ()
+  | Cli.Units r -> finish (V.foldl (\ok root -> unitsBuilt root and ok) True r.roots)
   -- `dis` is this compiler's build, listed by the back end.
   | Cli.Dis r ->
-      unlessUnacted (unheeded r.build) (\() -> disassembled r.path r.asm (prepared r.path r.build))
+      unlessUnacted (unheeded r.build) (\() ->
+        disassembled resolving r.path r.asm (prepared r.path r.build))
   -- What is not MeadowBoot's yet is `meadow`'s, asked the same way.
   | _ -> handedOn ()
 
@@ -632,33 +641,93 @@ fun pairsFor (b : CliBuild) =
 -- and the bytecode the back end makes of its Cut printed -- or, with `--asm`,
 -- the machine code Glade's ahead-of-time compiler makes of that, for this
 -- machine (`meadow cut --emit`).
-fun disassembled (path : Maybe String) (asm : Bool) (b : CliBuild) =
+fun disassembled (resolving : [String]) (path : Maybe String) (asm : Bool) (b : CliBuild) =
   let place = absolute (M.unwrapOr "." path) in
   let root = if S.endsWith ".mw" place then packageOf place else Just place in
   let said =
     V.foldl (\u flag -> writeError "meadowboot: `${flag}` is not acted on yet\n") () (unheeded b)
-  in match root with
-     | None -> inNoPackage place
-     | Just r ->
-         let profile = if b.release then "release" else "debug" in
-         if not (buildUnits profile (pairsFor b) r) then exit 1
-         else
-           (let program = Path.join (linkDirIn r profile) "program.cut" in
-            match backEnd [
-              "cut",
-              program,
-              "--emit",
-              if asm then "asm" else "bytecode",
-              "-O",
-              show (levelOf b)
-            ] with
-            | Ok code -> exit code
-            | Err why ->
-                (let u = writeError "meadowboot: the back end could not be run: ${why}\n" in
-                 exit 1))
+  in
+  let fetched = resolvedFor resolving "dis" path in
+  match root with
+  | None -> inNoPackage place
+  | Just r ->
+      let profile = if b.release then "release" else "debug" in
+      if not (buildUnits profile (pairsFor b) r) then exit 1
+      else
+        (let program = Path.join (linkDirIn r profile) "program.cut" in
+         match backEnd [
+           "cut",
+           program,
+           "--emit",
+           if asm then "asm" else "bytecode",
+           "-O",
+           show (levelOf b)
+         ] with
+         | Ok code -> exit code
+         | Err why ->
+             (let u = writeError "meadowboot: the back end could not be run: ${why}\n" in exit 1))
 
 -- The Rust compiler's `meadow`, as a program: `Unit.rustMeadow`.
 fun meadow () = rustMeadow ()
+
+-- What `--offline` and `--locked` say, as `meadow __resolve` is told it
+-- (`resolvedFor`).
+fun resolveFlags (every : CliOptions) : [String] =
+  V.concat [if every.offline then ["--offline"] else [], if every.locked then ["--locked"] else []]
+
+-- The dependencies of the package at `path` resolved as the Rust `meadow`'s
+-- build of it resolves them, by its `__resolve`, before anything here reads
+-- where they are (`Unit.locate`): each git dependency fetched into the cache
+-- where it is not there yet, and `Meadow.lock` written, as `flags` --
+-- `--offline`, `--locked` -- allow and saying what that build says. Git is
+-- the back end's to drive, in this process, through its library; MeadowBoot
+-- reads what it fetched where it put it. A build with no git dependency
+-- (`Unit.fetches`) asks nothing. What could not be resolved is reported as
+-- `command` -- `build`, `test` or `dis` -- reports it, and the run ends.
+fun resolvedFor (flags : [String]) (command : String) (path : Maybe String) =
+  let written = M.unwrapOr "." path in
+  let place = absolute written in
+  match (if S.endsWith ".mw" place then packageOf place else Just place) with
+  | None -> ()
+  | Just root ->
+      if not (fetches root) then ()
+      else
+        match backEnd (V.concat [["__resolve", "--as", command], flags, [written]]) with
+        | Ok 0 -> ()
+        | Ok code -> exit code
+        | Err why ->
+            (let u = writeError "meadowboot: the back end could not be run: ${why}\n" in exit 1)
+
+-- The language server and the debug adapter fetch what a package depends on
+-- as the Rust `meadow`'s do, where `fetching` says: the debug adapter for
+-- every build, the language server for `--check` and where `--fetch` says
+-- the workspace is trusted. Their builds are runs of `units` (`Lsp.load`,
+-- `Dap.launched`), and are told so by `MEADOWBOOT_FETCH`, which they inherit:
+-- what to tell `meadow __resolve` besides the package -- `--as quiet`, and
+-- `flags`.
+fun fetchingTold (flags : [String]) (fetching : Bool) =
+  if fetching then Proc.setEnv ("MEADOWBOOT_FETCH", S.join " " (V.append ["--as", "quiet"] flags))
+  else ()
+
+-- `units`: the package at `root` and every unit it depends on built, as the
+-- language server reads them -- its dependencies resolved first, where
+-- whoever started this said to fetch them (`fetchingTold`).
+fun unitsBuilt (root : String) =
+  let fetched = fetchedQuietly root in
+  buildUnits "debug" (told ()) root
+
+-- The package at `root` resolved by `meadow __resolve` as `MEADOWBOOT_FETCH`
+-- says, saying nothing: what it could not resolve, the build then says it
+-- cannot find.
+fun fetchedQuietly (root : String) =
+  match getEnv "MEADOWBOOT_FETCH" with
+  | None -> ()
+  | Just said ->
+      if not (fetches root) then ()
+      else
+        (let words = V.filter (\w -> not (S.isEmpty w)) (S.split " " said) in
+         let r = backEnd (V.concat [["__resolve"], words, [root]]) in
+         ())
 
 -- What `build`, `run`, `test` and `dis` are told, `b`, with what the package
 -- at `path` asks of a build: refused here, as `meadow` refuses it, where its
@@ -835,7 +904,9 @@ record BuildAsked = {
   sampleEvery : Maybe Int,
   sampleHz : Int,
   train : Bool,
-  gc : Maybe String
+  gc : Maybe String,
+  -- What `meadow __resolve` is told of how to fetch (`resolveFlags`).
+  resolving : [String]
 }
 
 def nothingAsked : BuildAsked =
@@ -850,7 +921,8 @@ def nothingAsked : BuildAsked =
     sampleEvery = None,
     sampleHz = 1000,
     train = False,
-    gc = None
+    gc = None,
+    resolving = []
   }
 
 -- Which of `-p`, `--workspace` and `--exclude` were given.
@@ -891,7 +963,9 @@ fun drivenWith (path : Maybe String) (b : CliBuild) (args : Maybe [String]) (ask
         asked.members,
         if V.elem "expanded" asked.emit then ["--emit expanded"] else []
       ]
-    in unlessUnacted unacted (\() -> builtOrRun root place b args theirs asked testing unacted)
+    in unlessUnacted unacted (\() ->
+         let fetched = resolvedFor asked.resolving "build" path in
+         builtOrRun root place b args theirs asked testing unacted)
 
 -- `drivenWith`, once what it was asked is MeadowBoot's to do: what of it
 -- MeadowBoot does not act on yet, `unacted`, is said.

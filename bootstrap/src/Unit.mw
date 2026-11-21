@@ -3,8 +3,9 @@
 -- A unit is a directory with a `Meadow.toml`, and its sources the `.mw` files
 -- under its `src/`. What it depends on is what its manifest's
 -- `[dependencies]` name -- a `path`, from the unit, or a `git` repository,
--- which `meadow` has fetched into its cache at the commit the root unit's
--- `Meadow.lock` pins -- and the standard library, which every unit but the
+-- which the Rust `meadow` has fetched into its cache at the commit the root
+-- unit's `Meadow.lock` pins, asked to by `Main.resolvedFor` before a build
+-- reads any of this -- and the standard library, which every unit but the
 -- standard library itself depends on, and whose sources are where
 -- `MEADOWBOOT_STD` says.
 --
@@ -198,7 +199,8 @@ fun under (dir : String) : [String] ! { Fs | e } =
     : Result String [String] ! { Fs, Process | e } =
   -- A root with a lock says so to the builds this one starts, of the programs
   -- that serve its dependencies' macros, so that they pin what it pins.
-  let said = (if M.isSome (lockOf root) then setEnv ("MEADOWBOOT_LOCK", root) else ()) in
+  let locks = lockDirOf root in
+  let said = (if M.isSome (lockOf locks) then setEnv ("MEADOWBOOT_LOCK", locks) else ()) in
   let manifest = readToml text in
   let std = stdDir () in
   let named = V.filter (\(e : Entry) -> e.section == "dependencies") manifest in
@@ -274,6 +276,43 @@ fun under (dir : String) : [String] ! { Fs | e } =
 fun exeSuffix (path : String) : String =
   if S.endsWith ".exe" path or S.endsWith ".EXE" path then ".exe" else ""
 
+-- Whether a build of the unit at `root` has a git dependency: one its
+-- manifest names, or one that a unit it reaches by `path` names. Only such
+-- a build has anything to fetch or to pin, which the back end does for it
+-- (`Main.resolvedFor`) before anything here reads where a dependency is; a
+-- build of path dependencies alone asks nothing of it. A dependency taken
+-- from the workspace, `{ workspace = true }`, may be either, and is taken
+-- for one that may need fetching.
+@pub fun fetches (root : String) : Bool ! { Fs, Process | e } = fetchesFrom [absolute root] []
+
+-- `fetches`, of the units `todo` and those they reach by `path`, but for
+-- those already looked at, `seen`.
+fun fetchesFrom (todo : [String]) (seen : [String]) : Bool ! { Fs, Process | e } =
+  match V.get todo 0 with
+  | None -> False
+  | Just d ->
+      if V.elem d seen then fetchesFrom (V.drop todo 1) seen
+      else
+        match readToString (manifestOf d) with
+        | Err _ -> fetchesFrom (V.drop todo 1) (V.pushBack seen d)
+        | Ok text ->
+            let named = V.filter (\(e : Entry) -> e.section == "dependencies") (readToml text) in
+            if V.any (\(e : Entry) -> mayFetch e.value) named then True
+            else
+              fetchesFrom
+                (V.append (V.drop todo 1) (V.concatMap (\(e : Entry) -> pathFrom d e.value) named))
+                (V.pushBack seen d)
+
+-- Whether a dependency written `v` may be a git repository's.
+fun mayFetch (v : TomlValue) : Bool = M.isSome (field "git" v) or M.isSome (field "workspace" v)
+
+-- The directory of a `path` dependency written `v` in the unit at `dir`,
+-- if it is one: `{ path = "../x" }`, or `"../x"` as it was once spelt.
+fun pathFrom (dir : String) (v : TomlValue) : [String] =
+  match v with
+  | Text p -> [Path.normalize (Path.join dir p)]
+  | _ -> M.unwrapOr [] (M.map (\p -> [Path.normalize (Path.join dir p)]) (field "path" v))
+
 -- Where dependency `e` of the unit at `dir` is.
 fun locate (root : String) (dir : String) (e : Entry) : Result String String ! { Fs, Process | f } =
   match (field "path" e.value, field "git" e.value) with
@@ -301,6 +340,21 @@ fun lockOf (dir : String) : Maybe String ! { Fs | e } =
   | Ok text -> Just text
   | Err _ -> None
 
+-- Where the `Meadow.lock` of a build of the unit at `root` is, as `meadow`
+-- keeps it (`lock::dir_for`): beside the manifest of the workspace the unit
+-- is in, where it is in one, which every member's build shares; and
+-- otherwise beside the unit's own.
+fun lockDirOf (root : String) : String ! { Fs, Process | e } =
+  lockDirFrom (Just (absolute root)) root
+
+fun lockDirFrom (dir : Maybe String) (root : String) : String ! { Fs | e } =
+  match dir with
+  | None -> root
+  | Just d ->
+      (match readToString (Path.join d "Meadow.toml") with
+       | Ok text -> if declaresWorkspace text then d else lockDirFrom (Path.parent d) root
+       | Err _ -> lockDirFrom (Path.parent d) root)
+
 -- The commit `Meadow.lock` pins package `name` at: the root's; then that of
 -- the build that started this one, `MEADOWBOOT_LOCK`, for the program that
 -- serves a dependency's macros, whose root has no lock; or the unit's.
@@ -315,7 +369,7 @@ fun pinned (root : String) (dir : String) (name : String) : Maybe String ! { Fs,
                (\(p : Entry) -> p.section == "package" and field "name" p.value == Just name)
                (tables (readToml text))))
         (lockOf d)
-  in match inLock root with
+  in match inLock (lockDirOf root) with
      | Just rev -> Just rev
      | None ->
          (match M.andThen inLock (getEnv "MEADOWBOOT_LOCK") with

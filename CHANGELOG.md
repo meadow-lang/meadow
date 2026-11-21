@@ -521,6 +521,18 @@ last release is under _Unreleased_.
   the program now. Hashing it takes about two seconds, once for each build
   of MeadowBoot: the hash is kept in the temporary directory, and a prompt
   starts as quickly as before.
+- `meadow build`, `run`, `test` and `dis` fetch a package's git dependencies
+  and write `Meadow.lock` again, now that `meadow` is MeadowBoot. MeadowBoot
+  read git dependencies from the cache the Rust compiler fills, and on an
+  installed toolchain nothing filled it, so every package with a git
+  dependency failed with "has not been fetched". MeadowBoot now has the back
+  end it loads resolve the package first, as the Rust compiler's build does:
+  the same cache, the same `Meadow.lock`, the same `Updating` lines, and
+  `--offline` and `--locked` honoured. A package whose dependencies are all
+  paths asks nothing of it. `meadow lsp --check`, the language server with
+  `--fetch`, and the debug adapter fetch as the Rust compiler's do, and a
+  package in a workspace reads the lock at the workspace's root, where it is
+  written.
 - Silo's leak check (`MEADOW_SILO_LEAKS`) no longer counts as left behind
   the regions of `TVar`s that a worker was still letting go of when `main`
   finished. A worker takes the list of `TVar`s nothing can reach and drops
