@@ -97,8 +97,15 @@ step "meadow test Strata"
 cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- test Strata
 cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- test --runtime silo Strata
 
+# Strata's own modules only: `Grade`, `Hir` and `Core` are vendored from
+# Idyll's `front/` as they are written there, until the extraction moves them
+# (docs/2LTT.md, L1), and are not laid out as `meadow fmt` lays them out.
 step "meadow fmt --check"
-cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- fmt --check lib/Std examples Strata
+strata_own=()
+for f in Strata/src/*.mw; do
+  head -n 1 "$f" | grep -q '^-- vendored from Idyll' || strata_own+=("$f")
+done
+cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- fmt --check lib/Std examples "${strata_own[@]}"
 
 # Every Meadow source in the repository, as the editor sees it: opened in the
 # language server, which must mark nothing. A build passing says the compiler

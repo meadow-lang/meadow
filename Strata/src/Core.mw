@@ -1,0 +1,436 @@
+-- vendored from Idyll front/ at 14e8cca, to be replaced by the extraction's verbatim move
+--
+-- Core: the elaborated, fully explicit terms the type checker works with,
+-- as `compiler/idyllic-typecheck/src/core.rs` has them, and the builtins.
+--
+-- Variables are de Bruijn indices (0 the innermost binder); the names
+-- beside them are for printing only. A `Meta` is a metavariable, a term not
+-- known yet, which unification solves. Grades are Core terms too, of type
+-- `Grade`. By the time a term is Core every argument is there, implicit
+-- ones included.
+--
+-- `shown` prints a term as the Rust checker does, for the REPL and for the
+-- differential tests, which compare the two printers' output: so it follows
+-- `impl Display for Core` exactly, precedence by precedence.
+
+use Std.Macro (Reflect)
+use Strata.Hir (Icit, Literal)
+use Strata.Hir as H
+use Strata.Grade (Grade)
+use Strata.Grade as G
+use Std.Collections.Vector as V
+use Std.String as S
+use Std.Maybe.Maybe.*
+
+-- --- builtins ----------------------------------------------------------------
+
+-- The primitive types, as `idyllic-builtins` reserves them.
+@derive(PartialEq, Reflect)
+-- `Number`: a sized integer or a float, by its name (`Int8`, `Float`).
+@pub data Builtin = Unit | Int | Bool | Str | Grade | Effect | Div | Char | Number String
+
+-- Every builtin, at the unique `idyllic-builtins` reserves for it: its
+-- place here. The primitive operations take the uniques after these.
+@pub def builtins : [Builtin] = V.append [Builtin.Unit, Builtin.Int, Builtin.Bool, Builtin.Str, Builtin.Grade, Builtin.Effect, Builtin.Div, Builtin.Char] (V.map (\n -> Builtin.Number n) numberTypes)
+
+-- The sized integers, then the floats, in `idyllic-builtins`' order.
+@pub def numberTypes : [String] = ["Int8", "Int16", "Int32", "UInt8", "UInt16", "UInt32", "UInt64", "Float", "Float32"]
+
+@pub fun isFloatType (n : String) : Bool = n == "Float" or n == "Float32"
+
+@pub fun builtinName (b : Builtin) : String =
+  match b with
+  | Builtin.Unit -> "Unit"
+  | Builtin.Int -> "Int"
+  | Builtin.Bool -> "Bool"
+  | Builtin.Str -> "String"
+  | Builtin.Grade -> "Grade"
+  | Builtin.Effect -> "Effect"
+  | Builtin.Div -> "Div"
+  | Builtin.Char -> "Char"
+  | Builtin.Number n -> n
+
+-- The primitive operations.
+@derive(PartialEq, Reflect)
+@pub data Prim = IntAdd | IntMul | IntSub | IntDiv | IntMod | IntLt | IntEq | StrAppend
+
+@pub fun primName (p : Prim) : String =
+  match p with
+  | Prim.IntAdd -> "+"
+  | Prim.IntMul -> "*"
+  | Prim.IntSub -> "-"
+  | Prim.IntDiv -> "/"
+  | Prim.IntMod -> "%"
+  | Prim.IntLt -> "<"
+  | Prim.IntEq -> "=="
+  | Prim.StrAppend -> "++"
+
+-- How tightly a saturated one binds, written infix.
+@pub fun precedence (p : Prim) : Int =
+  match p with
+  | Prim.IntAdd -> 6
+  | Prim.IntSub -> 6
+  | Prim.IntMul -> 7
+  | Prim.IntDiv -> 7
+  | Prim.IntMod -> 7
+  -- as `::`, Haskell's `infixr 5`
+  | Prim.StrAppend -> 5
+  -- below `::`
+  | Prim.IntLt -> 4
+  | Prim.IntEq -> 4
+
+-- The type of a literal.
+@pub fun literalBuiltin (l : Literal) : Builtin =
+  match l with
+  | Literal.Unit -> Builtin.Unit
+  | Literal.Int _ -> Builtin.Int
+  | Literal.Bool _ -> Builtin.Bool
+  | Literal.Str _ -> Builtin.Str
+  | Literal.Char _ -> Builtin.Char
+  | Literal.Float _ -> Builtin.Number "Float"
+  | Literal.Float32 _ -> Builtin.Number "Float32"
+  | Literal.Word w _ -> Builtin.Number w
+
+-- --- Core --------------------------------------------------------------------
+
+-- What a `case` alternative matches: a constructor, by its unique, or one of
+-- the `Bool` literals.
+@derive(PartialEq, Reflect)
+@pub data Head = Con Int | BoolLit Bool
+
+-- An alternative: what it matches, the constructor's name (for printing),
+-- the names its body binds (one a field, the last innermost), and the body.
+@derive(Reflect)
+@pub data CaseAlt = CaseAlt Head String [String] Core
+
+-- A handler's clause for an operation: the operation's unique and name, how
+-- many of its implicit arguments are erased, and its body.
+@derive(Reflect)
+@pub data OpClause = OpClause Int String Int Core
+
+-- What the elaborator knew, and erasure would otherwise forget.
+@derive(Reflect)
+@pub data Note
+  -- an argument never used at run time
+  = Erased
+  -- the variable a lambda binds: its grade, if a constant, and its type
+  | Binds (Maybe Grade) (Maybe Core)
+  -- a `case` its type forces, which looks at nothing
+  | Forced
+  -- a goal, `?name`, in place of a term of its type: what is under it is
+  -- no value (`Core.Error`, which the checker takes for anything), and
+  -- reaching it at run time stops the program, saying so
+  | Goal String
+
+@derive(Reflect)
+@pub data Core
+  = Type Int
+  | LitTy Builtin
+  | Lit Literal
+  | Prim Prim
+  | Var Int String
+  -- a recursive definition, a constructor or a data type, by its unique
+  | Opaque Int String
+  | Meta Int
+  -- `(x : (grade, inType) dom) -> cod`: name, icit, grade, in-type grade,
+  -- domain, codomain; the name is `_` for a plain arrow
+  | Pi String Icit Core Core Core Core
+  | Lam String Core
+  | App Core Core
+  -- `a [r]`: grade, then type
+  | BoxTy Core Core
+  | BoxIntro Core
+  | Unbox Core
+  | Let String Core Core
+  | GradeLit Grade
+  | GradeAdd Core Core
+  | GradeMul Core Core
+  | GradeRange Core Core
+  | Case Core [CaseAlt]
+  | Runtime Note Core
+  -- `b ! e`
+  | Comp Core Core
+  -- an effect row: the effects, then the row variables
+  | Row [Core] [Core]
+  -- `handle body with { return ..; op .. }`
+  | Handle Core Core [OpClause]
+  | Error
+
+@pub fun grade (g : Grade) : Core = Core.GradeLit g
+
+-- Whether any node of `c` is one `p` holds of.
+@pub fun anyNode (c : Core) (p : Core -> Bool) : Bool =
+  if p c then True
+  else
+    let go = \x -> anyNode x p in
+    match c with
+    | Core.Pi _ _ gr inType dom cod -> go gr or go inType or go dom or go cod
+    | Core.Lam _ b -> go b
+    | Core.App a b -> go a or go b
+    | Core.BoxTy a b -> go a or go b
+    | Core.BoxIntro a -> go a
+    | Core.Unbox a -> go a
+    | Core.Let _ e b -> go e or go b
+    | Core.GradeAdd a b -> go a or go b
+    | Core.GradeMul a b -> go a or go b
+    | Core.GradeRange a b -> go a or go b
+    | Core.Case sc alts -> go sc or V.any (\a -> match a with | CaseAlt.CaseAlt _ _ _ body -> go body) alts
+    | Core.Runtime n a -> go a or (match n with | Note.Binds _ (Just t) -> go t | _ -> False)
+    | Core.Comp a e -> go a or go e
+    | Core.Row ls ts -> V.any go ls or V.any go ts
+    | Core.Handle b r ops -> go b or go r or V.any (\o -> match o with | OpClause.OpClause _ _ _ body -> go body) ops
+    | _ -> False
+
+-- Every node, outermost first: what `f` answers for one is put in its place,
+-- and what it answers nothing for is gone into. `f` takes the node and how
+-- many binders are around it.
+@pub fun transform (c : Core) (depth : Int) (f : Core -> Int -> Maybe Core) : Core =
+  match f c depth with
+  | Just replaced -> replaced
+  | None ->
+      let go = \x d -> transform x d f in
+      match c with
+      | Core.Pi name icit gr inType dom cod -> Core.Pi name icit (go gr depth) (go inType depth) (go dom depth) (go cod (depth + 1))
+      | Core.Lam x b -> Core.Lam x (go b (depth + 1))
+      | Core.App a b -> Core.App (go a depth) (go b depth)
+      | Core.BoxTy a b -> Core.BoxTy (go a depth) (go b depth)
+      | Core.BoxIntro a -> Core.BoxIntro (go a depth)
+      | Core.Unbox a -> Core.Unbox (go a depth)
+      | Core.Let x e b -> Core.Let x (go e depth) (go b (depth + 1))
+      | Core.GradeAdd a b -> Core.GradeAdd (go a depth) (go b depth)
+      | Core.GradeMul a b -> Core.GradeMul (go a depth) (go b depth)
+      | Core.GradeRange a b -> Core.GradeRange (go a depth) (go b depth)
+      | Core.Case sc alts ->
+          Core.Case (go sc depth) (V.map (\a -> match a with | CaseAlt.CaseAlt h n vs body -> CaseAlt.CaseAlt h n vs (go body (depth + V.len vs))) alts)
+      | Core.Runtime n a ->
+          let n2 = match n with | Note.Binds g (Just t) -> Note.Binds g (Just (go t depth)) | other -> other in
+          Core.Runtime n2 (go a depth)
+      | Core.Comp a e -> Core.Comp (go a depth) (go e depth)
+      | Core.Row ls ts -> Core.Row (V.map (\l -> go l depth) ls) (V.map (\t -> go t depth) ts)
+      | Core.Handle b r ops -> Core.Handle (go b depth) (go r depth) (V.map (\o -> match o with | OpClause.OpClause u n k body -> OpClause.OpClause u n k (go body depth)) ops)
+      | other -> other
+
+-- The term with each solved metavariable replaced by its solution
+-- (`Core::zonked`). One applied to a spine has a function of it for its
+-- solution, which is applied there and then, for each argument that is a
+-- variable (as a metavariable's are): run as it is, it would build a
+-- closure at each use.
+@pub fun zonked (c : Core) (solutions : [Maybe Core]) : Core =
+  transform c 0 (\x d ->
+    match x with
+    | Core.Meta m -> (match V.get solutions m with | Just (Just s) -> Just (zonked s solutions) | _ -> None)
+    | Core.App _ _ ->
+        (match spineOf x [] with
+         | (Core.Meta m, args) ->
+             (match V.get solutions m with
+              | Just (Just s) -> Just (applied (zonked s solutions) (V.map (\a -> zonked a solutions) args))
+              | _ -> None)
+         | _ -> None)
+    | _ -> None)
+
+-- A term's head and the arguments it is applied to, in order.
+fun spineOf (c : Core) (args : [Core]) : (Core, [Core]) =
+  match c with
+  | Core.App f a -> spineOf f (V.append [a] args)
+  | _ -> (c, args)
+
+-- `f` applied to `args`, each a lambda of `f`'s that meets a variable
+-- applied there and then.
+fun applied (f : Core) (args : [Core]) : Core =
+  match (f, V.head args) with
+  | (Core.Lam _ body, Just (Core.Var j x)) -> applied (instantiate body j x) (V.drop args 1)
+  | _ -> V.foldl (\acc a -> Core.App acc a) f args
+
+-- A lambda's body with its variable made `Var j` of the context the lambda
+-- is in.
+fun instantiate (body : Core) (j : Int) (x : String) : Core =
+  transform body 0 (\c d ->
+    match c with
+    | Core.Var i n -> if i == d then Just (Core.Var (j + d) x) else if i > d then Just (Core.Var (i - 1) n) else None
+    | _ -> None)
+
+fun isGrade (c : Core) (g : Grade) : Bool =
+  match c with
+  | Core.GradeLit h -> h == g
+  | _ -> False
+
+-- --- printing ----------------------------------------------------------------
+
+-- A literal as the Rust compiler shows one: a string as Rust's `{:?}` does.
+@pub fun literalShown (l : Literal) : String =
+  match l with
+  | Literal.Unit -> "()"
+  | Literal.Int n -> show n
+  | Literal.Bool b -> if b then "True" else "False"
+  | Literal.Str s -> H.debugString s
+  | Literal.Char c -> H.showChar c
+  | Literal.Float x -> display x
+  | Literal.Float32 x -> display x
+  | Literal.Word w n -> H.wordText w n
+
+fun hex (n : Int) : String =
+  let digit = \d -> stringSlice "0123456789abcdef" d (d + 1) in
+  if n < 16 then digit n else hex (n / 16) ++ digit (n % 16)
+
+fun paren (yes : Bool) (inner : String) : String = if yes then "(" ++ inner ++ ")" else inner
+
+-- `a`, if `g` is `Pair a`: a pair's type, waiting for its second.
+fun pairOf (g : Core) : Maybe Core =
+  match g with
+  | Core.App (Core.Opaque _ name) a -> if name == "Pair" then Just a else None
+  | _ -> None
+
+-- `x : a`, `x : [s] a` or `x : (s, r) a`, the grades said only where they
+-- are not what goes unsaid.
+fun binder (linear : Bool) (x : String) (g : Core) (inType : Core) (default : Grade) (dom : Core) : String =
+  let grades =
+    if not (isGrade inType G.defaultInType) then "(" ++ go linear g 0 ++ ", " ++ go linear inType 0 ++ ") "
+    else if isGrade g default then ""
+    else if isGrade g G.any then "[] "
+    else "[" ++ go linear g 0 ++ "] "
+  in
+  (if sectionParam x then "_" else x) ++ " : " ++ grades ++ go linear dom 0
+
+-- Whether a binder is a section's parameter (see `Surface`), whose name no
+-- program can write, and which a type is shown without.
+fun sectionParam (x : String) : Bool = S.startsWith "#section@" x
+
+fun infixed (linear : Bool) (a : Core) (op : String) (b : Core) (level : Int) (prec : Int) : String =
+  paren (prec > level) (go linear a level ++ op ++ go linear b (level + 1))
+
+-- The grade a binder that says nothing has, as types are printed: `1` for
+-- a linear module, `[]` elsewhere.
+fun printedDefault (linear : Bool) : Grade = if linear then G.one else G.default
+
+fun go (linear : Bool) (c : Core) (prec : Int) : String =
+  let g = \t p -> go linear t p in
+  match c with
+  | Core.Type n -> if n == 0 then "Type" else paren (prec > 10) ("Type " ++ show n)
+  -- the unit type is written as its value is, as in Haskell
+  | Core.LitTy Builtin.Unit -> "()"
+  | Core.LitTy b -> builtinName b
+  | Core.Lit l -> literalShown l
+  -- (an instance with no name is shown as `instance Ord Int`)
+  | Core.Var _ n -> paren (prec > 10 and S.contains " " n) n
+  | Core.Opaque _ n -> paren (prec > 10 and S.contains " " n) n
+  | Core.Meta m -> "?" ++ show m
+  | Core.Error -> "?!"
+  | Core.Runtime _ inner -> g inner prec
+  -- looser than application, tighter than an arrow
+  | Core.Comp t e -> paren (prec > 1) (g t 2 ++ " ! " ++ g e 10)
+  | Core.Handle body ret ops ->
+      paren
+        (prec > 0)
+        ("handle " ++ g body 0 ++ " with { return " ++ g ret 11
+          ++ S.join "" (V.map (\o -> match o with | OpClause.OpClause _ name _ b -> "; " ++ name ++ " " ++ g b 11) ops)
+          ++ " }")
+  | Core.Row labels tails ->
+      if V.len labels + V.len tails == 1 then g (V.getOr Core.Error (V.append labels tails) 0) prec
+      else
+        let ls = S.join ", " (V.map (\l -> g l 0) labels) in
+        let ts =
+          S.join
+            ""
+            (V.map
+               (\i ->
+                 let sep = if i == 0 and not (V.isEmpty labels) then " | " else if i > 0 then ", " else "| " in
+                 sep ++ g (V.getOr Core.Error tails i) 0)
+               (V.range 0 (V.len tails)))
+        in
+        "{" ++ ls ++ ts ++ "}"
+  | Core.Case scrutinee alts ->
+      paren
+        (prec > 0)
+        ("case " ++ g scrutinee 0 ++ " of { "
+          ++ S.join
+               "; "
+               (V.map
+                  (\a -> match a with | CaseAlt.CaseAlt _ name vars body -> name ++ S.join "" (V.map (\x -> " " ++ x) vars) ++ " -> " ++ g body 0)
+                  alts)
+          ++ " }")
+  | Core.BoxIntro e -> "[" ++ g e 0 ++ "]"
+  -- the modality is postfix, and binds like an application
+  | Core.BoxTy gr a -> paren (prec > 10) (g a 10 ++ (if isGrade gr G.any then " []" else " [" ++ g gr 0 ++ "]"))
+  | Core.Unbox e -> paren (prec > 10) ("unbox " ++ g e 11)
+  | Core.GradeLit gr -> paren (not (G.isExact gr) and prec > 5) (G.shown gr)
+  | Core.GradeAdd a b -> infixed linear a " + " b 6 prec
+  | Core.GradeMul a b -> infixed linear a " * " b 7 prec
+  | Core.GradeRange a b -> paren (prec > 5) (g a 6 ++ ".." ++ g b 6)
+  -- a bare or partly applied operator is written sectioned
+  | Core.Prim p -> "(" ++ primName p ++ ")"
+  -- a saturated primitive reads infix
+  | Core.App (Core.App (Core.Prim p) a) b -> infixed linear a (" " ++ primName p ++ " ") b (precedence p) prec
+  | Core.App f b ->
+      (match pairOf f with
+       -- the prelude's pair is a tuple, and one nested to the right a longer
+       -- one, `(Int, Bool, String)`
+       | Just first -> tuple linear first b
+       | None -> paren (prec > 10) (g f 10 ++ " " ++ g b 11))
+  | Core.Lam x b -> paren (prec > 0) ("\\" ++ x ++ " -> " ++ g b 0)
+  | Core.Let x e b -> paren (prec > 0) ("let " ++ x ++ " = " ++ g e 0 ++ " in " ++ g b 0)
+  -- an implicit binder is written in braces; it is erased unless it says
+  -- otherwise
+  | Core.Pi name Icit.Implicit gr inType dom cod ->
+      paren (prec > 0) ("{" ++ binder linear name gr inType G.zero dom ++ "} -> " ++ g cod 0)
+  -- an auto binder with no name is a constraint, `C a => b`
+  | Core.Pi name Icit.Auto gr inType dom cod ->
+      if name == "_" and isGrade gr G.default then paren (prec > 0) (g dom 1 ++ " => " ++ g cod 0)
+      else paren (prec > 0) ("{auto " ++ binder linear name gr inType G.default dom ++ "} -> " ++ g cod 0)
+  | Core.Pi name _ gr inType dom cod ->
+      if (name == "_" or sectionParam name) and isGrade gr (printedDefault linear) and isGrade inType G.defaultInType then
+        -- an anonymous, default-graded binder is just an arrow
+        paren (prec > 0) (g dom 1 ++ " -> " ++ g cod 0)
+      else paren (prec > 0) ("(" ++ binder linear name gr inType (printedDefault linear) dom ++ ") -> " ++ g cod 0)
+
+fun tuple (linear : Bool) (first : Core) (rest : Core) : String =
+  let items = tupleItems [first] rest in
+  match items with
+  | (firsts, last) -> "(" ++ S.join "" (V.map (\a -> go linear a 0 ++ ", ") firsts) ++ go linear last 0 ++ ")"
+
+fun tupleItems (acc : [Core]) (rest : Core) : ([Core], Core) =
+  match rest with
+  | Core.App f b ->
+      (match pairOf f with
+       | Just a -> tupleItems (V.pushBack acc a) b
+       | None -> (acc, rest))
+  | _ -> (acc, rest)
+
+-- A term as the Rust checker prints it, for a module that is linear or not.
+@pub fun shown (linear : Bool) (c : Core) : String = go linear c 0
+
+-- --- tests -------------------------------------------------------------------
+
+use Std.Test (assertEq)
+use Std.Maybe as M
+
+fun v (i : Int) (n : String) : Core = Core.Var i n
+
+fun arrow (dom : Core) (cod : Core) : Core = Core.Pi "_" Icit.Explicit (grade G.default) (grade G.defaultInType) dom cod
+
+@test fun aPolymorphicIdentity () =
+  let ty = Core.Pi "a" Icit.Implicit (grade G.zero) (grade G.defaultInType) (Core.Type 0) (arrow (v 0 "a") (v 1 "a")) in
+  assertEq (shown False ty) "{a : Type} -> a -> a" "an erased implicit, then an arrow"
+
+@test fun gradesAreShownWhereTheyAreNotTheDefault () =
+  let affine = Core.Pi "x" Icit.Explicit (grade (M.unwrapOr G.any (G.range G.zero G.one))) (grade G.defaultInType) (Core.LitTy Builtin.Int) (Core.LitTy Builtin.Int) in
+  let a = assertEq (shown False affine) "(x : [0..1] Int) -> Int" "an affine binder" in
+  let one = Core.Pi "_" Icit.Explicit (grade G.one) (grade G.defaultInType) (Core.LitTy Builtin.Int) (Core.LitTy Builtin.Int) in
+  let b = assertEq (shown False one) "(_ : [1] Int) -> Int" "a linear field, outside a linear module" in
+  let c = assertEq (shown True one) "Int -> Int" "and in one" in
+  assertEq (shown True (arrow (Core.LitTy Builtin.Int) (Core.LitTy Builtin.Int))) "(_ : [] Int) -> Int" "an unrestricted one in a linear module"
+
+@test fun operatorsAndTuples () =
+  let sum = Core.App (Core.App (Core.Prim Prim.IntAdd) (v 0 "n")) (Core.Lit (Literal.Int 1)) in
+  let a = assertEq (shown False (Core.App (v 1 "Vec") sum)) "Vec (n + 1)" "an operator under an application" in
+  let pair = \x y -> Core.App (Core.App (Core.Opaque 9 "Pair") x) y in
+  let t = pair (Core.LitTy Builtin.Int) (pair (Core.LitTy Builtin.Bool) (Core.LitTy Builtin.Str)) in
+  assertEq (shown False t) "(Int, Bool, String)" "a pair nested to the right is a tuple"
+
+@test fun rowsAndComputations () =
+  let row = Core.Row [Core.Opaque 3 "Ask", Core.Opaque 4 "Log"] [] in
+  let a = assertEq (shown False (Core.Comp (Core.LitTy Builtin.Int) row)) "Int ! {Ask, Log}" "a row" in
+  let open = Core.Row [Core.Opaque 4 "Log"] [v 0 "e"] in
+  assertEq (shown False open) "{Log | e}" "an open one"
+
+@test fun stringsAsRustShowsThem () =
+  assertEq (literalShown (Literal.Str "a\"b\n")) "\"a\\\"b\\n\"" "escaped"

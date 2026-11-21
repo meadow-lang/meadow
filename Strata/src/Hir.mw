@@ -1,0 +1,183 @@
+-- vendored from Idyll front/ at 14e8cca, to be replaced by the extraction's verbatim move
+--
+-- What the passes after renaming share: an argument's `Icit`, a
+-- `Literal`, a declaration's `Visibility`, and an `Ident` -- a name as the
+-- checker's context keeps one, the uniques it may stand for and its text.
+-- (The renamed program itself is `Hir`, a Lingua language, in `Rename`.)
+--
+-- A name's uniques are a list. None is a name nothing in scope has (it is
+-- reported); one is a name resolved; several are a name brought in by more
+-- than one `use`, which the checker chooses between by type (ROADMAP,
+-- phase 3). A binder always has one.
+--
+-- And how the dumps write a literal and a name, as the Rust side does.
+
+use Std.Macro (Reflect, Datum)
+use Std.Collections.Vector as V
+use Std.String as S
+use Std.Maybe.Maybe.*
+
+-- Whether an argument is written, or left for the checker to work out.
+@derive(PartialEq, Reflect)
+-- `Auto`: `{auto d : t}`, or `t => ..`, found by search
+@pub data Icit = Explicit | Implicit | Auto
+
+@derive(PartialEq)
+-- A number with a point in it is a `Float`, or a `Float32` once read at
+-- one; an integer read at a sized type is a `Word`, by its type's name, of
+-- the number it stands for (a `UInt64` past `Int`'s as the `Int` with its
+-- bits). The parser makes only `Int`s and `Float`s; the checker reads one at
+-- the type wanted (see `Literals`).
+@pub data Literal = Unit | Int Int | Bool Bool | Str String | Char Char | Float Float | Float32 Float32 | Word String Int
+
+-- Kept as Meadow's `@derive(Reflect)` would keep it, but for a `Char`,
+-- kept as its code point, and a `Float32`, as a `Float`: Meadow's
+-- `Reflect` has neither.
+impl Reflect Literal {
+  fun toDatum l =
+    match l with
+    | Literal.Unit -> Datum.Tag "Unit" []
+    | Literal.Int n -> Datum.Tag "Int" [Datum.Int n]
+    | Literal.Bool b -> Datum.Tag "Bool" [Datum.Bool b]
+    | Literal.Str s -> Datum.Tag "Str" [Datum.Str s]
+    | Literal.Char c -> Datum.Tag "Char" [Datum.Int (charCode c)]
+    | Literal.Float x -> Datum.Tag "Float" [Datum.Float x]
+    | Literal.Float32 x -> Datum.Tag "Float32" [Datum.Float (toFloat64 x)]
+    | Literal.Word w n -> Datum.Tag "Word" [Datum.Str w, Datum.Int n]
+  fun fromDatum d =
+    match d with
+    | Datum.Tag tag args ->
+        (match (tag, V.get args 0, V.get args 1) with
+         | ("Unit", _, _) -> Ok Literal.Unit
+         | ("Int", Just (Datum.Int n), _) -> Ok (Literal.Int n)
+         | ("Bool", Just (Datum.Bool b), _) -> Ok (Literal.Bool b)
+         | ("Str", Just (Datum.Str s), _) -> Ok (Literal.Str s)
+         | ("Char", Just (Datum.Int c), _) -> Ok (Literal.Char (charFromCode c))
+         | ("Float", Just (Datum.Float x), _) -> Ok (Literal.Float x)
+         | ("Float32", Just (Datum.Float x), _) -> Ok (Literal.Float32 (toFloat32 x))
+         | ("Word", Just (Datum.Str w), Just (Datum.Int n)) -> Ok (Literal.Word w n)
+         | _ -> Err "not a literal")
+    | _ -> Err "not a literal"
+}
+
+-- How far a declaration is seen: its module, the module above, its
+-- package, or anywhere.
+@derive(PartialEq, Reflect)
+@pub data Visibility = Private | Super | Package | Public
+
+@pub data Ident = Ident [Int] String
+
+-- The one unique of a binder.
+@pub fun uniqueOf (x : Ident) : Int =
+  match x with
+  | Ident.Ident us _ -> V.getOr (0 - 1) us 0
+
+@pub fun textOf (x : Ident) : String = match x with | Ident.Ident _ t -> t
+
+-- Every unique a name may stand for.
+@pub fun uniquesOf (x : Ident) : [Int] = match x with | Ident.Ident us _ -> us
+
+-- --- writing -----------------------------------------------------------------
+
+-- A string as the Rust side writes it: in quotes, with `\`, `"` and the
+-- control characters escaped. Any other byte is itself.
+-- A character as `idyllic_ast::show_char` writes one: in single quotes,
+-- escaped as a one-character string is, but for `'`, `'\''`, and `"`, which
+-- needs no escape here.
+@pub fun showChar (c : Char) : String =
+  let n = charCode c in
+  if n == 39 then "'\\''"
+  else if n == 34 then "'\"'"
+  else
+    let d = debugString (charsToString #[c]) in
+    "'" ++ stringSlice d 1 (stringByteLength d - 1) ++ "'"
+
+-- Rust's `Debug` for a string: in quotes, `\`, `"` and control characters
+-- escaped, anything else as it is.
+@pub fun debugString (s : String) : String =
+  let n = stringByteLength s in
+  let byte = \i -> toInt (stringByteAt s i) in
+  let escape =
+    \b ->
+      if b == 92 then "\\\\"
+      else if b == 34 then "\\\""
+      else if b == 10 then "\\n"
+      else if b == 9 then "\\t"
+      else if b == 13 then "\\r"
+      else if b == 0 then "\\0"
+      else if b < 32 or b == 127 then "\\u{" ++ hexDigits b ++ "}"
+      else ""
+  in
+  let cut = V.filter (\i -> escape (byte i) != "") (V.range 0 n) in
+  let starts = V.append [0] (V.map (\i -> i + 1) cut) in
+  let ends = V.append cut [n] in
+  let runs =
+    V.map
+      (\k ->
+        let run = stringSlice s (V.getOr 0 starts k) (V.getOr n ends k) in
+        match V.get cut k with
+        | Just i -> run ++ escape (byte i)
+        | None -> run)
+      (V.range 0 (V.len starts))
+  in
+  "\"" ++ S.join "" runs ++ "\""
+
+fun hexDigits (n : Int) : String =
+  let digit = \d -> stringSlice "0123456789abcdef" d (d + 1) in
+  if n < 16 then digit n else hexDigits (n / 16) ++ digit (n % 16)
+
+@pub fun quoted (s : String) : String =
+  let n = stringByteLength s in
+  let byte = \i -> toInt (stringByteAt s i) in
+  -- the bytes that are escaped, and the runs between them copied whole, so
+  -- that no character is cut
+  let cut = V.filter (\i -> escaped (byte i) != "") (V.range 0 n) in
+  let starts = V.append [0] (V.map (\i -> i + 1) cut) in
+  let ends = V.append cut [n] in
+  let runs =
+    V.map
+      (\k ->
+        let run = stringSlice s (V.getOr 0 starts k) (V.getOr n ends k) in
+        match V.get cut k with
+        | Just i -> run ++ escaped (byte i)
+        | None -> run)
+      (V.range 0 (V.len starts))
+  in
+  "\"" ++ S.join "" runs ++ "\""
+
+-- How byte `b` is escaped, or "" if it is not.
+fun escaped (b : Int) : String =
+  if b == 92 then "\\\\"
+  else if b == 34 then "\\\""
+  else if b == 10 then "\\n"
+  else if b == 9 then "\\t"
+  else if b == 13 then "\\r"
+  else if b < 32 or b == 127 then "\\u{" ++ hex b ++ "}"
+  else ""
+
+fun hex (n : Int) : String =
+  let digit = \d -> stringSlice "0123456789abcdef" d (d + 1) in
+  if n < 16 then digit n else hex (n / 16) ++ digit (n % 16)
+
+@pub fun literal (l : Literal) : String =
+  match l with
+  | Literal.Unit -> "(lit ())"
+  | Literal.Int n -> "(lit ${show n})"
+  | Literal.Bool b -> if b then "(lit True)" else "(lit False)"
+  | Literal.Str s -> "(lit ${quoted s})"
+  | Literal.Char c -> "(lit ${showChar c})"
+  | Literal.Float x -> "(lit ${display x})"
+  | Literal.Float32 x -> "(lit ${display x})"
+  | Literal.Word w n -> "(lit ${wordText w n})"
+
+-- A sized integer's value, as text: a `UInt64` read as one.
+@pub fun wordText (w : String) (n : Int) : String = if w == "UInt64" then display (toUInt64 n) else show n
+
+fun sx (parts : [String]) : String = "(" ++ S.join " " parts ++ ")"
+
+@pub fun ident (x : Ident) : String =
+  match x with
+  | Ident.Ident us t ->
+      if V.isEmpty us then t ++ "@?"
+      else if V.len us == 1 then t ++ "@" ++ show (V.getOr 0 us 0)
+      else sx (V.append ["overload"] (V.map (\u -> t ++ "@" ++ show u) us))

@@ -9,9 +9,16 @@
 -- no front end, so that both front ends can depend on it.
 --
 -- What it knows so far: the two levels, and how a definition's level is
--- decided before its body is elaborated (`Level`).
+-- decided before its body is elaborated (`Level`); and the core's data
+-- types, vendored from Idyll's `front/` ahead of the extraction, which
+-- replaces them by moving them here unchanged: grades (`Grade`), the names
+-- and literals the core shares with a renamer (`Hir`), and the terms
+-- (`Core`).
 
 @pub mod Level
+@pub mod Grade
+@pub mod Hir
+@pub mod Core
 
 @cfg(test)
 mod Tests

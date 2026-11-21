@@ -1,0 +1,171 @@
+-- vendored from Idyll front/ at 14e8cca, to be replaced by the extraction's verbatim move
+--
+-- Grades: how many times a variable may be used, as
+-- `compiler/idyllic-typecheck/src/grade.rs` has them.
+--
+-- The semiring is Granule's `Interval (Ext Nat)`: a grade is a range
+-- `lo..hi` of use counts, each end a natural number or `∞`. A bare `n` is
+-- the point interval `n..n`, an exact count: `0` erased, `1` linear. `0..1`
+-- is affine, `1..∞` relevant, `0..∞` unrestricted (`[]`).
+--
+-- `+` combines the uses of a variable in two subterms, `*` scales them
+-- through a binder, and `fits` is the order, containment: may something be
+-- used this often where that grade was promised.
+--
+-- This is the concrete algebra. Grades in a program are terms, normalised
+-- to polynomials with these as coefficients (`Value`).
+
+use Std.Macro (Reflect)
+use Std.Maybe.Maybe.*
+
+-- A natural number or infinity. Every count is below `Inf`.
+@derive(PartialEq, Reflect)
+@pub data Ext = Fin Int | Inf
+
+-- An interval of use counts, `lo..hi` with `lo <= hi`.
+@derive(PartialEq, Reflect)
+@pub data Grade = Grade Ext Ext
+
+def maxCount = 9223372036854775807
+
+fun extLe (a : Ext) (b : Ext) : Bool =
+  match (a, b) with
+  | (_, Ext.Inf) -> True
+  | (Ext.Inf, Ext.Fin _) -> False
+  | (Ext.Fin x, Ext.Fin y) -> x <= y
+
+fun extMin (a : Ext) (b : Ext) : Ext = if extLe a b then a else b
+
+fun extMax (a : Ext) (b : Ext) : Ext = if extLe a b then b else a
+
+-- (a count that would overflow is infinite)
+fun extAdd (a : Ext) (b : Ext) : Ext =
+  match (a, b) with
+  | (Ext.Fin x, Ext.Fin y) -> if x > maxCount - y then Ext.Inf else Ext.Fin (x + y)
+  | _ -> Ext.Inf
+
+-- `0 * ∞ = 0`: an erased position erases everything in it, which is what
+-- makes type arguments free.
+fun extMul (a : Ext) (b : Ext) : Ext =
+  match (a, b) with
+  | (Ext.Fin 0, _) -> Ext.Fin 0
+  | (_, Ext.Fin 0) -> Ext.Fin 0
+  | (Ext.Fin x, Ext.Fin y) -> if x > maxCount / y then Ext.Inf else Ext.Fin (x * y)
+  | _ -> Ext.Inf
+
+fun extShown (e : Ext) : String =
+  match e with
+  | Ext.Fin n -> show n
+  | Ext.Inf -> "∞"
+
+-- Exactly `n` uses.
+@pub fun exact (n : Int) : Grade = Grade.Grade (Ext.Fin n) (Ext.Fin n)
+
+@pub def zero : Grade = exact 0
+
+@pub def one : Grade = exact 1
+
+@pub def inf : Grade = Grade.Grade Ext.Inf Ext.Inf
+
+-- Unrestricted, `0..∞`, written `[]`: what a binder that says nothing has,
+-- outside a linear module, and what a type may mention its binder.
+@pub def any : Grade = Grade.Grade (Ext.Fin 0) Ext.Inf
+
+@pub def default : Grade = any
+
+@pub def defaultInType : Grade = any
+
+-- `lo..hi`, from the lower end of one to the upper end of the other;
+-- nothing if that would be empty.
+@pub fun range (lo : Grade) (hi : Grade) : Maybe Grade =
+  match (lo, hi) with
+  | (Grade.Grade l _, Grade.Grade _ h) -> if extLe l h then Just (Grade.Grade l h) else None
+
+@pub fun isZero (g : Grade) : Bool = g == zero
+
+@pub fun isExact (g : Grade) : Bool = match g with | Grade.Grade l h -> l == h
+
+-- The least grade both fit: what a `case` uses, whose alternatives use
+-- something `a` and `b` times.
+@pub fun join (a : Grade) (b : Grade) : Grade =
+  match (a, b) with
+  | (Grade.Grade l1 h1, Grade.Grade l2 h2) -> Grade.Grade (extMin l1 l2) (extMax h1 h2)
+
+-- At least one use: what is computed once even if its value is used no
+-- times.
+@pub fun atLeastOnce (g : Grade) : Grade =
+  match g with
+  | Grade.Grade l h -> Grade.Grade (extMax l (Ext.Fin 1)) (extMax h (Ext.Fin 1))
+
+@pub fun upper (g : Grade) : Ext = match g with | Grade.Grade _ h -> h
+
+-- `used` fits `allowed`: every count it might be is one allowed.
+@pub fun fits (used : Grade) (allowed : Grade) : Bool =
+  match (used, allowed) with
+  | (Grade.Grade l h, Grade.Grade al ah) -> extLe al l and extLe h ah
+
+-- Uses in two subterms.
+@pub fun add (a : Grade) (b : Grade) : Grade =
+  match (a, b) with
+  | (Grade.Grade l1 h1, Grade.Grade l2 h2) -> Grade.Grade (extAdd l1 l2) (extAdd h1 h2)
+
+-- Uses scaled through a binder.
+@pub fun mul (a : Grade) (b : Grade) : Grade =
+  match (a, b) with
+  | (Grade.Grade l1 h1, Grade.Grade l2 h2) -> Grade.Grade (extMul l1 l2) (extMul h1 h2)
+
+-- `3`, `0..∞`, `∞`: as the Rust checker prints a grade.
+@pub fun shown (g : Grade) : String =
+  match g with
+  | Grade.Grade l h -> if l == h then extShown l else extShown l ++ ".." ++ extShown h
+
+-- --- tests -------------------------------------------------------------------
+
+use Std.Test (assertEq, assertTrue)
+use Std.Collections.Vector as V
+
+fun samples () : [Grade] =
+  let ends = [Ext.Fin 0, Ext.Fin 1, Ext.Fin 2, Ext.Fin 7, Ext.Inf] in
+  V.concatMap (\l -> V.concatMap (\h -> if extLe l h then [Grade.Grade l h] else []) ends) ends
+
+@test fun theSemiringLaws () =
+  let s = samples () in
+  let law =
+    V.all
+      (\a ->
+        add a zero == a and mul a one == a and mul a zero == zero and mul zero a == zero
+          and V.all
+            (\b ->
+              add a b == add b a and mul a b == mul b a
+                and V.all
+                  (\c ->
+                    add (add a b) c == add a (add b c) and mul (mul a b) c == mul a (mul b c)
+                      and mul a (add b c) == add (mul a b) (mul a c))
+                  s)
+            s)
+      s
+  in
+  assertTrue law "a commutative semiring, with 0 annihilating"
+
+@test fun theOperationsAreMonotone () =
+  let s = samples () in
+  assertTrue
+    (V.all (\a -> V.all (\b -> not (fits a b) or V.all (\c -> fits (add a c) (add b c) and fits (mul a c) (mul b c)) s) s) s)
+    "what makes checking a symbolic grade term by term sound"
+
+@test fun intervalsAreOrderedByContainment () =
+  let affine = Grade.Grade (Ext.Fin 0) (Ext.Fin 1) in
+  let relevant = Grade.Grade (Ext.Fin 1) Ext.Inf in
+  let a = assertTrue (fits zero affine and fits one affine and not (fits (exact 2) affine)) "affine" in
+  let b = assertTrue (not (fits zero relevant) and fits (exact 9) relevant) "relevant" in
+  let c = assertTrue (not (fits affine one) and fits one one and not (fits one (exact 2))) "exact counts are discrete" in
+  assertEq (range (exact 2) one) None "an empty range"
+
+@test fun overflowSaturatesToInfinity () =
+  let a = assertEq (add (exact maxCount) one) inf "adding" in
+  assertEq (mul (exact maxCount) (exact 2)) inf "multiplying"
+
+@test fun display () =
+  let a = assertEq (shown (exact 3)) "3" "exact" in
+  let b = assertEq (shown any) "0..∞" "unrestricted" in
+  assertEq (shown inf) "∞" "infinite"
