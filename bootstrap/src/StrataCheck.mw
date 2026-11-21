@@ -138,6 +138,7 @@ fun icitOf (tc : Tc s (Front s) String) (dom : Value) : Icit ! { St s | e } =
 fun universe (tc : Tc s (Front s) String) (ctx : Ctx) (ty : Core) : Int ! { St s | e } =
   match force tc (infer tc ctx ty) with
   | Value.Type n -> n
+  | Value.MetaType n -> n
   | Value.Error -> 0
   | other ->
       (let v = fail tc "not-a-type" (shown False ty ++ " : " ++ shownAt tc ctx.lvl other) in 0)
@@ -233,6 +234,18 @@ fun isEffect (tc : Tc s (Front s) String) (ctx : Ctx) (c : Core) : () ! { St s |
       Value.LitTy Builtin.Effect
   | Core.Handle b r ops -> handled tc ctx b r ops None
   | Core.Error -> Value.Error
+  -- The compile-time level, which the translation writes nothing of yet:
+  -- `MetaType n` is in `MetaType (n + 1)`, `Code a` in `MetaType n` for `a`
+  -- in `Type n`, a quote of a term of type `a` is of type `Code a`, and a
+  -- splice of one of type `Code a` is of type `a`.
+  | Core.MetaType n -> Value.MetaType (n + 1)
+  | Core.Code a -> Value.MetaType (universe tc ctx a)
+  | Core.Quote t -> Value.Code (infer tc ctx t)
+  | Core.Splice x ->
+      (match force tc (infer tc ctx x) with
+       | Value.Code a -> a
+       | Value.Error -> Value.Error
+       | other -> fail tc "splice-of-no-code" (shownAt tc ctx.lvl other))
   | Core.GradeLit _ -> Value.LitTy Builtin.Grade
   | Core.GradeAdd _ _ -> Value.LitTy Builtin.Grade
   | Core.GradeMul _ _ -> Value.LitTy Builtin.Grade

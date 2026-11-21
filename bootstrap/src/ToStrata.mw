@@ -1401,6 +1401,9 @@ fun collectNodes (c : Core) (f : Core -> [a]) : [a] =
           (V.concatMap (\alt -> match alt with | CaseAlt.CaseAlt _ _ _ b -> go b) alts)
     | Core.Runtime n x -> V.append (match n with | Note.Binds _ (Just t) -> go t | _ -> []) (go x)
     | Core.Comp x y -> V.append (go x) (go y)
+    | Core.Code x -> go x
+    | Core.Quote x -> go x
+    | Core.Splice x -> go x
     | Core.Row ls ts -> V.append (V.concatMap go ls) (V.concatMap go ts)
     | Core.Handle b r ops ->
         V.concat [
