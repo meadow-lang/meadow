@@ -38,6 +38,13 @@ pub fn enable() {
     ENABLED.store(true, Ordering::Relaxed);
 }
 
+/// Stop saying things: for a command line that says nothing, run in a
+/// process where an earlier one said things -- `meadow-host`, which runs
+/// every command MeadowBoot hands it in one process.
+pub fn disable() {
+    ENABLED.store(false, Ordering::Relaxed);
+}
+
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
