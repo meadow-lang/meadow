@@ -1,6 +1,7 @@
--- What Strata's core does not say yet, each written as a goal: a nested
--- pattern, a guard, a literal pattern, a structural record, and a local
--- function that calls itself.
+-- What Strata's core did not say before matches were compiled and local
+-- recursion lifted, each written as a goal then: a nested pattern, a
+-- guard, a literal pattern, a structural record, and a local function that
+-- calls itself.
 
 use Std.Maybe.Maybe.*
 

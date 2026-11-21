@@ -70,6 +70,7 @@ use Strata.Level (Level, notYet)
 -- By its module: `MeadowBoot.Types` has a `levelOf` of its own.
 use Strata.Level as StrataLevel
 use MeadowBoot.ToStrata (unitDefs, dumped)
+use MeadowBoot.StrataCheck (checkUnit)
 use Lingua.Query (jsonDatum)
 use Std.Json as J
 use Std.Json (Json)
@@ -533,7 +534,14 @@ fun checkedOf
     (strict : Bool)
     (positions : Bool)
     (mark : String -> () ! e)
-    (strata : Maybe (String -> Renamed -> Inferred -> [TypeEnv] -> () ! e))
+    (strata
+       : Maybe (String ->
+          Renamed ->
+          Inferred ->
+          [DepExports] ->
+          [TypeEnv] ->
+          [DefaultSig] ->
+          () ! e))
     : ([Export], Bool, TypeEnv, Maybe (CoreProgram, Linked, Object), [String]) ! e =
   let m0 = mark "start" in
   match unitOf cfg dir imported fx files asts with
@@ -632,7 +640,7 @@ fun checkedOf
       in
       let done =
         inferUnitWith
-          Wants.ForLowering
+          (if M.isSome strata then Wants.Everything else Wants.ForLowering)
           mark
           r
           deps
@@ -644,7 +652,14 @@ fun checkedOf
       -- nothing reads yet; a build without the option does nothing here.
       let leveled =
         (match strata with
-         | Just f -> f pkg r done (V.map (\(i : Interface) -> i.types) imported)
+         | Just f ->
+             f
+               pkg
+               r
+               done
+               deps
+               (V.map (\(i : Interface) -> i.types) imported)
+               (V.concatMap (\(i : Interface) -> i.linked.defaults) imported)
          | None -> ())
       in
       let linked = V.map (\(i : Interface) -> i.linked) imported in
@@ -2421,7 +2436,8 @@ fun compiling (o : UnitsOptions) (u : Given Interface) (clk : Clock) =
               o.positions
               mark
               (if o.strata then
-                 Just (\pkg r done theirs -> strataWritten (unitOut u) pkg r done theirs)
+                 Just (\pkg r done deps theirs defaults ->
+                   strataWritten (unitOut u) pkg r done deps theirs defaults)
                else None) with
             | _ if not (V.isEmpty misread and V.isEmpty unexpanded and V.isEmpty leveled) ->
                 Err (S.join "" (V.concat [misread, unexpanded, leveled]))
@@ -2511,18 +2527,26 @@ fun compileTimeRefused (asts : [(String, AstProgram)]) : [String] =
     asts
 
 -- `strata`: unit `r` of package `pkg`, typed as `done`, elaborated into
--- Strata's core with everything at run time (`ToStrata`). Nothing reads the
--- terms yet. `MEADOWBOOT_STRATA` has them written beside the unit's object,
--- in `out`, as `<package>.strata`, with what did not map counted by kind.
+-- Strata's core with everything at run time (`ToStrata`), and checked by
+-- Strata's kernel (`StrataCheck`). Nothing reads the terms yet.
+-- `MEADOWBOOT_STRATA` has them written beside the unit's object, in `out`,
+-- as `<package>.strata`, with what did not map counted by kind and what the
+-- checker said of each.
 fun strataWritten
     (out : String)
     (pkg : String)
     (r : Renamed)
     (done : Inferred)
-    (theirs : [TypeEnv]) =
-  let defs = unitDefs r done theirs in
+    (deps : [DepExports])
+    (theirs : [TypeEnv])
+    (defaults : [DefaultSig]) =
+  let made = unitDefs r done deps theirs defaults in
+  let checked = checkUnit made in
   if M.isSome (getEnv "MEADOWBOOT_STRATA") then
-    (match writeString (Path.join out "${pkg}.strata", dumped pkg defs) with
+    (match writeString (
+       Path.join out "${pkg}.strata",
+       dumped pkg made (fst checked) (snd checked)
+     ) with
      | Ok _ -> ()
      | Err why -> writeError "${why}\n")
   else ()

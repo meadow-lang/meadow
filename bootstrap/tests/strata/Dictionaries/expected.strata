@@ -1,0 +1,71 @@
+-- Strata's core for Dictionaries, from MeadowBoot's typed tree (docs/2LTT.md, L1)
+-- declarations: 24, of them made by the translation: 0
+-- unmapped: none
+-- leaves of case trees with no arm left: 0
+-- names without a binder: none
+-- of them, by name: none
+-- declarations of other units read: 3
+-- checked by Strata's kernel: accepted 24, rejected 0, skipped 0
+-- rejected, by reason: none
+-- skipped, by the first thing not said: none
+data Dictionaries.Named : Type -> Type
+  -- accepted
+con Dictionaries.Named.#dict : {a : [] Type} -> (a -> String) -> Dictionaries.Named a
+  -- accepted
+data Dictionaries.Box : Type -> Type
+  -- accepted
+con Dictionaries.Box.Box : {a : [] Type} -> a -> Dictionaries.Box a
+  -- accepted
+data Dictionaries.Greeter : Type -> Type
+  -- accepted
+con Dictionaries.Greeter.#dict : {a : [] Type} -> Dictionaries.Named a -> (a -> String) -> Dictionaries.Greeter a
+  -- accepted
+data Dictionaries.Holder : Type -> Type -> Type
+  -- accepted
+con Dictionaries.Holder.#dict : {a : [] Type} -> {b : [] Type} -> (a -> b) -> Dictionaries.Holder a b
+  -- accepted
+trait Dictionaries.Named : Type -> Type
+  -- accepted
+trait Dictionaries.Greeter : Type -> Type
+  -- accepted
+trait Dictionaries.Holder : Type -> Type -> Type
+  -- accepted
+method Dictionaries.Holder.held : {a : [] Type} -> {b : [] Type} -> Dictionaries.Holder a b => a -> b
+  = \a -> \b -> \d0 -> case d0 of { #dict held -> held }
+  -- accepted
+method Dictionaries.Greeter.greet : {a : [] Type} -> Dictionaries.Greeter a => a -> String
+  = \a -> \d0 -> case d0 of { #dict #super.Dictionaries.Named greet -> greet }
+  -- accepted
+method Dictionaries.Named.name : {a : [] Type} -> Dictionaries.Named a => a -> String
+  = \a -> \d0 -> case d0 of { #dict name -> name }
+  -- accepted
+default greet : {a : [] Type} -> Dictionaries.Greeter a => a -> String
+  = \a -> \d0 -> \x -> ++ "hello " (name a (case d0 of { #dict #super.Dictionaries.Named greet -> #super.Dictionaries.Named }) x)
+  -- accepted
+method name : Int -> String
+  = \n -> "an int"
+  -- accepted
+impl #impl.Dictionaries.Named Int : Dictionaries.Named Int
+  = #dict Int name
+  -- accepted
+impl #impl.Dictionaries.Greeter Int : Dictionaries.Greeter Int
+  = #dict Int (#impl.Dictionaries.Named Int) (greet Int (#impl.Dictionaries.Greeter Int))
+  -- accepted
+method name : {a : [] Type} -> Dictionaries.Named a => Dictionaries.Box a -> String
+  = \a -> \d0 -> \b -> case b of { Box x -> let x = x in ++ "a box of " (name a d0 x) }
+  -- accepted
+impl #impl.Dictionaries.Named Dictionaries.Box : {a : [] Type} -> Dictionaries.Named a => Dictionaries.Named (Dictionaries.Box a)
+  = \a -> \d0 -> #dict (Dictionaries.Box a) (name a d0)
+  -- accepted
+method held : {a : [] Type} -> Dictionaries.Box a -> a
+  = \a -> \b -> case b of { Box x -> let x = x in x }
+  -- accepted
+impl #impl.Dictionaries.Holder Dictionaries.Box : {a : [] Type} -> Dictionaries.Holder (Dictionaries.Box a) a
+  = \a -> #dict (Dictionaries.Box a) a (held a)
+  -- accepted
+def hi : Int -> String
+  = \n -> greet Int (#impl.Dictionaries.Greeter Int) n
+  -- accepted
+def twice : {a : [] Type} -> {b : [] Effect} -> Std.Ops.Add a => a -> a ! b
+  = \a -> \b -> \d0 -> \x -> + a d0 x x
+  -- accepted

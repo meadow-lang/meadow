@@ -1,15 +1,36 @@
 -- Strata's core for Unmapped, from MeadowBoot's typed tree (docs/2LTT.md, L1)
--- declarations: 5
--- unmapped: structural-record 2, guard 1, literal-pattern 1, nested-pattern 1, recursive-let 1
+-- declarations: 10, of them made by the translation: 4
+-- unmapped: none
+-- leaves of case trees with no arm left: 0
 -- names without a binder: none
 -- of them, by name: none
+-- declarations of other units read: 15
+-- checked by Strata's kernel: accepted 10, rejected 0, skipped 0
+-- rejected, by reason: none
+-- skipped, by the first thing not said: none
 def depth : Maybe (Maybe Int) -> Int
-  = \m -> ?nested-pattern
+  = \m -> case m of { None -> 0; Just x -> case x of { None -> 0; Just x -> let n = x in n } }
+  -- accepted
 def small : Int -> Bool
-  = \n -> ?guard
+  = \n -> let k = n in case < Int (#impl.Std.Cmp.PartialOrd Int) k 10 of { True -> True; False -> False }
+  -- accepted
 def named : Int -> String
-  = \n -> ?literal-pattern
-def corner : {a : [] Type} -> {b : [] Type} -> {c : [] Effect} -> () -> ?structural-record ! c
-  = \a -> \b -> \c -> \_ -> ?structural-record
+  = \n -> case n == 0 of { True -> "zero"; False -> "many" }
+  -- accepted
+def corner : {a : [] Type} -> {b : [] Type} -> {c : [] Effect} -> #Num a => #Num b => () -> #rec{x,y} a b ! c
+  = \a -> \b -> \c -> \n35 -> \n34 -> \_ -> #rec{x,y} a b (#fromInt a n35 1) (#fromInt b n34 2)
+  -- accepted
 def count : Int -> Int
-  = \n -> let go = \a -> \k -> case == Int (#impl.Std.Cmp.PartialEq Int) k 0 of { True -> 0; False -> + Int (#impl.Std.Ops.Add Int) 1 (?recursive-let (- Int (#impl.Std.Ops.Sub Int) k 1)) } in go n
+  = \n -> let go = countGo n in go {} n
+  -- accepted
+lifted countGo : (n : Int) -> {a : [] Effect} -> Int -> Int ! a
+  = \n -> \a -> \k -> case == Int (#impl.Std.Cmp.PartialEq Int) k 0 of { True -> 0; False -> + Int (#impl.Std.Ops.Add Int) 1 (countGo n a (- Int (#impl.Std.Ops.Sub Int) k 1)) }
+  -- accepted
+builtin #Num : Type -> Type
+  -- accepted
+builtin #fromInt : {a : [] Type} -> #Num a -> Int -> a
+  -- accepted
+data #rec{x,y} : Type -> Type -> Type
+  -- accepted
+con #rec{x,y} : {a : [] Type} -> {b : [] Type} -> (x : a) -> (y : b) -> #rec{x,y} a b
+  -- accepted

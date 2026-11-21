@@ -1,0 +1,53 @@
+-- Strata's core for Matches, from MeadowBoot's typed tree (docs/2LTT.md, L1)
+-- declarations: 17, of them made by the translation: 4
+-- unmapped: none
+-- leaves of case trees with no arm left: 0
+-- names without a binder: none
+-- of them, by name: none
+-- declarations of other units read: 26
+-- checked by Strata's kernel: accepted 17, rejected 0, skipped 0
+-- rejected, by reason: none
+-- skipped, by the first thing not said: none
+data Matches.Shape : Type
+  -- accepted
+con Matches.Shape.Circle : Int -> Matches.Shape
+  -- accepted
+con Matches.Shape.Rect : Int -> Int -> Matches.Shape
+  -- accepted
+con Matches.Shape.Dot : Matches.Shape
+  -- accepted
+def both : Tuple2 (Maybe Int) (Maybe Int) -> Int
+  = \p -> case p of { Tuple2 x x -> case x of { None -> 0; Just x -> case x of { None -> let a = x in a; Just x -> let a = x in let b = x in + Int (#impl.Std.Ops.Add Int) a b } } }
+  -- accepted
+def word : String -> Int
+  = \s -> case stringCompare {} {} s "one" == 0 of { True -> 1; False -> case stringCompare {} {} s "two" == 0 of { True -> 2; False -> 0 } }
+  -- accepted
+def vowel : Char -> Bool
+  = \c -> case charCode {} c == 97 of { True -> True; False -> case charCode {} c == 101 of { True -> True; False -> False } }
+  -- accepted
+def sized : Matches.Shape -> String
+  = \s -> case s of { Circle x -> let r = x in case > Int (#impl.Std.Cmp.PartialOrd Int) r 10 of { True -> "big"; False -> "other" }; Rect x x -> let w = x in let h = x in case == Int (#impl.Std.Cmp.PartialEq Int) w h of { True -> "square"; False -> "other" }; Dot -> "dot" }
+  -- accepted
+def firstTwo : List Int -> Int
+  = \xs -> case xs of { Nil -> 0; Cons x x -> case x of { Nil -> 0; Cons x x -> case x of { Nil -> let a = x in let b = x in + Int (#impl.Std.Ops.Add Int) a b; Cons x x -> 0 } } }
+  -- accepted
+def area : Matches.Shape -> Int
+  = \s -> case s of { Circle x -> let r = x in * Int (#impl.Std.Ops.Mul Int) r r; Rect x x -> let w = x in let h = x in * Int (#impl.Std.Ops.Mul Int) w h; Dot -> 0 }
+  -- accepted
+def large : Matches.Shape -> Bool
+  = \s -> let fallback = \_ -> True in let v = area s in case v == 0 of { True -> False; False -> fallback () }
+  -- accepted
+def xOf : #rec{x,y} Int Int -> Int
+  = \p -> case p of { #rec{x,y} x y -> let x = x in let y = y in x }
+  -- accepted
+def counted : Int -> Int
+  = \n -> runSt Int {} (\s -> \_ -> let r = stNewRef s Int {} 0 in let w = stSetRef s Int {} {} r (+ Int (#impl.Std.Ops.Add Int) (stGetRef s Int {} r) n) in stGetRef s Int {} r)
+  -- accepted
+data #rec{x,y} : Type -> Type -> Type
+  -- accepted
+con #rec{x,y} : {a : [] Type} -> {b : [] Type} -> (x : a) -> (y : b) -> #rec{x,y} a b
+  -- accepted
+data Tuple2 : Type -> Type -> Type
+  -- accepted
+con Tuple2 : {a : [] Type} -> {b : [] Type} -> a -> b -> Tuple2 a b
+  -- accepted

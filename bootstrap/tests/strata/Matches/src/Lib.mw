@@ -1,0 +1,40 @@
+-- Matches of more than one level, each a tree of one-level `case`s: nested
+-- constructors, literals of each kind, guards, a list's pattern, a view,
+-- a structural record's pattern, and `runSt`'s state.
+
+use Std.Maybe.Maybe.*
+
+@pub data Shape = Circle Int | Rect Int Int | Dot
+
+use Shape.*
+
+@pub fun both (p : (Maybe Int, Maybe Int)) : Int =
+  match p with
+  | (Just a, Just b) -> a + b
+  | (Just a, None) -> a
+  | _ -> 0
+
+@pub fun word (s : String) : Int = match s with | "one" -> 1 | "two" -> 2 | _ -> 0
+
+@pub fun vowel (c : Char) : Bool = match c with | 'a' -> True | 'e' -> True | _ -> False
+
+@pub fun sized (s : Shape) : String =
+  match s with
+  | Circle r if r > 10 -> "big"
+  | Rect w h if w == h -> "square"
+  | Dot -> "dot"
+  | _ -> "other"
+
+@pub fun firstTwo (xs : List Int) : Int = match xs with | [a; b] -> a + b | _ -> 0
+
+fun area (s : Shape) : Int = match s with | Circle r -> r * r | Rect w h -> w * h | Dot -> 0
+
+@pub fun large (s : Shape) : Bool = match s with | (area -> 0) -> False | _ -> True
+
+@pub fun xOf (p : { x : Int, y : Int }) : Int = match p with | { x, y } -> x
+
+@pub fun counted (n : Int) : Int =
+  runSt (\() ->
+    let r = stNewRef 0 in
+    let w = stSetRef r (stGetRef r + n) in
+    stGetRef r)
