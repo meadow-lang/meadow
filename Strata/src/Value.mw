@@ -17,6 +17,10 @@
 --
 -- Evaluating a value means consulting the metavariables, so `eval`, `quote`
 -- and `force` are in `Eval`, with the checker's state.
+--
+-- The compile-time level's values (see `Core`): its universe, `Code a`, and
+-- quoted code. A splice of code that is not a quote yet waits on it, an
+-- elimination on the spine (`Elim.Splice`), as in Kovács's staged 2LTT.
 
 use Strata.Hir (Icit, Literal)
 use Strata.Core (Core, CaseAlt, Builtin, Prim)
@@ -27,9 +31,10 @@ use Std.Collections.Vector as V
 use Std.String as S
 use Std.Maybe.Maybe.*
 
--- One elimination waiting on a stuck head: an application, an unboxing, or
--- a `case` that cannot choose yet (its alternatives, and where they were).
-@pub data Elim = App Value | Unbox | Case Env [CaseAlt]
+-- One elimination waiting on a stuck head: an application, an unboxing, a
+-- `case` that cannot choose yet (its alternatives, and where they were), or
+-- a splice of code that is not a quote yet.
+@pub data Elim = App Value | Unbox | Case Env [CaseAlt] | Splice
 
 -- The values of the variables in scope, innermost first, so that a Core
 -- index is a place in the list. Sharing its tail with whatever it was built
@@ -41,6 +46,8 @@ use Std.Maybe.Maybe.*
 
 @pub data Value
   = Type Int
+  -- the compile-time universe
+  | MetaType Int
   | LitTy Builtin
   | Lit Literal
   -- name, icit, grade, in-type grade, domain, codomain
@@ -49,6 +56,11 @@ use Std.Maybe.Maybe.*
   -- `a [r]`: grade, then type
   | BoxTy Value Value
   | BoxIntro Value
+  -- `Code a`
+  | Code Value
+  -- `quote { t }`; a quote of a splice waiting on a head is that head
+  -- (`Eval.vquote`, and `Eval.force` for one made otherwise)
+  | Quote Value
   -- stuck on an unsolved metavariable
   | Flex Int [Elim]
   -- stuck on a bound variable, by its level
@@ -288,7 +300,8 @@ fun padded (n : Int) : String =
              match e with
              | Elim.App a -> " (" ++ atomKey a ++ ")"
              | Elim.Unbox -> " unbox"
-             | Elim.Case _ alts -> " case@" ++ show (V.len alts))
+             | Elim.Case _ alts -> " case@" ++ show (V.len alts)
+             | Elim.Splice -> " splice")
            sp)
   in
   match v with
@@ -297,6 +310,9 @@ fun padded (n : Int) : String =
   | Value.Opaque u _ sp -> "c" ++ padded u ++ spine sp
   | Value.Stuck h sp -> "(" ++ atomKey h ++ ")" ++ spine sp
   | Value.Type n -> "Type " ++ show n
+  | Value.MetaType n -> "MetaType " ++ show n
+  | Value.Code a -> "(Code " ++ atomKey a ++ ")"
+  | Value.Quote q -> "quote{" ++ atomKey q ++ "}"
   | Value.LitTy b -> C.builtinName b
   | Value.Lit l -> C.literalShown l
   | Value.Error -> "!"

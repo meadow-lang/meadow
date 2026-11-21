@@ -6,6 +6,11 @@
 -- These consult the metacontext: a `Flex` value whose metavariable has
 -- since been solved is no longer stuck, and `force` is what makes that
 -- visible. Everything that looks at a value's head forces it first.
+--
+-- Code computes as Kovács's staged 2LTT has it: a splice of a quote is what
+-- was quoted (`vsplice`), and a quote of a splice waiting on a head is that
+-- head (`vquote`), so values are normal for both, and readback gives back
+-- `c` for `quote { $c }`.
 
 use Std.St (StRef, newRef, getRef, setRef)
 use Strata.Hir (Icit, Literal)
@@ -55,6 +60,11 @@ fun forceWith (tc : Tc s f p) (unfolding : Bool) (v : Value) : Value ! { St s | 
       (match force tc e with
        | Value.Row r -> if Va.rowIsEmpty r then t else v
        | _ -> v)
+  -- a quote of what has since become a splice waiting on a head
+  | Value.Quote inner ->
+      (match unspliced (force tc inner) with
+       | Just h -> forceWith tc unfolding h
+       | None -> v)
   -- a recursive definition that terminates, applied to enough to choose a
   -- right-hand side
   | Value.Opaque u _ sp ->
@@ -197,6 +207,30 @@ fun onInts (p : Prim) (a : Int) (b : Int) : Maybe Literal =
   | Value.BoxIntro inner -> inner
   | _ -> stuck v Elim.Unbox
 
+-- `$(quote { t })` is `t`; otherwise the splice waits on the head.
+@pub fun vsplice (v : Value) : Value =
+  match v with
+  | Value.Quote inner -> inner
+  | _ -> stuck v Elim.Splice
+
+-- `quote { $c }` is `c`, where the splice waits on a head; otherwise a
+-- quote.
+@pub fun vquote (v : Value) : Value =
+  match unspliced v with
+  | Just h -> h
+  | None -> Value.Quote v
+
+-- A value that is a splice waiting on a head, the splice taken off.
+@pub fun unspliced (v : Value) : Maybe Value =
+  let off = \sp -> match V.last sp with | Just Elim.Splice -> Just (V.take sp (V.len sp - 1)) | _ -> None in
+  match v with
+  | Value.Flex m sp -> M.map (\rest -> Value.Flex m rest) (off sp)
+  | Value.Rigid l n sp -> M.map (\rest -> Value.Rigid l n rest) (off sp)
+  | Value.Opaque u n sp -> M.map (\rest -> Value.Opaque u n rest) (off sp)
+  | Value.Stuck h sp ->
+      M.map (\rest -> if V.isEmpty rest then h else Value.Stuck h rest) (off sp)
+  | _ -> None
+
 -- An elimination waiting on a stuck head; on anything else it is ill-typed
 -- (and reported), so an error.
 fun stuck (head : Value) (elim : Elim) : Value =
@@ -214,7 +248,8 @@ fun stuck (head : Value) (elim : Elim) : Value =
       match e with
       | Elim.App a -> vapp tc acc a
       | Elim.Unbox -> vunbox tc acc
-      | Elim.Case env alts -> vcase tc acc env alts)
+      | Elim.Case env alts -> vcase tc acc env alts
+      | Elim.Splice -> vsplice acc)
     head
     sp
 
@@ -223,6 +258,7 @@ fun stuck (head : Value) (elim : Elim) : Value =
 @pub fun eval (tc : Tc s f p) (env : Env) (c : Core) : Value ! { St s | e } =
   match c with
   | Core.Type n -> Value.Type n
+  | Core.MetaType n -> Value.MetaType n
   | Core.LitTy b -> Value.LitTy b
   | Core.Lit l -> Value.Lit l
   | Core.Prim p -> Value.Prim p []
@@ -252,6 +288,9 @@ fun stuck (head : Value) (elim : Elim) : Value =
   | Core.Handle _ _ _ -> Value.Handle env c
   | Core.Case s alts -> vcase tc (eval tc env s) env alts
   | Core.Let _ e body -> eval tc (Va.push env (eval tc env e)) body
+  | Core.Code a -> Value.Code (eval tc env a)
+  | Core.Quote t -> vquote (eval tc env t)
+  | Core.Splice q -> vsplice (eval tc env q)
 
 -- Read a value back into Core, in a context of `l` slots. Solved
 -- metavariables are expanded on the way, so what comes out mentions only
@@ -259,6 +298,7 @@ fun stuck (head : Value) (elim : Elim) : Value =
 @pub fun quote (tc : Tc s f p) (l : Int) (v : Value) : Core ! { St s | e } =
   match force tc v with
   | Value.Type n -> Core.Type n
+  | Value.MetaType n -> Core.MetaType n
   | Value.LitTy b -> Core.LitTy b
   | Value.Lit x -> Core.Lit x
   | Value.Error -> Core.Error
@@ -275,6 +315,8 @@ fun stuck (head : Value) (elim : Elim) : Value =
   | Value.GradeRange lo hi -> Core.GradeRange (quote tc l lo) (quote tc l hi)
   | Value.BoxIntro e -> Core.BoxIntro (quote tc l e)
   | Value.Comp t e -> Core.Comp (quote tc l t) (quote tc l e)
+  | Value.Code a -> Core.Code (quote tc l a)
+  | Value.Quote q -> Core.Quote (quote tc l q)
   | Value.Handle env (Core.Handle body ret ops) ->
       let part = \c -> quote tc l (eval tc env c) in
       Core.Handle (part body) (part ret) (V.map (\o -> match o with | OpClause.OpClause u n k b -> OpClause.OpClause u n k (part b)) ops)
@@ -287,7 +329,8 @@ fun quoteSpine (tc : Tc s f p) (l : Int) (head : Core) (sp : [Elim]) : Core ! { 
       match e with
       | Elim.App a -> Core.App acc (quote tc l a)
       | Elim.Unbox -> Core.Unbox acc
-      | Elim.Case env alts -> Core.Case acc (V.map (\alt -> quoteAlt tc l env alt) alts))
+      | Elim.Case env alts -> Core.Case acc (V.map (\alt -> quoteAlt tc l env alt) alts)
+      | Elim.Splice -> Core.Splice acc)
     head
     sp
 
@@ -351,7 +394,14 @@ fun rowItem (tc : Tc s f p) (r : Row) (item : Value) : Row ! { St s | e } =
     \sp ->
       S.join
         ""
-        (V.map (\e -> match e with | Elim.App a -> " (" ++ effectKey tc a ++ ")" | Elim.Unbox -> " Unbox" | Elim.Case _ _ -> " Case") sp)
+        (V.map
+           (\e ->
+             match e with
+             | Elim.App a -> " (" ++ effectKey tc a ++ ")"
+             | Elim.Unbox -> " Unbox"
+             | Elim.Case _ _ -> " Case"
+             | Elim.Splice -> " Splice")
+           sp)
   in
   match force tc v with
   | Value.Rigid l _ sp -> "v" ++ padded l ++ spine sp
