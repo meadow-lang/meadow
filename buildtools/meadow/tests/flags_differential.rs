@@ -1041,6 +1041,9 @@ fn a_git_dependency_is_fetched_and_locked_as_meadow_does() {
             refusal(&theirs, &p.rust_root()),
             "{flag}:\n{ours}\n{theirs}"
         );
+        // Said on standard error alone, as `meadow` says it: standard output
+        // is the program's.
+        assert_eq!(ours.out, "", "{flag}: standard output\n{ours}");
         assert_eq!(lock(p.boot_root()), None, "{flag}: {ours}");
     }
 
@@ -1085,6 +1088,7 @@ fn a_git_dependency_is_fetched_and_locked_as_meadow_does() {
         refusal(&theirs, &p.rust_root()),
         "\n{ours}\n{theirs}"
     );
+    assert_eq!(ours.out, "", "standard output\n{ours}");
     let written = lock(p.boot_root());
     let ours = p.boot_in(Some(&boot_home), "run", &["--locked"]);
     assert_eq!(ours.code, Some(0), "{ours}");
