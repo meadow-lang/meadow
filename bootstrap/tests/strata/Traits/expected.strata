@@ -1,20 +1,35 @@
 -- Strata's core for Traits, from MeadowBoot's typed tree (docs/2LTT.md, L1)
--- declarations: 10
--- unmapped: dictionary-record 1
+-- declarations: 10, of them made by the translation: 0
+-- unmapped: none
+-- leaves of case trees with no arm left: 0
 -- names without a binder: none
 -- of them, by name: none
+-- declarations of other units read: 3
+-- checked by Strata's kernel: accepted 10, rejected 0, skipped 0
+-- rejected, by reason: none
+-- skipped, by the first thing not said: none
 data Traits.Box : Type
+  -- accepted
 con Traits.Box.Box : Int -> Traits.Box
+  -- accepted
 data Traits.Size : Type -> Type
+  -- accepted
 con Traits.Size.#dict : {a : [] Type} -> (a -> Int) -> Traits.Size a
+  -- accepted
 trait Traits.Size : Type -> Type
+  -- accepted
 method Traits.Size.size : {a : [] Type} -> Traits.Size a => a -> Int
   = \a -> \d0 -> case d0 of { #dict size -> size }
-impl Traits.Size Traits.Box : Traits.Size Traits.Box
-  = ?dictionary-record
+  -- accepted
 method size : Traits.Box -> Int
-  = \b -> case b of { Box n -> n }
+  = \b -> case b of { Box x -> let n = x in n }
+  -- accepted
+impl #impl.Traits.Size Traits.Box : Traits.Size Traits.Box
+  = #dict Traits.Box size
+  -- accepted
 def total : {a : [] Type} -> {b : [] Type} -> {c : [] Effect} -> Traits.Size a => Traits.Size b => a -> b -> Int ! c
   = \a -> \b -> \c -> \d0 -> \d1 -> \x -> \y -> + Int (#impl.Std.Ops.Add Int) (size a d0 x) (size b d1 y)
+  -- accepted
 def boxes : () -> Int
-  = \_ -> total Traits.Box Traits.Box (#impl.Traits.Size Traits.Box) (#impl.Traits.Size Traits.Box) (Box 1) (Box 2)
+  = \_ -> total Traits.Box Traits.Box {} (#impl.Traits.Size Traits.Box) (#impl.Traits.Size Traits.Box) (Box 1) (Box 2)
+  -- accepted

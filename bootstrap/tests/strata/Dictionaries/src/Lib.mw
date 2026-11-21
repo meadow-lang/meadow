@@ -1,0 +1,41 @@
+-- Traits as dictionaries: one that requires another, a default method, an
+-- associated type, an `impl` with a `where` of its own, and a function
+-- generic in a number type.
+
+@pub trait Named a {
+  fun name : a -> String
+}
+
+@pub trait Greeter a <: Named a {
+  fun greet : a -> String | greet x = "hello " ++ name x
+}
+
+@pub trait Holder c {
+  type Held c
+
+  fun held : c -> Held c
+}
+
+@pub data Box a = Box a
+
+use Box.*
+
+impl Named Int {
+  fun name n = "an int"
+}
+
+impl Greeter Int {}
+
+impl Named (Box a) where Named a {
+  fun name b = match b with | Box x -> "a box of " ++ name x
+}
+
+impl Holder (Box a) {
+  type Held (Box a) = a
+
+  fun held b = match b with | Box x -> x
+}
+
+@pub fun hi (n : Int) : String = greet n
+
+@pub fun twice x = x + x

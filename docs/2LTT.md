@@ -920,129 +920,198 @@ option can be on in CI with no difference.
 
 The translation was written against `Core` as Idyll has it, before the
 levels, to find out how much of Meadow the core says as it is. It runs on
-every unit under the option. A construct it has nothing for is written as a
-goal and counted, so its dumps are an inventory. Over the standard library
-it writes 2,926 declarations, and over MeadowBoot's own unit 14,749. What
-did not map, by kind (a `match` is counted once, by the first thing in it
-that stops it):
+every unit under the option, and Strata's kernel now checks what it writes
+(below). A construct it has nothing for is written as a goal and counted, so
+its dumps are an inventory. Over the standard library it writes 2,983
+declarations, and over MeadowBoot's own unit 15,405. The first count of each
+kind below is the translation's first version, over the sources of that
+time; the second is the translation now, over the sources with it and the
+checker in them.
 
-| kind | Std | MeadowBoot |
-| --- | --- | --- |
-| `structural-record` | 23 | 2,901 |
-| `view-pattern` | 0 | 1,070 |
-| `dictionary-record` | 366 | 507 |
-| `nested-pattern` | 146 | 699 |
-| `free-type-variable` | 250 | 363 |
-| `literal-pattern` | 3 | 132 |
-| `record-row-variable` | 4 | 122 |
-| `recursive-let` | 21 | 100 |
-| `method-with-generics-of-its-own` | 11 | 72 |
-| `guard` | 22 | 3 |
-| `collection-pattern` | 6 | 4 |
-| `bigint-literal` | 1 | 1 |
+| kind | Std, first | Std, now | MeadowBoot, first | MeadowBoot, now |
+| --- | --- | --- | --- | --- |
+| `structural-record` | 23 | 0 | 2,963 | 0 |
+| `view-pattern` | 0 | 0 | 1,070 | 0 |
+| `nested-pattern` | 146 | 0 | 721 | 0 |
+| `dictionary-record` | 366 | 0 | 507 | 0 |
+| `free-type-variable` | 250 | 0 | 364 | 0 |
+| `literal-pattern` | 3 | 0 | 133 | 0 |
+| `record-row-variable` | 4 | 19 | 122 | 851 |
+| `recursive-let` | 21 | 0 | 100 | 0 |
+| `method-with-generics-of-its-own` | 11 | 0 | 72 | 0 |
+| `guard` | 22 | 0 | 3 | 0 |
+| `collection-pattern` | 6 | 0 | 4 | 0 |
+| `bigint-literal` | 1 | 1 | 1 | 1 |
+| `missing-method` | 0 | 2 | 0 | 0 |
 
-**What maps cleanly.**
+The two counts are not taken the same way. The first version counted a
+`match` once, by the first thing in it that stopped it, and wrote a record
+type with a row variable over its fields as a `structural-record`. Now every
+match is compiled, so a goal is counted where it is, and each record type
+open in its fields is a `record-row-variable` wherever it is written: those
+are the row-polymorphic records that remain, most of them the `with cx`
+parameter of Lingua's `pass!`.
 
-- **Schemes.** Each quantifier is an implicit Pi, over `Type`, or over
-  `Effect` for an effect row's. Each arrow is a Pi, and a latent effect is a
-  `Comp` with a `Row`, an open row ending in its variable. Every binder has
-  grade ω, `[]`.
-- **Type application and dictionaries.** The typed tree already says, at
-  each mention of a generic name, the types it was used at and the
-  dictionaries inference found for it. So the core is explicit with nothing
-  inferred again: a definition takes its types and then its dictionaries as
-  lambdas, and a trait it asks for is an auto Pi over the trait's dictionary
-  type. MeadowBoot's dictionaries are already data types of one
-  constructor, so a method is a `case` on its trait's dictionary.
-- **Recursion between definitions**, mutual or not. A top-level name is an
-  `Opaque` constant by its binder, and Core needs nothing more.
-- **Data types, constructors and named records.** A named record is a data
-  type of one constructor, and a projection or an update is a `case`.
-- **Plain matches of one level.** A match whose arms are each a constructor
-  of variables, or a tuple of them, with at most a last arm for the rest, is
-  a `case`. The last arm stands for each constructor no other arm names. An
-  `as` pattern is a `let` in the arm, and `if` is a `case` on `Bool`.
-- **Handlers.** A `handle` is a `Handle`, each clause a function of the
-  operation's argument and of its resumption, as Idyll's are, and an
-  operation is a constant applied to its argument.
-- **Literals** of `Int`, the sized integers, `Float`, `Float32`, `Char`,
-  `String` and `Unit`, and `True` and `False`, which are `Bool`'s literals.
-- **Aliases**, as functions from types to a type.
+Names of no binder were the other half of the inventory: 1,197 mentions of
+Meadow's own types and effects, 1,103 tuples, 747 array literals and 11
+fields of required traits in Std; 4,590, 12,210 and 4,986 in MeadowBoot. Now
+there are none. What Meadow has no binder for is declared by the translation
+itself, at uniques of its own above every binder (from 2^61): 36 such
+declarations in Std and 395 in MeadowBoot, besides the dictionaries.
 
-**What does not map yet.**
+**How the gaps were closed, with the kernel as it is.**
 
-- **Building a dictionary.** An `impl`'s dictionary is never written. The
-  core could say it, since a dictionary is data, but the typed tree does not
-  say which method definitions and which required traits' dictionaries an
-  `impl`'s dictionary is made of. `Elab` puts that together from the trait's
-  shape and inference's evidence, and the translation would have to do the
-  same. A required trait's dictionary, read out of the one that requires
-  it, is written as a field of no binder. A method generic in more than its
-  trait's parameters is not said.
-- **Patterns of more than one level**, guards, literal patterns and
-  patterns of vectors and lists. `Case` takes one level of constructors and
-  the two `Bool` literals, with no default alternative. These need case
-  trees. For Meadow's plain matches that is its own compiler after
-  inference (`Exhaust`). The rule that a last arm stands for every other
-  constructor works only where the constructors are known: it cannot cover
-  an `Int`, and it repeats the arm once for each constructor.
-- **Structural records** and row variables over fields. Core has no records,
-  and Idyll none of this kind. In MeadowBoot most of them are Lingua's: each
-  view a `lang!` writes is a constructor whose one field is a structural
-  record, which a pass reads as `r.field`.
-- **View patterns**, `(f -> p)`, which Lingua's pattern synonyms are made of,
-  and so MeadowBoot's passes. Core has nothing for them; a case tree with a
-  call in it would do.
-- **Local recursion.** `Let` is not recursive, so a local function that
-  calls itself has nothing to be. It needs a recursive `let`, or lifting to a
-  constant.
-- **Type variables nothing constrains.** Inference leaves some variables
-  unsolved because nothing needs them: `Nil` compared with `Nil`, or what a
-  `runSt`'s state is instantiated at. An explicit core has to name them.
-- **Rank 2.** `runSt`'s state type is a constant in the typed tree (`s#27`),
-  where inference made it rigid, and not an implicit lambda in the argument.
-  Core can say `{s : Type} -> …` inside an argument, but the typed tree does
-  not say where the state type was bound.
-- **Meadow's own types and effects.** `Array`, `BigInt`, `StArray`, `Ref`,
-  `StRef`, `Task`, `TVar`, `Thread`, `Compact`, `Mut` and `St` are declared by
-  no package, so they have no binder, and Core's builtins do not have them.
-  They are written as constants of no unique: 1,197 mentions in Std and
-  4,586 in MeadowBoot, where `St` alone is 2,932. A `BigInt` literal is not
-  said.
-- **Tuples and array literals.** Core has neither: Idyll's tuple is its
-  prelude's `Pair`. The translation writes a tuple as a data type `TupleN`
-  and an array literal as a constant `#arrayN`, neither declared anywhere.
-  They are the most frequent names of no binder: 1,103 tuples and 747 array
-  literals in Std, 12,034 and 4,857 in MeadowBoot.
-- **What is dropped, not refused.** A variable over number types (`Num`,
-  `Frac`) is a variable over `Type`, and its constraint is gone; one that
-  defaults is `Int` or `Float`. A row's `lacks` constraints are gone. Core
-  carries no positions, so they are dropped; with `Tc s f p`, MeadowBoot's
-  span type can go where the kernel keeps them, in its metavariables, holes
-  and goals. Representation polymorphism does not appear here at
-  all: representations are chosen after the core, and Cut's descriptor
-  parameters are the lowering's.
-- **Primitives.** Core's `Prim` names eight integer and string operations.
-  Meadow's hundred or so primitives are written as constants by their
-  binders.
+- **Meadow's own types, effects and operations.** `Array`, `BigInt`, `St`,
+  `StArray`, `StRef`, `Ref`, `Mut`, `Thread`, `TVar`, `Task`, `Compact` and
+  `Channel` are constants with their types in `Tc`'s `constants`, and are
+  registered as Idyll's natives are, in `natives`, `nativeInfo` (their name
+  and how many erased arguments come first) and `datas`. Core's `Builtin` set
+  is left alone. The primitives are constants by their binders, at the types
+  their schemes give them.
+- **Tuples and array literals.** A tuple is a data type of one constructor
+  for each arity used, `TupleN`. An array literal is a builtin, `#array : {a}
+  -> List a -> Array a`, applied to a list.
+- **Structural records.** A record is a data type of one constructor for
+  each set of labels, `#rec{a,b}`, its parameters the fields' types in the
+  labels' order. A projection, an update and an extension are each a `case`.
+  A literal record's fields are bound first, in the order written, where that
+  is another. Lingua's views, constructors whose one field is such a record,
+  need nothing more.
+- **Local recursion.** A local function that calls itself is lifted to a
+  constant, named for its definition and itself (`countGo`), which takes
+  everything in scope where it was defined as its first parameters and then
+  its own. The `let` binds the constant applied to what is in scope. A
+  function that calls one defined after it in the same `let` would still not
+  map; none does.
+- **Patterns.** A `match` is a tree of one-level `case`s, as Maranget
+  compiles one: the first row's first pattern that tests anything is split
+  on. A constructor splits on every constructor of its type. A literal is a
+  test of equality with no default, as Idyll's matching does it (`split`'s
+  `How.ByLit`): an `Int` by `Prim.IntEq`, a character by `charCode` and then
+  `IntEq`, a string by `stringCompare … == 0`, and a sized number, a float or
+  a number of a type variable by Meadow's equality at its type. A view is its
+  function applied, and what it answers is matched. A guard that fails goes
+  on with the rows after its arm, a list's pattern is `Cons` and `Nil`, and
+  an `as` is a `let`. A literal's test refines nothing through
+  `Cases.unifyIndices`, as Meadow's types have no indices at run time.
+- **Views and the size of a tree.** Split on a constructor, a row that does
+  not test the variable goes into every alternative. With a view in each of
+  several rows, as Lingua's passes are written, that is exponential: on
+  MeadowBoot the first build grew past 14 GB before it was stopped. Where a view tests
+  the variable, the rows are compiled a block at a time instead (Augustsson's
+  mixture rule), the rows after the block a function of `()` written once and
+  called where the block has nothing. The cost is leaves no arm is left for,
+  where the match covers every value but the tree no longer knows it: 5 in
+  MeadowBoot, written as a failure, which the implied `Div` covers.
+- **Type variables nothing constrains** are `()`, and a row variable nothing
+  constrains is the empty row. One over number types is `Int` or `Float`, as
+  before.
+- **`runSt`.** The typed tree has the state as a rigid constant, `s#N`, made
+  where inference checked `runSt`'s argument. The translation binds it there:
+  the argument is `\s -> …`, `s#N` is that variable in it, and `runSt` is a
+  constant of type `{a} -> {e} -> ({s} -> () -> a ! {St s | e}) -> a ! e`.
+- **Constraints over number types** are dictionaries, like traits. A
+  quantifier over number types has an auto Pi over `#Num a` (`#Frac a` for
+  fractions), a literal at such a type is read through `#fromInt` or
+  `#fromFloat`, each number type's dictionary is a builtin (`#Num.Int`), and
+  `#fracNum` makes a fraction's a number's.
+- **Instantiation.** The typed tree says a mention's types for its plain and
+  number quantifiers only. An effect's or a row's is read off the type the
+  mention is used at, and a quantifier only a `where` mentions is read off
+  the dictionary found for it.
+- **Dictionaries.** An `impl`'s dictionary is written as `Elab` builds it: the
+  dictionaries of the traits its trait requires, from inference's evidence,
+  then each method, the `impl`'s own at the method's type there or the
+  trait's default given this dictionary (a dependency's default is a
+  constant at the scheme its unit exports). A required trait's dictionary is
+  a `case` on the one requiring it. A trait's associated types are
+  parameters of its dictionary's type. A method generic in more than its
+  trait, in associated types or effects, is a field generic in those.
+- **Handlers.** A `handle` is said to be of its type, by an annotated
+  identity, `(\(it : t) -> it) (handle …)`, which is what Core has for an
+  ascription: what its body answers may be a function that performs what its
+  clauses do, which a checker cannot read off its `return` clause.
+
+**What is left.** Row-polymorphic records (19 in Std, 851 in MeadowBoot, in
+77 declarations); one `BigInt` literal in each; and in Std two `impl`s that
+leave out a method their trait has no default for, which inference allows.
+
+**The checker.** Strata has no function that checks a whole Core term:
+Idyll's bidirectional checking is its front end's, `Elab`, which elaborates
+Idyll's syntax into Core. What the translation writes is Core already, and
+explicit throughout, so MeadowBoot checks it with a small checker of the Core
+forms it writes, `StrataCheck`, made of the kernel's parts: `Eval` for
+values, `Unify` for conversion (`unify`), for a value where another is
+wanted (`subtype`) and for effects (`effectsFit`), and `Ctx` for the
+context. Its state is Strata's `Tc s f p`, with MeadowBoot's own part in
+`f` (each data type's constructors, the effects performed by what is being
+checked, and the first thing found wrong) and declarations' names for `p`.
+A lambda is checked against a Pi, or inferred where its binder's type is
+written; an application's argument is checked against its head's domain;
+a `case` binds each constructor's fields at the scrutinee's type and must
+have an alternative for every constructor. An effect is what an application
+performs, where a function's last arrow is a `Comp`; what a body performs
+must fit what its function's type allows, and what a `handle`'s clauses
+handle is what their operations' types say. A declaration with a goal of
+the translation's in it is skipped. The dump says, under each declaration,
+whether it was accepted, rejected and why, or skipped.
+
+| | accepted | rejected | skipped |
+| --- | --- | --- | --- |
+| Std | 2,975 | 0 | 8 |
+| MeadowBoot | 15,326 | 1 | 78 |
+
+The first run rejected most of Std, and the classes of rejection were these.
+
+- **Translation bugs**, fixed: a constructor's field types written for the
+  scope before the fields bound ahead of them; an operation's type built
+  from its effect's declaration, with no row variable, where its scheme has
+  one; dependencies' dictionary constructors and defaults, and the
+  constructors a `case` names, missing from the constants; the handlers
+  above; and the evidence an `impl`'s binder is ambiguous for (below).
+- **What inference leaves implicit**, made explicit by the translation:
+  effect and row quantifiers, which a mention's types leave out; a
+  quantifier only a `where` says; and the method fields of a dictionary,
+  which inference writes with a method's own quantifiers made the empty
+  row, so that the field is not generic, where a typed core needs it
+  generic.
+- **What MeadowBoot's typed tree gets wrong or leaves ambiguous.**
+  - An `impl`'s dictionary is named in evidence by its binder, which is its
+    own among the units one unit sees, but not among units that do not see
+    each other: Lingua and Strata, both dependencies of MeadowBoot, each have
+    an `impl` of one binder (`PartialEq Lingua.Lang.Sort` and `PartialEq
+    Strata.Level.Level`, `Debug Lingua.Dap.Mode` and `PartialEq
+    Strata.Core.Head`). The translation names an `impl` by its key, and picks
+    among those of one binder the one of the trait and the type wanted.
+    `Elab` finds a dependency's dictionary for Cut by the same binder (the
+    package and binder of each dependency's `linked.dicts`), so where two
+    dependencies' binders meet, one may stand for the other there too. That
+    was not looked into here.
+  - A quantifier that is an effect only as the argument of a data type, and
+    never in a row, is a type variable in its scheme (`Plain`). The one
+    rejection left is that: `MeadowBoot.Dap.machineAdapter` passes an effect
+    row where `Lingua.Dap.machine`'s scheme says a type.
+- **The kernel's assumptions.** None was wrong. One was learned: a
+  metavariable made for an operation's parameter must be applied to the
+  context's bound variables, as Idyll's are, or pattern unification cannot
+  solve it with them.
 
 **What Core would need for Meadow.** For Idyll to weigh; nothing here is
-changed in the moved kernel.
+changed in the moved kernel, and nothing above needed it to be.
 
-- A way for a front end to declare builtin types and effects of its own,
-  with uniques, or builtins for Meadow's: `Array`, `BigInt`, the references
-  and the concurrency types, and the `St` and `Mut` effects.
-- A recursive `let`, or agreement that a front end lifts local recursion to
-  constants before the kernel sees it.
-- Literal heads beyond `Bool` (`Int`, `String`, `Char`) and a default
-  alternative in `Case`, so that a match of literals, or of a type with many
-  constructors, is a `case` and not one alternative for each constructor.
-- Tuples, or an agreed encoding of them as data that both front ends share,
-  and array literals.
-- A position for structural records: in the kernel as rows of fields, or
-  kept out of it by the front end.
-- Kinds or constraints for variables over number types, or agreement that
-  they are elaborated as dictionaries.
+- A function that checks a whole Core term against a type, in the kernel,
+  so that front ends share one; `StrataCheck` could move there.
+- A default alternative in `Case`, and literal heads beyond `Bool`: a match
+  of literals would be one `case` and not a chain of equality tests, and a
+  tree split on a view would need no function of `()` for its other rows,
+  nor have leaves no arm is left for.
+- An ascription, `(e : t)`, for what an annotated identity stands in for.
+- Rows of fields, for Meadow's row-polymorphic records, or agreement that a
+  front end keeps them out of the core.
+- A recursive `let`, for local functions that call each other, or agreement
+  that a front end lifts them, as this one does.
+- Agreement on encodings both front ends share: tuples as `TupleN`, records
+  as `#rec{…}`, and a range of uniques for what a front end declares itself.
 
 ### L2. Div, totality and coverage
 

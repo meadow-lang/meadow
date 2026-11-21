@@ -1,11 +1,22 @@
 -- Strata's core for Effects, from MeadowBoot's typed tree (docs/2LTT.md, L1)
--- declarations: 4
+-- declarations: 5, of them made by the translation: 1
 -- unmapped: none
--- names without a binder: array-literal 1
+-- leaves of case trees with no arm left: 0
+-- names without a binder: none
 -- of them, by name: none
+-- declarations of other units read: 8
+-- checked by Strata's kernel: accepted 5, rejected 0, skipped 0
+-- rejected, by reason: none
+-- skipped, by the first thing not said: none
 effect Effects.Log : Effect
-op Effects.Log.log : String -> () ! Effects.Log
+  -- accepted
+op Effects.Log.log : {a : [] Effect} -> String -> () ! {Effects.Log | a}
+  -- accepted
 def greet : String -> () ! Effects.Log
-  = \name -> log (concatStrings (#array2 String "hello " (display String (#impl.Std.Display.Display String) name)))
+  = \name -> log {} (concatStrings Effects.Log (#array String (Cons String "hello " (Cons String (display String (#impl.Std.Display.Display String) name) (Nil String)))))
+  -- accepted
 def quiet : {a : [] Effect} -> (() -> () ! {Effects.Log | a}) -> () ! a
-  = \a -> \f -> handle f () with { return (\x -> x); log (\line -> \k -> k ()) }
+  = \a -> \f -> (\it -> it) (handle f () with { return (\x -> x); log (\line -> \k -> k ()) })
+  -- accepted
+builtin #array : {a : [] Type} -> List a -> Array a
+  -- accepted

@@ -1,25 +1,47 @@
 -- Strata's core for Maps, from MeadowBoot's typed tree (docs/2LTT.md, L1)
--- declarations: 13
+-- declarations: 15, of them made by the translation: 2
 -- unmapped: none
--- names without a binder: tuple 4
+-- leaves of case trees with no arm left: 0
+-- names without a binder: none
 -- of them, by name: none
+-- declarations of other units read: 11
+-- checked by Strata's kernel: accepted 15, rejected 0, skipped 0
+-- rejected, by reason: none
+-- skipped, by the first thing not said: none
 data Maps.Shape : Type
+  -- accepted
 con Maps.Shape.Circle : Int -> Maps.Shape
+  -- accepted
 con Maps.Shape.Rect : Int -> Int -> Maps.Shape
+  -- accepted
 con Maps.Shape.Dot : Maps.Shape
+  -- accepted
 data Maps.Point : Type
+  -- accepted
 con Maps.Point.Point : Int -> Int -> Maps.Point
+  -- accepted
 def area : Maps.Shape -> Int
-  = \s -> case s of { Circle r -> * Int (#impl.Std.Ops.Mul Int) (* Int (#impl.Std.Ops.Mul Int) 3 r) r; Rect w h -> * Int (#impl.Std.Ops.Mul Int) w h; Dot -> 0 }
+  = \s -> case s of { Circle x -> let r = x in * Int (#impl.Std.Ops.Mul Int) (* Int (#impl.Std.Ops.Mul Int) 3 r) r; Rect x x -> let w = x in let h = x in * Int (#impl.Std.Ops.Mul Int) w h; Dot -> 0 }
+  -- accepted
 def twice : {a : [] Type} -> (a -> a) -> a -> a
   = \a -> \f -> \x -> f (f x)
+  -- accepted
 def swap : {a : [] Type} -> {b : [] Type} -> Tuple2 a b -> Tuple2 b a
-  = \a -> \b -> \p -> case p of { Tuple2 x y -> Tuple2 b a y x }
+  = \a -> \b -> \p -> case p of { Tuple2 x x -> let x = x in let y = x in Tuple2 b a y x }
+  -- accepted
 def moved : Maps.Point -> Maps.Point
   = \p -> case p of { Point x y -> Point (+ Int (#impl.Std.Ops.Add Int) (case p of { Point x y -> x }) 1) y }
+  -- accepted
 def origin : () -> Maps.Point
   = \_ -> Point 0 0
+  -- accepted
 def sign : Int -> String
   = \n -> let zero = 0 in case < Int (#impl.Std.Cmp.PartialOrd Int) n zero of { True -> "minus"; False -> "plus" }
+  -- accepted
 def bump : Vector Int -> Vector Int
-  = \xs -> map Int Int (\x -> + Int (#impl.Std.Ops.Add Int) x 1) xs
+  = \xs -> map Int Int {} (\x -> + Int (#impl.Std.Ops.Add Int) x 1) xs
+  -- accepted
+data Tuple2 : Type -> Type -> Type
+  -- accepted
+con Tuple2 : {a : [] Type} -> {b : [] Type} -> a -> b -> Tuple2 a b
+  -- accepted
