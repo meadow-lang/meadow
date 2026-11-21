@@ -486,6 +486,15 @@ last release is under _Unreleased_.
 
 ### Fixed
 
+- MeadowBoot's `meadow test` runs a package whose tests perform `St s`
+  with no `runSt` around them -- a test that calls a helper working on an
+  `StRef` it is handed -- as the Rust `meadow test` runs it. What runs the
+  tests was then generic in `s`, and MeadowBoot decided from that type that
+  it was a value to show rather than a `main` to run, so on Glade and Silo
+  every test of the package stopped "with status 0" (`--cek` was right).
+  The root's `main` and what runs a package's tests are entered as a `main`
+  is, `start = main ()`, by what they are, whatever their types were
+  inferred to be.
 - `meadow build`, `run`, `test` and `dis` in a directory with no
   `Meadow.toml` no longer take it for a package. They took one named after
   the directory (`.`, given `.`) and swept every `.mw` file below it into
