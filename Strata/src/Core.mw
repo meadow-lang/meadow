@@ -12,6 +12,15 @@
 -- `shown` prints a term as the Rust checker does, for the REPL and for the
 -- differential tests, which compare the two printers' output: so it follows
 -- `impl Display for Core` exactly, precedence by precedence.
+--
+-- The two levels of Meadow's staged type theory (Meadow's `docs/2LTT.md`,
+-- after Kovács, "Staged compilation with two-level type theory", ICFP 2022):
+-- `Type` is the run-time universe, as it always was, and `MetaType` the
+-- compile-time one. `Code a` lifts a run-time type to a compile-time one,
+-- `quote` makes run-time code of a run-time term, and `splice` runs code
+-- back into a term, so `splice (quote t)` is `t` and `quote (splice c)` is
+-- `c`. The Rust checker has none of these, and so no way of printing them:
+-- they are printed as Meadow writes them, `Code a`, `quote { t }` and `$c`.
 
 use Std.Macro (Reflect)
 use Strata.Hir (Icit, Literal)
@@ -125,6 +134,9 @@ use Std.Maybe.Maybe.*
 @derive(Reflect)
 @pub data Core
   = Type Int
+  -- the compile-time universe, at a level: `Code a` is in `MetaType n` for
+  -- `a` in `Type n`
+  | MetaType Int
   | LitTy Builtin
   | Lit Literal
   | Prim Prim
@@ -154,6 +166,14 @@ use Std.Maybe.Maybe.*
   | Row [Core] [Core]
   -- `handle body with { return ..; op .. }`
   | Handle Core Core [OpClause]
+  -- `Code a`, for a run-time type `a`: a compile-time type, whose values are
+  -- run-time terms of type `a`
+  | Code Core
+  -- `quote { t }`: run-time term `t`, of type `a`, as a value of `Code a`
+  | Quote Core
+  -- `$c`: the run-time term that `c`, of type `Code a`, stands for, of
+  -- type `a`; only inside a `quote`, or where staging runs
+  | Splice Core
   | Error
 
 @pub fun grade (g : Grade) : Core = Core.GradeLit g
@@ -179,6 +199,9 @@ use Std.Maybe.Maybe.*
     | Core.Comp a e -> go a or go e
     | Core.Row ls ts -> V.any go ls or V.any go ts
     | Core.Handle b r ops -> go b or go r or V.any (\o -> match o with | OpClause.OpClause _ _ _ body -> go body) ops
+    | Core.Code a -> go a
+    | Core.Quote a -> go a
+    | Core.Splice a -> go a
     | _ -> False
 
 -- Every node, outermost first: what `f` answers for one is put in its place,
@@ -208,6 +231,9 @@ use Std.Maybe.Maybe.*
       | Core.Comp a e -> Core.Comp (go a depth) (go e depth)
       | Core.Row ls ts -> Core.Row (V.map (\l -> go l depth) ls) (V.map (\t -> go t depth) ts)
       | Core.Handle b r ops -> Core.Handle (go b depth) (go r depth) (V.map (\o -> match o with | OpClause.OpClause u n k body -> OpClause.OpClause u n k (go body depth)) ops)
+      | Core.Code a -> Core.Code (go a depth)
+      | Core.Quote a -> Core.Quote (go a depth)
+      | Core.Splice a -> Core.Splice (go a depth)
       | other -> other
 
 -- The term with each solved metavariable replaced by its solution
@@ -306,6 +332,12 @@ fun go (linear : Bool) (c : Core) (prec : Int) : String =
   let g = \t p -> go linear t p in
   match c with
   | Core.Type n -> if n == 0 then "Type" else paren (prec > 10) ("Type " ++ show n)
+  | Core.MetaType n -> if n == 0 then "MetaType" else paren (prec > 10) ("MetaType " ++ show n)
+  -- `Code` binds like an application; a quote is closed by its braces, and
+  -- a splice takes an atom, `$x` or `$(f x)`
+  | Core.Code a -> paren (prec > 10) ("Code " ++ g a 11)
+  | Core.Quote t -> "quote { " ++ g t 0 ++ " }"
+  | Core.Splice c -> "$" ++ g c 11
   -- the unit type is written as its value is, as in Haskell
   | Core.LitTy Builtin.Unit -> "()"
   | Core.LitTy b -> builtinName b
