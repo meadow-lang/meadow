@@ -97,13 +97,13 @@ step "meadow test Strata"
 cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- test Strata
 cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- test --runtime silo Strata
 
-# Strata's own modules only: `Grade`, `Hir` and `Core` are vendored from
-# Idyll's `front/` as they are written there, until the extraction moves them
-# (docs/2LTT.md, L1), and are not laid out as `meadow fmt` lays them out.
+# Strata's own modules only: the kernel moved from Idyll's `front/` keeps
+# the layout it was written in there (docs/2LTT.md, L1), which is not the one
+# `meadow fmt` writes.
 step "meadow fmt --check"
 strata_own=()
 for f in Strata/src/*.mw; do
-  head -n 1 "$f" | grep -q '^-- vendored from Idyll' || strata_own+=("$f")
+  head -n 1 "$f" | grep -q '^-- moved from Idyll' || strata_own+=("$f")
 done
 cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- fmt --check lib/Std examples "${strata_own[@]}"
 

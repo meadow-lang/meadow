@@ -1,4 +1,4 @@
--- vendored from Idyll front/ at 14e8cca, to be replaced by the extraction's verbatim move
+-- moved from Idyll front/ at 10ecf25
 --
 -- Grades: how many times a variable may be used, as
 -- `compiler/idyllic-typecheck/src/grade.rs` has them.

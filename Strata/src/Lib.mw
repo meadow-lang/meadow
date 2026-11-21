@@ -2,23 +2,34 @@
 --
 -- `docs/2LTT.md` is the plan. Meadow gains a compile-time level above the
 -- language it is today, a total dependent type theory, and opt-in erased
--- dependent functions at run time; both are checked here. The core
--- calculus, normalisation by evaluation, unification, termination and
--- coverage, and staging are to come from Idyll's kernel, shared with Idyll,
--- which owns that code; this package is where they will live, depending on
--- no front end, so that both front ends can depend on it.
+-- dependent functions at run time; both are checked here. The kernel is
+-- Idyll's, shared with Idyll: its core calculus, normalisation by
+-- evaluation, unification and termination are here, and coverage and
+-- staging are to come. The package depends on no front end, so that both
+-- front ends can depend on it.
 --
--- What it knows so far: the two levels, and how a definition's level is
--- decided before its body is elaborated (`Level`); and the core's data
--- types, vendored from Idyll's `front/` ahead of the extraction, which
--- replaces them by moving them here unchanged: grades (`Grade`), the names
--- and literals the core shares with a renamer (`Hir`), and the terms
--- (`Core`).
+-- What it holds: the two levels, and how a definition's level is decided
+-- before its body is elaborated (`Level`); and Idyll's kernel, moved here
+-- from Idyll's `front/` unchanged but for its module paths: grades
+-- (`Grade`), the names and literals the kernel shares with a renamer
+-- (`Hir`), terms (`Core`) and values (`Value`), the checker's state (`Tc`)
+-- and context (`Ctx`), normalisation by evaluation (`Eval`), unification
+-- (`Unify`), termination (`Termination`), strict positivity (`Positivity`),
+-- usage (`Usage`), and strongly connected components (`Graph`).
 
 @pub mod Level
 @pub mod Grade
 @pub mod Hir
 @pub mod Core
+@pub mod Value
+@pub mod Tc
+@pub mod Ctx
+@pub mod Eval
+@pub mod Unify
+@pub mod Termination
+@pub mod Positivity
+@pub mod Usage
+@pub mod Graph
 
 @cfg(test)
 mod Tests

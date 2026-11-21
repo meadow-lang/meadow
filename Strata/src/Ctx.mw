@@ -1,0 +1,204 @@
+-- moved from Idyll front/ at 10ecf25
+--
+-- The typing context: `Ctx` in `compiler/idyllic-typecheck/src/lib.rs`.
+--
+-- A slot for each variable in scope, outermost first, so a slot's place is
+-- its level; the environment, with a neutral variable for a binder that
+-- nothing has defined and the value of a definition (which then unfolds in
+-- types); and what each name refers to, by its unique: a slot, or a
+-- constant (a data type, a constructor, a recursive definition), which has
+-- no slot.
+
+use Strata.Core (Core)
+use Strata.Value (Value, Env)
+use Strata.Value as Va
+use Strata.Hir (Ident)
+use Strata.Hir as H
+use Std.Collections.Vector as V
+use Std.Collections.HashMap as Hm
+use Std.Collections.HashMap (HashMap)
+use Std.Maybe.Maybe.*
+
+-- Whether a slot is a binder, a definition, or a definition by a
+-- computation with effects, which has a value at run time that the types
+-- may not see (two runs need not agree), so is as good as bound to them.
+@derive(PartialEq)
+@pub data Info = Bound | Defined | Effectful
+
+-- A slot: what it is, its name (for printing), its type, the unique its
+-- uses are charged to, and how often it may be used, where that is known.
+@pub data Binder = Binder Info String Value (Maybe Int) (Maybe Value)
+
+@pub data Entry = Local Int | Constant Value
+
+@pub record Ctx = {
+  lvl : Int,
+  env : Env,
+  binders : [Binder],
+  names : HashMap Int Entry,
+  -- the slots matching has split: the constructor each turned out to be,
+  -- and the slots of that constructor's arguments
+  splits : HashMap Int (Int, [Int]),
+  -- the slots that are auto binders, which a search for an auto argument
+  -- may find, by level
+  autos : [Int]
+}
+
+@pub fun empty () : Ctx = Ctx { lvl = 0, env = Va.emptyEnv (), binders = [], names = Hm.empty, splits = Hm.empty, autos = [] }
+
+-- The innermost slot, as an auto binder: what a search may find.
+@pub fun autoBound (ctx : Ctx) : Ctx = if ctx.lvl > 0 then { ctx | autos = V.pushBack ctx.autos (ctx.lvl - 1) } else ctx
+
+@pub fun extend (ctx : Ctx) (unique : Maybe Int) (hint : String) (ty : Value) (info : Info) (value : Value) : Ctx =
+  let names =
+    match unique with
+    | Just u -> Hm.insert u (Entry.Local ctx.lvl) ctx.names
+    | None -> ctx.names
+  in
+  { ctx | lvl = ctx.lvl + 1, env = Va.push ctx.env value, binders = V.pushBack ctx.binders (Binder.Binder info hint ty unique None), names = names }
+
+fun uniqueOf (x : Ident) : Maybe Int =
+  let u = H.uniqueOf x in
+  if u < 0 then None else Just u
+
+-- A binder; none is the anonymous one of a plain arrow, which still has a
+-- slot, so that the indices line up.
+@pub fun bind (ctx : Ctx) (x : Maybe Ident) (hint : String) (ty : Value) : Ctx =
+  let u = match x with | Just i -> uniqueOf i | None -> None in
+  extend ctx u hint ty Info.Bound (Va.vvar ctx.lvl hint)
+
+-- The innermost slot, with the grade it may be used at.
+@pub fun graded (ctx : Ctx) (g : Value) : Ctx =
+  match V.last ctx.binders with
+  | Just (Binder.Binder i n t k _) -> { ctx | binders = V.set ctx.binders (V.len ctx.binders - 1) (Binder.Binder i n t k (Just g)) }
+  | None -> ctx
+
+-- A definition, which unfolds in types.
+@pub fun define (ctx : Ctx) (x : Ident) (ty : Value) (value : Value) : Ctx = extend ctx (uniqueOf x) (H.textOf x) ty Info.Defined value
+
+-- A definition whose value the types may not know.
+@pub fun defineEffectful (ctx : Ctx) (x : Ident) (ty : Value) : Ctx =
+  extend ctx (uniqueOf x) (H.textOf x) ty Info.Effectful (Va.vvar ctx.lvl (H.textOf x))
+
+-- A constant: nameable, with no slot and no value.
+@pub fun declareConstant (ctx : Ctx) (x : Ident) (ty : Value) : Ctx =
+  match uniqueOf x with
+  | Just u -> { ctx | names = Hm.insert u (Entry.Constant ty) ctx.names }
+  | None -> ctx
+
+-- A name: the Core term for it, its type, and the unique its uses are
+-- charged to.
+@pub fun lookup (ctx : Ctx) (x : Ident) : Maybe (Core, Value, Int) =
+  match uniqueOf x with
+  | None -> None
+  | Just u ->
+      (match Hm.lookup u ctx.names with
+       | Just (Entry.Local l) ->
+           (match V.get ctx.binders l with
+            | Just (Binder.Binder _ _ ty key _) ->
+                let charged = match key with | Just k -> k | None -> u in
+                Just (Core.Var (ctx.lvl - l - 1) (H.textOf x), ty, charged)
+            | None -> None)
+       | Just (Entry.Constant ty) -> Just (Core.Opaque u (H.textOf x), ty, u)
+       | None -> None)
+
+fun unknownInfo (i : Info) : Bool = i != Info.Defined
+
+-- The levels of the slots the types know nothing of: what a new
+-- metavariable is applied to, which keeps metavariables closed.
+@pub fun boundLevels (ctx : Ctx) : [Int] =
+  V.concatMap
+    (\l -> match V.get ctx.binders l with | Just (Binder.Binder i _ _ _ _) -> if unknownInfo i then [l] else [] | None -> [])
+    (V.range 0 ctx.lvl)
+
+-- The same, as Core variables.
+@pub fun boundVarCores (ctx : Ctx) : [Core] =
+  V.map (\l -> Core.Var (ctx.lvl - l - 1) (nameAt ctx l)) (boundLevels ctx)
+
+@pub fun nameAt (ctx : Ctx) (l : Int) : String =
+  match V.get ctx.binders l with
+  | Just (Binder.Binder _ n _ _ _) -> n
+  | None -> "_"
+
+@pub fun infoAt (ctx : Ctx) (l : Int) : Maybe Info =
+  match V.get ctx.binders l with
+  | Just (Binder.Binder i _ _ _ _) -> Just i
+  | None -> None
+
+-- The type of the slot charged to `key`, the innermost such.
+@pub fun typeOfKey (ctx : Ctx) (key : Int) : Maybe Value =
+  V.foldl
+    (\acc b -> match b with | Binder.Binder _ _ ty (Just k) _ -> if k == key then Just ty else acc | _ -> acc)
+    None
+    ctx.binders
+
+-- The name and type of every slot, by level.
+@pub fun types (ctx : Ctx) : [(String, Value)] =
+  V.map (\b -> match b with | Binder.Binder _ n ty _ _ -> (n, ty)) ctx.binders
+
+-- A binder no name refers to yet, charged to `key`, with its grade.
+@pub fun bindKeyed (ctx : Ctx) (key : Int) (hint : String) (ty : Value) (grade : Maybe Value) : Ctx =
+  let next = extend ctx None hint ty Info.Bound (Va.vvar ctx.lvl hint) in
+  { next | binders = V.set next.binders ctx.lvl (Binder.Binder Info.Bound hint ty (Just key) grade) }
+
+-- Let `x` name the slot at `lvl`.
+@pub fun alias (ctx : Ctx) (x : Ident) (lvl : Int) : Ctx =
+  match uniqueOf x with
+  | Just u -> { ctx | names = Hm.insert u (Entry.Local lvl) ctx.names }
+  | None -> ctx
+
+-- The value in a slot.
+@pub fun value (ctx : Ctx) (lvl : Int) : Value =
+  match Va.envGet ctx.env (ctx.lvl - lvl - 1) with
+  | Just v -> v
+  | None -> Value.Error
+
+@pub fun typeAt (ctx : Ctx) (lvl : Int) : Value =
+  match V.get ctx.binders lvl with
+  | Just (Binder.Binder _ _ ty _ _) -> ty
+  | None -> Value.Error
+
+@pub fun keyAt (ctx : Ctx) (lvl : Int) : Maybe Int =
+  match V.get ctx.binders lvl with
+  | Just (Binder.Binder _ _ _ k _) -> k
+  | None -> None
+
+@pub fun gradeAt (ctx : Ctx) (lvl : Int) : Maybe Value =
+  match V.get ctx.binders lvl with
+  | Just (Binder.Binder _ _ _ _ g) -> g
+  | None -> None
+
+-- A slot with its type replaced, and made a definition if `defined`.
+@pub fun refined (ctx : Ctx) (lvl : Int) (ty : Value) (defined : Bool) : Ctx =
+  match V.get ctx.binders lvl with
+  | Just (Binder.Binder i n _ k g) ->
+      { ctx | binders = V.set ctx.binders lvl (Binder.Binder (if defined then Info.Defined else i) n ty k g) }
+  | None -> ctx
+
+-- The slot a name refers to, if it is a variable nothing has defined.
+@pub fun boundSlot (ctx : Ctx) (x : Ident) : Maybe Int =
+  match uniqueOf x with
+  | None -> None
+  | Just u ->
+      (match Hm.lookup u ctx.names with
+       | Just (Entry.Local l) -> if (match infoAt ctx l with | Just i -> unknownInfo i | None -> False) then Just l else None
+       | _ -> None)
+
+-- Whether the types know nothing of a slot's value.
+@pub fun unknownAt (ctx : Ctx) (lvl : Int) : Bool =
+  match infoAt ctx lvl with
+  | Just i -> unknownInfo i
+  | None -> False
+
+-- The context as it was when it had `lvl` slots: the outermost of these.
+@pub fun prefix (ctx : Ctx) (lvl : Int) : Ctx =
+  if lvl >= ctx.lvl then ctx
+  else
+    {
+      ctx |
+      lvl = lvl,
+      env = Va.envDrop ctx.env (ctx.lvl - lvl),
+      binders = V.take ctx.binders lvl,
+      splits = Hm.fromVec (V.filter (\kv -> fst kv < lvl) (Hm.toVec ctx.splits)),
+      autos = V.filter (\l -> l < lvl) ctx.autos
+    }

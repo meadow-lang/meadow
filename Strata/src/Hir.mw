@@ -1,4 +1,4 @@
--- vendored from Idyll front/ at 14e8cca, to be replaced by the extraction's verbatim move
+-- moved from Idyll front/ at 10ecf25
 --
 -- What the passes after renaming share: an argument's `Icit`, a
 -- `Literal`, a declaration's `Visibility`, and an `Ident` -- a name as the

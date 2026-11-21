@@ -1,0 +1,69 @@
+-- moved from Idyll front/ at 10ecf25
+--
+-- Graphs of numbered nodes: what the checker needs of them, which is the
+-- strongly connected components. `Scc` orders definitions by them, and
+-- `Positivity` decides a group of data types together.
+
+use Std.St (StRef, newRef, getRef, setRef, runSt)
+use Std.Collections.Vector as V
+use Std.Collections.HashMap as Hm
+use Std.Collections.HashMap (HashMap)
+use Std.Maybe.Maybe.*
+
+-- The strongly connected components of a graph of `n` nodes, by Tarjan's
+-- algorithm: each comes out after every component it reaches.
+@pub fun components (n : Int) (edges : [[Int]]) : [[Int]] =
+  runSt (\() ->
+    let t =
+      Tarjan {
+        index = newRef Hm.empty,
+        low = newRef Hm.empty,
+        onStack = newRef Hm.empty,
+        stack = newRef [],
+        next = newRef 0,
+        components = newRef []
+      }
+    in
+    let w = V.foldl (\acc v -> if Hm.member v (getRef t.index) then () else visit t v edges) () (V.range 0 n) in
+    getRef t.components)
+
+-- Tarjan's state, the algorithm's own.
+record Tarjan s = {
+  index : StRef s (HashMap Int Int),
+  low : StRef s (HashMap Int Int),
+  onStack : StRef s (HashMap Int Bool),
+  stack : StRef s [Int],
+  next : StRef s Int,
+  components : StRef s [[Int]]
+}
+
+fun visit (t : Tarjan s) (v : Int) (edges : [[Int]]) =
+  let i = getRef t.next in
+  let w1 = setRef t.index (Hm.insert v i (getRef t.index)) in
+  let w2 = setRef t.low (Hm.insert v i (getRef t.low)) in
+  let w3 = setRef t.next (i + 1) in
+  let w4 = setRef t.stack (V.pushBack (getRef t.stack) v) in
+  let w5 = setRef t.onStack (Hm.insert v True (getRef t.onStack)) in
+  let w6 =
+    V.foldl
+      (\acc w ->
+        match Hm.lookup w (getRef t.index) with
+        | None ->
+            let u = visit t w edges in
+            lower t v (Hm.getOr 0 w (getRef t.low))
+        | Just wi -> if Hm.getOr False w (getRef t.onStack) then lower t v wi else ())
+      ()
+      (V.getOr [] edges v)
+  in
+  if Hm.getOr 0 v (getRef t.low) == i then setRef t.components (V.pushBack (getRef t.components) (popTo t v [])) else ()
+
+fun lower (t : Tarjan s) (v : Int) (x : Int) =
+  if x < Hm.getOr 0 v (getRef t.low) then setRef t.low (Hm.insert v x (getRef t.low)) else ()
+
+fun popTo (t : Tarjan s) (v : Int) (acc : [Int]) : [Int] ! { St s | e } =
+  match V.last (getRef t.stack) with
+  | Just w ->
+      let u = setRef t.stack (V.take (getRef t.stack) (V.len (getRef t.stack) - 1)) in
+      let u2 = setRef t.onStack (Hm.insert w False (getRef t.onStack)) in
+      if w == v then V.pushBack acc w else popTo t v (V.pushBack acc w)
+  | None -> acc

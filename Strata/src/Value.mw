@@ -1,0 +1,330 @@
+-- moved from Idyll front/ at 10ecf25
+--
+-- The semantic domain: values, spines and closures, as
+-- `compiler/idyllic-typecheck/src/value.rs` has them.
+--
+-- A value is a term evaluated as far as it goes. What cannot compute is kept
+-- as a head and the eliminations waiting on it (a spine): a bound variable
+-- (`Rigid`, stuck for good), an unsolved metavariable (`Flex`, which may
+-- compute once it is solved), a constant (`Opaque`). Pattern unification
+-- needs a metavariable's whole argument list at once, which is why.
+--
+-- Grades are polynomials (`Poly`) whose coefficients are the concrete grades
+-- of `Grade`: `2 * r + 0..1`. Two grade expressions the semiring laws make
+-- equal get the same polynomial, which is all the checker knows of grade
+-- variables. Effect rows are sets of effects and row variables (`Row`),
+-- kept sorted by a printed key.
+--
+-- Evaluating a value means consulting the metavariables, so `eval`, `quote`
+-- and `force` are in `Eval`, with the checker's state.
+
+use Strata.Hir (Icit, Literal)
+use Strata.Core (Core, CaseAlt, Builtin, Prim)
+use Strata.Core as C
+use Strata.Grade (Grade)
+use Strata.Grade as G
+use Std.Collections.Vector as V
+use Std.String as S
+use Std.Maybe.Maybe.*
+
+-- One elimination waiting on a stuck head: an application, an unboxing, or
+-- a `case` that cannot choose yet (its alternatives, and where they were).
+@pub data Elim = App Value | Unbox | Case Env [CaseAlt]
+
+-- The values of the variables in scope, innermost first, so that a Core
+-- index is a place in the list. Sharing its tail with whatever it was built
+-- from, which is what makes closures cheap.
+@pub data Env = Env (List Value)
+
+-- A term, and the environment it was found in.
+@pub data Closure = Closure Env Core
+
+@pub data Value
+  = Type Int
+  | LitTy Builtin
+  | Lit Literal
+  -- name, icit, grade, in-type grade, domain, codomain
+  | Pi String Icit Value Value Value Closure
+  | Lam String Closure
+  -- `a [r]`: grade, then type
+  | BoxTy Value Value
+  | BoxIntro Value
+  -- stuck on an unsolved metavariable
+  | Flex Int [Elim]
+  -- stuck on a bound variable, by its level
+  | Rigid Int String [Elim]
+  -- stuck on a constant, by its unique
+  | Opaque Int String [Elim]
+  -- a primitive waiting for its arguments, or stuck on one that is not a
+  -- literal
+  | Prim Prim [Value]
+  -- a saturated primitive that is stuck, and what waits on it
+  | Stuck Value [Elim]
+  -- a grade in normal form, never a lone atom
+  | Grade Poly
+  -- `lo..hi` whose ends are not both constants
+  | GradeRange Value Value
+  -- `b ! e`, with `e` not empty
+  | Comp Value Value
+  | Row Row
+  -- a `handle`, which only runs at run time
+  | Handle Env Core
+  | Error
+
+-- An effect row: its effects and its row variables, each under a printed
+-- key, sorted, with no repeats.
+@pub data Row = Row [(String, Value)] [(String, Value)]
+
+-- A polynomial over atoms (stuck values of type `Grade`): each monomial is
+-- its atoms' keys (sorted), the atoms, and a coefficient that is not zero;
+-- sorted by key, the constant monomial (no atoms) first.
+@pub data Poly = Poly [([String], [Value], Grade)]
+
+@pub fun emptyEnv () : Env = Env.Env [;]
+
+@pub fun push (e : Env) (v : Value) : Env = match e with | Env.Env l -> Env.Env (v :: l)
+
+@pub fun envGet (e : Env) (i : Int) : Maybe Value =
+  match e with
+  | Env.Env l -> listGet l i
+
+fun listGet (l : List Value) (i : Int) : Maybe Value =
+  match l with
+  | [;] -> None
+  | x :: rest -> if i == 0 then Just x else listGet rest (i - 1)
+
+@pub fun envLen (e : Env) : Int = match e with | Env.Env l -> listLen l 0
+
+-- The environment without its `n` innermost values.
+@pub fun envDrop (e : Env) (n : Int) : Env =
+  match e with
+  | Env.Env l -> Env.Env (listDrop l n)
+
+fun listDrop (l : List Value) (n : Int) : List Value =
+  if n <= 0 then l
+  else
+    match l with
+    | [;] -> l
+    | _ :: rest -> listDrop rest (n - 1)
+
+-- The values of an environment, outermost first: by level.
+@pub fun envValues (e : Env) : [Value] = match e with | Env.Env l -> V.reverse (V.fromList l)
+
+fun listLen (l : List Value) (n : Int) : Int =
+  match l with
+  | [;] -> n
+  | _ :: rest -> listLen rest (n + 1)
+
+@pub fun vvar (l : Int) (name : String) : Value = Value.Rigid l name []
+
+@pub fun vmeta (m : Int) : Value = Value.Flex m []
+
+-- --- rows --------------------------------------------------------------------
+
+@pub fun emptyRow () : Value = Value.Row (Row.Row [] [])
+
+@pub fun rowIsEmpty (r : Row) : Bool = match r with | Row.Row ls ts -> V.isEmpty ls and V.isEmpty ts
+
+-- Add an effect (or, `tail`, a row variable) under its key, keeping the set
+-- sorted and without repeats.
+@pub fun rowInsert (r : Row) (key : String) (v : Value) (tail : Bool) : Row =
+  match r with
+  | Row.Row ls ts -> if tail then Row.Row ls (insertSorted ts key v) else Row.Row (insertSorted ls key v) ts
+
+fun insertSorted (part : [(String, Value)]) (key : String) (v : Value) : [(String, Value)] =
+  if V.any (\p -> fst p == key) part then part
+  else
+    let before = V.filter (\p -> S.lessThan (fst p) key) part in
+    let after = V.filter (\p -> S.lessThan key (fst p)) part in
+    V.concat [before, [(key, v)], after]
+
+-- A row as a value: one that is a lone row variable is that variable.
+@pub fun rowValue (r : Row) : Value =
+  match r with
+  | Row.Row ls ts -> if V.isEmpty ls and V.len ts == 1 then snd (V.getOr ("", Value.Error) ts 0) else Value.Row r
+
+-- --- polynomials -------------------------------------------------------------
+
+@pub fun polyZero () : Poly = Poly.Poly []
+
+@pub fun polyConstant (g : Grade) : Poly = addTerm (polyZero ()) [] [] g
+
+-- A stuck value, standing for itself.
+@pub fun polyAtom (v : Value) : Poly = addTerm (polyZero ()) [atomKey v] [v] G.one
+
+fun compareKeys (a : [String]) (b : [String]) : Int =
+  match (V.get a 0, V.get b 0) with
+  | (None, None) -> 0
+  | (None, _) -> 0 - 1
+  | (_, None) -> 1
+  | (Just x, Just y) ->
+      if S.lessThan x y then 0 - 1 else if S.lessThan y x then 1 else compareKeys (V.drop a 1) (V.drop b 1)
+
+fun addTerm (p : Poly) (key : [String]) (atoms : [Value]) (g : Grade) : Poly =
+  if G.isZero g then p
+  else
+    match p with
+    | Poly.Poly ts ->
+        match V.find (\t -> match t with | (k, _, _) -> compareKeys k key == 0) ts with
+        | Just (_, a, h) ->
+            Poly.Poly (V.map (\t -> match t with | (k, at, c) -> if compareKeys k key == 0 then (k, at, G.add c g) else t) ts)
+        | None ->
+            let before = V.filter (\t -> match t with | (k, _, _) -> compareKeys k key < 0) ts in
+            let after = V.filter (\t -> match t with | (k, _, _) -> compareKeys k key > 0) ts in
+            Poly.Poly (V.concat [before, [(key, atoms, g)], after])
+
+@pub fun polyIsZero (p : Poly) : Bool = match p with | Poly.Poly ts -> V.isEmpty ts
+
+-- The grade it is, if it mentions no atoms.
+@pub fun asConstant (p : Poly) : Maybe Grade =
+  match p with
+  | Poly.Poly ts ->
+      if V.isEmpty ts then Just G.zero
+      else if V.len ts == 1 then
+        match V.get ts 0 with
+        | Just (k, _, g) -> if V.isEmpty k then Just g else None
+        | None -> None
+      else None
+
+-- Each monomial's atoms and coefficient, the constant term first.
+@pub fun polyTerms (p : Poly) : [([Value], Grade)] =
+  match p with
+  | Poly.Poly ts -> V.map (\t -> match t with | (_, a, g) -> (a, g)) ts
+
+@pub fun polyKeys (p : Poly) : [[String]] = match p with | Poly.Poly ts -> V.map (\t -> match t with | (k, _, _) -> k) ts
+
+-- A monomial's coefficient; zero if it does not occur.
+@pub fun coefficient (p : Poly) (key : [String]) : Grade =
+  match p with
+  | Poly.Poly ts ->
+      match V.find (\t -> match t with | (k, _, _) -> compareKeys k key == 0) ts with
+      | Just (_, _, g) -> g
+      | None -> G.zero
+
+@pub fun polyAdd (p : Poly) (q : Poly) : Poly =
+  match q with
+  | Poly.Poly ts -> V.foldl (\acc t -> match t with | (k, a, g) -> addTerm acc k a g) p ts
+
+@pub fun polyMul (p : Poly) (q : Poly) : Poly =
+  match (p, q) with
+  | (Poly.Poly ps, Poly.Poly qs) ->
+      V.foldl
+        (\acc t1 ->
+          V.foldl
+            (\acc2 t2 ->
+              match (t1, t2) with
+              | ((k1, a1, g1), (k2, a2, g2)) ->
+                  let pairs = sortPairs (V.zip (V.append k1 k2) (V.append a1 a2)) in
+                  addTerm acc2 (V.map fst pairs) (V.map snd pairs) (G.mul g1 g2))
+            acc
+            qs)
+        (polyZero ())
+        ps
+
+fun sortPairs (ps : [(String, Value)]) : [(String, Value)] =
+  V.foldl (\acc p -> insertPair acc p) [] ps
+
+fun insertPair (acc : [(String, Value)]) (p : (String, Value)) : [(String, Value)] =
+  let before = V.filter (\q -> not (S.lessThan (fst p) (fst q))) acc in
+  let after = V.filter (\q -> S.lessThan (fst p) (fst q)) acc in
+  V.concat [before, [p], after]
+
+-- An upper bound of both, monomial by monomial (a missing one counting as
+-- zero).
+@pub fun polyJoin (p : Poly) (q : Poly) : Poly =
+  match (p, q) with
+  | (Poly.Poly ps, Poly.Poly qs) ->
+      let mine =
+        V.map
+          (\t ->
+            match t with
+            | (k, a, g) -> if V.any (\u -> match u with | (k2, _, _) -> compareKeys k k2 == 0) qs then t else (k, a, G.join g G.zero))
+          ps
+      in
+      V.foldl
+        (\acc u ->
+          match u with
+          | (k, a, g) ->
+              (match acc with
+               | Poly.Poly ts ->
+                   if V.any (\t -> match t with | (k2, _, _) -> compareKeys k k2 == 0) ts then
+                     Poly.Poly (V.map (\t -> match t with | (k2, a2, g2) -> if compareKeys k k2 == 0 then (k2, a2, G.join g2 g) else t) ts)
+                   else addJoined acc k a (G.join g G.zero)))
+        (Poly.Poly mine)
+        qs
+
+fun addJoined (p : Poly) (key : [String]) (atoms : [Value]) (g : Grade) : Poly =
+  match p with
+  | Poly.Poly ts ->
+      let before = V.filter (\t -> match t with | (k, _, _) -> compareKeys k key < 0) ts in
+      let after = V.filter (\t -> match t with | (k, _, _) -> compareKeys k key > 0) ts in
+      Poly.Poly (V.concat [before, [(key, atoms, g)], after])
+
+-- As a value: a polynomial that is one atom is that atom, so that a grade
+-- variable looks the same whether or not it has been through arithmetic.
+@pub fun polyValue (p : Poly) : Value =
+  match p with
+  | Poly.Poly ts ->
+      (match (V.get ts 0, V.len ts) with
+       | (Just (_, atoms, g), 1) -> if V.len atoms == 1 and g == G.one then V.getOr Value.Error atoms 0 else Value.Grade p
+       | _ -> Value.Grade p)
+
+-- --- keys ----------------------------------------------------------------------
+
+fun padded (n : Int) : String =
+  let s = show n in
+  S.repeat "0" (20 - stringByteLength s) ++ s
+
+-- A printed form of a stuck value, the same for two values only if they are
+-- the same; sound but incomplete under binders, which is fine for what
+-- reaches it: variables, and metavariables applied to variables.
+@pub fun atomKey (v : Value) : String =
+  let spine =
+    \sp ->
+      S.join
+        ""
+        (V.map
+           (\e ->
+             match e with
+             | Elim.App a -> " (" ++ atomKey a ++ ")"
+             | Elim.Unbox -> " unbox"
+             | Elim.Case _ alts -> " case@" ++ show (V.len alts))
+           sp)
+  in
+  match v with
+  | Value.Rigid l _ sp -> "v" ++ padded l ++ spine sp
+  | Value.Flex m sp -> "?" ++ padded m ++ spine sp
+  | Value.Opaque u _ sp -> "c" ++ padded u ++ spine sp
+  | Value.Stuck h sp -> "(" ++ atomKey h ++ ")" ++ spine sp
+  | Value.Type n -> "Type " ++ show n
+  | Value.LitTy b -> C.builtinName b
+  | Value.Lit l -> C.literalShown l
+  | Value.Error -> "!"
+  | Value.BoxIntro e -> "[" ++ atomKey e ++ "]"
+  | Value.BoxTy g a -> atomKey a ++ " [" ++ atomKey g ++ "]"
+  | Value.GradeRange lo hi -> "(" ++ atomKey lo ++ ".." ++ atomKey hi ++ ")"
+  | Value.Grade (Poly.Poly ts) ->
+      "(" ++ S.join "+" (V.map (\t -> match t with | (k, _, g) -> G.shown g ++ "*" ++ S.join "*" k) ts) ++ ")"
+  | Value.Prim p args -> C.primName p ++ S.join "" (V.map (\a -> " (" ++ atomKey a ++ ")") args)
+  | Value.Comp t e -> "(" ++ atomKey t ++ " ! " ++ atomKey e ++ ")"
+  | Value.Row (Row.Row ls ts) -> "{" ++ S.join "," (V.map fst (V.append ls ts)) ++ "}"
+  | Value.Pi _ _ _ _ _ _ -> "@pi"
+  | Value.Lam _ _ -> "@lam"
+  | Value.Handle _ _ -> "@handle"
+
+-- --- tests -------------------------------------------------------------------
+
+use Std.Test (assertEq, assertTrue)
+
+@test fun gradeArithmeticHasNormalForms () =
+  let r = polyAtom (vvar 0 "r") in
+  let two = polyConstant (G.exact 2) in
+  let a = assertEq (polyKeys (polyAdd r r)) (polyKeys (polyMul two r)) "r + r is 2 * r" in
+  let b = assertEq (coefficient (polyAdd r r) [atomKey (vvar 0 "r")]) (G.exact 2) "with coefficient 2" in
+  assertEq (asConstant (polyAdd two (polyConstant G.one))) (Just (G.exact 3)) "constants add up"
+
+@test fun aRowIsASet () =
+  let ask = Value.Opaque 3 "Ask" [] in
+  let r = rowInsert (rowInsert (rowInsert (Row.Row [] []) "c3" ask False) "c3" ask False) "v1" (vvar 1 "e") True in
+  match r with
+  | Row.Row ls ts -> assertTrue (V.len ls == 1 and V.len ts == 1) "one effect, one row variable"

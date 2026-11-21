@@ -1,4 +1,4 @@
--- vendored from Idyll front/ at 14e8cca, to be replaced by the extraction's verbatim move
+-- moved from Idyll front/ at 10ecf25
 --
 -- Core: the elaborated, fully explicit terms the type checker works with,
 -- as `compiler/idyllic-typecheck/src/core.rs` has them, and the builtins.

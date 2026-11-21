@@ -1,0 +1,83 @@
+-- moved from Idyll front/ at 10ecf25
+--
+-- How often a term uses each variable, and what it does besides compute a
+-- value: `Usage` in `compiler/idyllic-typecheck/src/lib.rs`.
+--
+-- This is Granule's context of graded assumptions, read as what checking
+-- a term gives back rather than what it is given: the counts, by the unique
+-- of each variable (symbolic, as a grade can be a variable: `f x`, with
+-- `f : (x : [r] a) -> b`, uses `x` `r` times), whether some part failed to
+-- elaborate (then the counts are a lower bound, and holding binders to them
+-- would only pile up errors), and the rows of the calls it makes. Effects
+-- happen where the term is evaluated, once, so they are not scaled.
+
+use Strata.Value (Value, Poly)
+use Strata.Value as Va
+use Strata.Grade as G
+use Std.Collections.Vector as V
+use Std.Sort as Srt
+use Std.Maybe.Maybe.*
+
+@pub data Usage = Usage [(Int, Poly)] Bool [Value]
+
+@pub fun none () : Usage = Usage.Usage [] False []
+
+-- One use of one variable.
+@pub fun var (u : Int) : Usage = Usage.Usage [(u, Va.polyConstant G.one)] False []
+
+-- The usage of a term that failed to elaborate.
+@pub fun unknown () : Usage = Usage.Usage [] True []
+
+-- Having the effects of a row.
+@pub fun performs (row : Value) : Usage = Usage.Usage [] False [row]
+
+@pub fun isUnknown (u : Usage) : Bool = match u with | Usage.Usage _ k _ -> k
+
+@pub fun effectsOf (u : Usage) : [Value] = match u with | Usage.Usage _ _ es -> es
+
+-- The effects taken out, where a lambda (or a definition) ends.
+@pub fun withoutEffects (u : Usage) : Usage = match u with | Usage.Usage cs k _ -> Usage.Usage cs k []
+
+-- Everything here happens `g` times.
+@pub fun scale (u : Usage) (g : Poly) : Usage =
+  match u with
+  | Usage.Usage cs k es ->
+      let scaled = V.map (\c -> match c with | (x, p) -> (x, Va.polyMul p g)) cs in
+      Usage.Usage (V.filter (\c -> not (Va.polyIsZero (snd c))) scaled) k es
+
+fun countOf (cs : [(Int, Poly)]) (x : Int) : Poly =
+  match V.find (\c -> fst c == x) cs with
+  | Just (_, p) -> p
+  | None -> Va.polyZero ()
+
+fun keysOf (a : [(Int, Poly)]) (b : [(Int, Poly)]) : [Int] =
+  V.foldl (\acc c -> if V.elem (fst c) acc then acc else V.pushBack acc (fst c)) [] (V.append a b)
+
+-- The uses of two subterms.
+@pub fun add (a : Usage) (b : Usage) : Usage =
+  match (a, b) with
+  | (Usage.Usage ca ka ea, Usage.Usage cb kb eb) ->
+      let cs = V.map (\x -> (x, Va.polyAdd (countOf ca x) (countOf cb x))) (keysOf ca cb) in
+      Usage.Usage cs (ka or kb) (V.append ea eb)
+
+-- The usage of a `case`, from two of its alternatives: only one runs.
+@pub fun join (a : Usage) (b : Usage) : Usage =
+  match (a, b) with
+  | (Usage.Usage ca ka ea, Usage.Usage cb kb eb) ->
+      let cs = V.map (\x -> (x, Va.polyJoin (countOf ca x) (countOf cb x))) (keysOf ca cb) in
+      Usage.Usage cs (ka or kb) (V.append ea eb)
+
+-- The same, each count joined as `f` says, the variables in order of their
+-- uniques.
+@pub fun joinWith (a : Usage) (b : Usage) (f : Poly -> Poly -> Poly ! e) : Usage ! e =
+  match (a, b) with
+  | (Usage.Usage ca ka ea, Usage.Usage cb kb eb) ->
+      let cs = V.map (\x -> (x, f (countOf ca x) (countOf cb x))) (Srt.sort (keysOf ca cb)) in
+      Usage.Usage cs (ka or kb) (V.append ea eb)
+
+-- A variable's count, and the usage without it (its binder is being
+-- left). No unique, no count.
+@pub fun take (u : Usage) (x : Maybe Int) : (Poly, Usage) =
+  match (u, x) with
+  | (Usage.Usage cs k es, Just v) -> (countOf cs v, Usage.Usage (V.filter (\c -> fst c != v) cs) k es)
+  | _ -> (Va.polyZero (), u)

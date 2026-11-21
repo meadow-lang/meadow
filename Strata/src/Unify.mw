@@ -1,0 +1,727 @@
+-- moved from Idyll front/ at 10ecf25
+--
+-- Unification, as `compiler/idyllic-typecheck/src/unify.rs` has it:
+-- deciding whether two values are the same, solving metavariables on the
+-- way, which is how the checker learns the types it was not told.
+--
+-- A metavariable is solved only in the pattern fragment: applied to distinct
+-- bound variables, `?m x y =? t` has the one solution `?m := \x y -> t`,
+-- if `t` does not mention `?m` and mentions no variable but `x` and `y`.
+-- Anything else is a mismatch, not a question kept for later.
+--
+-- Grades are compared as polynomials, so `r + r` is `2 * r`; rows are sets,
+-- and a row variable still to be found takes what the other side has more,
+-- staying open for more yet (`?e := {Log | ?t}`). `subtype` is the order
+-- the checker uses where a value is given: a smaller universe in a larger,
+-- a function using its argument less, or with fewer effects, where one using
+-- it more, or with more, is wanted.
+
+use Std.St (StRef, newRef, getRef, setRef)
+use Strata.Hir (Icit, Literal)
+use Strata.Core (Core, CaseAlt, OpClause, Builtin, Head)
+use Strata.Core as C
+use Strata.Value (Value, Elim, Env, Closure, Row, Poly)
+use Strata.Value as Va
+use Strata.Grade (Grade)
+use Strata.Grade as G
+use Strata.Tc (Tc, Meta, MetaInfo, MetaTy, Origin)
+use Strata.Tc as T
+use Strata.Ctx (Ctx)
+use Strata.Eval (force, forceNamed, apply, vapp, eval, quote, row, rowParts, toPoly, effectKey, renormalise)
+use Std.Collections.Vector as V
+use Std.Collections.HashMap as Hm
+use Std.Collections.HashMap (HashMap)
+use Std.String as S
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+
+-- `actual` where `expected` is wanted.
+@pub fun subtype (tc : Tc s f p) (l : Int) (actual : Value) (expected : Value) : Bool ! { St s | e } =
+  let a = force tc actual in
+  let x = force tc expected in
+  match (a, x) with
+  | (Value.Type i, Value.Type j) -> i <= j
+  -- a row resumed at most once is one that may be resumed more
+  | (Value.LitTy Builtin.Effect, _) if rowKind tc x == Just True -> True
+  -- a function using its argument within what is allowed, and whose
+  -- results have fewer effects than allowed
+  | (Value.Pi name i1 g1 t1 d1 c1, Value.Pi _ i2 g2 t2 d2 c2) if i1 == i2 ->
+      let known = \g -> Va.asConstant (toPoly tc g) in
+      let grades =
+        match (known g1, known g2) with
+        | (Just p, Just q) -> p == q or G.fits p q
+        | _ -> unify tc l g1 g2
+      in
+      let v = Va.vvar l name in
+      grades and unify tc l t1 t2 and unify tc l d1 d2 and subtype tc (l + 1) (apply tc c1 v) (apply tc c2 v)
+  | (Value.Comp t1 e1, Value.Comp t2 e2) -> subtype tc l t1 t2 and effectsFit tc l e1 e2
+  -- a pure result fits wherever effects are allowed
+  | (Value.Flex _ _, Value.Comp _ _) -> unify tc l a x
+  | (_, Value.Comp t2 _) -> subtype tc l a t2
+  | _ -> unify tc l a x
+
+-- A new row variable beside `tail`, made where it was.
+@pub fun sibling (tc : Tc s f p) (tail : Value) : Maybe Value ! { St s | e } =
+  match force tc tail with
+  | Value.Flex m sp ->
+      (match T.meta tc m with
+       | Just entry ->
+           let fresh = T.newMeta tc (T.infoOf entry) in
+           let w = setRef tc.opened (V.pushBack (getRef tc.opened) (fresh, V.len sp)) in
+           Just (Value.Flex fresh sp)
+       | None -> None)
+  | _ -> None
+
+-- Whether two values are the same, solving metavariables as needed.
+@pub fun unify (tc : Tc s f p) (l : Int) (t0 : Value) (u0 : Value) : Bool ! { St s | e } =
+  let t = force tc t0 in
+  let u = force tc u0 in
+  let fresh = Va.vvar l "_" in
+  match (t, u) with
+  -- an error already reported is the same as anything
+  | (Value.Error, _) -> True
+  | (_, Value.Error) -> True
+  | (Value.Lam _ a, Value.Lam _ b) -> unify tc (l + 1) (apply tc a fresh) (apply tc b fresh)
+  -- eta: a lambda is anything that behaves like it applied
+  | (Value.Lam _ a, _) -> unify tc (l + 1) (apply tc a fresh) (vapp tc u fresh)
+  | (_, Value.Lam _ b) -> unify tc (l + 1) (vapp tc t fresh) (apply tc b fresh)
+  | (Value.Type i, Value.Type j) -> i == j
+  | (Value.LitTy a, Value.LitTy b) -> a == b
+  | (Value.Lit a, Value.Lit b) -> a == b
+  | (Value.Pi _ i1 g1 t1 d1 c1, Value.Pi _ i2 g2 t2 d2 c2) ->
+      i1 == i2 and unify tc l g1 g2 and unify tc l t1 t2 and unify tc l d1 d2
+        and unify tc (l + 1) (apply tc c1 fresh) (apply tc c2 fresh)
+  | (Value.BoxTy g1 a1, Value.BoxTy g2 a2) -> unify tc l g1 g2 and unify tc l a1 a2
+  | (Value.GradeRange a1 b1, Value.GradeRange a2 b2) -> unify tc l a1 a2 and unify tc l b1 b2
+  | (Value.BoxIntro a, Value.BoxIntro b) -> unify tc l a b
+  | (Value.Handle _ _, Value.Handle _ _) -> C.shown False (quote tc l t) == C.shown False (quote tc l u)
+  | (Value.Comp a e, Value.Comp b f) -> unify tc l a b and unify tc l e f
+  | (Value.Rigid k _ sp, Value.Rigid k2 _ sp2) if k == k2 -> unifySpine tc l sp sp2
+  | (Value.Opaque a _ sp, Value.Opaque b _ sp2) if a == b -> unifySpine tc l sp sp2
+  | (Value.Flex m sp, Value.Flex m2 sp2) if m == m2 -> unifySpine tc l sp sp2
+  -- two stuck primitives are the same when their arguments are: purely
+  -- structural, so `n + 1` is not `1 + n`
+  | (Value.Stuck h sp, Value.Stuck h2 sp2) -> unify tc l h h2 and unifySpine tc l sp sp2
+  | (Value.Prim p args, Value.Prim p2 args2) if p == p2 and V.len args == V.len args2 ->
+      V.all (\pr -> match pr with | (x, y) -> unify tc l x y) (V.zip args args2)
+  -- (solved with the other side as it was given, a definition by its name,
+  -- which `solveMeta` reads it off)
+  | (Value.Flex m sp, _) -> solve tc l m sp u0
+  | (_, Value.Flex m sp) -> solve tc l m sp t0
+  -- a pure type where one with effects is wanted, or the other way
+  | (Value.Comp a e, _) -> unify tc l a u and unify tc l e (Va.emptyRow ())
+  | (_, Value.Comp b f) -> unify tc l t b and unify tc l (Va.emptyRow ()) f
+  | (Value.Row _, _) -> unifyRows tc l t u True
+  | (_, Value.Row _) -> unifyRows tc l t u True
+  -- grade arithmetic: the same when the normal forms are
+  | (Value.Grade _, _) -> samePoly (toPoly tc t) (toPoly tc u)
+  | (_, Value.Grade _) -> samePoly (toPoly tc t) (toPoly tc u)
+  | _ -> False
+
+fun samePoly (p : Poly) (q : Poly) : Bool =
+  let (pk, qk) = (Va.polyKeys p, Va.polyKeys q) in
+  V.len pk == V.len qk
+    and V.all (\pr -> match pr with | (a, b) -> a == b) (V.zip pk qk)
+    and V.all (\k -> Va.coefficient p k == Va.coefficient q k) pk
+
+fun unifySpine (tc : Tc s f p) (l : Int) (a : [Elim]) (b : [Elim]) : Bool ! { St s | e } =
+  V.len a == V.len b
+    and V.all
+      (\pr ->
+        match pr with
+        | (Elim.App x, Elim.App y) -> unify tc l x y
+        | (Elim.Unbox, Elim.Unbox) -> True
+        -- two stuck cases agree if their alternatives do, on the same fresh
+        -- fields
+        | (Elim.Case env alts, Elim.Case env2 alts2) ->
+            V.len alts == V.len alts2
+              and V.all
+                (\ap ->
+                  match ap with
+                  | (CaseAlt.CaseAlt h _ vars body, CaseAlt.CaseAlt h2 _ vars2 body2) ->
+                      h == h2 and V.len vars == V.len vars2
+                        and (let fresh = V.map (\i -> Va.vvar (l + i) "_") (V.range 0 (V.len vars)) in
+                             let e1 = V.foldl Va.push env fresh in
+                             let e2 = V.foldl Va.push env2 fresh in
+                             unify tc (l + V.len vars) (eval tc e1 body) (eval tc e2 body2)))
+                (V.zip alts alts2)
+        | _ -> False)
+      (V.zip a b)
+
+-- --- rows --------------------------------------------------------------------
+
+@pub fun rowHasError (tc : Tc s f p) (r : Value) : Bool ! { St s | e } =
+  match rowParts tc r with
+  | Row.Row ls ts -> V.any (\kv -> match snd kv with | Value.Error -> True | _ -> False) (V.append ls ts)
+
+-- A row as a message shows it: without the row variables made only to keep
+-- it open, which nothing has filled.
+@pub fun shownRow (tc : Tc s f p) (r : Value) : Value ! { St s | e } =
+  match rowParts tc r with
+  | Row.Row ls ts ->
+      let opened = V.map fst (getRef tc.opened) in
+      row tc (V.filter (\v -> match v with | Value.Flex m _ -> not (V.elem m opened) | _ -> True) (V.map snd (V.append ls ts)))
+
+-- The head of an effect with parameters, `State` of `State s`.
+fun effectHead (tc : Tc s f p) (v : Value) : Maybe (Bool, Int) ! { St s | e } =
+  match force tc v with
+  | Value.Opaque u _ sp -> if V.isEmpty sp then None else Just (False, u)
+  | Value.Rigid k _ sp -> if V.isEmpty sp then None else Just (True, k)
+  | _ -> None
+
+fun isFlex (v : Value) : Bool = match v with | Value.Flex _ _ -> True | _ -> False
+
+-- What `x` has that `y` lacks: its effects, and its row variables.
+fun only (x : Row) (y : Row) : ([Value], [Value]) =
+  match (x, y) with
+  | (Row.Row xl xt, Row.Row yl yt) ->
+      ( V.map snd (V.filter (\kv -> not (V.any (\k2 -> fst k2 == fst kv) yl)) xl),
+        V.map snd (V.filter (\kv -> not (V.any (\k2 -> fst k2 == fst kv) yt)) xt) )
+
+-- Two rows are the same when they have the same effects and row variables;
+-- what one lacks, a row variable still to be found on it can make up.
+fun unifyRows (tc : Tc s f p) (l : Int) (t : Value) (u : Value) (pair : Bool) : Bool ! { St s | e } =
+  if rowHasError tc t or rowHasError tc u then True
+  else
+    -- effects with parameters that differ only in those (`State ?s` and
+    -- `State s`) are unified first, and the rows compared again
+    let paired =
+      if not pair then Just False
+      else
+        match (only (rowParts tc t) (rowParts tc u), only (rowParts tc u) (rowParts tc t)) with
+        | ((la, _), (lb, _)) ->
+            let ha = V.map (\x -> effectHead tc x) la in
+            let hb = V.map (\y -> effectHead tc y) lb in
+            V.foldl
+              (\acc i ->
+                match acc with
+                | None -> None
+                | Just done ->
+                    (match V.getOr None ha i with
+                     | None -> acc
+                     | Just h ->
+                         let count = \hs -> V.len (V.filter (\g -> g == Just h) hs) in
+                         if count ha != 1 or count hb != 1 then acc
+                         else
+                           match V.find (\j -> V.getOr None hb j == Just h) (V.range 0 (V.len lb)) with
+                           | Just j -> if unify tc l (V.getOr Value.Error la i) (V.getOr Value.Error lb j) then Just True else None
+                           | None -> acc))
+              (Just False)
+              (V.range 0 (V.len la))
+    in
+    match paired with
+    | None -> False
+    | Just True -> unifyRows tc l t u False
+    | Just False ->
+        match (only (rowParts tc t) (rowParts tc u), only (rowParts tc u) (rowParts tc t)) with
+        | ((la, ta), (lb, tb)) ->
+            if V.isEmpty la and V.isEmpty ta and V.isEmpty lb and V.isEmpty tb then True
+            -- one side's extra is one row variable: it is the other's extra
+            else if V.isEmpty la and V.len ta == 1 and isFlex (V.getOr Value.Error ta 0) then
+              unify tc l (V.getOr Value.Error ta 0) (row tc (V.append lb tb))
+            else if V.isEmpty lb and V.len tb == 1 and isFlex (V.getOr Value.Error tb 0) then
+              unify tc l (row tc (V.append la ta)) (V.getOr Value.Error tb 0)
+            -- several row variables still to be found on one side: made one
+            else if (V.len ta > 1 and V.all isFlex ta) or (V.len tb > 1 and V.all isFlex tb) then
+              merge tc l ta and merge tc l tb and unifyRows tc l t u False
+            -- each side a row variable still to be found, and effects the
+            -- other lacks: both the other's effects, and one fresh tail more
+            else if V.len ta == 1 and V.len tb == 1 and isFlex (V.getOr Value.Error ta 0) and isFlex (V.getOr Value.Error tb 0) then
+              let aTail = V.getOr Value.Error ta 0 in
+              let bTail = V.getOr Value.Error tb 0 in
+              match sibling tc aTail with
+              | Just fresh -> unify tc l aTail (row tc (V.pushBack lb fresh)) and unify tc l bTail (row tc (V.pushBack la fresh))
+              | None -> False
+            else False
+
+fun merge (tc : Tc s f p) (l : Int) (ts : [Value]) : Bool ! { St s | e } =
+  V.len ts < 2 or not (V.all isFlex ts) or V.all (\x -> unify tc l x (V.getOr Value.Error ts 0)) (V.drop ts 1)
+
+-- `effects` fit within `allowed`. A row variable of `allowed` still to be
+-- found takes what is missing, and stays open for more.
+@pub fun effectsFit (tc : Tc s f p) (l : Int) (effects : Value) (allowed : Value) : Bool ! { St s | e } =
+  if rowHasError tc effects or rowHasError tc allowed then True
+  else
+    -- an effect with parameters is the allowed one of its head, if just one
+    let w =
+      match (rowParts tc effects, rowParts tc allowed) with
+      | (Row.Row el _, Row.Row al _) ->
+          V.foldl
+            (\acc kv ->
+              if V.any (\k2 -> fst k2 == fst kv) al then acc
+              else
+                match effectHead tc (snd kv) with
+                | None -> acc
+                | Just h ->
+                    let same = V.filter (\w2 -> effectHead tc w2 == Just h) (V.map snd al) in
+                    if V.len same == 1 then (let b = unify tc l (snd kv) (V.getOr Value.Error same 0) in ()) else acc)
+            ()
+            el
+    in
+    match (rowParts tc effects, rowParts tc allowed) with
+    | (Row.Row el et, Row.Row al at) ->
+        let missing =
+          V.append
+            (V.map snd (V.filter (\kv -> not (V.any (\k2 -> fst k2 == fst kv) al)) el))
+            (V.map snd (V.filter (\kv -> not (V.any (\k2 -> fst k2 == fst kv) at)) et))
+        in
+        if V.isEmpty missing then True
+        else
+          let flex = V.filter isFlex (V.map snd at) in
+          -- several of them still to be found are made one
+          let merged = V.len flex < 2 or V.all (\x -> unify tc l x (V.getOr Value.Error flex 0)) (V.drop flex 1) in
+          if not merged then False
+          else if V.len flex >= 1 then
+            let tail = V.getOr Value.Error flex 0 in
+            let open = M.unwrapOr [] (M.map (\s -> [s]) (sibling tc tail)) in
+            unify tc l tail (row tc (V.append missing open))
+          -- what is missing is row variables still to be found: each may be
+          -- what is allowed, and no more
+          else if V.all isFlex missing then V.all (\m -> unify tc l m allowed) missing
+          else False
+
+-- Which kind of row a type is: `Just False` for `Effect`, `Just True` for
+-- `Effect []`, nothing for neither.
+@pub fun rowKind (tc : Tc s f p) (ty : Value) : Maybe Bool ! { St s | e } =
+  match force tc ty with
+  | Value.LitTy Builtin.Effect -> Just False
+  | Value.BoxTy g a ->
+      (match force tc a with
+       | Value.LitTy Builtin.Effect -> if Va.asConstant (toPoly tc g) == Just G.any then Just True else None
+       | _ -> None)
+  | _ -> None
+
+-- Whether a row holds an operation that may be resumed more than once.
+fun rowIsMany (tc : Tc s f p) (types : [(String, Value)]) (r : Value) : Bool ! { St s | e } =
+  let neutral =
+    \ty sp ->
+      let final =
+        V.foldl
+          (\acc el ->
+            match acc with
+            | None -> None
+            | Just t ->
+                (match (el, force tc t) with
+                 | (Elim.App a, Value.Pi _ _ _ _ _ cod) -> Just (apply tc cod a)
+                 | _ -> None))
+          (Just ty)
+          sp
+      in
+      match final with
+      | Just t -> rowKind tc t == Just True
+      | None -> False
+  in
+  match force tc r with
+  | Value.Row (Row.Row ls ts) -> V.any (\kv -> rowIsMany tc types (snd kv)) (V.append ls ts)
+  | Value.Opaque u _ sp ->
+      (match Hm.lookup u (getRef tc.constants) with
+       | Just ty -> neutral ty sp
+       | None -> False)
+  | Value.Rigid k _ sp ->
+      (match V.get types k with
+       | Just (_, ty) -> neutral ty sp
+       | None -> False)
+  | Value.Flex m _ ->
+      (match M.map T.infoOf (T.meta tc m) with
+       | Just (MetaInfo.MetaInfo _ _ (Just (MetaTy.MetaTy _ _ ty))) -> rowKind tc ty == Just True
+       | _ -> False)
+  | _ -> False
+
+-- --- pattern unification -----------------------------------------------------
+
+-- The inverse of a metavariable's spine: the size of its context (the
+-- spine's length), the size of the context the right-hand side is in, each
+-- of that context's levels the spine names back to the meta's own, and the
+-- names, for readable solutions.
+data Renaming = Renaming Int Int (HashMap Int Int) [String]
+
+-- Under a binder on both sides.
+fun lift (p : Renaming) (name : String) : Renaming =
+  match p with
+  | Renaming.Renaming dom cod mp names -> Renaming.Renaming (dom + 1) (cod + 1) (Hm.insert cod dom mp) (V.pushBack names name)
+
+-- A spine of distinct bound variables, inverted; nothing outside the
+-- pattern fragment.
+fun invert (tc : Tc s f p) (gamma : Int) (sp : [Elim]) : Maybe Renaming ! { St s | e } =
+  V.foldl
+    (\acc pr ->
+      match acc with
+      | None -> None
+      | Just (Renaming.Renaming dom cod mp names) ->
+          (match pr with
+           | (i, Elim.App v) ->
+               (match force tc v with
+                | Value.Rigid k n args ->
+                    if V.isEmpty args and not (Hm.member k mp) then Just (Renaming.Renaming dom cod (Hm.insert k i mp) (V.pushBack names n))
+                    else None
+                | _ -> None)
+           | _ -> None))
+    (Just (Renaming.Renaming (V.len sp) gamma Hm.empty []))
+    (V.zip (V.range 0 (V.len sp)) sp)
+
+-- `?m sp =? rhs`. A metavariable in `rhs` applied to variables `?m` may not
+-- depend on (`?n x y`, where `?m` is made outside the binder of `y`) is
+-- pruned of them: solved as `\x y. ?n' x` with a new `?n'` that takes only
+-- what `?m` may mention, and the solution tried again. So a metavariable
+-- made inside a lambda, or a handler's clause, can meet one made outside it.
+fun solve (tc : Tc s f p) (gamma : Int) (m : Int) (sp : [Elim]) (rhs : Value) : Bool ! { St s | e } =
+  let waiting = getRef tc.deferredAutos in
+  match V.find (\d -> match d with | (n, _, _, _) -> n == m) waiting with
+  | Just (_, ctx, _, _) if V.isEmpty sp -> solveDeferredAuto tc gamma m ctx rhs
+  | _ -> solveMeta tc gamma m sp rhs
+
+-- An auto argument still waiting for its search, met by unification: what
+-- it is equated with is what it is, in the context the search would have
+-- been made in, which it may mention (as a found instance may); and there
+-- is nothing left to search for. So `size l`, with `l : MapBy k o v`, is
+-- given `o`.
+fun solveDeferredAuto (tc : Tc s f p) (gamma : Int) (m : Int) (ctx : Ctx) (rhs : Value) : Bool ! { St s | e } =
+  let lvl = ctx.lvl in
+  let keep = if lvl < gamma then lvl else gamma in
+  let pren = Renaming.Renaming lvl gamma (V.foldl (\mp k -> Hm.insert k k mp) Hm.empty (V.range 0 keep)) [] in
+  -- (an instance by its name, as `solveMeta` reads one)
+  let named = renameNamed tc m pren rhs in
+  let w1 = setRef tc.prunes [] in
+  let body = match named with | Just b -> Just b | None -> rename tc m pren rhs in
+  let w0 = setRef tc.prunes [] in
+  match body with
+  | None -> False
+  | Just b ->
+      let value = eval tc ctx.env b in
+      let w = T.solve tc m value in
+      let w2 = setRef tc.chosen (Hm.insert m (b, lvl) (getRef tc.chosen)) in
+      let w3 = setRef tc.deferredAutos (V.filter (\d -> match d with | (n, _, _, _) -> n != m) (getRef tc.deferredAutos)) in
+      True
+
+fun solveMeta (tc : Tc s f p) (gamma : Int) (m : Int) (sp : [Elim]) (rhs : Value) : Bool ! { St s | e } =
+  match invert tc gamma sp with
+  | None -> False
+  | Just pren ->
+      -- what it was equated with as it was written, a definition by its
+      -- name (`instance Hash Int`) rather than what that unfolds to, so that
+      -- what is solved keeps it, as a type shows it and code calls it; and
+      -- if that mentions what the solution may not, as `const x y` with `y`
+      -- out of scope does, what it unfolds to
+      let w0 = setRef tc.prunes [] in
+      let named = renameNamed tc m pren rhs in
+      let w1 = setRef tc.prunes [] in
+      match (match named with | Just b -> Just b | None -> renamePruning tc m pren rhs) with
+      | None -> False
+      | Just body ->
+          match pren with
+          | Renaming.Renaming _ _ _ names ->
+              let solution = V.foldr (\n acc -> Core.Lam n acc) body names in
+              let value = eval tc (Va.emptyEnv ()) solution in
+              let info = M.unwrapOr (MetaInfo.MetaInfo (getRef tc.at) Origin.Hole None) (M.map T.infoOf (T.meta tc m)) in
+              -- a solution too large, or holding effects resumed more than
+              -- once where they may not be, is reported here, and the
+              -- metavariable solved with an error
+              match violation tc info value with
+              | Just (kind, types, words) ->
+                  let w = match info with | MetaInfo.MetaInfo at _ _ -> T.errorAt tc at kind types words in
+                  let v = T.solve tc m Value.Error in
+                  True
+              | None ->
+                  let v = T.solve tc m value in
+                  True
+
+-- `rename`, definitions kept by their names.
+fun renameNamed (tc : Tc s f p) (m : Int) (pren : Renaming) (rhs : Value) : Maybe Core ! { St s | e } =
+  let w = setRef tc.naming True in
+  let named = rename tc m pren rhs in
+  let w2 = setRef tc.naming False in
+  named
+
+-- `rename`, pruning what it asks to be pruned and trying again.
+fun renamePruning (tc : Tc s f p) (m : Int) (pren : Renaming) (rhs : Value) : Maybe Core ! { St s | e } =
+  match rename tc m pren rhs with
+  | Just body -> Just body
+  | None ->
+      let prunes = getRef tc.prunes in
+      let w = setRef tc.prunes [] in
+      if V.isEmpty prunes then None
+      else if pruneAll tc prunes 0 then renamePruning tc m pren rhs
+      else None
+
+fun pruneAll (tc : Tc s f p) (prunes : [(Int, [Bool])]) (i : Int) : Bool ! { St s | e } =
+  match V.get prunes i with
+  | None -> True
+  | Just (n, keep) -> if prune tc n keep then pruneAll tc prunes (i + 1) else False
+
+-- Solve `?n` as `\x1 .. xk. ?n' (the xi `keep` says)`, with a new `?n'`. Not
+-- if the type `?n` must have mentions its context, which the new one might
+-- then lack.
+fun prune (tc : Tc s f p) (n : Int) (keep : [Bool]) : Bool ! { St s | e } =
+  match T.meta tc n with
+  | None -> False
+  -- pruned already, by an earlier occurrence
+  | Just (Meta.Solved _ _) -> True
+  | Just (Meta.Unsolved (MetaInfo.MetaInfo node origin mty)) ->
+      let ty =
+        match mty with
+        | None -> Just None
+        | Just (MetaTy.MetaTy types spine t) ->
+            let closed = rename tc n (Renaming.Renaming 0 (V.len types) Hm.empty []) t in
+            -- (what that would have pruned is not to be)
+            let w = setRef tc.prunes [] in
+            if M.isNone closed or V.len spine != V.len keep then None
+            else
+              let kept = V.concatMap (\p -> match p with | (l, k) -> if k then [l] else []) (V.zip spine keep) in
+              Just (Just (MetaTy.MetaTy types kept t))
+      in
+      match ty with
+      | None -> False
+      | Just mt ->
+          let fresh = T.newMeta tc (MetaInfo.MetaInfo node origin mt) in
+          let count = V.len (V.filter (\k -> k) keep) in
+          let w1 = setRef tc.opened (V.map (\o -> match o with | (o2, c) -> if o2 == n then (fresh, count) else (o2, c)) (getRef tc.opened)) in
+          let len = V.len keep in
+          let body =
+            V.foldl
+              (\acc p -> match p with | (i, k) -> if k then Core.App acc (Core.Var (len - 1 - i) "x${show i}") else acc)
+              (Core.Meta fresh)
+              (V.zip (V.range 0 len) keep)
+          in
+          let solution = V.foldr (\i acc -> Core.Lam "x${show i}" acc) body (V.range 0 len) in
+          let w2 = T.solve tc n (eval tc (Va.emptyEnv ()) solution) in
+          True
+
+-- Which of a metavariable's arguments are in scope, if its spine is distinct
+-- variables (a pattern) and some are not; nothing otherwise.
+fun prunable (tc : Tc s f p) (pren : Renaming) (sp : [Elim]) : Maybe [Bool] ! { St s | e } =
+  match pren with
+  | Renaming.Renaming _ _ mp _ ->
+      let picked =
+        V.foldl
+          (\acc e ->
+            match acc with
+            | None -> None
+            | Just (seen, keep) ->
+                (match e with
+                 | Elim.App v ->
+                     (match force tc v with
+                      | Value.Rigid k _ args ->
+                          if V.isEmpty args and not (V.elem k seen) then Just (V.pushBack seen k, V.pushBack keep (Hm.member k mp)) else None
+                      | _ -> None)
+                 | _ -> None))
+          (Just ([], []))
+          sp
+      in
+      match picked with
+      | Just (_, keep) -> if V.all (\k -> k) keep then None else Just keep
+      | None -> None
+
+-- What is wrong with a solution, if anything: the error's kind, and what
+-- its words are made of.
+fun violation (tc : Tc s f p) (info : MetaInfo p) (solution : Value) : Maybe (String, [Core], [String]) ! { St s | e } =
+  match info with
+  | MetaInfo.MetaInfo _ origin (Just (MetaTy.MetaTy types spine ty)) ->
+      -- (the solution, back in the context the metavariable was made in)
+      let at = V.len types in
+      let inst = V.foldl (\f k -> vapp tc f (Va.vvar k (fst (V.getOr ("_", Value.Error) types k)))) solution spine in
+      let what = match origin with | Origin.Hole -> "this hole" | Origin.Inferred desc -> desc in
+      let large =
+        match force tc ty with
+        | Value.Type allowed ->
+            (match sortOf tc types inst with
+             | Just actual -> if actual > allowed then Just (allowed, actual) else None
+             | None -> None)
+        | _ -> None
+      in
+      (match large with
+       | Just (allowed, actual) -> Just ("UniverseTooLarge", [quote tc at inst, Core.Type allowed, Core.Type actual], [what])
+       | None ->
+           if rowKind tc ty == Just False and rowIsMany tc types inst then Just ("ManyEffectsInRow", [quote tc at (shownRow tc inst)], [what])
+           else None)
+  | _ -> None
+
+-- A lower bound on the universe a type is in, given the variables' types;
+-- nothing if nothing is known.
+@pub fun sortOf (tc : Tc s f p) (types : [(String, Value)]) (v : Value) : Maybe Int ! { St s | e } =
+  match force tc v with
+  | Value.Type n -> Just (n + 1)
+  | Value.LitTy _ -> Just 0
+  | Value.BoxTy _ a -> sortOf tc types a
+  | Value.Comp a _ -> sortOf tc types a
+  | Value.Pi name _ _ _ dom cod ->
+      let d = sortOf tc types dom in
+      let c = sortOf tc (V.pushBack types (name, dom)) (apply tc cod (Va.vvar (V.len types) name)) in
+      (match (d, c) with
+       | (Just x, Just y) -> Just (if x > y then x else y)
+       | (Just x, None) -> Just x
+       | (None, y) -> y)
+  | Value.Rigid k _ sp ->
+      (match V.get types k with
+       | Just (_, ty) -> neutralSort tc ty sp
+       | None -> None)
+  | Value.Opaque u _ sp ->
+      (match Hm.lookup u (getRef tc.constants) with
+       | Just ty -> neutralSort tc ty sp
+       | None -> None)
+  | _ -> None
+
+fun neutralSort (tc : Tc s f p) (ty : Value) (sp : [Elim]) : Maybe Int ! { St s | e } =
+  let final =
+    V.foldl
+      (\acc el ->
+        match acc with
+        | None -> None
+        | Just t ->
+            (match (el, force tc t) with
+             | (Elim.App a, Value.Pi _ _ _ _ _ cod) -> Just (apply tc cod a)
+             | (Elim.Unbox, Value.BoxTy _ a) -> Just a
+             | _ -> None))
+      (Just ty)
+      sp
+  in
+  match M.map (\t -> force tc t) final with
+  | Just (Value.Type n) -> Just n
+  | _ -> None
+
+-- A value read back into the metavariable's context through the renaming;
+-- nothing if it mentions the metavariable, or a variable out of scope.
+fun rename (tc : Tc s f p) (m : Int) (pren : Renaming) (v : Value) : Maybe Core ! { St s | e } =
+  let go = \x -> rename tc m pren x in
+  match pren with
+  | Renaming.Renaming dom cod mp _ ->
+      match (if getRef tc.naming then forceNamed tc v else force tc v) with
+      | Value.Type n -> Just (Core.Type n)
+      | Value.LitTy b -> Just (Core.LitTy b)
+      | Value.Lit x -> Just (Core.Lit x)
+      | Value.Error -> Just Core.Error
+      | Value.Flex m2 sp ->
+          if m2 == m then None
+          else
+            -- applied to variables out of scope: pruned of them, if its spine
+            -- is a pattern, and then tried again
+            (match prunable tc pren sp with
+             | Just keep ->
+                 let w = setRef tc.prunes (V.pushBack (getRef tc.prunes) (m2, keep)) in
+                 None
+             | None -> renameSpine tc m pren (Core.Meta m2) sp)
+      | Value.Rigid k n sp ->
+          (match Hm.lookup k mp with
+           | Just k2 -> renameSpine tc m pren (Core.Var (dom - k2 - 1) n) sp
+           | None -> None)
+      | Value.Opaque u n sp -> renameSpine tc m pren (Core.Opaque u n) sp
+      | Value.Stuck h sp ->
+          (match go h with
+           | Just head -> renameSpine tc m pren head sp
+           | None -> None)
+      | Value.Prim p args ->
+          V.foldl (\acc a -> M.andThen (\f -> M.map (\x -> Core.App f x) (go a)) acc) (Just (Core.Prim p)) args
+      | Value.Lam x cl ->
+          M.map (\b -> Core.Lam x b) (rename tc m (lift pren x) (apply tc cl (Va.vvar cod x)))
+      | Value.Pi name icit g r dom1 cl ->
+          (match (go g, go r, go dom1, rename tc m (lift pren name) (apply tc cl (Va.vvar cod name))) with
+           | (Just g2, Just r2, Just d2, Just c2) -> Just (Core.Pi name icit g2 r2 d2 c2)
+           | _ -> None)
+      | Value.BoxTy g a ->
+          (match (go g, go a) with
+           | (Just g2, Just a2) -> Just (Core.BoxTy g2 a2)
+           | _ -> None)
+      | Value.Grade p -> renamePoly tc p go
+      | Value.GradeRange lo hi ->
+          (match (go lo, go hi) with
+           | (Just a, Just b) -> Just (Core.GradeRange a b)
+           | _ -> None)
+      | Value.BoxIntro e -> M.map (\x -> Core.BoxIntro x) (go e)
+      | Value.Comp t e ->
+          (match (go t, go e) with
+           | (Just a, Just b) -> Just (Core.Comp a b)
+           | _ -> None)
+      | Value.Handle env c -> Just c
+      | Value.Row (Row.Row ls ts) ->
+          let ls2 = V.map (\kv -> go (snd kv)) ls in
+          let ts2 = V.map (\kv -> go (snd kv)) ts in
+          if V.all M.isSome ls2 and V.all M.isSome ts2 then Just (Core.Row (V.map (\x -> M.unwrapOr Core.Error x) ls2) (V.map (\x -> M.unwrapOr Core.Error x) ts2))
+          else None
+
+-- A polynomial read back through the renaming.
+fun renamePoly (tc : Tc s f p) (p : Poly) go : Maybe Core ! { St s | e } =
+  let renamed = V.map (\t -> match t with | (atoms, g) -> (V.map go atoms, g)) (Va.polyTerms (renormalise tc p)) in
+  if V.any (\t -> match t with | (atoms, _) -> V.any M.isNone atoms) renamed then None
+  else
+    let products =
+      V.map
+        (\t ->
+          match t with
+          | (atoms, g) ->
+              let start = if V.isEmpty atoms or g != G.one then Just (C.grade g) else None in
+              M.unwrapOr
+                (C.grade G.zero)
+                (V.foldl
+                   (\acc a -> match acc with | None -> a | Just q -> Just (Core.GradeMul q (M.unwrapOr Core.Error a)))
+                   start
+                   atoms))
+        renamed
+    in
+    match V.head products with
+    | None -> Just (C.grade G.zero)
+    | Just first -> Just (V.foldl (\s q -> Core.GradeAdd s q) first (V.drop products 1))
+
+fun renameSpine (tc : Tc s f p) (m : Int) (pren : Renaming) (head : Core) (sp : [Elim]) : Maybe Core ! { St s | e } =
+  V.foldl
+    (\acc el ->
+      match acc with
+      | None -> None
+      | Just h ->
+          (match el with
+           | Elim.App v -> M.map (\x -> Core.App h x) (rename tc m pren v)
+           | Elim.Unbox -> Just (Core.Unbox h)
+           | Elim.Case env alts ->
+               let renamed =
+                 V.map
+                   (\alt ->
+                     match alt with
+                     | CaseAlt.CaseAlt hd n vars body ->
+                         let under = V.foldl (\p x -> lift p x) pren vars in
+                         let inner = V.foldl (\e i -> Va.push e (Va.vvar (renamingCod pren + i) (V.getOr "_" vars i))) env (V.range 0 (V.len vars)) in
+                         M.map (\b -> CaseAlt.CaseAlt hd n vars b) (rename tc m under (eval tc inner body)))
+                   alts
+               in
+               if V.all M.isSome renamed then Just (Core.Case h (V.map (\x -> M.unwrapOr (CaseAlt.CaseAlt (Head.BoolLit True) "" [] Core.Error) x) renamed))
+               else None))
+    (Just head)
+    sp
+
+fun renamingCod (p : Renaming) : Int = match p with | Renaming.Renaming _ cod _ _ -> cod
+
+-- --- tests -------------------------------------------------------------------
+
+use Std.Test (assertEq, assertTrue)
+
+fun intTy () : Value = Value.LitTy Builtin.Int
+
+@test fun aMetavariableIsSolvedByWhatItMeets () =
+  let tc = T.new () 0 in
+  let m = T.newMeta tc (MetaInfo.MetaInfo (getRef tc.at) (Origin.Inferred "a test") None) in
+  let a = assertTrue (unify tc 0 (Va.vmeta m) (intTy ())) "?m =? Int" in
+  assertEq (C.shown False (quote tc 0 (Va.vmeta m))) "Int" "and ?m is Int from then on"
+
+@test fun aMetavariableAppliedToVariablesIsAFunctionOfThem () =
+  let tc = T.new () 0 in
+  let m = T.newMeta tc (MetaInfo.MetaInfo (getRef tc.at) (Origin.Inferred "a test") None) in
+  -- ?m x =? (x, Int), in a context of one variable
+  let x = Va.vvar 0 "x" in
+  let rhs = Value.Pi "_" Icit.Explicit (Va.polyValue (Va.polyConstant G.any)) (Va.polyValue (Va.polyConstant G.any)) x (Closure.Closure (Va.emptyEnv ()) (Core.LitTy Builtin.Int)) in
+  let a = assertTrue (unify tc 1 (Value.Flex m [Elim.App x]) rhs) "solved" in
+  assertEq (C.shown False (quote tc 0 (Va.vmeta m))) "\\x -> x -> Int" "?m := \\x -> x -> Int"
+
+@test fun theOccursCheckRefuses () =
+  let tc = T.new () 0 in
+  let m = T.newMeta tc (MetaInfo.MetaInfo (getRef tc.at) (Origin.Inferred "a test") None) in
+  let arrow = Value.Pi "_" Icit.Explicit (Va.polyValue (Va.polyConstant G.any)) (Va.polyValue (Va.polyConstant G.any)) (Va.vmeta m) (Closure.Closure (Va.emptyEnv ()) (Core.LitTy Builtin.Int)) in
+  assertTrue (not (unify tc 0 (Va.vmeta m) arrow)) "?m =? ?m -> Int has no solution"
+
+@test fun twoOpenRowsMeetThroughAFreshTail () =
+  let tc = T.new () 0 in
+  let kind = Just (MetaTy.MetaTy [] [] (Value.LitTy Builtin.Effect)) in
+  let a1 = T.newMeta tc (MetaInfo.MetaInfo (getRef tc.at) (Origin.Inferred "a row") kind) in
+  let b1 = T.newMeta tc (MetaInfo.MetaInfo (getRef tc.at) (Origin.Inferred "a row") kind) in
+  let log = Value.Opaque 30 "Log" [] in
+  let ask = Value.Opaque 31 "Ask" [] in
+  let ra = row tc [log, Va.vmeta a1] in
+  let rb = row tc [ask, Va.vmeta b1] in
+  let ok = assertTrue (unify tc 0 ra rb) "{Log | ?a} =? {Ask | ?b}" in
+  assertEq (C.shown False (quote tc 0 ra)) (C.shown False (quote tc 0 rb)) "and both are {Ask, Log | ?t}"
