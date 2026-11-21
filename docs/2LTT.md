@@ -166,38 +166,59 @@ Strata's terms are plain Meadow data, not a `lang!`, and where the kernel
 needs a source position it has a span type of its own, or a type parameter.
 L0's Strata imports nothing from Lingua.
 
-Strata is to be built from Idyll's kernel, which Idyll's `front/` already has
-in Meadow. Measured against `front/`'s imports, the kernel splits as follows.
+Strata is built from Idyll's kernel, which Idyll's `front/` already had in
+Meadow. Measured against `front/`'s imports, the kernel split as follows.
 
-- **Clean to extract once `Tc` is split** (below): `Grade`, `Core`, `Value`,
-  `Ctx`, `Eval` (NbE), `Unify` (pattern unification), `Termination`
-  (size-change, with transparent unfolding), `Positivity`, and `Usage`.
-  `Hir`'s `Icit` and `Literal` move down with them.
-  - `Positivity` imports `Lingua.Lang (Meta)` for spans, the one Lingua
-    import among them. It takes Strata's own span type before it moves.
-- **Not clean: `Tc`, which every kernel module takes.** `Tc s` is the
-  elaborator's whole state in one record: the metavariables and the tables
-  the kernel reads (`constants`, `globals`, `transparent`, `prunes`,
-  `positive` and the rest), and also the renamed program (`HirArena`), the
-  elaborating function (typed with `Elab.Cx`), deferred source expressions,
-  and `Lingua.Lang.Meta` spans in its errors, holes and goals. So `Eval`,
-  `Unify`, `Termination` and `Positivity` reach `Elab` and Lingua through it.
-  `Tc` is split first: a kernel record holding what those four modules read,
-  with the span abstracted, inside the elaborator's own record holding the
-  rest. Kernel errors leave through a callback or a returned list.
-  `Positivity` also needs `Scc`, which moves with it.
-- **Not clean**: `Matching`, the elaboration to case trees. It imports about
-  twenty functions from `Elab` (`check`, `infer`, `insert`, `freshMeta`,
-  `gradeFits`, `settleGrade` and others). The proposal is to split it:
-  - case-tree compilation and coverage move into Strata;
-  - the elaborator is passed in as a record of functions.
+- **Clean to extract once `Tc` was parameterised** (below): `Grade`,
+  `Core`, `Value`, `Ctx`, `Eval` (NbE), `Unify` (pattern unification),
+  `Termination` (size-change, with transparent unfolding), `Positivity`, and
+  `Usage`. `Hir` moves whole: it imports only Std, and `Ctx` needs its
+  `Ident` as well as the `Icit` and `Literal` the others use.
+  - `Positivity` imported `Lingua.Lang (Meta)` for spans, the one Lingua
+    import among them. Its `Shape` now takes the span type as a parameter.
+  - `Positivity` also needs Tarjan's `components`, split out of `Scc` into
+    a module of its own, `Graph`, which moves with it.
+- **`Tc`, which every kernel module takes.** `Tc s` was the elaborator's
+  whole state in one record: the metavariables and the tables the kernel
+  reads (`constants`, `globals`, `transparent`, `prunes`, `positive` and the
+  rest), and also the renamed program (`HirArena`), the elaborating function
+  (typed with `Elab.Cx`), deferred source expressions, and
+  `Lingua.Lang.Meta` spans in its errors, holes and goals. So `Eval`,
+  `Unify`, `Termination` and `Positivity` reached `Elab` and Lingua through
+  it. It is parameterised instead of split: `Tc s f p`, where `f` is the
+  front end's own state (the renamed program, the elaborating function, the
+  deferred expressions) and `p` the span type, which `MetaInfo`, `Meta`,
+  `HoleAt`, `GoalAt` and `Postponed` take too. `new`, `save` and `restore`
+  take the front end's state, or a way to copy it. The other fields stay for
+  now; a slimmer kernel record inside Strata may come later. A front end
+  brings its own span type, so MeadowBoot can keep its positions in the
+  terms it hands the kernel.
+- **`Matching`, the elaboration to case trees, is split by what is
+  reusable.** It imported about twenty functions from `Elab` (`check`,
+  `infer`, `insert`, `freshMeta`, `gradeFits`, `settleGrade` and others).
+  - The part driven by the problem walks Idyll's patterns: overloads,
+    literals at their types, `#[..]` patterns, implicit and dot patterns,
+    and Idyll's kinds of error. It stays in Idyll as Idyll's driver.
+  - The reusable part, the dependent-matching core of Cockx and Abel, is a
+    kernel module of its own, `Cases`: `instantiate`, which binds a
+    constructor's fields for a slot and unifies the indices, with the rule
+    for the fields' grades passed in (Idyll passes its rule, which knows
+    linearity; Meadow passes ω); `unifyIndices` and `solveIndices`, which
+    answer `Refined`, `Absurd` or `Stuck`; the refinement and substitution
+    functions; `mentions` on `Core`; `describe` and `shownPattern`, for
+    messages about missing cases; and `ctorOf`, `isCtor` and `ctorArity`.
+  - Each front end keeps its own driver, and no elaborator is passed in.
+    Meadow's opt-in matches on grade-0 indices are a Meadow driver over
+    Meadow's patterns that calls `Cases`. Its plain matches keep MeadowBoot's
+    own compiler after inference (`Exhaust`).
 
   Strata does not take Idyll's elaborator. Meadow's elaboration is
   inference first, and Idyll's is not, so each front end keeps its own.
+  The kernel is thirteen modules: the twelve above and `Cases`.
 - **`Core` is more than a dependent core.** It includes Idyll's effect rows,
   handlers (`OpClause`), effect keys, and its set of builtins and
-  primitives. That primitive set is one to one with Cut's primitives, which
-  are Meadow's.
+  primitives. Its `Prim` names eight integer and string operations; the rest
+  of Cut's primitives, which are Meadow's, are constants by their uniques.
 
 That kernel is graded throughout: `Value.Pi` and `Core.Pi` each carry grades
 as terms, solved as polynomial normal forms. Meadow starts with that kernel
@@ -211,15 +232,22 @@ as it is.
 A kernel parameterised over its grade algebra can follow if `Mem` brings more
 grades to Meadow.
 
-**How the extraction is done** (decided; it is L1's first part, done by
-Idyll's session in Idyll's repository):
+**How the extraction is done** (decided; it is L1's first part):
 
 1. **Refactor inside Idyll's repository** until the kernel modules import
-   nothing from `Elab` or from Lingua. That means splitting `Tc`, the span
-   type, the `Matching` split, and moving `Icit` and `Literal` down. Idyll's Rust
-   compiler and `front/` stay in parity at every step.
+   nothing from `Elab` or from Lingua. That meant parameterising `Tc`, the
+   span type, splitting `Graph` out of `Scc`, and moving `Hir` down; the
+   `Matching` split into `Cases` follows. Idyll's Rust compiler and `front/`
+   stay in parity at every step. This is Idyll's session's, in Idyll's
+   repository.
 2. **Move those modules into `Strata/` verbatim.** `front/` then depends on
    Strata by revision. Nothing changes meaning in the move.
+
+The first twelve moved at Idyll's 10ecf25, each changed only in its module
+paths, with a first line saying where it came from. `Cases` moves when
+Idyll's split of `Matching` is done. The moved modules keep the layout they
+were written in, so `scripts/check.sh` checks the layout of Strata's own
+modules only.
 
 `front/` (Idyll's compiler in Meadow, a Meadow package) depends on Strata as
 a git dependency with `subdir = "Strata"`. Idyll's Rust compiler does not use
@@ -854,16 +882,22 @@ _Tested by_:
 
 _Proves_: the elaborator can be replaced without changing anything.
 
-- **First, the extraction** ([Strata](#strata-the-kernel)), by Idyll's
-  session. The kernel modules are refactored inside
-  Idyll's repository until they import nothing from `Elab` or Lingua, with
-  Idyll's Rust compiler and `front/` in parity at each step. They are then
-  moved into `Strata/` verbatim, and `front/` depends on Strata by revision.
+- **First, the extraction** ([Strata](#strata-the-kernel)). The kernel
+  modules were refactored inside Idyll's repository until they imported
+  nothing from `Elab` or Lingua, with Idyll's Rust compiler and `front/` in
+  parity at each step, and then moved into `Strata/` verbatim: twelve at
+  Idyll's 10ecf25 and `Cases` at d73d4af. `front/` depending on Strata by
+  revision, with its parity suite green, is Idyll's next step.
 - **Then the levels.** Strata's core (plain Meadow data, no `lang!`) gains
-  two universes, `Code`, and quote and splice.
+  two universes, `Code`, and quote and splice. Not started.
 - **Then MeadowBoot's elaboration into it.** Under the `strata` option,
   MeadowBoot's typed tree elaborates into the core, with everything at run
-  time and grade ω, and staging is the identity.
+  time and grade ω, and staging is the identity. Begun ahead of the levels:
+  `bootstrap/src/ToStrata.mw` writes each unit's declarations as terms of
+  `Strata.Core` under the option, and nothing reads them yet.
+  `MEADOWBOOT_STRATA` writes them beside the unit's object as
+  `<package>.strata`, with what did not map counted by kind, and
+  `bootstrap/tests/strata` holds golden packages for them.
 
 _Tested by_:
 
@@ -874,6 +908,134 @@ _Tested by_:
 
 _Done when_: `front/` runs on Strata with its parity suite green, and the
 option can be on in CI with no difference.
+
+#### What the translation found
+
+The translation was written against `Core` as Idyll has it, before the
+levels, to find out how much of Meadow the core says as it is. It runs on
+every unit under the option. A construct it has nothing for is written as a
+goal and counted, so its dumps are an inventory. Over the standard library
+it writes 2,926 declarations, and over MeadowBoot's own unit 14,749. What
+did not map, by kind (a `match` is counted once, by the first thing in it
+that stops it):
+
+| kind | Std | MeadowBoot |
+| --- | --- | --- |
+| `structural-record` | 23 | 2,901 |
+| `view-pattern` | 0 | 1,070 |
+| `dictionary-record` | 366 | 507 |
+| `nested-pattern` | 146 | 699 |
+| `free-type-variable` | 250 | 363 |
+| `literal-pattern` | 3 | 132 |
+| `record-row-variable` | 4 | 122 |
+| `recursive-let` | 21 | 100 |
+| `method-with-generics-of-its-own` | 11 | 72 |
+| `guard` | 22 | 3 |
+| `collection-pattern` | 6 | 4 |
+| `bigint-literal` | 1 | 1 |
+
+**What maps cleanly.**
+
+- **Schemes.** Each quantifier is an implicit Pi, over `Type`, or over
+  `Effect` for an effect row's. Each arrow is a Pi, and a latent effect is a
+  `Comp` with a `Row`, an open row ending in its variable. Every binder has
+  grade ω, `[]`.
+- **Type application and dictionaries.** The typed tree already says, at
+  each mention of a generic name, the types it was used at and the
+  dictionaries inference found for it. So the core is explicit with nothing
+  inferred again: a definition takes its types and then its dictionaries as
+  lambdas, and a trait it asks for is an auto Pi over the trait's dictionary
+  type. MeadowBoot's dictionaries are already data types of one
+  constructor, so a method is a `case` on its trait's dictionary.
+- **Recursion between definitions**, mutual or not. A top-level name is an
+  `Opaque` constant by its binder, and Core needs nothing more.
+- **Data types, constructors and named records.** A named record is a data
+  type of one constructor, and a projection or an update is a `case`.
+- **Plain matches of one level.** A match whose arms are each a constructor
+  of variables, or a tuple of them, with at most a last arm for the rest, is
+  a `case`. The last arm stands for each constructor no other arm names. An
+  `as` pattern is a `let` in the arm, and `if` is a `case` on `Bool`.
+- **Handlers.** A `handle` is a `Handle`, each clause a function of the
+  operation's argument and of its resumption, as Idyll's are, and an
+  operation is a constant applied to its argument.
+- **Literals** of `Int`, the sized integers, `Float`, `Float32`, `Char`,
+  `String` and `Unit`, and `True` and `False`, which are `Bool`'s literals.
+- **Aliases**, as functions from types to a type.
+
+**What does not map yet.**
+
+- **Building a dictionary.** An `impl`'s dictionary is never written. The
+  core could say it, since a dictionary is data, but the typed tree does not
+  say which method definitions and which required traits' dictionaries an
+  `impl`'s dictionary is made of. `Elab` puts that together from the trait's
+  shape and inference's evidence, and the translation would have to do the
+  same. A required trait's dictionary, read out of the one that requires
+  it, is written as a field of no binder. A method generic in more than its
+  trait's parameters is not said.
+- **Patterns of more than one level**, guards, literal patterns and
+  patterns of vectors and lists. `Case` takes one level of constructors and
+  the two `Bool` literals, with no default alternative. These need case
+  trees. For Meadow's plain matches that is its own compiler after
+  inference (`Exhaust`). The rule that a last arm stands for every other
+  constructor works only where the constructors are known: it cannot cover
+  an `Int`, and it repeats the arm once for each constructor.
+- **Structural records** and row variables over fields. Core has no records,
+  and Idyll none of this kind. In MeadowBoot most of them are Lingua's: each
+  view a `lang!` writes is a constructor whose one field is a structural
+  record, which a pass reads as `r.field`.
+- **View patterns**, `(f -> p)`, which Lingua's pattern synonyms are made of,
+  and so MeadowBoot's passes. Core has nothing for them; a case tree with a
+  call in it would do.
+- **Local recursion.** `Let` is not recursive, so a local function that
+  calls itself has nothing to be. It needs a recursive `let`, or lifting to a
+  constant.
+- **Type variables nothing constrains.** Inference leaves some variables
+  unsolved because nothing needs them: `Nil` compared with `Nil`, or what a
+  `runSt`'s state is instantiated at. An explicit core has to name them.
+- **Rank 2.** `runSt`'s state type is a constant in the typed tree (`s#27`),
+  where inference made it rigid, and not an implicit lambda in the argument.
+  Core can say `{s : Type} -> …` inside an argument, but the typed tree does
+  not say where the state type was bound.
+- **Meadow's own types and effects.** `Array`, `BigInt`, `StArray`, `Ref`,
+  `StRef`, `Task`, `TVar`, `Thread`, `Compact`, `Mut` and `St` are declared by
+  no package, so they have no binder, and Core's builtins do not have them.
+  They are written as constants of no unique: 1,197 mentions in Std and
+  4,586 in MeadowBoot, where `St` alone is 2,932. A `BigInt` literal is not
+  said.
+- **Tuples and array literals.** Core has neither: Idyll's tuple is its
+  prelude's `Pair`. The translation writes a tuple as a data type `TupleN`
+  and an array literal as a constant `#arrayN`, neither declared anywhere.
+  They are the most frequent names of no binder: 1,103 tuples and 747 array
+  literals in Std, 12,034 and 4,857 in MeadowBoot.
+- **What is dropped, not refused.** A variable over number types (`Num`,
+  `Frac`) is a variable over `Type`, and its constraint is gone; one that
+  defaults is `Int` or `Float`. A row's `lacks` constraints are gone. Core
+  carries no positions, so they are dropped; with `Tc s f p`, MeadowBoot's
+  span type can go where the kernel keeps them, in its metavariables, holes
+  and goals. Representation polymorphism does not appear here at
+  all: representations are chosen after the core, and Cut's descriptor
+  parameters are the lowering's.
+- **Primitives.** Core's `Prim` names eight integer and string operations.
+  Meadow's hundred or so primitives are written as constants by their
+  binders.
+
+**What Core would need for Meadow.** For Idyll to weigh; nothing here is
+changed in the moved kernel.
+
+- A way for a front end to declare builtin types and effects of its own,
+  with uniques, or builtins for Meadow's: `Array`, `BigInt`, the references
+  and the concurrency types, and the `St` and `Mut` effects.
+- A recursive `let`, or agreement that a front end lifts local recursion to
+  constants before the kernel sees it.
+- Literal heads beyond `Bool` (`Int`, `String`, `Char`) and a default
+  alternative in `Case`, so that a match of literals, or of a type with many
+  constructors, is a `case` and not one alternative for each constructor.
+- Tuples, or an agreed encoding of them as data that both front ends share,
+  and array literals.
+- A position for structural records: in the kernel as rows of fields, or
+  kept out of it by the front end.
+- Kinds or constraints for variables over number types, or agreement that
+  they are elaborated as dictionaries.
 
 ### L2. Div, totality and coverage
 
@@ -1162,20 +1324,20 @@ _Done when_: every shared function in Std passes.
   receives, so the two must agree on its pace and its tests. The rule is that
   a kernel change keeps Idyll's parity suite green, or comes with Idyll's
   matching change.
-- **The `Matching` split may not be clean.** Case-tree compilation that
-  calls back into an elaborator passed in as a record of functions has to
-  serve two elaborators with different ideas of when a type is known.
-  A proposed mitigation splits by the kind of match instead of stretching
-  one interface over both:
+- **The `Matching` split may not be clean.** One case-tree compiler that
+  calls back into an elaborator would have to serve two elaborators with
+  different ideas of when a type is known. The mitigation splits by the kind
+  of match instead of stretching one interface over both:
   - **Plain matches** are compiled after inference. Meadow's ordinary
     run-time matches refine no types, so they can become case trees once
     types are solved, which is when `Exhaust` runs today. No elaborator is
-    passed in.
-  - **Dependent matches** take the interleaved path, with the elaborator
-    passed in as a record. These are Idyll's matches and Meadow's opt-in
-    matches on grade-0 indices, where the match refines types as it goes.
-    Meadow's opt-in ones already come with written signatures, so their
-    types are known when the match is checked.
+    involved.
+  - **Dependent matches** go through `Cases`, the kernel's dependent-matching
+    core, each front end driving it over its own patterns. These are Idyll's
+    matches and Meadow's opt-in matches on grade-0 indices, where the match
+    refines types as it goes. Meadow's driver is its own, and its opt-in
+    matches already come with written signatures, so their types are known
+    when the match is checked.
 - **Reflected semantics** breaks the opacity of `Code` that staging's
   soundness rests on. Doing it without losing that is open research.
 - **The oracle disappears.** With the Rust front end deleted, the
