@@ -63,7 +63,7 @@ use MeadowBoot.Timings (Clock)
 use MeadowBoot.Dictionaries (emptySummary)
 use MeadowBoot.Types
 use MeadowBoot.Core (CoreProgram, joinedUnits)
-use MeadowBoot.Solve (TypeEnv, noTypes, Entry)
+use MeadowBoot.Solve (TypeEnv, noTypes, Entry, dictsHere, typesHere)
 use Std.Macro (Reflect, Datum, toDatum, fromDatum)
 use MeadowBoot.Packed (pack, unpack)
 use Lingua.Query (jsonDatum)
@@ -350,7 +350,7 @@ fun inferredOf
                     | None -> []))
              files)
       in
-      let done = inferUnit r deps (V.map (\(i : Interface) -> i.types) imported) texts in
+      let done = inferUnit r deps (typesHereOf imported) texts in
       let dumps = H.fromVec done.dumps in
       let exports =
         V.map (\(e : Export) -> { e | scheme = H.lookup e.binder done.schemes }) r.exports
@@ -470,7 +470,7 @@ fun studying db (imported : [Interface]) (homes : [String]) (clk : Clock) =
                        | None -> []))
                 triples)
          in
-         let done = inferUnit r deps (V.map (\(i : Interface) -> i.types) imported) texts in
+         let done = inferUnit r deps (typesHereOf imported) texts in
          let inferredAt = T.lap clk "infer" in
          Study {
            sources,
@@ -622,15 +622,7 @@ fun checkedOf
              (\x -> match x with | (_, text, _) -> packageName text)
              (V.find (\x -> match x with | (p, _, _) -> S.endsWith "Meadow.toml" p) files))
       in
-      let done =
-        inferUnitWith
-          Wants.ForLowering
-          mark
-          r
-          deps
-          (V.map (\(i : Interface) -> i.types) imported)
-          texts
-      in
+      let done = inferUnitWith Wants.ForLowering mark r deps (typesHereOf imported) texts in
       let m2 = mark "inferred" in
       let linked = V.map (\(i : Interface) -> i.linked) imported in
       let theirs =
@@ -1514,6 +1506,14 @@ fun loweredOf
            fx
            answered)
   | None -> None
+
+-- What each unit a unit imports knows about types, each `impl`'s
+-- dictionary by the binder it has in the importing unit (`dictsHere`):
+-- what inference is given, and `Elab` works out the same.
+fun typesHereOf (imported : [Interface]) : [TypeEnv] =
+  let here =
+    dictsHere (V.map (\(i : Interface) -> (i.package, i.linked.dicts, i.types)) imported)
+  in V.map (\(i : Interface) -> typesHere (fst here) i.types) imported
 
 -- Each unit a unit imports with the name its manifest gives it, which a
 -- `use` knows it by: the manifest's dependencies in the order it lists

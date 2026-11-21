@@ -486,6 +486,16 @@ last release is under _Unreleased_.
 
 ### Fixed
 
+- MeadowBoot could call one package's `impl` for another's. An `impl`'s
+  dictionary is named by a binder below every binder of the packages its
+  own package depends on, so two packages that do not depend on each other
+  could each give one the same, and a package that depends on both took
+  one for the other: with `Apple` and `Banana` each implementing `Display`,
+  `display` of an `Apple` called `Banana`'s `display` and failed with
+  "non-exhaustive pattern match", on Glade and on Silo. A package that
+  depends on both now gives the later one a binder of its own; each keeps
+  its symbol, and a program whose packages number their `impl`s apart is
+  compiled to the same Cut as before.
 - `meadow build`, `run`, `test` and `dis` in a directory with no
   `Meadow.toml` no longer take it for a package. They took one named after
   the directory (`.`, given `.`) and swept every `.mw` file below it into
