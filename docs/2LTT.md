@@ -90,7 +90,7 @@ construction, and it runs by evaluation inside the compiler.
 | **quote** and **splice** | quote turns a run-time term into a `Code a`; splice runs a compile-time computation of type `Code a` and puts the term it gives in its place. |
 | **staging** | running every compile-time computation in a program, leaving a run-time program with none. |
 | **erased** | gone before the program runs. By stage: everything at the compile-time level. By relevance: run-time things at grade 0. |
-| **grade 0 / grade ω** | erased / unrestricted. The two grades Meadow's surface allows; Idyll has the full algebra. |
+| **grade 0 / grade ω** | erased / unrestricted (ω is Idyll's `[]`, 0..∞, the grade of a binder that writes nothing). The two grades Meadow's surface allows; Idyll has the full algebra. |
 | **`Div`** | the one implied effect: might not return normally. |
 | **shared fragment** | data types, total pure functions, and traits and impls over them, written once and usable at both levels. |
 | **dictionary** | a trait's evidence at run time: a record of the impl's methods ([RUNTIME.md](RUNTIME.md)). |
@@ -159,22 +159,69 @@ Strata is a package in this repository (`Strata/`). It holds the core
 calculus: the checker, NbE, unification, termination and coverage checking,
 and staging. MeadowBoot depends on it. It depends on no front end.
 
-Strata is to be built from Idyll's kernel, which Idyll's `front/` already has
-in Meadow. That kernel has:
+**Strata depends on Std alone, and in particular not on Lingua.** `front/`
+pins Lingua at one revision, because Cut's builders take `Lingua.Lang.Meta`
+and two Lingua revisions in one build are two different types. A kernel that
+depended on Lingua would put every user of Strata in the same lockstep. So
+Strata's terms are plain Meadow data, not a `lang!`, and where the kernel
+needs a source position it has a span type of its own, or a type parameter.
+L0's Strata imports nothing from Lingua.
 
-- NbE (`Eval`, `Value`) and pattern unification (`Unify`);
-- elaboration to case trees (`Matching`);
-- size-change termination with transparent unfolding (`Termination`);
-- strict positivity (`Positivity`).
+Strata is to be built from Idyll's kernel, which Idyll's `front/` already has
+in Meadow. Measured against `front/`'s imports, the kernel splits as follows.
+
+- **Clean to extract**: `Grade`, `Core`, `Value`, `Tc` (metavariables),
+  `Ctx`, `Eval` (NbE), `Unify` (pattern unification), `Termination`
+  (size-change, with transparent unfolding), `Positivity`, and `Usage`.
+  `Hir`'s `Icit` and `Literal` move down with them.
+  - `Positivity` imports `Lingua.Lang (Meta)` for spans, the one Lingua
+    import among them. It takes Strata's own span type before it moves.
+- **Not clean**: `Matching`, the elaboration to case trees. It imports about
+  twenty functions from `Elab` (`check`, `infer`, `insert`, `freshMeta`,
+  `gradeFits`, `settleGrade` and others). The proposal is to split it:
+  - case-tree compilation and coverage move into Strata;
+  - the elaborator is passed in as a record of functions.
+
+  Strata does not take Idyll's elaborator. Meadow's elaboration is
+  inference first, and Idyll's is not, so each front end keeps its own.
+- **`Core` is more than a dependent core.** It includes Idyll's effect rows,
+  handlers (`OpClause`), effect keys, and its set of builtins and
+  primitives. That primitive set is one to one with Cut's primitives, which
+  are Meadow's.
 
 That kernel is graded throughout: `Value.Pi` and `Core.Pi` each carry grades
 as terms, solved as polynomial normal forms. Meadow starts with that kernel
-as it is, with every grade fixed at ω for the compile-time level, and at 0 or
-ω on the run-time level's binders. A kernel parameterised over its grade
-algebra can follow if `Mem` brings more grades to Meadow. The extraction is
-agreed with Idyll's session, which owns `front/`. Idyll then depends on
-Strata as a git dependency with `subdir = "Strata"`, which both package
-loaders already support.
+as it is.
+
+- At the compile-time level every grade is ω.
+- On run-time binders a grade is 0 or ω.
+- ω is Idyll's `[]`, the grade 0..∞. A Meadow binder that writes nothing has
+  that grade.
+
+A kernel parameterised over its grade algebra can follow if `Mem` brings more
+grades to Meadow.
+
+**How the extraction is done** is a proposal, for the user and Idyll's session
+to agree (it is L1's first part):
+
+1. **Refactor inside Idyll's repository** until the kernel modules import
+   nothing from `Elab` or from Lingua. That means the span type, the
+   `Matching` split, and moving `Icit` and `Literal` down. Idyll's Rust
+   compiler and `front/` stay in parity at every step.
+2. **Move those modules into `Strata/` verbatim.** `front/` then depends on
+   Strata by revision. Nothing changes meaning in the move.
+
+`front/` (Idyll's compiler in Meadow, a Meadow package) depends on Strata as
+a git dependency with `subdir = "Strata"`. Idyll's Rust compiler does not use
+Strata.
+
+**Idyll's parity suite is an independent check of Strata's kernel.** Idyll
+keeps its Rust compiler, checked pass by pass against `front/`
+(`the_messages_agree`, `the_error_places_agree` and the rest). Once `front/`
+runs on Strata, that suite checks Strata's kernel for the graded fragment
+against a second implementation. The rule: a Strata change that touches the
+kernel keeps Idyll's parity suite green, or comes with Idyll's matching
+change.
 
 ### Div: the one implied effect
 
@@ -246,7 +293,10 @@ linearity, Low\*-style extraction and the verification stack stay Idyll's.
   is involved, so nothing about the compiler has to be trusted to make it
   apply.
 - **Grade 0 is written `@0` on a binder** (suggested; still open). Idyll's
-  `[r]` cannot be used because Meadow's lists are written `[a; b]`.
+  `[r]` cannot be used because Meadow's lists are written `[a; b]`. `@0`
+  clashes with nothing in Idyll.
+- **A binder that writes nothing is ω**, Idyll's `[]`: unrestricted, as every
+  Meadow binder is today.
 
 ### The compile-time level
 
@@ -791,16 +841,26 @@ _Tested by_:
 
 _Proves_: the elaborator can be replaced without changing anything.
 
-- Strata gains its core language (a `lang!`) with two universes, `Code`,
-  quote and splice, and grades 0 and ω on binders. It is extracted from
-  Idyll's kernel as agreed with Idyll's session.
-- Under the `strata` option, MeadowBoot's typed tree elaborates into it, with
-  everything at run time and grade ω, and staging is the identity.
+- **First, the extraction** ([Strata](#strata-the-kernel)), if the user
+  and Idyll's session agree to it. The kernel modules are refactored inside
+  Idyll's repository until they import nothing from `Elab` or Lingua, with
+  Idyll's Rust compiler and `front/` in parity at each step. They are then
+  moved into `Strata/` verbatim, and `front/` depends on Strata by revision.
+- **Then the levels.** Strata's core (plain Meadow data, no `lang!`) gains
+  two universes, `Code`, and quote and splice.
+- **Then MeadowBoot's elaboration into it.** Under the `strata` option,
+  MeadowBoot's typed tree elaborates into the core, with everything at run
+  time and grade ω, and staging is the identity.
 
-_Tested by_: byte-identical Cut over the whole repository, option on against
-option off; the corpus and self-build invariants.
+_Tested by_:
 
-_Done when_: the option can be on in CI with no difference.
+- Idyll's parity suite, green on `front/` running on Strata, for the move;
+- byte-identical Cut over the whole repository, option on against option
+  off;
+- the corpus and self-build invariants.
+
+_Done when_: `front/` runs on Strata with its parity suite green, and the
+option can be on in CI with no difference.
 
 ### L2. Div, totality and coverage
 
@@ -1086,13 +1146,23 @@ _Done when_: every shared function in Std passes.
   indexed types only, are the options. Neither is designed, and linearity is
   Idyll's.
 - **Strata is shared.** A change Meadow needs in the kernel is a change Idyll
-  receives, so the two must agree on its pace and its tests.
+  receives, so the two must agree on its pace and its tests. The rule is that
+  a kernel change keeps Idyll's parity suite green, or comes with Idyll's
+  matching change.
+- **The `Matching` split may not be clean.** Case-tree compilation that
+  calls back into an elaborator passed in as a record of functions has to
+  serve two elaborators with different ideas of when a type is known.
 - **Reflected semantics** breaks the opacity of `Code` that staging's
   soundness rests on. Doing it without losing that is open research.
 - **The oracle disappears.** With the Rust front end deleted, the
   differentials compare MeadowBoot with its own earlier output, so a bug
-  present in both versions is invisible to them. The Cut reference
-  interpreter becomes the main independent check.
+  present in both versions is invisible to them. Two independent checks are
+  left:
+  - the Cut reference interpreter, for what programs mean;
+  - Idyll's parity suite, for Strata's kernel. Idyll keeps its Rust
+    compiler, checked pass by pass against `front/`, so once `front/` runs on
+    Strata, that suite tests the graded fragment against a second
+    implementation.
 
 ## Prior art
 
@@ -1195,7 +1265,9 @@ Taken on drafts 1 and 2.
      the other with checked types. Grades and dependencies are checked at the
      border, or erased there with a run-time check.
 
-   **Recommendation: (a) now, (c) as the goal**, agreed with Idyll's session.
+   **Recommendation: (a) now, (c) as the goal.** Idyll's session agrees. The
+   border format has to be designed for size: Idyll's interfaces carry normal
+   forms, which once made its Std's export 18 MB until it was trimmed.
 4. **`Fail` and `Expand` at compile time.**
    - **(a)** As effects, with total handlers in the compiler.
    - **(b)** As ordinary values, with a generator returning a result.
