@@ -1,0 +1,32 @@
+-- What maps to Strata's core as it is: a data type, a `match` of flat
+-- constructors with an arm for the rest, a generic function, a named
+-- record, tuples, `let`, `if`, a lambda and literals.
+
+use Std.Collections.Vector as V
+
+@pub data Shape = Circle Int | Rect Int Int | Dot
+
+use Shape.*
+
+@pub record Point = {
+  x : Int,
+  y : Int
+}
+
+@pub fun area (s : Shape) : Int =
+  match s with
+  | Circle r -> 3 * r * r
+  | Rect w h -> w * h
+  | _ -> 0
+
+@pub fun twice (f : a -> a) (x : a) : a = f (f x)
+
+@pub fun swap (p : (a, b)) : (b, a) = match p with | (x, y) -> (y, x)
+
+@pub fun moved (p : Point) : Point = { p | x = p.x + 1 }
+
+@pub fun origin () : Point = Point { x = 0, y = 0 }
+
+@pub fun sign (n : Int) : String = let zero = 0 in if n < zero then "minus" else "plus"
+
+@pub fun bump (xs : [Int]) : [Int] = V.map (\x -> x + 1) xs

@@ -1,0 +1,10 @@
+-- An effect, a function that performs it, and a handler.
+
+@pub effect Log {
+  log : String -> ()
+}
+
+@pub fun greet (name : String) : () ! { Log } = log "hello ${name}"
+
+@pub fun quiet (f : () -> () ! { Log | e }) : () ! e =
+  handle f () with { log line k -> k (), return x -> x }

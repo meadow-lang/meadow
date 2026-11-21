@@ -1,0 +1,16 @@
+-- A trait, an `impl`, and a function asking for one: the dictionary is an
+-- argument of the core, given where the function is used.
+
+@pub trait Size a {
+  fun size : a -> Int
+}
+
+@pub data Box = Box Int
+
+impl Size Box {
+  fun size b = match b with | Box n -> n
+}
+
+@pub fun total x y = size x + size y
+
+@pub fun boxes () : Int = total (Box 1) (Box 2)

@@ -67,6 +67,7 @@ use MeadowBoot.Solve (TypeEnv, noTypes, Entry)
 use Std.Macro (Reflect, Datum, toDatum, fromDatum)
 use MeadowBoot.Packed (pack, unpack)
 use Strata.Level (Level, levelOf, notYet)
+use MeadowBoot.ToStrata (unitDefs, dumped)
 use Lingua.Query (jsonDatum)
 use Std.Json as J
 use Std.Json (Json)
@@ -242,7 +243,8 @@ database! {
              False
              False
              False
-             (\x -> ()))
+             (\x -> ())
+             None)
     -- The same with no entry: every definition of the unit, for whoever runs
     -- one of them -- a macro -- rather than the unit.
     | query whole (unit : Int) : Maybe CoreProgram =
@@ -270,7 +272,8 @@ database! {
              False
              False
              False
-             (\x -> ()))
+             (\x -> ())
+             None)
 }
 
 -- The files of a unit that are its modules: all but its manifest.
@@ -509,7 +512,8 @@ fun studying db (imported : [Interface]) (homes : [String]) (clk : Clock) =
 -- lowered with, and its declarations of Cut as text. Unless it is to `keep`
 -- them, a method asked of a dictionary in plain sight is the method
 -- (`Dictionaries`); and if it `inlines`, a call of a small function is the
--- function's body (`Inline`).
+-- function's body (`Inline`). Under the `strata` option it hands its typed
+-- tree to `strata` as well.
 fun checkedOf
     (cfg : Cfg)
     (dir : String)
@@ -527,6 +531,7 @@ fun checkedOf
     (strict : Bool)
     (positions : Bool)
     (mark : String -> () ! e)
+    (strata : Maybe (String -> Renamed -> Inferred -> [TypeEnv] -> () ! e))
     : ([Export], Bool, TypeEnv, Maybe (CoreProgram, Linked, Object), [String]) ! e =
   let m0 = mark "start" in
   match unitOf cfg dir imported fx files asts with
@@ -633,6 +638,13 @@ fun checkedOf
           texts
       in
       let m2 = mark "inferred" in
+      -- `strata`: the typed tree as Strata's core (docs/2LTT.md, L1), which
+      -- nothing reads yet; a build without the option does nothing here.
+      let leveled =
+        (match strata with
+         | Just f -> f pkg r done (V.map (\(i : Interface) -> i.types) imported)
+         | None -> ())
+      in
       let linked = V.map (\(i : Interface) -> i.linked) imported in
       let theirs =
         V.map
@@ -1844,7 +1856,8 @@ fun enteredChecked
        True
        False
        False
-       (\x -> T.lap clk (T.passOf x)) with
+       (\x -> T.lap clk (T.passOf x))
+       None with
      | (exports, anyVis, types, made, problems) ->
          Entered {
            wrong = V.append misread problems,
@@ -2404,7 +2417,10 @@ fun compiling (o : UnitsOptions) (u : Given Interface) (clk : Clock) =
               o.checked
               (o.checked and o.strict)
               o.positions
-              mark with
+              mark
+              (if o.strata then
+                 Just (\pkg r done theirs -> strataWritten (unitOut u) pkg r done theirs)
+               else None) with
             | _ if not (V.isEmpty misread and V.isEmpty unexpanded and V.isEmpty leveled) ->
                 Err (S.join "" (V.concat [misread, unexpanded, leveled]))
             -- A unit whose `main` is not one is not compiled, as the Rust
@@ -2490,6 +2506,23 @@ fun compileTimeRefused (asts : [(String, AstProgram)]) : [String] =
                    else [])
                  (declsOf (Source { path = [], file, ast }))))
     asts
+
+-- `strata`: unit `r` of package `pkg`, typed as `done`, elaborated into
+-- Strata's core with everything at run time (`ToStrata`). Nothing reads the
+-- terms yet. `MEADOWBOOT_STRATA` has them written beside the unit's object,
+-- in `out`, as `<package>.strata`, with what did not map counted by kind.
+fun strataWritten
+    (out : String)
+    (pkg : String)
+    (r : Renamed)
+    (done : Inferred)
+    (theirs : [TypeEnv]) =
+  let defs = unitDefs r done theirs in
+  if M.isSome (getEnv "MEADOWBOOT_STRATA") then
+    (match writeString (Path.join out "${pkg}.strata", dumped pkg defs) with
+     | Ok _ -> ()
+     | Err why -> writeError "${why}\n")
+  else ()
 
 -- What the attributes of the unit's modules, `@!feature(…)` and the rest,
 -- say is wrong, each a line, as the Rust compiler refuses them: an attribute

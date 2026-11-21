@@ -1,0 +1,20 @@
+-- Strata's core for Traits, from MeadowBoot's typed tree (docs/2LTT.md, L1)
+-- declarations: 10
+-- unmapped: dictionary-record 1
+-- names without a binder: none
+-- of them, by name: none
+data Traits.Box : Type
+con Traits.Box.Box : Int -> Traits.Box
+data Traits.Size : Type -> Type
+con Traits.Size.#dict : {a : [] Type} -> (a -> Int) -> Traits.Size a
+trait Traits.Size : Type -> Type
+method Traits.Size.size : {a : [] Type} -> Traits.Size a => a -> Int
+  = \a -> \d0 -> case d0 of { #dict size -> size }
+impl Traits.Size Traits.Box : Traits.Size Traits.Box
+  = ?dictionary-record
+method size : Traits.Box -> Int
+  = \b -> case b of { Box n -> n }
+def total : {a : [] Type} -> {b : [] Type} -> {c : [] Effect} -> Traits.Size a => Traits.Size b => a -> b -> Int ! c
+  = \a -> \b -> \c -> \d0 -> \d1 -> \x -> \y -> + Int (#impl.Std.Ops.Add Int) (size a d0 x) (size b d1 y)
+def boxes : () -> Int
+  = \_ -> total Traits.Box Traits.Box (#impl.Traits.Size Traits.Box) (#impl.Traits.Size Traits.Box) (Box 1) (Box 2)

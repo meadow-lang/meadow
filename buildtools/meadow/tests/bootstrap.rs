@@ -4487,3 +4487,83 @@ fn every_glade_case_evaluates_as_the_cek_machine_evaluates_it() {
             .join("\n\n")
     );
 }
+
+/// Under the `strata` option MeadowBoot elaborates each unit's typed tree into
+/// Strata's core, everything at run time and every binder of grade Ï‰
+/// (`docs/2LTT.md`, L1), and `MEADOWBOOT_STRATA` has it write the terms beside
+/// the unit's object, with what did not map counted by kind. Each package of
+/// `bootstrap/tests/strata` is built so, and its terms are its
+/// `expected.strata`. `MEADOWBOOT_BLESS` writes what they are there instead.
+#[test]
+fn strata_terms_are_as_their_goldens() {
+    let dir = meadow_scratch::scratch!("meadowboot-strata-{}", std::process::id());
+    let cases = repo().join("bootstrap").join("tests").join("strata");
+    let bless = std::env::var_os("MEADOWBOOT_BLESS").is_some();
+    let mut names: Vec<String> = std::fs::read_dir(&cases)
+        .expect("the cases")
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert!(!names.is_empty(), "no cases in {}", cases.display());
+    let mut bad = Vec::new();
+    for name in &names {
+        let pkg = dir.join(name);
+        std::fs::create_dir_all(pkg.join("src")).expect("a package directory");
+        std::fs::copy(
+            cases.join(name).join("Meadow.toml"),
+            pkg.join("Meadow.toml"),
+        )
+        .expect("the manifest");
+        copy_tree(&cases.join(name).join("src"), &pkg.join("src"));
+        // A package with no `main` is not linked into a program; its units
+        // are compiled all the same, and they are what is asked for.
+        let out = Command::new(meadowboot_exe())
+            .arg("build")
+            .arg(&pkg)
+            .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+            .env("MEADOW", meadow())
+            .env("MEADOWBOOT_SET", "strata=true")
+            .env("MEADOWBOOT_STRATA", "1")
+            .env_remove("MEADOWBOOT_EXPANSIONS")
+            .output()
+            .expect("MeadowBoot runs");
+        let written = pkg
+            .join("target")
+            .join("debug")
+            .join("units")
+            .join(name)
+            .join(format!("{name}.strata"));
+        let Ok(got) = std::fs::read_to_string(&written) else {
+            bad.push(format!(
+                "{name}: no terms written:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+            continue;
+        };
+        let golden = cases.join(name).join("expected.strata");
+        if bless {
+            std::fs::write(&golden, &got).expect("the golden written");
+            continue;
+        }
+        let want = std::fs::read_to_string(&golden)
+            .unwrap_or_default()
+            .replace("\r\n", "\n");
+        if got != want {
+            let at = got
+                .lines()
+                .zip(want.lines())
+                .position(|(a, b)| a != b)
+                .unwrap_or_else(|| got.lines().count().min(want.lines().count()));
+            bad.push(format!(
+                "{name}: line {}:\n  got:  {}\n  want: {}",
+                at + 1,
+                got.lines().nth(at).unwrap_or("<end>"),
+                want.lines().nth(at).unwrap_or("<end>")
+            ));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(bad.is_empty(), "{}", bad.join("\n\n"));
+}

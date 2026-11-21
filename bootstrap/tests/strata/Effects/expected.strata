@@ -1,0 +1,11 @@
+-- Strata's core for Effects, from MeadowBoot's typed tree (docs/2LTT.md, L1)
+-- declarations: 4
+-- unmapped: none
+-- names without a binder: array-literal 1
+-- of them, by name: none
+effect Effects.Log : Effect
+op Effects.Log.log : String -> () ! Effects.Log
+def greet : String -> () ! Effects.Log
+  = \name -> log (concatStrings (#array2 String "hello " (display String (#impl.Std.Display.Display String) name)))
+def quiet : {a : [] Effect} -> (() -> () ! {Effects.Log | a}) -> () ! a
+  = \a -> \f -> handle f () with { return (\x -> x); log (\line -> \k -> k ()) }

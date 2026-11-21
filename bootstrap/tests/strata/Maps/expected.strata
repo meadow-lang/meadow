@@ -1,0 +1,25 @@
+-- Strata's core for Maps, from MeadowBoot's typed tree (docs/2LTT.md, L1)
+-- declarations: 13
+-- unmapped: none
+-- names without a binder: tuple 4
+-- of them, by name: none
+data Maps.Shape : Type
+con Maps.Shape.Circle : Int -> Maps.Shape
+con Maps.Shape.Rect : Int -> Int -> Maps.Shape
+con Maps.Shape.Dot : Maps.Shape
+data Maps.Point : Type
+con Maps.Point.Point : Int -> Int -> Maps.Point
+def area : Maps.Shape -> Int
+  = \s -> case s of { Circle r -> * Int (#impl.Std.Ops.Mul Int) (* Int (#impl.Std.Ops.Mul Int) 3 r) r; Rect w h -> * Int (#impl.Std.Ops.Mul Int) w h; Dot -> 0 }
+def twice : {a : [] Type} -> (a -> a) -> a -> a
+  = \a -> \f -> \x -> f (f x)
+def swap : {a : [] Type} -> {b : [] Type} -> Tuple2 a b -> Tuple2 b a
+  = \a -> \b -> \p -> case p of { Tuple2 x y -> Tuple2 b a y x }
+def moved : Maps.Point -> Maps.Point
+  = \p -> case p of { Point x y -> Point (+ Int (#impl.Std.Ops.Add Int) (case p of { Point x y -> x }) 1) y }
+def origin : () -> Maps.Point
+  = \_ -> Point 0 0
+def sign : Int -> String
+  = \n -> let zero = 0 in case < Int (#impl.Std.Cmp.PartialOrd Int) n zero of { True -> "minus"; False -> "plus" }
+def bump : Vector Int -> Vector Int
+  = \xs -> map Int Int (\x -> + Int (#impl.Std.Ops.Add Int) x 1) xs

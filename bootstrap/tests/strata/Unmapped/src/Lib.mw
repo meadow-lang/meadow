@@ -1,0 +1,15 @@
+-- What Strata's core does not say yet, each written as a goal: a nested
+-- pattern, a guard, a literal pattern, a structural record, and a local
+-- function that calls itself.
+
+use Std.Maybe.Maybe.*
+
+@pub fun depth (m : Maybe (Maybe Int)) : Int = match m with | Just (Just n) -> n | _ -> 0
+
+@pub fun small (n : Int) : Bool = match n with | k if k < 10 -> True | _ -> False
+
+@pub fun named (n : Int) : String = match n with | 0 -> "zero" | _ -> "many"
+
+@pub fun corner () = { x = 1, y = 2 }
+
+@pub fun count (n : Int) : Int = let go k = if k == 0 then 0 else 1 + go (k - 1) in go n

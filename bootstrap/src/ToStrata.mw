@@ -1,0 +1,1256 @@
+-- ToStrata: a unit's typed tree, as inference leaves it, written as terms of
+-- Strata's core (`Strata.Core`), with everything at run time and every
+-- binder of grade ω (`docs/2LTT.md`, L1).
+--
+-- It runs only under the `strata` option, and nothing reads what it makes
+-- yet: what Cut is lowered from is still `Elab`'s core. It is here to find
+-- out how much of Meadow the core says as it is. So a construct the core has
+-- nothing for is not an error: it is written as a goal, `unmapped:<kind>`,
+-- which the dump counts by kind (`MEADOWBOOT_STRATA`).
+--
+-- What maps, and how:
+--
+-- - a definition is a constant, by its binder, of the type its scheme says:
+--   each quantifier an implicit Pi over `Type` (or `Effect`, for an effect
+--   row's), each trait it asks for an auto Pi over the trait's dictionary
+--   type, and then its type, each arrow a Pi and each latent effect a `Comp`
+--   with a `Row`;
+-- - its body takes those as lambdas, the types first, then the dictionaries;
+--   a mention of a generic name is applied to the types it was used at and
+--   to the dictionaries inference found for it, so the core is explicit;
+-- - a local is a de Bruijn index, and a top-level name, a constructor or a
+--   type an `Opaque` by its binder: so top-level recursion, mutual or not,
+--   needs nothing more;
+-- - a `match` whose arms are each a constructor of variables, or a tuple of
+--   them, with at most a last arm that matches anything, is a `case`; that
+--   last arm stands for each constructor no other arm names;
+-- - a named record is a data type of one constructor, read by a `case`;
+-- - a `handle` is a `Handle`, each clause a function of the operation's
+--   argument and of its resumption, as Idyll's are.
+--
+-- Data types, constructors, effects, operations, aliases, traits, methods
+-- and `impl`s are said from what inference tells the units after this one
+-- of types (`TypeEnv`).
+
+use MeadowBoot.Infer
+use MeadowBoot.Infer (Typed!)
+use MeadowBoot.Infer (Inferred)
+use MeadowBoot.Rename (Binder)
+use MeadowBoot.Scopes (Renamed, Item, Declared)
+use MeadowBoot.Solve (
+  Evidence, TypeEnv, Entry, VariantSig, EffectInfo, EffOp, AliasDef, TraitShape, ImplDef,
+  Generalized
+)
+use MeadowBoot.Types (Type, Scheme, Pred, VarKind)
+use MeadowBoot.Types.Type.*
+use Strata.Core (Core, CaseAlt, OpClause, Note, Head, Builtin, numberTypes, transform, shown)
+use Strata.Hir (Icit, Literal)
+use Strata.Grade as G
+use Std.Collections.Vector as V
+use Std.Collections.HashMap as H
+use Std.Collections.HashMap (HashMap)
+use Std.Num.Float as F
+use Std.String as S
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+use Std.Sort (sortOn)
+
+-- --- what the translation knows ----------------------------------------------
+
+-- A declaration of the core: what it is (`def`, `data`, `con`, `effect`,
+-- `op`, `alias`, `trait`, `method`, `impl`, `default`), its name, its
+-- unique -- its binder, or -1 for what has none here -- its type, and its
+-- definition, for one that has one.
+@pub record Def = {
+  kind : String,
+  name : String,
+  unique : Int,
+  ty : Core,
+  term : Maybe Core
+}
+
+-- What is in scope at a term, innermost last, each a binder of the core: a
+-- local by its binder; a type variable -- the arena's variable behind it in
+-- the typed tree, or -1 for a scheme's, and its place among its binding's
+-- quantifiers; a dictionary by its place among its binding's; and a binder
+-- nothing names.
+data Slot
+  = Local Int String
+  | Quant Int Int String
+  | Dict Int
+  | Anon String
+
+use Slot.*
+
+-- What the translation of a module reads: its tables; every binder's name;
+-- each type and constructor by its canonical name; each type's
+-- constructors; what inference says of the unit's bindings; and the binders
+-- of the `let`s being defined, which are not in scope in themselves.
+record Env = {
+  a : TypedArena,
+  binders : [Binder],
+  ids : HashMap String Int,
+  variants : HashMap String [VariantSig],
+  ctorSchemes : HashMap String Scheme,
+  schemes : HashMap Int Scheme,
+  generics : HashMap Int Generalized,
+  wheres : HashMap Int [String],
+  numbers : HashMap Int Bool,
+  impls : HashMap Int String,
+  pending : [Int]
+}
+
+-- Every binder's grade, and every type's: ω, Idyll's `[]`.
+def omega : Core = Core.GradeLit G.any
+
+-- A construct the core has nothing for yet, said where it was, by its kind.
+fun unmapped (kind : String) : Core = Core.Runtime (Note.Goal ("unmapped:" ++ kind)) Core.Error
+
+fun apps (f : Core) (xs : [Core]) : Core = V.foldl (\g x -> Core.App g x) f xs
+
+-- A lambda of the core, with the grade and the type of what it binds.
+fun lam (x : String) (dom : Maybe Core) (body : Core) : Core =
+  Core.Runtime (Note.Binds (Just G.any) dom) (Core.Lam x body)
+
+fun pi (x : String) (icit : Icit) (dom : Core) (cod : Core) : Core =
+  Core.Pi x icit omega omega dom cod
+
+-- The `i`th quantifier's name: `a`, `b`, and so on.
+fun letter (i : Int) : String =
+  if i < 26 then stringSlice "abcdefghijklmnopqrstuvwxyz" i (i + 1) else "a${show i}"
+
+fun nameOf (env : Env) (id : Int) : String =
+  match V.get env.binders id with
+  | Just (b : Binder) -> b.name
+  | None -> M.unwrapOr "#${show id}" (H.lookup id env.impls)
+
+-- The last segment of a canonical name: `Shape.Circle`'s `Circle`.
+fun lastOf (name : String) : String = M.unwrapOr name (V.last (S.split "." name))
+
+fun slotName (s : Slot) : String =
+  match s with
+  | Local _ n -> n
+  | Quant _ _ n -> n
+  | Dict k -> "d${show k}"
+  | Anon n -> n
+
+-- The innermost slot `p` holds of, as a de Bruijn index, and the slot.
+fun innermost (ctx : [Slot]) (p : Slot -> Bool) : Maybe (Int, Slot) =
+  innermostFrom ctx p (V.len ctx - 1)
+
+fun innermostFrom (ctx : [Slot]) (p : Slot -> Bool) (k : Int) : Maybe (Int, Slot) =
+  if k < 0 then None
+  else
+    match V.get ctx k with
+    | Just s -> if p s then Just (V.len ctx - 1 - k, s) else innermostFrom ctx p (k - 1)
+    | None -> None
+
+-- Where in `xs` the first that `p` holds of is.
+fun indexWhere (p : a -> Bool) (xs : [a]) : Maybe Int =
+  V.find (\i -> match V.get xs i with | Just x -> p x | None -> False) (V.range 0 (V.len xs))
+
+fun maybeVec (m : Maybe a) : [a] = match m with | Just x -> [x] | None -> []
+
+-- `c`, made to mean what it meant under `k` more binders.
+fun shift (k : Int) (c : Core) : Core =
+  if k == 0 then c
+  else
+    transform c 0 (\x d ->
+      match x with
+      | Core.Var i n -> if i >= d then Just (Core.Var (i + k) n) else None
+      | _ -> None)
+
+-- --- types -------------------------------------------------------------------
+
+-- A type of inference's, in scope `ctx`.
+fun typeOf (env : Env) (ctx : [Slot]) (t : Type) : Core =
+  match t with
+  | Var v ->
+      (match innermost ctx (\s -> match s with | Quant u _ _ -> u == v | _ -> False) with
+       | Just (i, s) -> Core.Var i (slotName s)
+       -- A variable over number types that its binding is not copied for
+       -- is the type it defaults to.
+       | None ->
+           (match H.lookup v env.numbers with
+            | Just frac ->
+                if frac then Core.LitTy (Builtin.Number "Float") else Core.LitTy Builtin.Int
+            | None -> unmapped "free-type-variable"))
+  | Bound q ->
+      (match innermost ctx (\s -> match s with | Quant _ j _ -> j == q | _ -> False) with
+       | Just (i, s) -> Core.Var i (slotName s)
+       | None -> unmapped "free-type-variable")
+  | Con name args -> apps (typeCon env name) (V.map (typeOf env ctx) args)
+  | Fun ps ret eff -> arrows env ctx ps ret eff
+  | Tuple ts -> apps (Core.Opaque (0 - 1) "Tuple${show (V.len ts)}") (V.map (typeOf env ctx) ts)
+  | Record _ -> unmapped "structural-record"
+  | RowEmpty -> Core.Row [] []
+  | RowExtend _ _ _ -> row env ctx t
+  | Error -> unmapped "error-type"
+
+-- A type constructor: one of the core's builtins, or a type by its binder.
+fun typeCon (env : Env) (name : String) : Core =
+  match name with
+  | "Int" -> Core.LitTy Builtin.Int
+  | "Int64" -> Core.LitTy Builtin.Int
+  | "Bool" -> Core.LitTy Builtin.Bool
+  | "String" -> Core.LitTy Builtin.Str
+  | "Char" -> Core.LitTy Builtin.Char
+  | "Unit" -> Core.LitTy Builtin.Unit
+  | "Float64" -> Core.LitTy (Builtin.Number "Float")
+  | n if V.elem n numberTypes -> Core.LitTy (Builtin.Number n)
+  | _ -> Core.Opaque (M.unwrapOr (0 - 1) (H.lookup name env.ids)) name
+
+-- A function's type: a Pi for each parameter, and what it answers, under
+-- its latent effect if it has one.
+fun arrows (env : Env) (ctx : [Slot]) (ps : [Type]) (ret : Type) (eff : Type) : Core =
+  match V.get ps 0 with
+  | Just p ->
+      pi
+        "_"
+        Icit.Explicit
+        (typeOf env ctx p)
+        (arrows env (V.pushBack ctx (Anon "_")) (V.drop ps 1) ret eff)
+  | None ->
+      (match eff with
+       | RowEmpty -> typeOf env ctx ret
+       | _ -> Core.Comp (typeOf env ctx ret) (row env ctx eff))
+
+-- An effect row: each effect applied to its arguments, and its end.
+fun row (env : Env) (ctx : [Slot]) (t : Type) : Core =
+  match splitRow t [] with
+  | (labels, rest) ->
+      let effects =
+        V.map
+          (\l ->
+            match l with
+            | (name, Tuple args) -> apps (typeCon env name) (V.map (typeOf env ctx) args)
+            | (name, arg) -> Core.App (typeCon env name) (typeOf env ctx arg))
+          labels
+      in Core.Row
+           effects
+           (match rest with
+            | RowEmpty -> []
+            | other -> [typeOf env ctx other])
+
+fun splitRow (t : Type) (acc : [(String, Type)]) : ([(String, Type)], Type) =
+  match t with
+  | RowExtend l f rest -> splitRow rest (V.pushBack acc (l, f))
+  | other -> (acc, other)
+
+-- What a quantified variable ranges over.
+fun kindOf (k : VarKind) : Core =
+  match k with
+  | VarKind.Effect -> Core.LitTy Builtin.Effect
+  | VarKind.Row -> unmapped "record-row-variable"
+  | _ -> Core.Type 0
+
+-- A trait asked of types: its dictionary's type.
+fun predType (env : Env) (ctx : [Slot]) (p : Pred) : Core =
+  apps (typeCon env p.tr) (V.map (typeOf env ctx) p.tys)
+
+-- A scheme's type: an implicit Pi for each quantifier, an auto Pi for each
+-- trait it asks for, and its type.
+fun schemeType (env : Env) (ctx : [Slot]) (sc : Scheme) : Core = quantPis env ctx sc 0
+
+fun quantPis (env : Env) (ctx : [Slot]) (sc : Scheme) (i : Int) : Core =
+  match V.get sc.quant i with
+  | Just k ->
+      pi
+        (letter i)
+        Icit.Implicit
+        (kindOf k)
+        (quantPis env (V.pushBack ctx (Quant (0 - 1) i (letter i))) sc (i + 1))
+  | None -> predPis env ctx sc.preds 0 sc.ty
+
+fun predPis (env : Env) (ctx : [Slot]) (preds : [Pred]) (k : Int) (t : Type) : Core =
+  match V.get preds k with
+  | Just p ->
+      pi
+        "_"
+        Icit.Auto
+        (predType env ctx p)
+        (predPis env (V.pushBack ctx (Anon "_")) preds (k + 1) t)
+  | None -> typeOf env ctx t
+
+-- `Type -> … -> Type`, a type constructor's type, over `kinds`.
+fun constructorType (kinds : [Core]) (result : Core) : Core =
+  V.foldr (\k acc -> pi "_" Icit.Explicit k (shift 1 acc)) result kinds
+
+-- --- terms -------------------------------------------------------------------
+
+-- A binding's definition: lambdas for the types it is generic in and the
+-- dictionaries its `where` asks for, around `body`.
+fun generic (env : Env) (ctx : [Slot]) (id : Int) (body : [Slot] -> Core) : Core =
+  let g = H.lookup id env.generics in
+  let vars = M.unwrapOr [] (M.map (\(x : Generalized) -> x.vars) g) in
+  let quant = M.unwrapOr [] (M.map (\(x : Generalized) -> x.scheme.quant) g) in
+  let preds = M.unwrapOr [] (M.map (\(x : Generalized) -> x.scheme.preds) g) in
+  let dicts = M.unwrapOr [] (H.lookup id env.wheres) in
+  typeLams env ctx vars quant 0 (\c -> dictLams env c preds dicts 0 body)
+
+fun typeLams
+    (env : Env)
+    (ctx : [Slot])
+    (vars : [Int])
+    (quant : [VarKind])
+    (i : Int)
+    (body : [Slot] -> Core)
+    : Core =
+  match V.get vars i with
+  | Just v ->
+      lam
+        (letter i)
+        (Just (kindOf (V.getOr VarKind.Plain quant i)))
+        (typeLams env (V.pushBack ctx (Quant v i (letter i))) vars quant (i + 1) body)
+  | None -> body ctx
+
+fun dictLams
+    (env : Env)
+    (ctx : [Slot])
+    (preds : [Pred])
+    (dicts : [String])
+    (k : Int)
+    (body : [Slot] -> Core)
+    : Core =
+  if k >= V.len dicts then body ctx
+  else
+    lam
+      "d${show k}"
+      (M.map (predType env ctx) (V.get preds k))
+      (dictLams env (V.pushBack ctx (Dict k)) preds dicts (k + 1) body)
+
+-- An expression, in scope `ctx`.
+fun expr (env : Env) (ctx : [Slot]) (e : TypedExpr) : Core =
+  let a = env.a in
+  let t = typTypedExpr a e in
+  match viewTypedExpr a e with
+  | TypedExprView.Var r -> mention env ctx (typedRefId a r.ref) r.ev r.inst
+  | TypedExprView.Lit r -> literal (viewTypedLit a r.lit) t
+  | TypedExprView.Unit _ -> Core.Lit Literal.Unit
+  | TypedExprView.Hole _ -> Core.Runtime (Note.Goal "_") Core.Error
+  | TypedExprView.MacCall _ -> unmapped "macro-call"
+  | TypedExprView.Lam r -> lambdas env ctx r.params (\c -> expr env c r.body)
+  | TypedExprView.App r -> apps (expr env ctx r.func) (V.map (expr env ctx) r.args)
+  | TypedExprView.Let r -> lets env ctx r.binds (\c -> expr env c r.body)
+  | TypedExprView.If r ->
+      Core.Case (expr env ctx r.cond) [
+        CaseAlt.CaseAlt (Head.BoolLit True) "True" [] (expr env ctx r.yes),
+        CaseAlt.CaseAlt (Head.BoolLit False) "False" [] (expr env ctx r.no)
+      ]
+  | TypedExprView.Match r ->
+      matching
+        env
+        ctx
+        (expr env ctx r.scrutinee)
+        (typTypedExpr a r.scrutinee)
+        (V.map
+           (\arm ->
+             (
+               typedArmPat a arm,
+               M.isSome (typedArmGuard a arm),
+               \c -> expr env c (typedArmBody a arm)
+             ))
+           r.arms)
+  | TypedExprView.Tuple r ->
+      let tys =
+        (match t with
+         | Tuple ts -> V.map (typeOf env ctx) ts
+         | _ -> [])
+      in apps
+           (Core.Opaque (0 - 1) "Tuple${show (V.len r.items)}")
+           (V.append tys (V.map (expr env ctx) r.items))
+  | TypedExprView.Array r ->
+      let tys =
+        (match t with
+         | Con _ args -> V.map (typeOf env ctx) args
+         | _ -> [])
+      in apps
+           (Core.Opaque (0 - 1) "#array${show (V.len r.items)}")
+           (V.append tys (V.map (expr env ctx) r.items))
+  | TypedExprView.List r ->
+      let tys =
+        (match t with
+         | Con _ args -> V.map (typeOf env ctx) args
+         | _ -> [])
+      in
+      let cons =
+        apps (Core.Opaque (M.unwrapOr (0 - 1) (H.lookup "List.Cons" env.ids)) "Cons") tys
+      in V.foldr
+           (\x acc -> apps cons [expr env ctx x, acc])
+           (apps (Core.Opaque (M.unwrapOr (0 - 1) (H.lookup "List.Nil" env.ids)) "Nil") tys)
+           r.items
+  | TypedExprView.Cons r ->
+      let id = typedRefId a r.ref in
+      let name = nameOf env id in
+      let given =
+        (match (namedOf env id t, V.len r.args, V.get r.args 0) with
+         | (Just labels, 1, Just arg) ->
+             (match viewTypedExpr a arg with
+              | TypedExprView.Record x ->
+                  if M.isSome x.base then None
+                  else
+                    Just
+                      (V.map
+                         (\label ->
+                           match V.find
+                             (\f -> typedNameText a (typedExprFieldName a f) == label)
+                             x.fields with
+                           | Just f -> expr env ctx (typedExprFieldValue a f)
+                           | None -> unmapped "missing-field")
+                         labels)
+              | _ -> None)
+         | _ -> None)
+      in if (name == "True" or name == "False") and t == Con "Bool" [] then
+           Core.Lit (Literal.Bool (name == "True"))
+         else
+           apps
+             (Core.Opaque id name)
+             (V.append
+                (V.map (typeOf env ctx) (resultArgs t))
+                (M.unwrapOr (V.map (expr env ctx) r.args) given))
+  | TypedExprView.Record r ->
+      (match (r.base, recordOf env t) with
+       | (None, Just (v, targs)) ->
+           apps
+             (constructor env v)
+             (V.append
+                (V.map (typeOf env ctx) targs)
+                (V.map
+                   (\label ->
+                     match V.find
+                       (\f -> typedNameText a (typedExprFieldName a f) == label)
+                       r.fields with
+                     | Just f -> expr env ctx (typedExprFieldValue a f)
+                     | None -> unmapped "missing-field")
+                   (labelsOf v)))
+       | (Just b, Just (v, targs)) -> updated env ctx b r.fields v targs
+       | _ -> unmapped "structural-record")
+  | TypedExprView.Update r ->
+      (match recordOf env (typTypedExpr a r.base) with
+       | Just (v, targs) -> updated env ctx r.base r.fields v targs
+       | None -> unmapped "structural-record")
+  | TypedExprView.Proj r ->
+      (match recordOf env (typTypedExpr a r.target) with
+       | Just (v, targs) ->
+           let labels = labelsOf v in
+           let n = V.len labels in
+           let label = typedNameText a r.label in
+           (match indexWhere (\l -> l == label) labels with
+            | Just j ->
+                Core.Case
+                  (expr env ctx r.target)
+                  [CaseAlt.CaseAlt
+                     (conHead env v)
+                     (lastOf v.name)
+                     labels
+                     (Core.Var (n - 1 - j) label)]
+            | None -> unmapped "structural-record")
+       | None -> unmapped "structural-record")
+  | TypedExprView.Handle r ->
+      let ret =
+        (match r.ret with
+         | Just x -> lambdas env ctx [typedRetPat a x] (\c -> expr env c (typedRetBody a x))
+         | None -> lam "x" None (Core.Var 0 "x"))
+      in
+      let ops =
+        V.map
+          (\h ->
+            let op = typedRefId a (typedHArmOpRef a h) in
+            let k = typedHArmResume a h in
+            OpClause.OpClause
+              op
+              (typedNameText a (typedHArmOp a h))
+              0
+              (lambdas env ctx [typedHArmParam a h] (\c ->
+                 lam
+                   (nameOf env k)
+                   None
+                   (expr env (V.pushBack c (Local k (nameOf env k))) (typedHArmBody a h)))))
+          r.arms
+      in Core.Handle (expr env ctx r.body) ret ops
+  | _ -> unmapped "expression"
+
+-- A name mentioned: a local, or a constant by its binder, applied to the
+-- types it is used at and to the dictionaries found for it.
+fun mention (env : Env) (ctx : [Slot]) (id : Int) (evs : [Evidence]) (inst : [Type]) : Core =
+  let head =
+    (match innermost ctx (\s -> match s with | Local b _ -> b == id | _ -> False) with
+     | Just (i, _) -> Core.Var i (nameOf env id)
+     | None ->
+         if V.elem id env.pending then unmapped "recursive-let" else Core.Opaque id (nameOf env id))
+  in apps (apps head (V.map (typeOf env ctx) inst)) (V.map (evidence env ctx) evs)
+
+-- A dictionary, as inference found it.
+fun evidence (env : Env) (ctx : [Slot]) (ev : Evidence) : Core =
+  match ev with
+  | Evidence.Given k ->
+      (match innermost ctx (\s -> match s with | Dict j -> j == k | _ -> False) with
+       | Just (i, _) -> Core.Var i "d${show k}"
+       | None -> unmapped "dictionary-not-in-scope")
+  -- A required trait's dictionary, a field of the one requiring it.
+  | Evidence.Super inner label ->
+      Core.App (Core.Opaque (0 - 1) "#super.${label}") (evidence env ctx inner)
+  | Evidence.Impl d tys evs ->
+      apps
+        (apps (Core.Opaque d (nameOf env d)) (V.map (typeOf env ctx) tys))
+        (V.map (evidence env ctx) evs)
+  | Evidence.Missing -> unmapped "missing-evidence"
+
+-- The type arguments of what a constructor builds.
+fun resultArgs (t : Type) : [Type] =
+  match t with
+  | Con _ args -> args
+  | Fun _ r _ -> resultArgs r
+  | _ -> []
+
+-- A literal, at its type.
+fun literal (l : TypedLitView) (t : Type) : Core =
+  match l with
+  | TypedLitView.Int r ->
+      let n = M.unwrapOr 0 (S.toInt r.text) in
+      (match t with
+       | Con "BigInt" [] -> unmapped "bigint-literal"
+       | Con "Int" [] -> Core.Lit (Literal.Int n)
+       | Con "Int64" [] -> Core.Lit (Literal.Int n)
+       | Con name [] ->
+           if V.elem name numberTypes then Core.Lit (Literal.Word name n)
+           else Core.Lit (Literal.Int n)
+       | _ -> Core.Lit (Literal.Int n))
+  | TypedLitView.Float r ->
+      let x = fraction r.text in
+      (match t with
+       | Con "Float32" [] -> Core.Lit (Literal.Float32 (toFloat32 x))
+       | _ -> Core.Lit (Literal.Float x))
+  | TypedLitView.Char r -> Core.Lit (Literal.Char (charFromCode (M.unwrapOr 0 (S.toInt r.text))))
+  | TypedLitView.String r -> Core.Lit (Literal.Str r.text)
+
+-- The `Float` a literal's text writes, as `Elab` reads one.
+fun fraction (text : String) : Float =
+  if S.startsWith "-" text then fraction (S.drop text 1) * (0.0 - 1.0)
+  else
+    (let parts = S.split "." text in
+     let part = V.getOr "" parts 1 in
+     F.fromDecimal (V.getOr "" parts 0 ++ part) (0 - stringByteLength part))
+
+-- --- binders and patterns ----------------------------------------------------
+
+fun bare (a : TypedArena) (p : TypedPat) : TypedPat =
+  match viewTypedPat a p with
+  | TypedPatView.Ann r -> bare a r.pat
+  | _ -> p
+
+-- What a pattern that matches anything binds: a name, or nothing.
+fun simple (env : Env) (p : TypedPat) : Maybe Slot =
+  match viewTypedPat env.a (bare env.a p) with
+  | TypedPatView.Var r -> Just (Local r.id (nameOf env r.id))
+  | TypedPatView.Wild _ -> Just (Anon "_")
+  | TypedPatView.Unit _ -> Just (Anon "_")
+  | _ -> None
+
+-- Lambdas binding `pats`, around `body`: a pattern that is more than a
+-- name is matched on what its lambda binds.
+fun lambdas (env : Env) (ctx : [Slot]) (pats : [TypedPat]) (body : [Slot] -> Core) : Core =
+  match V.get pats 0 with
+  | None -> body ctx
+  | Just p ->
+      let rest = V.drop pats 1 in
+      let dom = Just (typeOf env ctx (typTypedPat env.a p)) in
+      (match simple env p with
+       | Just s -> lam (slotName s) dom (lambdas env (V.pushBack ctx s) rest body)
+       | None ->
+           lam
+             "x"
+             dom
+             (matching
+                env
+                (V.pushBack ctx (Anon "x"))
+                (Core.Var 0 "x")
+                (typTypedPat env.a p)
+                [(p, False, \c -> lambdas env c rest body)]))
+
+-- A `let`'s bindings, each in scope in those after it and in `body`. A
+-- function mentioning itself, or one after it, is a recursion `let` has
+-- none of.
+fun lets (env : Env) (ctx : [Slot]) (binds : [TypedBind]) (body : [Slot] -> Core) : Core =
+  match V.get binds 0 with
+  | None -> body ctx
+  | Just b ->
+      let rest = V.drop binds 1 in
+      let defining = V.concatMap (\x -> funId env.a x) binds in
+      (match viewTypedBind env.a b with
+       | TypedBindView.Fun r ->
+           let inside = { env | pending = V.append env.pending defining } in
+           let value =
+             generic inside ctx r.id (\c ->
+               lambdas inside c r.params (\c2 -> expr inside c2 r.body))
+           in
+           let name = nameOf env r.id in
+           Core.Let name value (lets env (V.pushBack ctx (Local r.id name)) rest body)
+       | TypedBindView.Pat r ->
+           let value = expr env ctx r.value in
+           (match simple env r.pat with
+            | Just s ->
+                let named =
+                  (match s with
+                   | Local id _ -> generic env ctx id (\c -> expr env c r.value)
+                   | _ -> value)
+                in Core.Let (slotName s) named (lets env (V.pushBack ctx s) rest body)
+            | None ->
+                Core.Let
+                  "p"
+                  value
+                  (matching
+                     env
+                     (V.pushBack ctx (Anon "p"))
+                     (Core.Var 0 "p")
+                     (typTypedPat env.a r.pat)
+                     [(r.pat, False, \c -> lets env c rest body)])))
+
+fun funId (a : TypedArena) (b : TypedBind) : [Int] =
+  match viewTypedBind a b with
+  | TypedBindView.Fun r -> [r.id]
+  | _ -> []
+
+-- What an arm's pattern is, at its top: one that matches anything, binding
+-- what it says; a constructor, by its binder (-1 for a tuple's), of
+-- patterns that match anything; or one the core cannot say without a
+-- compiler of matches, by its kind. And the names an `as` gives it.
+data Top = Any Slot | Ctor Int String [Slot] | Unsaid String
+
+fun topOf (env : Env) (p : TypedPat) : (Top, [(Int, String)]) =
+  let a = env.a in
+  match viewTypedPat a (bare a p) with
+  | TypedPatView.Var r -> (Top.Any (Local r.id (nameOf env r.id)), [])
+  | TypedPatView.Wild _ -> (Top.Any (Anon "_"), [])
+  | TypedPatView.Unit _ -> (Top.Any (Anon "_"), [])
+  | TypedPatView.As r ->
+      (match topOf env r.pat with
+       | (top, names) -> (top, V.append [(r.id, nameOf env r.id)] names))
+  | TypedPatView.Cons r ->
+      let slots = V.map (simple env) r.args in
+      if V.all M.isSome slots then
+        (let id = typedRefId a r.ref in
+         (Top.Ctor id (nameOf env id) (V.concatMap maybeVec slots), []))
+      else (Top.Unsaid "nested-pattern", [])
+  | TypedPatView.Tuple r ->
+      let slots = V.map (simple env) r.items in
+      if V.all M.isSome slots then
+        (Top.Ctor (0 - 1) "Tuple${show (V.len slots)}" (V.concatMap maybeVec slots), [])
+      else (Top.Unsaid "nested-pattern", [])
+  | TypedPatView.Lit _ -> (Top.Unsaid "literal-pattern", [])
+  | TypedPatView.Record _ -> (Top.Unsaid "record-pattern", [])
+  | TypedPatView.Array _ -> (Top.Unsaid "collection-pattern", [])
+  | TypedPatView.Vector _ -> (Top.Unsaid "collection-pattern", [])
+  | TypedPatView.List _ -> (Top.Unsaid "collection-pattern", [])
+  | TypedPatView.View _ -> (Top.Unsaid "view-pattern", [])
+  | _ -> (Top.Unsaid "pattern", [])
+
+-- A `match` of `scrut`, of type `t`, valid in `ctx`: each arm its pattern,
+-- whether it has a guard, and its body in the scope its pattern makes.
+fun matching
+    (env : Env)
+    (ctx : [Slot])
+    (scrut : Core)
+    (t : Type)
+    (arms : [(TypedPat, Bool, [Slot] -> Core)])
+    : Core =
+  let tops = V.map (\x -> match x with | (p, g, k) -> (topOf env p, g, k)) arms in
+  -- Those up to the first that matches anything: the rest are never taken.
+  let reached =
+    (match indexWhere (\x -> match x with | ((Top.Any _, _), _, _) -> True | _ -> False) tops with
+     | Just i -> V.take tops (i + 1)
+     | None -> tops)
+  in
+  let names =
+    \x ->
+      match x with
+      | ((Top.Any (Local _ _), _), _, _) -> True
+      | ((_, ns), _, _) -> not (V.isEmpty ns)
+  in match V.find
+       (\x ->
+         match x with
+         | ((Top.Unsaid _, _), _, _) -> True
+         | _ -> False)
+       reached with
+     | Just ((Top.Unsaid kind, _), _, _) -> unmapped kind
+     | _ ->
+         if V.any (\x -> match x with | (_, g, _) -> g) reached then unmapped "guard"
+         -- The scrutinee is named first where an arm names it, unless it is a
+         -- name already.
+         else if V.any names reached and not (isVar scrut) then
+           Core.Let "s" scrut (cases env (V.pushBack ctx (Anon "s")) (Core.Var 0 "s") t reached)
+         else cases env ctx scrut t reached
+
+fun isVar (c : Core) : Bool = match c with | Core.Var _ _ -> True | _ -> False
+
+-- The arms, each of a constructor but perhaps the last, as a `case`.
+fun cases
+    (env : Env)
+    (ctx : [Slot])
+    (scrut : Core)
+    (t : Type)
+    (arms : [((Top, [(Int, String)]), Bool, [Slot] -> Core)])
+    : Core =
+  -- An arm's body, in the scope of `slots` more than `ctx`: with the names
+  -- its `as` gives what it matched, and its own if it matches anything.
+  let under =
+    \(names : [(Int, String)]) (k : [Slot] -> Core) (c : [Slot]) ->
+      V.foldr
+        (\n inner ->
+          \c2 ->
+            Core.Let
+              (snd n)
+              (shift (V.len c2 - V.len ctx) scrut)
+              (inner (V.pushBack c2 (Local (fst n) (snd n)))))
+        k
+        names
+        c
+  in
+  let catchAll = V.find (\x -> match x with | ((Top.Any _, _), _, _) -> True | _ -> False) arms in
+  match V.get arms 0 with
+  | Just ((Top.Any s, ns), _, k) ->
+      (match s with
+       | Local id n -> under (V.append ns [(id, n)]) k ctx
+       | _ -> under ns k ctx)
+  | _ ->
+      let ctors =
+        V.foldl
+          (\acc x ->
+            match x with
+            | ((Top.Ctor id name slots, ns), _, k) ->
+                if V.any (\y -> match y with | (i, n, _, _, _) -> i == id and n == name) acc then
+                  acc
+                else V.pushBack acc (id, name, slots, ns, k)
+            | _ -> acc)
+          []
+          arms
+      in
+      let isBool = t == Con "Bool" [] in
+      let head = \id name -> if isBool then Head.BoolLit (name == "True") else Head.Con id in
+      let alts =
+        V.map
+          (\x ->
+            match x with
+            | (id, name, slots, ns, k) ->
+                CaseAlt.CaseAlt
+                  (head id name)
+                  name
+                  (V.map slotName slots)
+                  (under ns k (V.append ctx slots)))
+          ctors
+      in
+      -- What no arm names, the arm that matches anything says, where there
+      -- is one.
+      let missing =
+        (match catchAll with
+         | None -> []
+         | Just ((Top.Any s, ns), _, k) ->
+             (match constructorsOf env t with
+              | None -> [unmappedAlt]
+              | Just vs ->
+                  V.concatMap
+                    (\(v : VariantSig) ->
+                      let id = M.unwrapOr (0 - 1) (H.lookup v.name env.ids) in
+                      let name = lastOf v.name in
+                      if V.any
+                        (\y -> match y with | (i, n, _, _, _) -> i == id and n == name)
+                        ctors then []
+                      else
+                        (let slots = V.map (\f -> Anon "_") v.fields in
+                         let named = (match s with | Local b n -> V.append ns [(b, n)] | _ -> ns) in
+                         [CaseAlt.CaseAlt
+                            (head id name)
+                            name
+                            (V.map slotName slots)
+                            (under named k (V.append ctx slots))]))
+                    vs)
+         | _ -> [])
+      in Core.Case scrut (V.append alts missing)
+
+-- An alternative standing for a `case` whose other constructors are not
+-- known.
+def unmappedAlt : CaseAlt = CaseAlt.CaseAlt (Head.Con (0 - 1)) "_" [] (unmapped "catch-all")
+
+-- Every constructor of a type, where it is a data type the unit knows.
+fun constructorsOf (env : Env) (t : Type) : Maybe [VariantSig] =
+  match t with
+  | Con "Bool" [] ->
+      Just [
+        VariantSig { name = "Bool.False", fields = [], labels = None },
+        VariantSig { name = "Bool.True", fields = [], labels = None }
+      ]
+  | Con name _ -> H.lookup name env.variants
+  | Tuple ts -> Just [VariantSig { name = "Tuple${show (V.len ts)}", fields = ts, labels = None }]
+  | _ -> None
+
+-- A named record's one constructor, and the type's arguments.
+fun recordOf (env : Env) (t : Type) : Maybe (VariantSig, [Type]) =
+  match t with
+  | Con name args ->
+      (match H.lookup name env.variants with
+       | Just vs ->
+           (match (V.len vs, V.get vs 0) with
+            | (1, Just (v : VariantSig)) -> if M.isSome v.labels then Just (v, args) else None
+            | _ -> None)
+       | None -> None)
+  | _ -> None
+
+fun labelsOf (v : VariantSig) : [String] = M.unwrapOr [] v.labels
+
+-- The labels of constructor `id`'s fields, where they are named, by the
+-- type `t` it builds.
+fun namedOf (env : Env) (id : Int) (t : Type) : Maybe [String] =
+  match resultOf t with
+  | Con name _ ->
+      M.andThen
+        (\(v : VariantSig) -> v.labels)
+        (M.andThen
+           (\vs -> V.find (\(v : VariantSig) -> H.lookup v.name env.ids == Just id) vs)
+           (H.lookup name env.variants))
+  | _ -> None
+
+-- What a constructor's type builds.
+fun resultOf (t : Type) : Type = match t with | Fun _ r _ -> resultOf r | other -> other
+
+-- A key of inference's tables, whose parts are a line each, as one line.
+fun spaced (key : String) : String = S.join " " (S.split "\n" key)
+
+fun constructor (env : Env) (v : VariantSig) : Core =
+  Core.Opaque (M.unwrapOr (0 - 1) (H.lookup v.name env.ids)) (lastOf v.name)
+
+fun conHead (env : Env) (v : VariantSig) : Head =
+  Head.Con (M.unwrapOr (0 - 1) (H.lookup v.name env.ids))
+
+-- A named record `base` with `fields` given again: taken apart, and built
+-- again of the fields given and those it had.
+fun updated
+    (env : Env)
+    (ctx : [Slot])
+    (base : TypedExpr)
+    (fields : [TypedExprField])
+    (v : VariantSig)
+    (targs : [Type])
+    : Core =
+  let a = env.a in
+  let labels = labelsOf v in
+  let n = V.len labels in
+  let inside = V.append ctx (V.map (\l -> Anon l) labels) in
+  Core.Case
+    (expr env ctx base)
+    [CaseAlt.CaseAlt
+       (conHead env v)
+       (lastOf v.name)
+       labels
+       (apps
+          (constructor env v)
+          (V.append
+             (V.map (typeOf env inside) targs)
+             (V.map
+                (\j ->
+                  let label = V.getOr "" labels j in
+                  match V.find (\f -> typedNameText a (typedExprFieldName a f) == label) fields with
+                  | Just f -> expr env inside (typedExprFieldValue a f)
+                  | None -> Core.Var (n - 1 - j) label)
+                (V.range 0 n))))]
+
+-- --- declarations ------------------------------------------------------------
+
+fun schemeOfId (env : Env) (id : Int) : Core =
+  match H.lookup id env.schemes with
+  | Just sc -> schemeType env [] sc
+  | None -> unmapped "no-scheme"
+
+fun declDefs (env : Env) (d : TypedDecl) : [Def] =
+  match viewTypedDecl env.a d with
+  | TypedDeclView.Bind r -> bindDefs env "def" r.bind
+  | TypedDeclView.Attributed r -> declDefs env r.decl
+  | TypedDeclView.Trait r -> V.concatMap (bindDefs env "default") r.defaults
+  | TypedDeclView.Impl r -> V.concatMap (bindDefs env "method") r.methods
+  | _ -> []
+
+fun bindDefs (env : Env) (kind : String) (b : TypedBind) : [Def] =
+  match viewTypedBind env.a b with
+  | TypedBindView.Fun r ->
+      [Def {
+         kind,
+         name = nameOf env r.id,
+         unique = r.id,
+         ty = schemeOfId env r.id,
+         term =
+           Just (generic env [] r.id (\c -> lambdas env c r.params (\c2 -> expr env c2 r.body)))
+       }]
+  | TypedBindView.Pat r ->
+      (match simple env r.pat with
+       | Just (Local id name) ->
+           [Def {
+              kind,
+              name,
+              unique = id,
+              ty = schemeOfId env id,
+              term = Just (generic env [] id (\c -> expr env c r.value))
+            }]
+       | _ ->
+           [Def {
+              kind,
+              name = "_",
+              unique = 0 - 1,
+              ty = unmapped "top-level-pattern",
+              term = Just (unmapped "top-level-pattern")
+            }])
+
+-- What the unit declares of types, as it tells the units after it.
+fun typeDefs (env : Env) (types : TypeEnv) : [Def] =
+  let idOf = \name -> M.unwrapOr (0 - 1) (H.lookup name env.ids) in
+  let datas =
+    V.concatMap
+      (\(e : Entry [VariantSig]) ->
+        let arity =
+          M.unwrapOr
+            0
+            (M.andThen
+               (\(v : VariantSig) ->
+                 M.map (\(s : Scheme) -> V.len s.quant) (H.lookup v.name env.ctorSchemes))
+               (V.get e.value 0))
+        in V.append
+             [Def {
+                kind = "data",
+                name = e.key,
+                unique = idOf e.key,
+                ty = constructorType (V.map (\i -> Core.Type 0) (V.range 0 arity)) (Core.Type 0),
+                term = None
+              }]
+             (V.map
+                (\(v : VariantSig) ->
+                  Def {
+                    kind = "con",
+                    name = v.name,
+                    unique = idOf v.name,
+                    ty =
+                      (match H.lookup v.name env.ctorSchemes with
+                       | Just sc -> schemeType env [] sc
+                       | None -> unmapped "no-scheme"),
+                    term = None
+                  })
+                e.value))
+      types.variants
+  in
+  let effects =
+    V.concatMap
+      (\(e : Entry EffectInfo) ->
+        let params = e.value.params in
+        let quants = V.map (\i -> Quant (0 - 1) i (letter i)) (V.range 0 params) in
+        let applied =
+          apps
+            (typeCon env e.key)
+            (V.map (\i -> Core.Var (params - 1 - i) (letter i)) (V.range 0 params))
+        in V.append
+             [Def {
+                kind = "effect",
+                name = e.key,
+                unique = idOf e.key,
+                ty =
+                  constructorType
+                    (V.map (\i -> Core.Type 0) (V.range 0 params))
+                    (Core.LitTy Builtin.Effect),
+                term = None
+              }]
+             (V.map
+                (\(op : EffOp) ->
+                  Def {
+                    kind = "op",
+                    name = "${e.key}.${op.name}",
+                    unique = 0 - 1,
+                    ty =
+                      V.foldr
+                        (\i acc -> pi (letter i) Icit.Implicit (Core.Type 0) acc)
+                        (pi
+                           "_"
+                           Icit.Explicit
+                           (typeOf env quants op.arg)
+                           (Core.Comp
+                              (typeOf env (V.pushBack quants (Anon "_")) op.ret)
+                              (Core.Row [shift 1 applied] [])))
+                        (V.range 0 params),
+                    term = None
+                  })
+                e.value.ops))
+      types.effects
+  in
+  let aliases =
+    V.map
+      (\(e : Entry AliasDef) ->
+        let params = e.value.params in
+        let quants = V.map (\i -> Quant (0 - 1) i (letter i)) (V.range 0 params) in
+        Def {
+          kind = "alias",
+          name = e.key,
+          unique = idOf e.key,
+          ty = constructorType (V.map (\i -> Core.Type 0) (V.range 0 params)) (Core.Type 0),
+          term =
+            Just
+              (V.foldr
+                 (\i acc -> lam (letter i) (Just (Core.Type 0)) acc)
+                 (typeOf env quants e.value.body)
+                 (V.range 0 params))
+        })
+      types.aliases
+  in
+  let traits =
+    V.map
+      (\(e : Entry TraitShape) ->
+        Def {
+          kind = "trait",
+          name = e.key,
+          unique = idOf e.key,
+          ty =
+            constructorType
+              (V.map
+                 (\i ->
+                   if V.getOr False e.value.effectParams i then Core.LitTy Builtin.Effect
+                   else Core.Type 0)
+                 (V.range 0 e.value.params))
+              (Core.Type 0),
+          term = None
+        })
+      types.shapes
+  in
+  let shapes =
+    V.foldl (\h (e : Entry TraitShape) -> H.insert e.key e.value h) H.empty types.shapes
+  in
+  let methods =
+    V.map
+      (\(e : Entry Scheme) ->
+        let parts = S.split "\n" e.key in
+        let tr = V.getOr "" parts 0 in
+        Def {
+          kind = "method",
+          name = S.join "." parts,
+          unique = 0 - 1,
+          ty = schemeType env [] e.value,
+          term = Just (selector env tr (H.lookup tr shapes) (V.getOr "" parts 1) e.value)
+        })
+      types.methods
+  in
+  let impls =
+    V.map
+      (\(e : Entry ImplDef) ->
+        Def {
+          kind = "impl",
+          name = spaced e.key,
+          unique = e.value.dict,
+          ty = schemeType env [] e.value.scheme,
+          term = Just (unmapped "dictionary-record")
+        })
+      types.impls
+  in V.concat [datas, effects, aliases, traits, methods, impls]
+
+-- Method `m` of trait `tr`, of scheme `sc`: its field of the trait's
+-- dictionary, which is a data type of one constructor. A method generic in
+-- more than its trait's parameters, or asking for more than its trait, is
+-- not said yet: what its field holds is not read here.
+fun selector (env : Env) (tr : String) (shape : Maybe TraitShape) (m : String) (sc : Scheme)
+    : Core =
+  match (shape, M.andThen (\vs -> V.get vs 0) (H.lookup tr env.variants)) with
+  | (Just (s : TraitShape), Just (v : VariantSig)) ->
+      let labels = labelsOf v in
+      let n = V.len labels in
+      let q = V.len sc.quant in
+      (match indexWhere (\l -> l == m) labels with
+       | Just j ->
+           if q != s.params or V.len sc.preds != 1 then unmapped "method-with-generics-of-its-own"
+           else
+             V.foldr
+               (\i acc -> lam (letter i) (Just (kindOf (V.getOr VarKind.Plain sc.quant i))) acc)
+               (lam
+                  "d0"
+                  (M.map
+                     (predType env (V.map (\i -> Quant (0 - 1) i (letter i)) (V.range 0 q)))
+                     (V.get sc.preds 0))
+                  (Core.Case
+                     (Core.Var 0 "d0")
+                     [CaseAlt.CaseAlt
+                        (conHead env v)
+                        (lastOf v.name)
+                        labels
+                        (Core.Var (n - 1 - j) m)]))
+               (V.range 0 q)
+       | None -> unmapped "dictionary-field")
+  | _ -> unmapped "dictionary-field"
+
+-- Unit `r`, as inference typed it, `done`, with `theirs` what the units it
+-- depends on tell it of types: every declaration of it as the core says it.
+@pub fun unitDefs (r : Renamed) (done : Inferred) (theirs : [TypeEnv]) : [Def] =
+  let all = V.pushBack theirs done.types in
+  let items = V.append (V.concatMap (\(d : Declared) -> d.items) r.modules) r.depItems in
+  let ids =
+    V.foldl
+      (\h (i : Item) ->
+        if (i.kind == "t" or i.kind == "c") and not (S.isEmpty i.canon) then H.insert i.canon i.id h
+        else h)
+      H.empty
+      items
+  in
+  let env =
+    Env {
+      a = newEmptyArena (),
+      binders = r.binders,
+      ids,
+      variants =
+        V.foldl
+          (\h (t : TypeEnv) ->
+            V.foldl (\g (e : Entry [VariantSig]) -> H.insert e.key e.value g) h t.variants)
+          H.empty
+          all,
+      ctorSchemes =
+        V.foldl
+          (\h (t : TypeEnv) ->
+            V.foldl (\g (e : Entry Scheme) -> H.insert e.key e.value g) h t.ctors)
+          H.empty
+          all,
+      schemes = H.union done.schemes done.general,
+      generics = done.generics,
+      wheres = done.wheres,
+      numbers = H.fromVec done.numbers,
+      impls =
+        V.foldl
+          (\h (t : TypeEnv) ->
+            V.foldl
+              (\g (e : Entry ImplDef) -> H.insert e.value.dict "#impl.${spaced e.key}" g)
+              h
+              t.impls)
+          H.empty
+          all,
+      pending = []
+    }
+  in V.append
+       (typeDefs env (ownTypes theirs done.types))
+       (V.concatMap
+          (\p ->
+            match p with
+            | TypedProgram a root ->
+                V.concatMap (declDefs { env | a = a }) (typedModuleDecls a root))
+          done.typed)
+
+-- What `mine` says of types that none of `theirs` says: what inference
+-- tells the units after this one holds what it was told as well.
+fun ownTypes (theirs : [TypeEnv]) (mine : TypeEnv) : TypeEnv =
+  let told =
+    \(f : TypeEnv -> [String]) ->
+      V.foldl (\h (t : TypeEnv) -> V.foldl (\g k -> H.insert k True g) h (f t)) H.empty theirs
+  in
+  let fresh = \known k -> M.isNone (H.lookup k known) in
+  let variants = told (\(t : TypeEnv) -> V.map (\(e : Entry [VariantSig]) -> e.key) t.variants) in
+  let ctors = told (\(t : TypeEnv) -> V.map (\(e : Entry Scheme) -> e.key) t.ctors) in
+  let effects = told (\(t : TypeEnv) -> V.map (\(e : Entry EffectInfo) -> e.key) t.effects) in
+  let aliases = told (\(t : TypeEnv) -> V.map (\(e : Entry AliasDef) -> e.key) t.aliases) in
+  let shapes = told (\(t : TypeEnv) -> V.map (\(e : Entry TraitShape) -> e.key) t.shapes) in
+  let methods = told (\(t : TypeEnv) -> V.map (\(e : Entry Scheme) -> e.key) t.methods) in
+  let impls = told (\(t : TypeEnv) -> V.map (\(e : Entry ImplDef) -> e.key) t.impls) in
+  {
+    mine | variants = V.filter (\(e : Entry [VariantSig]) -> fresh variants e.key) mine.variants,
+    ctors = V.filter (\(e : Entry Scheme) -> fresh ctors e.key) mine.ctors,
+    effects = V.filter (\(e : Entry EffectInfo) -> fresh effects e.key) mine.effects,
+    aliases = V.filter (\(e : Entry AliasDef) -> fresh aliases e.key) mine.aliases,
+    shapes = V.filter (\(e : Entry TraitShape) -> fresh shapes e.key) mine.shapes,
+    methods = V.filter (\(e : Entry Scheme) -> fresh methods e.key) mine.methods,
+    impls = V.filter (\(e : Entry ImplDef) -> fresh impls e.key) mine.impls
+  }
+
+-- An arena with nothing in it, for the declarations no module's tables are
+-- read for.
+fun newEmptyArena () : TypedArena =
+  runSt (\() ->
+    match TypedProgram (freezeTyped (newTypedBuilder ())) 0 with
+    | TypedProgram a _ -> a)
+
+-- --- what it comes to --------------------------------------------------------
+
+-- Each construct written as a goal, by its kind, and each name written with
+-- no binder of its own -- a tuple's, an array's, a required trait's field,
+-- or a type or constructor the unit has no binder for -- by what it is.
+fun tally (c : Core) (acc : ([String], [String])) : ([String], [String]) =
+  let go = \x y -> tally x y in
+  let goAll = \xs y -> V.foldl (\z x -> tally x z) y xs in
+  match c with
+  | Core.Runtime (Note.Goal g) _ ->
+      if S.startsWith "unmapped:" g then (V.pushBack (fst acc) (S.drop g 9), snd acc) else acc
+  | Core.Opaque u name ->
+      if u == 0 - 1 then (fst acc, V.pushBack (snd acc) (encodedKind name)) else acc
+  | Core.Pi _ _ gr inType dom cod -> goAll [gr, inType, dom, cod] acc
+  | Core.Lam _ b -> go b acc
+  | Core.App f x -> go x (go f acc)
+  | Core.BoxTy x y -> go y (go x acc)
+  | Core.BoxIntro x -> go x acc
+  | Core.Unbox x -> go x acc
+  | Core.Let _ x y -> go y (go x acc)
+  | Core.GradeAdd x y -> go y (go x acc)
+  | Core.GradeMul x y -> go y (go x acc)
+  | Core.GradeRange x y -> go y (go x acc)
+  | Core.Case s alts ->
+      V.foldl (\z alt -> match alt with | CaseAlt.CaseAlt _ _ _ body -> go body z) (go s acc) alts
+  | Core.Runtime n x -> go x (match n with | Note.Binds _ (Just t) -> go t acc | _ -> acc)
+  | Core.Comp x y -> go y (go x acc)
+  | Core.Row ls ts -> goAll ts (goAll ls acc)
+  | Core.Handle b r ops ->
+      V.foldl
+        (\z o -> match o with | OpClause.OpClause _ _ _ body -> go body z)
+        (go r (go b acc))
+        ops
+  | _ -> acc
+
+fun encodedKind (name : String) : String =
+  if S.startsWith "Tuple" name then "tuple"
+  else if S.startsWith "#array" name then "array-literal"
+  else if S.startsWith "#super." name then "required-trait-field"
+  else "name:${name}"
+
+-- A name of no binder is counted as one, and by its name too.
+fun kindOfName (k : String) : String = if S.startsWith "name:" k then "type-or-constructor" else k
+
+fun nameOnly (k : String) : [String] = if S.startsWith "name:" k then [S.drop k 5] else []
+
+-- How many of each, most first.
+fun counted (kinds : [String]) : [(String, Int)] =
+  sortOn
+    (\x -> (0 - snd x, fst x))
+    (H.toVec (V.foldl (\h k -> H.insert k (M.unwrapOr 0 (H.lookup k h) + 1) h) H.empty kinds))
+
+fun countsText (cs : [(String, Int)]) : String =
+  if V.isEmpty cs then "none" else S.join ", " (V.map (\x -> "${fst x} ${show (snd x)}") cs)
+
+-- A goal shown as the kind it stands for, `?kind`.
+fun goalsShown (c : Core) : Core =
+  transform c 0 (\x d ->
+    match x with
+    | Core.Runtime (Note.Goal g) Core.Error ->
+        Just (Core.Opaque (0 - 1) ("?" ++ (if S.startsWith "unmapped:" g then S.drop g 9 else g)))
+    | _ -> None)
+
+-- What `MEADOWBOOT_STRATA` writes of package `pkg`: what was not said, and
+-- what was said with names of no binder, counted, then each declaration,
+-- its type and its definition.
+@pub fun dumped (pkg : String) (defs : [Def]) : String =
+  let both =
+    V.foldl
+      (\acc (d : Def) -> tally d.ty (match d.term with | Just t -> tally t acc | None -> acc))
+      ([], [])
+      defs
+  in
+  let header =
+    [
+      "-- Strata's core for ${pkg}, from MeadowBoot's typed tree (docs/2LTT.md, L1)",
+      "-- declarations: ${show (V.len defs)}",
+      "-- unmapped: ${countsText (counted (fst both))}",
+      "-- names without a binder: ${countsText (counted (V.map kindOfName (snd both)))}",
+      "-- of them, by name: ${countsText (V.take (counted (V.concatMap nameOnly (snd both))) 12)}"
+    ]
+  in
+  let lines =
+    V.map
+      (\(d : Def) ->
+        "${d.kind} ${d.name} : ${shown False (goalsShown d.ty)}"
+          ++ (match d.term with
+           | Just t -> "\n  = ${shown False (goalsShown t)}"
+           | None -> ""))
+      defs
+  in S.join "\n" (V.append header lines) ++ "\n"

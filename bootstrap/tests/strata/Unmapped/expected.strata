@@ -1,0 +1,15 @@
+-- Strata's core for Unmapped, from MeadowBoot's typed tree (docs/2LTT.md, L1)
+-- declarations: 5
+-- unmapped: structural-record 2, guard 1, literal-pattern 1, nested-pattern 1, recursive-let 1
+-- names without a binder: none
+-- of them, by name: none
+def depth : Maybe (Maybe Int) -> Int
+  = \m -> ?nested-pattern
+def small : Int -> Bool
+  = \n -> ?guard
+def named : Int -> String
+  = \n -> ?literal-pattern
+def corner : {a : [] Type} -> {b : [] Type} -> {c : [] Effect} -> () -> ?structural-record ! c
+  = \a -> \b -> \c -> \_ -> ?structural-record
+def count : Int -> Int
+  = \n -> let go = \a -> \k -> case == Int (#impl.Std.Cmp.PartialEq Int) k 0 of { True -> 0; False -> + Int (#impl.Std.Ops.Add Int) 1 (?recursive-let (- Int (#impl.Std.Ops.Sub Int) k 1)) } in go n
