@@ -169,12 +169,23 @@ L0's Strata imports nothing from Lingua.
 Strata is to be built from Idyll's kernel, which Idyll's `front/` already has
 in Meadow. Measured against `front/`'s imports, the kernel splits as follows.
 
-- **Clean to extract**: `Grade`, `Core`, `Value`, `Tc` (metavariables),
+- **Clean to extract once `Tc` is split** (below): `Grade`, `Core`, `Value`,
   `Ctx`, `Eval` (NbE), `Unify` (pattern unification), `Termination`
   (size-change, with transparent unfolding), `Positivity`, and `Usage`.
   `Hir`'s `Icit` and `Literal` move down with them.
   - `Positivity` imports `Lingua.Lang (Meta)` for spans, the one Lingua
     import among them. It takes Strata's own span type before it moves.
+- **Not clean: `Tc`, which every kernel module takes.** `Tc s` is the
+  elaborator's whole state in one record: the metavariables and the tables
+  the kernel reads (`constants`, `globals`, `transparent`, `prunes`,
+  `positive` and the rest), and also the renamed program (`HirArena`), the
+  elaborating function (typed with `Elab.Cx`), deferred source expressions,
+  and `Lingua.Lang.Meta` spans in its errors, holes and goals. So `Eval`,
+  `Unify`, `Termination` and `Positivity` reach `Elab` and Lingua through it.
+  `Tc` is split first: a kernel record holding what those four modules read,
+  with the span abstracted, inside the elaborator's own record holding the
+  rest. Kernel errors leave through a callback or a returned list.
+  `Positivity` also needs `Scc`, which moves with it.
 - **Not clean**: `Matching`, the elaboration to case trees. It imports about
   twenty functions from `Elab` (`check`, `infer`, `insert`, `freshMeta`,
   `gradeFits`, `settleGrade` and others). The proposal is to split it:
@@ -204,8 +215,8 @@ grades to Meadow.
 Idyll's session in Idyll's repository):
 
 1. **Refactor inside Idyll's repository** until the kernel modules import
-   nothing from `Elab` or from Lingua. That means the span type, the
-   `Matching` split, and moving `Icit` and `Literal` down. Idyll's Rust
+   nothing from `Elab` or from Lingua. That means splitting `Tc`, the span
+   type, the `Matching` split, and moving `Icit` and `Literal` down. Idyll's Rust
    compiler and `front/` stay in parity at every step.
 2. **Move those modules into `Strata/` verbatim.** `front/` then depends on
    Strata by revision. Nothing changes meaning in the move.
