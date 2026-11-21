@@ -889,7 +889,14 @@ _Proves_: the elaborator can be replaced without changing anything.
   Idyll's 10ecf25 and `Cases` at d73d4af. `front/` depending on Strata by
   revision, with its parity suite green, is Idyll's next step.
 - **Then the levels.** Strata's core (plain Meadow data, no `lang!`) gains
-  two universes, `Code`, and quote and splice. Not started.
+  two universes, `Code`, and quote and splice. Done in the kernel: `Type n`
+  stays the run-time universe, and `Core` gains `MetaType n`, `Code a`,
+  `Quote t` and `Splice c`. `Value` gains `MetaType`, `Code` and `Quote`, and
+  a splice of a neutral is an elimination on its spine, `Elim.Splice`, as in
+  Kovács's staged 2LTT. Evaluation gives `$(quote { t })` ≡ `t` and
+  `quote { $c }` ≡ `c`, and unification has η for code. The kernel has no
+  typing judgement of its own, so the typing rules belong to each front
+  end's elaborator. Checking stages is L9's.
 - **Then MeadowBoot's elaboration into it.** Under the `strata` option,
   MeadowBoot's typed tree elaborates into the core, with everything at run
   time and grade ω, and staging is the identity. Begun ahead of the levels:

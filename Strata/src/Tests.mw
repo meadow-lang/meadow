@@ -1,8 +1,19 @@
 -- Strata's tests, compiled only by `meadow test`.
 
-use Std.Test (assertEq)
+use Std.Test (assertEq, assertTrue, assertFalse)
+use Std.St (getRef)
+use Std.Collections.Vector as V
 use Strata.Level (Level, levelOf, compTime, notYet)
 use Strata.Level.Level.*
+use Strata.Core (Core, Builtin, Prim, shown)
+use Strata.Hir (Icit, Literal)
+use Strata.Grade as G
+use Strata.Value (Value, Elim)
+use Strata.Value as Va
+use Strata.Eval (eval, quote, vsplice)
+use Strata.Unify (unify, subtype)
+use Strata.Tc (MetaInfo, Origin)
+use Strata.Tc as T
 
 @test
 fun unmarkedIsRunTime () = assertEq (levelOf []) Run "a definition with no attributes"
@@ -24,3 +35,180 @@ fun notYetNamesWhat () =
     (notYet "`power`")
     "`power` is marked `@compTime`, and compile-time definitions are not supported yet (docs/2LTT.md, L1 and L9)"
     "the refusal names the definition"
+
+-- --- the two levels in the kernel --------------------------------------------
+
+fun int () : Core = Core.LitTy Builtin.Int
+
+fun lit (n : Int) : Core = Core.Lit (Literal.Int n)
+
+fun plus (a : Core) (b : Core) : Core = Core.App (Core.App (Core.Prim Prim.IntAdd) a) b
+
+-- A term evaluated in a context of `vars`, the last innermost, and read back.
+fun normalIn (vars : [String]) (c : Core) : String ! { St s | e } =
+  let tc = T.new () 0 in
+  let env =
+    V.foldl
+      (\e i -> Va.push e (Va.vvar i (V.getOr "_" vars i)))
+      (Va.emptyEnv ())
+      (V.range 0 (V.len vars))
+  in shown False (quote tc (Va.envLen env) (eval tc env c))
+
+@test
+fun theLevelsArePrinted () =
+  let a = assertEq (shown False (Core.MetaType 0)) "MetaType" "the compile-time universe" in
+  let b =
+    assertEq (shown False (Core.Code (Core.MetaType 1))) "Code (MetaType 1)" "a level above"
+  in
+  let c = assertEq (shown False (Core.Code (int ()))) "Code Int" "code of a run-time type" in
+  let arrow =
+    Core.Pi
+      "_"
+      Icit.Explicit
+      (Core.GradeLit G.default)
+      (Core.GradeLit G.defaultInType)
+      (Core.Code (int ()))
+      (Core.Code (int ()))
+  in
+  let d = assertEq (shown False arrow) "Code Int -> Code Int" "binding like an application" in
+  let e =
+    assertEq (shown False (Core.Quote (plus (Core.Var 0 "x") (lit 1)))) "quote { x + 1 }" "a quote"
+  in
+  let f = assertEq (shown False (Core.Splice (Core.Var 0 "x"))) "$x" "a splice of a variable" in
+  let g =
+    assertEq
+      (shown False (Core.Splice (Core.App (Core.Var 1 "f") (Core.Var 0 "x"))))
+      "$(f x)"
+      "of an application"
+  in assertEq
+       (shown False (Core.Quote (plus (Core.Splice (Core.Var 0 "x")) (lit 1))))
+       "quote { $x + 1 }"
+       "a splice inside a quote"
+
+@test
+fun aSpliceOfAQuoteIsWhatWasQuoted () =
+  let a =
+    assertEq
+      (normalIn [] (Core.Splice (Core.Quote (plus (lit 2) (lit 3)))))
+      "5"
+      "$(quote { 2 + 3 })"
+  in
+  let b =
+    assertEq (normalIn ["x"] (Core.Splice (Core.Quote (Core.Var 0 "x")))) "x" "$(quote { x })"
+  in
+  let quoted = Core.Let "c" (Core.Quote (lit 7)) (plus (Core.Splice (Core.Var 0 "c")) (lit 1)) in
+  assertEq (normalIn [] quoted) "8" "code let-bound and spliced"
+
+@test
+fun aQuoteOfASpliceIsTheCode () =
+  let a =
+    assertEq (normalIn ["c"] (Core.Quote (Core.Splice (Core.Var 0 "c")))) "c" "quote { $c }"
+  in
+  let b =
+    assertEq
+      (normalIn ["x"] (Core.Quote (Core.Var 0 "x")))
+      "quote { x }"
+      "a quote of a variable stays"
+  in assertEq
+       (normalIn [] (Core.Lam "c" (Core.Quote (Core.Splice (Core.Var 0 "c")))))
+       "\\c -> c"
+       "under a binder"
+
+@test
+fun aNeutralSpliceIsReadBack () =
+  let a =
+    assertEq (normalIn ["c"] (Core.Splice (Core.Var 0 "c"))) "$c" "a splice of a variable waits"
+  in
+  let b =
+    assertEq
+      (normalIn ["f", "x"] (Core.Splice (Core.App (Core.Var 1 "f") (Core.Var 0 "x"))))
+      "$(f x)"
+      "of an application"
+  in
+  let c =
+    assertEq
+      (normalIn ["f", "x"] (Core.App (Core.Splice (Core.Var 1 "f")) (Core.Var 0 "x")))
+      "$f x"
+      "applied"
+  in
+  let tc = T.new () 0 in
+  let spine = Value.Rigid 0 "c" [Elim.Splice] in
+  let d = assertEq (shown False (quote tc 1 spine)) "$c" "a splice on the spine" in
+  assertEq (shown False (quote tc 1 (Value.Quote spine))) "c" "and a quote of it"
+
+@test
+fun codeHasEtaBothWays () =
+  let tc = T.new () 0 in
+  let c = Va.vvar 0 "c" in
+  let env = Va.push (Va.emptyEnv ()) c in
+  let etaExpanded = eval tc env (Core.Quote (Core.Splice (Core.Var 0 "c"))) in
+  let a = assertTrue (unify tc 1 etaExpanded c) "quote { $c } is c" in
+  let b = assertTrue (unify tc 1 c etaExpanded) "c is quote { $c }" in
+  -- a quote not made by `eval`, which `force` takes off
+  let unreduced = Value.Quote (Value.Rigid 0 "c" [Elim.Splice]) in
+  let d = assertTrue (unify tc 1 unreduced c) "a quote of c's splice, on the left" in
+  let e = assertTrue (unify tc 1 c unreduced) "and on the right" in
+  -- a quote of what is not a splice yet: unified as one, which solves it
+  let code = Value.Opaque 41 "code" [] in
+  let m = T.newMeta tc (MetaInfo.MetaInfo (getRef tc.at) (Origin.Inferred "a test") None) in
+  let j = assertTrue (unify tc 0 (Value.Quote (Va.vmeta m)) code) "quote { ?m } =? code" in
+  let k = assertEq (shown False (quote tc 0 (Va.vmeta m))) "$code" "solves ?m as $code" in
+  let n = T.newMeta tc (MetaInfo.MetaInfo (getRef tc.at) (Origin.Inferred "a test") None) in
+  let o = assertTrue (unify tc 0 code (Value.Quote (Va.vmeta n))) "code =? quote { ?n }" in
+  let q = assertEq (shown False (quote tc 0 (Va.vmeta n))) "$code" "the other way round" in
+  let x = Va.vvar 1 "x" in
+  let f = assertTrue (unify tc 2 (vsplice (Value.Quote x)) x) "$(quote { x }) is x" in
+  let g =
+    assertTrue
+      (unify tc 2 (Value.Rigid 0 "c" [Elim.Splice]) (Value.Rigid 0 "c" [Elim.Splice]))
+      "a splice is itself"
+  in
+  let h = assertFalse (unify tc 2 (Value.Quote x) c) "quote { x } is not c" in
+  let i =
+    assertFalse
+      (unify tc 2 (Value.Quote (Value.Lit (Literal.Int 1))) (Value.Lit (Literal.Int 1)))
+      "nor code a value"
+  in assertFalse
+       (unify
+          tc
+          2
+          (Value.Quote (Value.Lit (Literal.Int 1)))
+          (Value.Quote (Value.Lit (Literal.Int 2))))
+       "quote { 1 } is not quote { 2 }"
+
+@test
+fun codeUnifies () =
+  let tc = T.new () 0 in
+  let m = T.newMeta tc (MetaInfo.MetaInfo (getRef tc.at) (Origin.Inferred "a test") None) in
+  let intTy = Value.LitTy Builtin.Int in
+  let a =
+    assertTrue (unify tc 0 (Value.Code (Va.vmeta m)) (Value.Code intTy)) "Code ?m =? Code Int"
+  in
+  let b = assertEq (shown False (quote tc 0 (Va.vmeta m))) "Int" "solves ?m as Int" in
+  let c =
+    assertFalse
+      (unify tc 0 (Value.Code intTy) (Value.Code (Value.LitTy Builtin.Bool)))
+      "Code Int is not Code Bool"
+  in
+  let d = assertFalse (unify tc 0 (Value.Code intTy) intTy) "nor Int" in
+  let e = assertTrue (unify tc 0 (Value.MetaType 0) (Value.MetaType 0)) "MetaType is MetaType" in
+  let f = assertFalse (unify tc 0 (Value.MetaType 0) (Value.Type 0)) "and not Type" in
+  let g =
+    assertTrue
+      (subtype tc 0 (Value.MetaType 0) (Value.MetaType 1))
+      "a smaller compile-time universe in a larger"
+  in
+  let n = T.newMeta tc (MetaInfo.MetaInfo (getRef tc.at) (Origin.Inferred "a test") None) in
+  let h =
+    assertTrue
+      (unify tc 0 (Va.vmeta n) (Value.Quote (Value.Lit (Literal.Int 1))))
+      "?n =? quote { 1 }"
+  in
+  let i = assertEq (shown False (quote tc 0 (Va.vmeta n))) "quote { 1 }" "solves ?n as the quote" in
+  let k = T.newMeta tc (MetaInfo.MetaInfo (getRef tc.at) (Origin.Inferred "a test") None) in
+  let waiting = Value.Quote (Va.vmeta k) in
+  let j =
+    assertTrue (unify tc 0 (Va.vmeta k) (Value.Opaque 40 "code" [Elim.Splice])) "?k =? $code"
+  in
+  let o = assertEq (shown False (quote tc 0 (Va.vmeta k))) "$code" "solves ?k as the splice" in
+  assertEq (shown False (quote tc 0 waiting)) "code" "and quote { ?k } is code from then on"

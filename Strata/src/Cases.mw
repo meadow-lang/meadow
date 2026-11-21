@@ -45,6 +45,9 @@ use Std.Maybe.Maybe.*
   | Core.GradeRange a b -> mentions a i or mentions b i
   | Core.BoxIntro a -> mentions a i
   | Core.Unbox a -> mentions a i
+  | Core.Code a -> mentions a i
+  | Core.Quote a -> mentions a i
+  | Core.Splice a -> mentions a i
   | Core.Runtime _ a -> mentions a i
   | Core.Comp a e -> mentions a i or mentions e i
   | Core.Handle b r ops -> mentions b i or mentions r i or V.any (\o -> match o with | OpClause.OpClause _ _ _ body -> mentions body i) ops

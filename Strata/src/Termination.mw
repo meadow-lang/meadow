@@ -441,6 +441,11 @@ fun term (w : Walk s) (c : Core) (lvl : Int) =
   | Core.GradeRange a b -> V.foldl (\acc x -> term w x lvl) () [a, b]
   | Core.BoxIntro a -> term w a lvl
   | Core.Unbox a -> term w a lvl
+  -- (a call in a quote is code, which runs only where it is spliced: looked
+  -- at all the same, as if it ran)
+  | Core.Code a -> term w a lvl
+  | Core.Quote a -> term w a lvl
+  | Core.Splice a -> term w a lvl
   | Core.Runtime _ a -> term w a lvl
   | _ -> ()
 

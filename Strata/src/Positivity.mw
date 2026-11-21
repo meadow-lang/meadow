@@ -133,6 +133,8 @@ fun negative (tc : Tc s f p) (l : Int) (v0 : Value) (target : Target) : Maybe (S
             | None -> negative tc (l + 1) (apply tc cod (Va.vvar l "_")) target)
        | Value.BoxTy _ a -> negative tc l a target
        | Value.Comp a _ -> negative tc l a target
+       -- code of a type is as positive as the type
+       | Value.Code a -> negative tc l a target
        | Value.Opaque u outer sp ->
            if isData target u then inArguments tc l sp target
            else if Hm.member u (getRef tc.datas) or Hm.member u (getRef tc.natives) then
@@ -187,6 +189,8 @@ fun mentions (tc : Tc s f p) (l : Int) (v0 : Value) (target : Target) : Maybe St
   | Value.Lam _ body -> mentions tc (l + 1) (apply tc body (Va.vvar l "_")) target
   | Value.BoxTy _ a -> mentions tc l a target
   | Value.BoxIntro a -> mentions tc l a target
+  | Value.Code a -> mentions tc l a target
+  | Value.Quote a -> mentions tc l a target
   | Value.Comp a e -> firstOf tc l [a, e] target
   | Value.Row (Row.Row ls ts) -> firstOf tc l (V.map snd (V.append ls ts)) target
   | Value.Rigid k name sp -> if isParam target k then Just name else spineMentions tc l sp target
@@ -203,6 +207,7 @@ fun spineMentions (tc : Tc s f p) (l : Int) (sp : [Elim]) (target : Target) : Ma
           (match e with
            | Elim.App a -> mentions tc l a target
            | Elim.Unbox -> None
+           | Elim.Splice -> None
            | Elim.Case env alts ->
                V.foldl
                  (\acc2 alt ->
