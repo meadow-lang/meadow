@@ -1,0 +1,5 @@
+@pub data Shape = Dot Int
+
+@pub effect Ask {
+  ask : () -> Int
+}

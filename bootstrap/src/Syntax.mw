@@ -324,8 +324,10 @@ use Std.Result.Result.*
     TCon = name:("upper" | "mac_upper") quals:TQual* args:TAtom*
     TAtom = paren:TParen | array:TArray | brack:TBrack | recTy:RecTy | var:("lower" | "mac_lower")
       | name:("upper" | "mac_upper") quals:TQual*
-    -- `M.Ty`: the type `Ty` of the module `M` qualifies.
-    TQual = "." name:"upper"
+    -- `M.Ty`: the type `Ty` of the module `M` qualifies. A `!` after it -- a
+    -- result with its effects, `M.Ty ! { St s | e }` -- makes `Ty` a name on
+    -- a path a `!` ends, as it makes `M` one: either kind, then.
+    TQual = "." name:("upper" | "mac_upper")
     HeadTy = paren:TParen
       | array:TArray
       | brack:TBrack

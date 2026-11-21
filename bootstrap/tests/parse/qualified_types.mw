@@ -1,0 +1,27 @@
+-- A type named through the module that qualifies it, `O.Meta`, with the
+-- effects of a result after it: a `!` after a path makes each name on it a
+-- macro's to the lexer, the qualified type's last name too.
+
+use Std.Maybe as O
+
+fun withRow (x : Int) : O.Meta ! { St s | e } = x
+
+fun noRow (x : Int) : O.Meta = x
+
+fun unqualified (x : Int) : Meta ! { St s | e } = x
+
+fun rowVar (x : Int) : O.Meta ! e = x
+
+fun oneLabel (x : Int) : O.Meta ! Io = x
+
+fun deeper (x : Int) : A.B.Meta ! { St s | e } = x
+
+fun inParam (g : Int -> O.Meta ! { St s | e }) : Int = 0
+
+fun annotated (x : O.Meta) : O.Meta ! { Io } = x
+
+fun nested (x : Int) : Maybe O.Meta ! { St s | e } = x
+
+fun nestedTwice (x : Int) : Result O.Meta O.Other ! { St s | e } = x
+
+fun arrow (x : Int) : Int -> O.Meta ! { St s | e } = x
