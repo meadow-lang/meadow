@@ -1152,6 +1152,17 @@ _Done when_: every shared function in Std passes.
 - **The `Matching` split may not be clean.** Case-tree compilation that
   calls back into an elaborator passed in as a record of functions has to
   serve two elaborators with different ideas of when a type is known.
+  A proposed mitigation splits by the kind of match instead of stretching
+  one interface over both:
+  - **Plain matches** are compiled after inference. Meadow's ordinary
+    run-time matches refine no types, so they can become case trees once
+    types are solved, which is when `Exhaust` runs today. No elaborator is
+    passed in.
+  - **Dependent matches** take the interleaved path, with the elaborator
+    passed in as a record. These are Idyll's matches and Meadow's opt-in
+    matches on grade-0 indices, where the match refines types as it goes.
+    Meadow's opt-in ones already come with written signatures, so their
+    types are known when the match is checked.
 - **Reflected semantics** breaks the opacity of `Code` that staging's
   soundness rests on. Doing it without losing that is open research.
 - **The oracle disappears.** With the Rust front end deleted, the
