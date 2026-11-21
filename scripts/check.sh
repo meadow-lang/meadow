@@ -91,8 +91,14 @@ for example in examples/*/; do
   cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- test "$example"
 done
 
+# Strata, the kernel of Meadow's two levels (docs/2LTT.md): its own tests, on
+# both runtimes, since MeadowBoot runs it natively on Silo.
+step "meadow test Strata"
+cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- test Strata
+cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- test --runtime silo Strata
+
 step "meadow fmt --check"
-cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- fmt --check lib/Std examples
+cargo run --quiet --manifest-path buildtools/Cargo.toml -p meadow -- fmt --check lib/Std examples Strata
 
 # Every Meadow source in the repository, as the editor sees it: opened in the
 # language server, which must mark nothing. A build passing says the compiler

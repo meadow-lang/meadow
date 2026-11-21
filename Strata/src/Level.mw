@@ -1,0 +1,30 @@
+-- Strata.Level: the two levels a definition can be at, and how its level is
+-- decided.
+--
+-- A definition's level is fixed before its body is elaborated, as in
+-- Kovács's staged two-level type theory, where every definition says its
+-- stage. Meadow's default is run time, so every definition written today is
+-- what it was: only one that asks to be is at compile time.
+
+use Std.Collections.Vector as V
+
+-- Run time is Meadow as it is; compile time is a total, pure, dependent
+-- type theory the compiler runs, gone before the program runs.
+@derive(Debug, PartialEq, Eq)
+@pub data Level = Run | Compile
+
+use Level.*
+
+-- The attribute that puts a definition at compile time: `@compTime`.
+@pub def compTime : String = "compTime"
+
+-- A definition's level, from the names of the attributes written on it.
+-- One whose signature mentions a compile-time type is at compile time too;
+-- that is decided where signatures are checked, which is not here yet.
+@pub fun levelOf (attributes : [String]) : Level =
+  if V.elem compTime attributes then Compile else Run
+
+-- What a front end says of a definition at compile time while it has no
+-- compile-time level to elaborate it at: that it cannot compile one yet.
+@pub fun notYet (what : String) : String =
+  "${what} is marked `@compTime`, and compile-time definitions are not supported yet (docs/2LTT.md, L1 and L9)"

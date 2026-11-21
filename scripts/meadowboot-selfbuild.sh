@@ -33,11 +33,13 @@ case "$(uname -s)" in MINGW* | MSYS* | CYGWIN*) exe=".exe" ;; esac
 rm -rf "$work"
 mkdir -p "$work"
 
-# A fresh copy of MeadowBoot's sources, for stage `$1` to compile.
+# A fresh copy of MeadowBoot's sources, for stage `$1` to compile, with
+# Strata beside it, where MeadowBoot's manifest finds it (`../Strata`).
 fresh() {
-  mkdir -p "$work/$1/MeadowBoot"
+  mkdir -p "$work/$1/MeadowBoot" "$work/$1/Strata"
   cp -r "$root/bootstrap/src" "$root/bootstrap/Meadow.toml" "$root/bootstrap/Meadow.lock" \
     "$work/$1/MeadowBoot/"
+  cp -r "$root/Strata/src" "$root/Strata/Meadow.toml" "$work/$1/Strata/"
 }
 cut_of() { echo "$work/$1/MeadowBoot/target/release/link/program.cut"; }
 exe_of() { echo "$work/$1/MeadowBoot/target/release/link/target/release/native/silo/program$exe"; }

@@ -66,6 +66,7 @@ use MeadowBoot.Core (CoreProgram, joinedUnits)
 use MeadowBoot.Solve (TypeEnv, noTypes, Entry)
 use Std.Macro (Reflect, Datum, toDatum, fromDatum)
 use MeadowBoot.Packed (pack, unpack)
+use Strata.Level (Level, levelOf, notYet)
 use Lingua.Query (jsonDatum)
 use Std.Json as J
 use Std.Json (Json)
@@ -1916,6 +1917,9 @@ make! {
       checked : Bool =
         True
           "stop a build at whatever is wrong with a unit -- a name nothing binds, types that do not agree -- where it otherwise stops only at a `main` that is not one"
+      strata : Bool =
+        False
+          "ask Strata, the kernel of Meadow's two levels (docs/2LTT.md), each declaration's level: every one is at run time until there is a compile-time level, so one marked `@compTime` is refused"
       entry : Maybe String =
         None
           "a value at the root the program answers, in place of `result` or of running `main`"
@@ -2060,22 +2064,28 @@ def stdLayout : Int = 2
 
 -- What a unit's compile depends on of its options: each that the build's
 -- `compile` is keyed by, which `entry`, the link's, is not.
+-- `strata` is said only when it is on, so a key made without it is the key
+-- it was before there was such an option.
 fun keyOf (o : UnitsOptions) : String =
-  S.join "," [
-    show o.opt,
-    show o.dictionaries,
-    show o.kind,
-    o.os,
-    o.arch,
-    o.backend,
-    show o.test,
-    S.join ";" o.flags,
-    show o.macros,
-    show o.whole,
-    show o.strict,
-    show o.checked,
-    show o.positions
-  ]
+  S.join
+    ","
+    (V.append
+       [
+         show o.opt,
+         show o.dictionaries,
+         show o.kind,
+         o.os,
+         o.arch,
+         o.backend,
+         show o.test,
+         S.join ";" o.flags,
+         show o.macros,
+         show o.whole,
+         show o.strict,
+         show o.checked,
+         show o.positions
+       ]
+       (if o.strata then ["strata"] else []))
 
 -- The options, and the unit's sources -- by their paths in it, so that where
 -- the library is installed does not matter -- that a compile of it was of.
@@ -2361,6 +2371,7 @@ fun compiling (o : UnitsOptions) (u : Given Interface) (clk : Clock) =
                  ))
             in
             let m3b = mark "expanded" in
+            let leveled = if o.strata then compileTimeRefused asts else [] in
             let made = H.fromVec (V.map (\a -> (fst a, True)) asts) in
             -- Its types inferred once, and lowered: its declarations of Cut
             -- are its object, written where the link reads them.
@@ -2394,8 +2405,8 @@ fun compiling (o : UnitsOptions) (u : Given Interface) (clk : Clock) =
               (o.checked and o.strict)
               o.positions
               mark with
-            | _ if not (V.isEmpty misread and V.isEmpty unexpanded) ->
-                Err (S.join "" (V.append misread unexpanded))
+            | _ if not (V.isEmpty misread and V.isEmpty unexpanded and V.isEmpty leveled) ->
+                Err (S.join "" (V.concat [misread, unexpanded, leveled]))
             -- A unit whose `main` is not one is not compiled, as the Rust
             -- compiler does not compile it: a `main` that answers a number
             -- would hand the runtime the number as the program's answer.
@@ -2460,6 +2471,25 @@ fun compiling (o : UnitsOptions) (u : Given Interface) (clk : Clock) =
                         macros = macrosOf (unitDir u) pkg asts,
                         bindings
                       })
+
+-- `strata`: each declaration of the unit's modules, asked of Strata for its
+-- level by the attributes written on it (`docs/2LTT.md`, L0). Every one is
+-- at run time until there is a compile-time level to elaborate one at, so
+-- one marked `@compTime` is refused, a line each.
+fun compileTimeRefused (asts : [(String, AstProgram)]) : [String] =
+  V.concatMap
+    (\x ->
+      match x with
+      | (file, ast) ->
+          (match ast with
+           | AstProgram a _ ->
+               V.concatMap
+                 (\y ->
+                   let names = V.map (\at -> astNameText a (astAttrName a at)) (fst y) in
+                   if levelOf names == Level.Compile then ["${file}: ${notYet "a declaration"}\n"]
+                   else [])
+                 (declsOf (Source { path = [], file, ast }))))
+    asts
 
 -- What the attributes of the unit's modules, `@!feature(…)` and the rest,
 -- say is wrong, each a line, as the Rust compiler refuses them: an attribute

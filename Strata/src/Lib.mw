@@ -1,0 +1,17 @@
+-- Strata: the kernel Meadow's two levels are checked by.
+--
+-- `docs/2LTT.md` is the plan. Meadow gains a compile-time level above the
+-- language it is today, a total dependent type theory, and opt-in erased
+-- dependent functions at run time; both are checked here. The core
+-- calculus, normalisation by evaluation, unification, termination and
+-- coverage, and staging are to come from Idyll's kernel, shared with Idyll,
+-- which owns that code; this package is where they will live, depending on
+-- no front end, so that both front ends can depend on it.
+--
+-- What it knows so far: the two levels, and how a definition's level is
+-- decided before its body is elaborated (`Level`).
+
+@pub mod Level
+
+@cfg(test)
+mod Tests

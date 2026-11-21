@@ -1,0 +1,26 @@
+-- Strata's tests, compiled only by `meadow test`.
+
+use Std.Test (assertEq)
+use Strata.Level (Level, levelOf, compTime, notYet)
+use Strata.Level.Level.*
+
+@test
+fun unmarkedIsRunTime () = assertEq (levelOf []) Run "a definition with no attributes"
+
+@test
+fun otherAttributesAreRunTime () =
+  assertEq (levelOf ["pub", "test", "derive"]) Run "attributes that say nothing of the level"
+
+@test
+fun compTimeIsCompileTime () =
+  assertEq (levelOf ["pub", compTime]) Compile "a definition marked `@compTime`"
+
+@test
+fun theAttributeIsCompTime () = assertEq compTime "compTime" "the attribute's name"
+
+@test
+fun notYetNamesWhat () =
+  assertEq
+    (notYet "`power`")
+    "`power` is marked `@compTime`, and compile-time definitions are not supported yet (docs/2LTT.md, L1 and L9)"
+    "the refusal names the definition"
