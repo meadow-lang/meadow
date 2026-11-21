@@ -4,8 +4,8 @@
 -- language it is today, a total dependent type theory, and opt-in erased
 -- dependent functions at run time; both are checked here. The kernel is
 -- Idyll's, shared with Idyll: its core calculus, normalisation by
--- evaluation, unification and termination are here, and coverage and
--- staging are to come. The package depends on no front end, so that both
+-- evaluation, unification, termination and dependent matching are here,
+-- and staging is to come. The package depends on no front end, so that both
 -- front ends can depend on it.
 --
 -- What it holds: the two levels, and how a definition's level is decided
@@ -15,7 +15,9 @@
 -- (`Hir`), terms (`Core`) and values (`Value`), the checker's state (`Tc`)
 -- and context (`Ctx`), normalisation by evaluation (`Eval`), unification
 -- (`Unify`), termination (`Termination`), strict positivity (`Positivity`),
--- usage (`Usage`), and strongly connected components (`Graph`).
+-- usage (`Usage`), strongly connected components (`Graph`), and the
+-- splitting of a variable into its constructors that dependent matching is
+-- built on (`Cases`).
 
 @pub mod Level
 @pub mod Grade
@@ -30,6 +32,7 @@
 @pub mod Positivity
 @pub mod Usage
 @pub mod Graph
+@pub mod Cases
 
 @cfg(test)
 mod Tests

@@ -1,0 +1,239 @@
+-- moved from Idyll front/ at d73d4af
+--
+-- Splitting a variable into the constructors it could be, the part of
+-- dependent matching (Cockx & Abel, "Elaborating Dependent (Co)pattern
+-- Matching", ICFP 2018) that is the kernel's: a constructor's fields bound
+-- as new variables, and the variable unified with the constructor applied
+-- to them, the type's indices with the constructor's (`instantiate`). That
+-- unification (`unifyIndices`) solves the context's own variables, not
+-- metavariables: matching `xs : Vec n a` against `Cons x rest` defines `n`
+-- as `S m`, in the goal and in every other type (`refine`). Where it finds
+-- two different constructors, the case cannot happen.
+--
+-- A front end's match compiler, which reads its own patterns and decides
+-- where to split, is its own (Idyll's is `Matching`); this is what it
+-- splits with.
+
+use Std.St (getRef)
+use Strata.Core (Core, CaseAlt, OpClause)
+use Strata.Core as C
+use Strata.Value (Value, Elim, Env)
+use Strata.Value as Va
+use Strata.Tc (Tc, Meta, CtorInfo)
+use Strata.Tc as T
+use Strata.Eval (force, apply, eval, quote, toPoly)
+use Strata.Unify (unify)
+use Strata.Ctx (Ctx)
+use Strata.Ctx as X
+use Std.Collections.Vector as V
+use Std.String as S
+use Std.Collections.HashMap as Hm
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+
+-- Whether a Core term mentions the variable of index `i`.
+@pub fun mentions (c : Core) (i : Int) : Bool =
+  match c with
+  | Core.Var j _ -> j == i
+  | Core.Pi _ _ g r dom cod -> mentions g i or mentions r i or mentions dom i or mentions cod (i + 1)
+  | Core.Lam _ b -> mentions b (i + 1)
+  | Core.Let _ e b -> mentions e i or mentions b (i + 1)
+  | Core.App a b -> mentions a i or mentions b i
+  | Core.BoxTy a b -> mentions a i or mentions b i
+  | Core.GradeAdd a b -> mentions a i or mentions b i
+  | Core.GradeMul a b -> mentions a i or mentions b i
+  | Core.GradeRange a b -> mentions a i or mentions b i
+  | Core.BoxIntro a -> mentions a i
+  | Core.Unbox a -> mentions a i
+  | Core.Runtime _ a -> mentions a i
+  | Core.Comp a e -> mentions a i or mentions e i
+  | Core.Handle b r ops -> mentions b i or mentions r i or V.any (\o -> match o with | OpClause.OpClause _ _ _ body -> mentions body i) ops
+  | Core.Row ls ts -> V.any (\x -> mentions x i) (V.append ls ts)
+  | Core.Case s alts -> mentions s i or V.any (\a -> match a with | CaseAlt.CaseAlt _ _ vars body -> mentions body (i + V.len vars)) alts
+  | _ -> False
+
+-- Unifying a constructor's indices with a variable's: possible (the
+-- context with what was learned, and the substitution), impossible, or no
+-- telling.
+@pub data Unified = Refined Ctx (Maybe Env) | Absurd | Stuck Value Value
+
+@pub fun ctorOf (tc : Tc s f p) (c : Int) : CtorInfo ! { St s | e } =
+  M.unwrapOr (CtorInfo.CtorInfo "?" (0 - 1) 0 0 0) (T.ctorInfo tc c)
+
+@pub fun isCtor (tc : Tc s f p) (c : Int) : Bool ! { St s | e } = M.isSome (T.ctorInfo tc c)
+
+-- A case no clause covers, as the patterns that would match it: each
+-- argument as far as the splits have made it out (`_` where they have not),
+-- as the Rust checker's `describe` says it.
+@pub fun describe (tc : Tc s f p) (ctx : Ctx) (args : [Int]) : String ! { St s | e } =
+  let nested = V.len args > 1 in
+  S.join " " (V.map (\l -> shownPattern tc (X.value ctx l) nested) args)
+
+@pub fun shownPattern (tc : Tc s f p) (v : Value) (nested : Bool) : String ! { St s | e } =
+  match force tc v with
+  | Value.Opaque c name sp ->
+      (match T.ctorInfo tc c with
+       | Just (CtorInfo.CtorInfo _ _ _ params _) ->
+           let args = V.concatMap (\e -> match e with | Elim.App a -> [shownPattern tc a True] | _ -> []) (V.drop sp params) in
+           if V.isEmpty args then name
+           else
+             let shown = if S.startsWith ":" name and V.len args == 2 then "${V.getOr "" args 0} ${name} ${V.getOr "" args 1}" else name ++ " " ++ S.join " " args in
+             if nested then "(" ++ shown ++ ")" else shown
+       | None -> "_")
+  | Value.Lit l -> C.literalShown l
+  | _ -> "_"
+
+@pub fun ctorArity (tc : Tc s f p) (c : Int) : Int ! { St s | e } = match ctorOf tc c with | CtorInfo.CtorInfo _ _ _ ps fs -> ps + fs
+
+-- Bind the arguments of constructor `c` as new variables, and unify the
+-- variable in slot `k` with `c` applied to them, indices and all.
+-- How often each field may be used is the front end's to say:
+-- `gradeOf` gives, for a field of a type, the grade its own grade is
+-- multiplied by (Idyll's says the value's grade, but the default for a
+-- field not of a linear type taken out of a linear value: `Matching`).
+@pub fun instantiate (tc : Tc s f p) (ctx : Ctx) (k : Int) (c : Int) (hints : [Maybe String]) gradeOf : (Ctx, [(Int, Int, String, Value)], Unified) ! { St s | e } =
+  let cty0 = M.unwrapOr Value.Error (Hm.lookup c (getRef tc.constants)) in
+  let (inner, delta, cty) = telescope tc gradeOf ctx [] cty0 hints in
+  match (force tc (X.typeAt ctx k), force tc cty) with
+  | (Value.Opaque _ _ indices, Value.Opaque _ _ result) ->
+      let apps = \sp -> V.concatMap (\e -> match e with | Elim.App a -> [a] | _ -> []) sp in
+      let spine = V.map (\dl -> match dl with | (l, _, hint, _) -> Elim.App (Va.vvar l hint)) delta in
+      let name = match ctorOf tc c with | CtorInfo.CtorInfo n _ _ _ _ -> n in
+      let eqs = V.pushBack (V.zip (apps indices) (apps result)) (X.value ctx k, Value.Opaque c name spine) in
+      (inner, delta, unifyIndices tc inner eqs)
+  | _ -> (inner, delta, Unified.Absurd)
+
+fun telescope (tc : Tc s f p) gradeOf (inner : Ctx) (delta : [(Int, Int, String, Value)]) (cty : Value) (hints : [Maybe String]) : (Ctx, [(Int, Int, String, Value)], Value) ! { St s | e } =
+  match V.head hints with
+  | None -> (inner, delta, cty)
+  | Just hint0 ->
+      (match force tc cty with
+       | Value.Pi name _ grade _ dom cod ->
+           let hint = match hint0 with | Just h -> h | None -> if name == "_" then "x" else name in
+           let key = T.freshKey tc in
+           let lvl = inner.lvl in
+           let w = gradeOf dom in
+           let g = Va.polyValue (Va.polyMul (toPoly tc grade) (toPoly tc w)) in
+           let inner2 = X.bindKeyed inner key hint dom (Just g) in
+           telescope tc gradeOf inner2 (V.pushBack delta (lvl, key, hint, g)) (apply tc cod (Va.vvar lvl hint)) (V.drop hints 1)
+       | _ -> (inner, delta, cty))
+
+-- --- unifying indices -------------------------------------------------------------
+
+-- Equations between values solved for the context's own variables, which
+-- matching is how they become known.
+@pub fun unifyIndices (tc : Tc s f p) (ctx : Ctx) (eqs : [(Value, Value)]) : Unified ! { St s | e } =
+  solveIndices tc ctx eqs []
+
+fun asVar (ctx : Ctx) (v : Value) : Maybe Int =
+  match v with
+  | Value.Rigid x _ [] -> if X.unknownAt ctx x then Just x else None
+  | _ -> None
+
+fun solveIndices (tc : Tc s f p) (ctx : Ctx) (work : [(Value, Value)]) (sigma : [(Int, Value)]) : Unified ! { St s | e } =
+  let l = ctx.lvl in
+  match V.head work with
+  | None ->
+      if V.isEmpty sigma then Unified.Refined ctx None
+      else
+        let env = sigmaEnv ctx sigma in
+        Unified.Refined (refine tc ctx sigma env) (Just env)
+  | Just (a0, b0) ->
+      let more = V.drop work 1 in
+      let a = force tc (applySigma tc ctx sigma a0) in
+      let b = force tc (applySigma tc ctx sigma b0) in
+      (match (asVar ctx a, asVar ctx b) with
+       | (Just x, Just y) ->
+           if x == y then solveIndices tc ctx more sigma
+           -- two variables: the older one kept, the one likelier named
+           else if x > y then solveIndices tc ctx more (assign tc ctx sigma x b)
+           else solveIndices tc ctx more (assign tc ctx sigma y a)
+       | (Just x, None) -> oneVar tc ctx more sigma x b a b
+       | (None, Just x) -> oneVar tc ctx more sigma x a a b
+       | (None, None) ->
+           (match (a, b) with
+            | (Value.Opaque c1 _ s1, Value.Opaque c2 _ s2) ->
+                if isCtor tc c1 and isCtor tc c2 then
+                  if c1 != c2 then Unified.Absurd
+                  else
+                    let pairs = V.concatMap (\pr -> match pr with | (Elim.App x, Elim.App y) -> [(x, y)] | _ -> []) (V.zip s1 s2) in
+                    solveIndices tc ctx (V.append more pairs) sigma
+                else if unify tc l a b then solveIndices tc ctx more sigma
+                else Unified.Stuck a b
+            | (Value.Lit x, Value.Lit y) -> if x != y then Unified.Absurd else solveIndices tc ctx more sigma
+            | _ -> if unify tc l a b then solveIndices tc ctx more sigma else Unified.Stuck a b))
+
+fun oneVar (tc : Tc s f p) (ctx : Ctx) (more : [(Value, Value)]) (sigma : [(Int, Value)]) (x : Int) (t : Value) (a : Value) (b : Value) : Unified ! { St s | e } =
+  if not (mentions (quote tc ctx.lvl t) (ctx.lvl - x - 1)) then solveIndices tc ctx more (assign tc ctx sigma x t)
+  -- `n = S n`
+  else if rigidlyIn tc x t then Unified.Absurd
+  else Unified.Stuck a b
+
+fun rigidlyIn (tc : Tc s f p) (x : Int) (t : Value) : Bool ! { St s | e } =
+  match force tc t with
+  | Value.Rigid y _ sp -> y == x and V.isEmpty sp
+  | Value.Opaque c _ sp -> isCtor tc c and V.any (\e -> match e with | Elim.App a -> rigidlyIn tc x a | _ -> False) sp
+  | _ -> False
+
+-- `x := t` added, keeping the substitution idempotent.
+fun assign (tc : Tc s f p) (ctx : Ctx) (sigma : [(Int, Value)]) (x : Int) (t : Value) : [(Int, Value)] ! { St s | e } =
+  let single = sigmaEnv ctx [(x, t)] in
+  V.pushBack (V.map (\kv -> match kv with | (k, s) -> (k, eval tc single (quote tc ctx.lvl s))) sigma) (x, t)
+
+-- A substitution as an environment: each solved variable its solution,
+-- every other itself.
+fun sigmaEnv (ctx : Ctx) (sigma : [(Int, Value)]) : Env =
+  V.foldl
+    (\env k ->
+      let v = match V.find (\kv -> fst kv == k) sigma with | Just (_, s) -> s | None -> Va.vvar k (X.nameAt ctx k) in
+      Va.push env v)
+    (Va.emptyEnv ())
+    (V.range 0 ctx.lvl)
+
+fun applySigma (tc : Tc s f p) (ctx : Ctx) (sigma : [(Int, Value)]) (v : Value) : Value ! { St s | e } =
+  if V.isEmpty sigma then v else eval tc (sigmaEnv ctx sigma) (quote tc ctx.lvl v)
+
+-- The goal, in a case that learned `sigma`. A goal still a bare
+-- metavariable is an unannotated result type, left as it is.
+@pub fun refineGoal (tc : Tc s f p) (l : Int) (sigma : Maybe Env) (goal : Value) : Value ! { St s | e } =
+  match force tc goal with
+  | Value.Flex _ _ -> goal
+  | _ -> resubst tc l sigma goal
+
+-- A result type left unsolved by a match that failed: an error, so it is
+-- not reported again as unsolved.
+@pub fun abandon (tc : Tc s f p) (ty : Value) =
+  match force tc ty with
+  | Value.Flex m _ ->
+      (match T.meta tc m with
+       | Just (Meta.Unsolved _) -> T.solve tc m Value.Error
+       | _ -> ())
+  | _ -> ()
+
+@pub fun resubst (tc : Tc s f p) (l : Int) (sigma : Maybe Env) (v : Value) : Value ! { St s | e } =
+  match sigma with
+  | None -> v
+  | Just env -> eval tc env (quote tc l v)
+
+-- The context, having learned `sigma`: each solved variable defined as its
+-- solution, and every value and type that could mention one brought up to
+-- date. Slots before the first solved one stay as they are.
+@pub fun refine (tc : Tc s f p) (ctx : Ctx) (sigma : [(Int, Value)]) (env : Env) : Ctx ! { St s | e } =
+  let first = V.foldl (\acc kv -> if fst kv < acc then fst kv else acc) ctx.lvl sigma in
+  let l = ctx.lvl in
+  let old = Va.envValues ctx.env in
+  let (next, newEnv) =
+    V.foldl
+    (\acc k ->
+      match acc with
+      | (c, newEnv) ->
+          let v = V.getOr Value.Error old k in
+          if k < first then (c, Va.push newEnv v)
+          else
+            let ty = eval tc env (quote tc l (X.typeAt ctx k)) in
+            let solved = V.any (\kv -> fst kv == k) sigma in
+            (X.refined c k ty solved, Va.push newEnv (eval tc env (quote tc l v))))
+      (ctx, Va.emptyEnv ())
+      (V.range 0 ctx.lvl)
+  in
+  { next | env = newEnv }
