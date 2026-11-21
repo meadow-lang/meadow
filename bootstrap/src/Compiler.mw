@@ -66,7 +66,9 @@ use MeadowBoot.Core (CoreProgram, joinedUnits)
 use MeadowBoot.Solve (TypeEnv, noTypes, Entry)
 use Std.Macro (Reflect, Datum, toDatum, fromDatum)
 use MeadowBoot.Packed (pack, unpack)
-use Strata.Level (Level, levelOf, notYet)
+use Strata.Level (Level, notYet)
+-- By its module: `MeadowBoot.Types` has a `levelOf` of its own.
+use Strata.Level as StrataLevel
 use MeadowBoot.ToStrata (unitDefs, dumped)
 use Lingua.Query (jsonDatum)
 use Std.Json as J
@@ -2502,7 +2504,8 @@ fun compileTimeRefused (asts : [(String, AstProgram)]) : [String] =
                V.concatMap
                  (\y ->
                    let names = V.map (\at -> astNameText a (astAttrName a at)) (fst y) in
-                   if levelOf names == Level.Compile then ["${file}: ${notYet "a declaration"}\n"]
+                   if StrataLevel.levelOf names == Level.Compile then
+                     ["${file}: ${notYet "a declaration"}\n"]
                    else [])
                  (declsOf (Source { path = [], file, ast }))))
     asts
