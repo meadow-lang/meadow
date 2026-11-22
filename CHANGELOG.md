@@ -741,6 +741,14 @@ last release is under _Unreleased_.
   `Failed` line alone on standard output. Both went to standard output, so
   a harness that shows a failed build's standard error -- `meadow test` run
   from a test in CI -- showed no reason at all.
+- MeadowBoot embeds a file with `includeStr`, as the Rust compiler does:
+  beside the module that wrote it, with the same errors for a file that is
+  not there, a path that is not a string literal, and anything but one
+  argument, and a binding of that name in scope still wins. It said
+  "undefined variable: includeStr". A file a package embeds is an input of
+  its build: editing it compiles the package again. MeadowBoot cannot embed
+  a `.mw` file from outside its package's `src`, which its build would take
+  for a module.
 
 ## 0.4.0 - 2026-10-24
 

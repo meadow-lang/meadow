@@ -28,7 +28,9 @@ use MeadowBoot.Syntax
 use MeadowBoot.Parse (checkedTree)
 use MeadowBoot.Channel (attributesSaid)
 use MeadowBoot.Fixity (Fixity, Grouped, declare, grouped)
-use MeadowBoot.Unit (dependenciesOf, unitFilesOf, manifestOf, packageName, dependencyNames)
+use MeadowBoot.Unit (
+  dependenciesOf, unitFilesOf, manifestOf, packageName, dependencyNames, embedsIn, beside
+)
 use MeadowBoot.Lower (lowered, loweredWith, Request, Cfg, shownCfg)
 use MeadowBoot.Expand (
   Binding, MacroFun, Dep, Batch, scopeOf, procFor, visOf, writeRound, readAnswers
@@ -561,7 +563,9 @@ fun checkedOf
               -- nowhere; a type or a constructor nothing declares is a use
               -- of the one binder that stands for every such name.
               (let what =
-                 if S.startsWith "?" b.site and b.name != "?" then Just "undefined variable: "
+                 -- A file `includeStr` could not embed: the binder says why.
+                 if b.site == "?!" then Just ""
+                 else if S.startsWith "?" b.site and b.name != "?" then Just "undefined variable: "
                  else if S.isEmpty b.name and b.site == "-" and b.kind == "t" and b.until < 0 then
                    Just "unknown type "
                  else if S.isEmpty b.name and b.site == "-" and b.kind == "c" then
@@ -1471,18 +1475,25 @@ fun unitOf
   in
   let isStd = pkg == "Std" in
   let src = Path.join dir "src" in
+  let texts =
+    H.fromVec (V.map (\x -> match x with | (p, text, _) -> (Path.normalize p, text)) files)
+  in
   let sources =
     V.concatMap
       (\x ->
         match x with
         | (path, text, tree) ->
             let file = "${pkg}/${relativeTo dir path}" in
-            let from = \ast -> [(path, Source { path = modulePath isStd src path, file, ast })] in
-            (match (H.lookup path made, tree) with
-             | (Just ast, _) -> from ast
-             | (None, Just (g, _)) ->
-                 from (lowered cfg path pkg text g (M.unwrapOr H.empty (H.lookup file expanded)) fx)
-             | (None, None) -> []))
+            let from =
+              \ast ->
+                (let embeds = embedsOf src texts path text in
+                 [(path, Source { path = modulePath isStd src path, file, ast, embeds })])
+            in (match (H.lookup path made, tree) with
+                | (Just ast, _) -> from ast
+                | (None, Just (g, _)) ->
+                    from
+                      (lowered cfg path pkg text g (M.unwrapOr H.empty (H.lookup file expanded)) fx)
+                | (None, None) -> []))
       files
   in
   let deps =
@@ -1492,6 +1503,35 @@ fun unitOf
         | (name, (i : Interface)) -> DepExports { name, exports = i.exports, anyVis = i.anyVis })
       (namedDeps files imported)
   in (sources, renameUnit pkg isStd (V.map snd sources) deps)
+
+-- What each `includeStr` of the module at `path`, its source `text`, embeds,
+-- by the path it wrote: the text of the file beside the module, if it is
+-- among the unit's files `texts` -- each by where it is -- or why not, as
+-- `meadow-rename` says it. A file the unit embeds is among them if it is
+-- there to read (`Unit.unitFilesOf`).
+fun embedsOf (src : String) (texts : HashMap String String) (path : String) (text : String)
+    : HashMap String (Result String String) =
+  V.foldl
+    (\h written ->
+      let at = Path.normalize (beside path written) in
+      let found =
+        (match H.lookup at texts with
+         | Just t -> Ok t
+         | None -> Err (unembeddable src at))
+      in H.insert written found h)
+    H.empty
+    (embedsIn text)
+
+-- Why the file at `at` cannot be embedded: it is not there -- said as the
+-- system the compiler runs on says it, which is what the Rust compiler
+-- reports -- or it is a `.mw` file outside the unit's `src`, which a build of
+-- the unit would take for one of its modules.
+fun unembeddable (src : String) (at : String) : String =
+  if S.endsWith ".mw" at and not (S.startsWith (Path.normalize src ++ "/") at) then
+    "cannot embed `${at}`: a `.mw` file is embedded only from its own package's `src`"
+  else if hostOs == "windows" then
+    "cannot embed `${at}`: The system cannot find the file specified. (os error 2)"
+  else "cannot embed `${at}`: No such file or directory (os error 2)"
 
 -- The file at `path` of the unit at `dir`, package `pkg`, as abstract syntax:
 -- what `unitOf` makes of each, made of one alone -- so of each on a thread of
@@ -2524,7 +2564,8 @@ fun moduleOf (dir : String) (pkg : String) (path : String) (ast : AstProgram) : 
   Source {
     path = modulePath (pkg == "Std") (Path.join dir "src") path,
     file = "${pkg}/${relativeTo dir path}",
-    ast
+    ast,
+    embeds = H.empty
   }
 
 -- The functions the unit marks `@macro`.

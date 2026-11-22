@@ -2114,7 +2114,9 @@ fun undeclared (v : View) : [Diagnostic] =
   V.concatMap
     (\(b : Binder) ->
       let says =
-        if S.startsWith "?" b.site and b.name != "?" then Just "undefined variable: "
+        -- A file `includeStr` could not embed: the binder says why.
+        if b.site == "?!" then Just ""
+        else if S.startsWith "?" b.site and b.name != "?" then Just "undefined variable: "
         else if S.isEmpty b.name and b.site == "-" and b.kind == "t" and b.until < 0 then
           Just "unknown type "
         else if S.isEmpty b.name and b.site == "-" and b.kind == "c" then
