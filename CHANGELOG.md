@@ -774,6 +774,16 @@ last release is under _Unreleased_.
   `program.cut` its link never wrote, and failed after "Linked" saying the
   path was not there. The library the self-build checks exports to C, and
   so has a program.
+- MeadowBoot's `build` of a program puts what it makes where `meadow`
+  puts it, named for the package: the executable at
+  `target/<profile>/native/<Package>` (Silo's under `native/silo/`) and the
+  image at `target/<profile>/bytecode/<Package>.mbc`, for debug and release
+  and on either runtime, and says `Executable <path>` as `meadow` does. It
+  built them under its link's own directory,
+  `target/<profile>/link/target/release/native/silo/program`, so a script
+  that runs a package's executable found nothing. `meadow cut --no-run`
+  takes `--package DIR --name NAME --profile debug|release` to build into a
+  front end's package this way.
 
 ## 0.4.0 - 2026-10-24
 

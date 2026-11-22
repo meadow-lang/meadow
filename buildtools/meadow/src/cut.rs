@@ -355,6 +355,44 @@ fn unquoted(shown: &str) -> String {
     out
 }
 
+/// Where a build of a program puts what it makes, and the name it is made
+/// under: beside a lone file, or in a front end's package as `meadow build`
+/// puts a package's (`--package`).
+pub struct Place {
+    /// The directory whose `target` it goes under.
+    pub root: PathBuf,
+    /// What the executable, and the image, are named.
+    pub name: String,
+    /// Which profile's directory of `target` it goes in.
+    pub profile: Profile,
+}
+
+impl Place {
+    /// Beside the file at `path`, under `target/release`, named for the
+    /// file: where a lone program of Cut is built.
+    pub fn beside(path: &Path) -> Result<Place, String> {
+        let root = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or("a file with a name")?;
+        Ok(Place {
+            root: root.to_path_buf(),
+            name: name.to_string(),
+            profile: Profile::Release,
+        })
+    }
+}
+
+/// The program's bytecode image, written where `meadow build` writes a
+/// package's, in `place`: the one a run of the same text keeps beside it.
+pub fn write_image(path: &Path, place: &Place) -> Result<PathBuf, String> {
+    crate::artifacts::write_image(&place.root, place.profile, &place.name, &image(path)?)
+}
+
 /// Whether the program at `path` exports functions to C, and so is built as
 /// a library of them rather than run: whether a line of it starts `export`,
 /// which only a top-level declaration can.
@@ -363,24 +401,17 @@ pub fn is_library(path: &Path) -> bool {
 }
 
 /// Build it for Glade ahead of time -- its bytecode compiled to machine
-/// code, linked with the `meadow_glade` runtime -- beside the file, under
-/// `target`, and answer where the executable is: or, for a program that
-/// exports functions to C, the library of them. Its calls are guided by
-/// what a training run saw, where `calls` names a profile of this image
-/// (`crate::pgo`).
+/// code, linked with the `meadow_glade` runtime -- in `place`, and answer
+/// where the executable is: or, for a program that exports functions to C,
+/// the library of them. Its calls are guided by what a training run saw,
+/// where `calls` names a profile of this image (`crate::pgo`).
 pub fn build_for_glade(
     path: &Path,
+    place: &Place,
     opt: meadow_compiler::OptLevel,
     calls: Option<&Path>,
 ) -> Result<PathBuf, String> {
-    let root = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let name = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or("a file with a name")?;
+    let (root, name, profile) = (place.root.as_path(), place.name.as_str(), place.profile);
     let program = lowered(path)?;
     let image = meadow_codegen::compile(&program).map_err(|e| e.msg)?;
     let shown = |at: &Path| crate::dap::session::plain_path(&at.display().to_string());
@@ -407,7 +438,7 @@ pub fn build_for_glade(
     if !program.exports.is_empty() {
         return aot::build_library(
             root,
-            Profile::Release,
+            profile,
             opt,
             name,
             &image,
@@ -418,7 +449,7 @@ pub fn build_for_glade(
     }
     aot::build(
         root,
-        Profile::Release,
+        profile,
         opt,
         name,
         &image,
@@ -428,29 +459,28 @@ pub fn build_for_glade(
 }
 
 /// Build it for Silo -- LLVM's code, linked with the `meadow_silo` runtime
-/// -- beside the file, under `target`, and answer where the executable is:
-/// for `on`, or this machine.
+/// -- in `place`, and answer where the executable is: for `on`, or this
+/// machine.
 pub fn build_for_silo(
     path: &Path,
+    place: &Place,
     opt: meadow_compiler::OptLevel,
     on: Option<aot::Target>,
 ) -> Result<PathBuf, String> {
-    let root = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let name = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or("a file with a name")?;
     let target = match on {
         Some(t) => t,
         None => aot::Target::host()?,
     }
     .with_runtime(aot::Runtime::Silo);
-    aot::build_native_of(root, Profile::Release, opt, name, target, None, || {
-        lowered(path)
-    })
+    aot::build_native_of(
+        &place.root,
+        place.profile,
+        opt,
+        &place.name,
+        target,
+        None,
+        || lowered(path),
+    )
 }
 
 #[cfg(test)]
