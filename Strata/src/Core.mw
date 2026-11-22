@@ -130,6 +130,9 @@ use Std.Maybe.Maybe.*
   -- no value (`Core.Error`, which the checker takes for anything), and
   -- reaching it at run time stops the program, saying so
   | Goal String
+  -- an ascription: what is under it said to be of this type, which a
+  -- checker checks it against
+  | Has Core
 
 @derive(Reflect)
 @pub data Core
@@ -195,7 +198,7 @@ use Std.Maybe.Maybe.*
     | Core.GradeMul a b -> go a or go b
     | Core.GradeRange a b -> go a or go b
     | Core.Case sc alts -> go sc or V.any (\a -> match a with | CaseAlt.CaseAlt _ _ _ body -> go body) alts
-    | Core.Runtime n a -> go a or (match n with | Note.Binds _ (Just t) -> go t | _ -> False)
+    | Core.Runtime n a -> go a or (match n with | Note.Binds _ (Just t) -> go t | Note.Has t -> go t | _ -> False)
     | Core.Comp a e -> go a or go e
     | Core.Row ls ts -> V.any go ls or V.any go ts
     | Core.Handle b r ops -> go b or go r or V.any (\o -> match o with | OpClause.OpClause _ _ _ body -> go body) ops
@@ -226,7 +229,7 @@ use Std.Maybe.Maybe.*
       | Core.Case sc alts ->
           Core.Case (go sc depth) (V.map (\a -> match a with | CaseAlt.CaseAlt h n vs body -> CaseAlt.CaseAlt h n vs (go body (depth + V.len vs))) alts)
       | Core.Runtime n a ->
-          let n2 = match n with | Note.Binds g (Just t) -> Note.Binds g (Just (go t depth)) | other -> other in
+          let n2 = match n with | Note.Binds g (Just t) -> Note.Binds g (Just (go t depth)) | Note.Has t -> Note.Has (go t depth) | other -> other in
           Core.Runtime n2 (go a depth)
       | Core.Comp a e -> Core.Comp (go a depth) (go e depth)
       | Core.Row ls ts -> Core.Row (V.map (\l -> go l depth) ls) (V.map (\t -> go t depth) ts)
@@ -347,6 +350,8 @@ fun go (linear : Bool) (c : Core) (prec : Int) : String =
   | Core.Opaque _ n -> paren (prec > 10 and S.contains " " n) n
   | Core.Meta m -> "?" ++ show m
   | Core.Error -> "?!"
+  -- (an ascription, which the Rust checker has not, as Meadow writes one)
+  | Core.Runtime (Note.Has t) inner -> "(" ++ g inner 0 ++ " : " ++ g t 0 ++ ")"
   | Core.Runtime _ inner -> g inner prec
   -- looser than application, tighter than an arrow
   | Core.Comp t e -> paren (prec > 1) (g t 2 ++ " ! " ++ g e 10)

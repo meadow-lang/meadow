@@ -1,0 +1,27 @@
+-- Strata's core for Kinds, from MeadowBoot's typed tree (docs/2LTT.md, L1)
+-- declarations: 7, of them made by the translation: 0
+-- unmapped: none
+-- leaves of case trees with no arm left: 0
+-- names without a binder: none
+-- of them, by name: none
+-- declarations of other units read: 3
+-- checked by Strata's kernel: accepted 7, rejected 0, skipped 0
+-- rejected, by reason: none
+-- skipped, by the first thing not said: none
+data Kinds.Stepper : Type -> Effect -> Type
+  -- accepted
+con Kinds.Stepper.Stepper : {a : [] Type} -> {b : [] Effect} -> (a -> a ! b) -> Kinds.Stepper a b
+  -- accepted
+effect Kinds.Log : Effect
+  -- accepted
+op Kinds.Log.log : {a : [] Effect} -> String -> () ! {Kinds.Log | a}
+  -- accepted
+def stepper : {a : [] Type} -> {b : [] Effect} -> (a -> a ! b) -> Kinds.Stepper a b
+  = \a -> \b -> \step -> Stepper a b step
+  -- accepted
+def counted : {a : [] Effect} -> Kinds.Stepper Int a -> Kinds.Stepper Int a
+  = \a -> \s -> s
+  -- accepted
+def noisy : {a : [] Effect} -> {b : [] Effect} -> () -> Kinds.Stepper Int {Kinds.Log | a} ! b
+  = \a -> \b -> \_ -> counted {Kinds.Log | a} (stepper Int {Kinds.Log | a} (\n -> let w = log a "step" in + Int (#impl.Std.Ops.Add Int) n 1))
+  -- accepted

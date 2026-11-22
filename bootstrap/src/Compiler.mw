@@ -2528,7 +2528,8 @@ fun compileTimeRefused (asts : [(String, AstProgram)]) : [String] =
 
 -- `strata`: unit `r` of package `pkg`, typed as `done`, elaborated into
 -- Strata's core with everything at run time (`ToStrata`), and checked by
--- Strata's kernel (`StrataCheck`). Nothing reads the terms yet.
+-- Strata's checker of Core terms (`Strata.Check`, through `StrataCheck`).
+-- Nothing reads the terms yet.
 -- `MEADOWBOOT_STRATA` has them written beside the unit's object, in `out`,
 -- as `<package>.strata`, with what did not map counted by kind and what the
 -- checker said of each.

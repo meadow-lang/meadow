@@ -1,0 +1,18 @@
+-- A record's parameter that its fields use as an effect row, and a
+-- function whose quantifier is a row only as the record's argument: each
+-- is a row in the core, the kind its uses demand, though inference gives
+-- both a plain type's kind.
+
+@pub effect Log {
+  log : String -> ()
+}
+
+@pub record Stepper m e = {
+  @pub step : m -> m ! e
+}
+
+@pub fun stepper (step : m -> m ! e) : Stepper m e = Stepper { step }
+
+@pub fun counted (s : Stepper Int e) : Stepper Int e = s
+
+@pub fun noisy () = counted (stepper (\(n : Int) -> let w = log "step" in n + 1))

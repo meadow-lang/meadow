@@ -5,15 +5,20 @@ use Std.St (getRef)
 use Std.Collections.Vector as V
 use Strata.Level (Level, levelOf, compTime, notYet)
 use Strata.Level.Level.*
-use Strata.Core (Core, Builtin, Prim, shown)
+use Strata.Core (Core, Builtin, Prim, Note, Head, CaseAlt, OpClause, shown)
 use Strata.Hir (Icit, Literal)
 use Strata.Grade as G
 use Strata.Value (Value, Elim)
 use Strata.Value as Va
 use Strata.Eval (eval, quote, vsplice)
 use Strata.Unify (unify, subtype)
-use Strata.Tc (MetaInfo, Origin)
+use Strata.Tc (MetaInfo, Origin, CtorInfo)
 use Strata.Tc as T
+use Strata.Ctx as X
+use Strata.Check (checker, ctorsFromTc, definition, verdictText)
+use Std.St (setRef)
+use Std.Collections.HashMap as Hm
+use Std.String as S
 
 @test
 fun unmarkedIsRunTime () = assertEq (levelOf []) Run "a definition with no attributes"
@@ -212,3 +217,232 @@ fun codeUnifies () =
   in
   let o = assertEq (shown False (quote tc 0 (Va.vmeta k))) "$code" "solves ?k as the splice" in
   assertEq (shown False (quote tc 0 waiting)) "code" "and quote { ?k } is code from then on"
+
+-- --- the checker of Core terms -----------------------------------------------
+
+-- A small world for `Strata.Check`: the naturals, vectors indexed by them,
+-- a function on naturals that is no constructor, and an effect `Ask` with
+-- one operation, `ask : () -> Int ! {Ask}`.
+fun nat () : Core = Core.Opaque 1 "Nat"
+
+fun zero () : Core = Core.Opaque 2 "Z"
+
+fun succ (n : Core) : Core = Core.App (Core.Opaque 3 "S") n
+
+fun vec (a : Core) (n : Core) : Core = Core.App (Core.App (Core.Opaque 4 "Vec") a) n
+
+fun boolTy () : Core = Core.LitTy Builtin.Bool
+
+fun unitTy () : Core = Core.LitTy Builtin.Unit
+
+fun grade1 () : Core = Core.GradeLit G.one
+
+fun to (dom : Core) (cod : Core) : Core =
+  Core.Pi "_" Icit.Explicit (Core.GradeLit G.any) (Core.GradeLit G.any) dom cod
+
+fun pi (x : String) (icit : Icit) (dom : Core) (cod : Core) : Core =
+  Core.Pi x icit (Core.GradeLit G.any) (Core.GradeLit G.any) dom cod
+
+fun ask () : Core = Core.Opaque 11 "ask"
+
+fun askRow () : Core = Core.Row [Core.Opaque 10 "Ask"] []
+
+fun world () : [(Int, Core)] =
+  [
+    (1, Core.Type 0),
+    (2, nat ()),
+    (3, to (nat ()) (nat ())),
+    (4, to (Core.Type 0) (to (nat ()) (Core.Type 0))),
+    (5, pi "a" Icit.Implicit (Core.Type 0) (vec (Core.Var 0 "a") (zero ()))),
+    (
+      6,
+      pi
+        "a"
+        Icit.Implicit
+        (Core.Type 0)
+        (pi
+           "n"
+           Icit.Implicit
+           (nat ())
+           (pi
+              "x"
+              Icit.Explicit
+              (Core.Var 1 "a")
+              (pi
+                 "xs"
+                 Icit.Explicit
+                 (vec (Core.Var 2 "a") (Core.Var 1 "n"))
+                 (vec (Core.Var 3 "a") (succ (Core.Var 2 "n"))))))
+    ),
+    (7, to (nat ()) (nat ())),
+    (10, Core.LitTy Builtin.Effect),
+    (11, to (unitTy ()) (Core.Comp (int ()) (askRow ())))
+  ]
+
+-- What the checker says of a definition of type `ty` and term `term`.
+fun said (ty : Core) (term : Core) : String ! { St s | e } =
+  let tc = T.new () 0 in
+  let w =
+    setRef
+      tc.constants
+      (V.foldl
+         (\h kv -> Hm.insert (fst kv) (eval tc (Va.emptyEnv ()) (snd kv)) h)
+         Hm.empty
+         (world ()))
+  in
+  let w2 =
+    setRef
+      tc.ctors
+      (Hm.fromVec [
+         (2, CtorInfo.CtorInfo "Z" 1 0 0 0),
+         (3, CtorInfo.CtorInfo "S" 1 1 0 1),
+         (5, CtorInfo.CtorInfo "VNil" 4 0 1 0),
+         (6, CtorInfo.CtorInfo "VCons" 4 1 2 2)
+       ])
+  in
+  let cx = checker tc (ctorsFromTc tc) in
+  verdictText (definition cx (X.empty ()) ty (Just term))
+
+fun lam (x : String) (body : Core) : Core = Core.Lam x body
+
+fun typedLam (x : String) (dom : Core) (body : Core) : Core =
+  Core.Runtime (Note.Binds None (Just dom)) (Core.Lam x body)
+
+fun alt (c : Int) (name : String) (vars : [String]) (body : Core) : CaseAlt =
+  CaseAlt.CaseAlt (Head.Con c) name vars body
+
+fun rejectedFor (why : String) (v : String) : Bool = S.startsWith ("rejected, " ++ why ++ ":") v
+
+@test
+fun theCheckerChecksFunctionsAndAscriptions () =
+  let idTy = pi "a" Icit.Implicit (Core.Type 0) (to (Core.Var 0 "a") (Core.Var 1 "a")) in
+  let a = assertEq (said idTy (lam "a" (lam "x" (Core.Var 0 "x")))) "accepted" "the identity" in
+  let b =
+    assertTrue
+      (rejectedFor "mismatch" (said (int ()) (Core.Lit (Literal.Bool True))))
+      "True is no Int"
+  in
+  let c =
+    assertEq (said (int ()) (Core.Runtime (Note.Has (int ())) (lit 1))) "accepted" "(1 : Int)"
+  in
+  let d =
+    assertTrue
+      (rejectedFor "mismatch" (said (int ()) (Core.Runtime (Note.Has (boolTy ())) (lit 1))))
+      "(1 : Bool)"
+  in
+  let e =
+    assertTrue
+      (rejectedFor "mismatch" (said (boolTy ()) (Core.Runtime (Note.Has (int ())) (lit 1))))
+      "(1 : Int) where a Bool is wanted"
+  in
+  let applied = Core.App (typedLam "x" (int ()) (plus (Core.Var 0 "x") (lit 1))) (lit 2) in
+  let f = assertEq (said (int ()) applied) "accepted" "an inferred lambda applied" in
+  assertEq
+    (shown False (Core.Runtime (Note.Has (int ())) (lit 1)))
+    "(1 : Int)"
+    "an ascription printed"
+
+@test
+fun theCheckerChecksBoxesAndGrades () =
+  let boxed = Core.BoxTy (grade1 ()) (int ()) in
+  let a =
+    assertEq (said (to boxed (int ())) (lam "b" (Core.Unbox (Core.Var 0 "b")))) "accepted" "unbox"
+  in
+  let b = assertEq (said boxed (Core.BoxIntro (lit 1))) "accepted" "[1] : Int [1]" in
+  let c =
+    assertTrue
+      (rejectedFor "mismatch" (said boxed (Core.BoxIntro (Core.Lit (Literal.Bool True)))))
+      "[True] : Int [1]"
+  in
+  let d = assertTrue (rejectedFor "not-a-box" (said (int ()) (Core.Unbox (lit 1)))) "unbox 1" in
+  let e =
+    assertEq
+      (said (Core.LitTy Builtin.Grade) (Core.GradeAdd (grade1 ()) (grade1 ())))
+      "accepted"
+      "1 + 1 : Grade"
+  in assertTrue
+       (rejectedFor
+          "not-a-grade"
+          (said (Core.LitTy Builtin.Grade) (Core.GradeAdd (grade1 ()) (lit 1))))
+       "1 + an Int"
+
+@test
+fun theCheckerMatchesDependently () =
+  -- `head : {a} -> {n} -> Vec a (S n) -> a`, binding every argument of
+  -- `VCons`, as Idyll does, and with no alternative for `VNil`, which
+  -- cannot be there
+  let headTy =
+    pi
+      "a"
+      Icit.Implicit
+      (Core.Type 0)
+      (pi
+         "n"
+         Icit.Implicit
+         (nat ())
+         (to (vec (Core.Var 1 "a") (succ (Core.Var 0 "n"))) (Core.Var 3 "a")))
+  in
+  let headBody =
+    Core.Case (Core.Var 0 "v") [alt 6 "VCons" ["a2", "m", "x", "xs"] (Core.Var 1 "x")]
+  in
+  let a = assertEq (said headTy (lam "a" (lam "n" (lam "v" headBody)))) "accepted" "head" in
+  -- `pred`, binding only the fields, as Meadow does
+  let predBody =
+    Core.Case (Core.Var 0 "k") [alt 2 "Z" [] (zero ()), alt 3 "S" ["j"] (Core.Var 0 "j")]
+  in
+  let b = assertEq (said (to (nat ()) (nat ())) (lam "k" predBody)) "accepted" "pred" in
+  let anyVec =
+    pi
+      "a"
+      Icit.Implicit
+      (Core.Type 0)
+      (pi "n" Icit.Implicit (nat ()) (to (vec (Core.Var 1 "a") (Core.Var 0 "n")) (nat ())))
+  in
+  let tailBody = Core.Case (Core.Var 0 "v") [alt 6 "VCons" ["a2", "m", "x", "xs"] (zero ())] in
+  let c =
+    assertTrue
+      (rejectedFor "case-not-covering" (said anyVec (lam "a" (lam "n" (lam "v" tailBody)))))
+      "a vector of any length may be empty"
+  in
+  -- indices that are no pattern: `Vec a (f n)` against `Vec a Z`
+  let stuckTy =
+    pi
+      "a"
+      Icit.Implicit
+      (Core.Type 0)
+      (pi
+         "n"
+         Icit.Implicit
+         (nat ())
+         (to (vec (Core.Var 1 "a") (Core.App (Core.Opaque 7 "f") (Core.Var 0 "n"))) (nat ())))
+  in
+  let stuckBody =
+    Core.Case (Core.Var 0 "v") [
+      alt 5 "VNil" ["a2"] (zero ()),
+      alt 6 "VCons" ["a2", "m", "x", "xs"] (zero ())
+    ]
+  in assertTrue
+       (S.startsWith "not supported yet: " (said stuckTy (lam "a" (lam "n" (lam "v" stuckBody)))))
+       "refused, not rejected"
+
+@test
+fun theCheckerChecksHandlers () =
+  let performs = Core.App (ask ()) (Core.Lit Literal.Unit) in
+  let clause = lam "u" (lam "k" (Core.App (Core.Var 0 "k") (lit 42))) in
+  let handler =
+    Core.Handle
+      performs
+      (typedLam "x" (int ()) (Core.Var 0 "x"))
+      [OpClause.OpClause 11 "ask" 0 clause]
+  in
+  let a = assertEq (said (int ()) handler) "accepted" "ask, handled" in
+  let b = assertTrue (rejectedFor "effects" (said (int ()) performs)) "ask, not handled" in
+  let c =
+    assertEq
+      (said (to (unitTy ()) (Core.Comp (int ()) (askRow ()))) (lam "u" performs))
+      "accepted"
+      "ask, in a function that may"
+  in assertEq
+       (said (int ()) (Core.Runtime (Note.Has (int ())) handler))
+       "accepted"
+       "a handler said to be of its type"

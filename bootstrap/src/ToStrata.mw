@@ -1,7 +1,7 @@
 -- ToStrata: a unit's typed tree, as inference leaves it, written as terms of
 -- Strata's core (`Strata.Core`), with everything at run time and every
--- binder of grade ω (`docs/2LTT.md`, L1). `StrataCheck` checks what it
--- writes with Strata's kernel.
+-- binder of grade ω (`docs/2LTT.md`, L1). `StrataCheck` has Strata's
+-- checker (`Strata.Check`) check what it writes.
 --
 -- It runs only under the `strata` option: what Cut is lowered from is still
 -- `Elab`'s core. A construct the core has nothing for is not an error: it is
@@ -121,7 +121,7 @@ use Slot.*
 
 -- What the translation of a module reads: its tables; every binder's name;
 -- each type and constructor by its canonical name; each type's
--- constructors; what inference says of the unit's bindings, its traits and
+-- constructors, and what its parameters range over; what inference says of the unit's bindings, its traits and
 -- its `impl`s; the binder of each default, by its method's key; the
 -- primitives' binders, by name; the top-level definition being translated;
 -- the binders of the `let`s being defined, which are not in scope in
@@ -133,6 +133,7 @@ record Env = {
   ids : HashMap String Int,
   variants : HashMap String [VariantSig],
   ctorSchemes : HashMap String Scheme,
+  kinds : HashMap String [VarKind],
   schemes : HashMap Int Scheme,
   generics : HashMap Int Generalized,
   wheres : HashMap Int [String],
@@ -432,14 +433,111 @@ fun typeOf (env : Env) (ctx : [Slot]) (t : Type) : Core =
   | RowExtend _ _ _ -> row env ctx t
   | Error -> unmapped "error-type"
 
--- What a data type's parameters range over, by its constructors' schemes.
-fun paramKinds (env : Env) (name : String) : [VarKind] =
-  match M.andThen (\vs -> V.get vs 0) (H.lookup name env.variants) with
-  | Just (v : VariantSig) ->
-      (match H.lookup v.name env.ctorSchemes with
-       | Just (sc : Scheme) -> sc.quant
-       | None -> [])
-  | None -> []
+-- What a data type's parameters range over (`kindTable`).
+fun paramKinds (env : Env) (name : String) : [VarKind] = M.unwrapOr [] (H.lookup name env.kinds)
+
+-- What each data type's parameters range over. Inference gives every
+-- parameter of a data type or record a plain type's kind, as the Rust
+-- compiler does, so a parameter its fields use as an effect row -- the
+-- tail of a function's effects, or where another data type's parameter is
+-- a row -- is a type in its constructors' schemes, and so is a quantifier
+-- of a generic definition that is a row only as such a data type's
+-- argument. Here such a parameter is a row, `Effect`: the kind its uses
+-- demand. A row's tail is of that kind in the core, so nothing that was
+-- well kinded is not now; the same is done for a definition's quantifiers
+-- (`kindsOf`). It is the least such assignment, found by going over the
+-- data types until nothing changes, as one data type's fields may pass a
+-- parameter to another's. A trait's dictionary keeps its parameters'
+-- kinds, as its constructor's type is written from its trait.
+fun kindTable
+    (variants : HashMap String [VariantSig])
+    (ctorSchemes : HashMap String Scheme)
+    (dicts : HashMap String TraitShape)
+    : HashMap String [VarKind] =
+  let start =
+    H.fromVec
+      (V.map
+         (\kv ->
+           (
+             fst kv,
+             match M.andThen
+               (\(v : VariantSig) -> H.lookup v.name ctorSchemes)
+               (V.get (snd kv) 0) with
+             | Just (sc : Scheme) -> sc.quant
+             | None -> []
+           ))
+         (H.toVec variants))
+  in settleKinds variants ctorSchemes dicts start 0
+
+fun settleKinds
+    (variants : HashMap String [VariantSig])
+    (ctorSchemes : HashMap String Scheme)
+    (dicts : HashMap String TraitShape)
+    (table : HashMap String [VarKind])
+    (rounds : Int)
+    : HashMap String [VarKind] =
+  let next =
+    H.fromVec
+      (V.map
+         (\kv ->
+           let quant = M.unwrapOr [] (H.lookup (fst kv) table) in
+           let rows =
+             if M.isSome (H.lookup (fst kv) dicts) then []
+             else
+               V.concatMap
+                 (\(v : VariantSig) ->
+                   match H.lookup v.name ctorSchemes with
+                   | Just (sc : Scheme) -> rowUses table sc.ty
+                   | None -> [])
+                 (snd kv)
+           in (fst kv, promoted quant rows))
+         (H.toVec variants))
+  in if effectCount next == effectCount table or rounds > 16 then next
+     else settleKinds variants ctorSchemes dicts next (rounds + 1)
+
+fun effectCount (table : HashMap String [VarKind]) : Int =
+  V.foldl (\n kv -> n + V.len (V.filter (\k -> k == VarKind.Effect) (snd kv))) 0 (H.toVec table)
+
+-- Quantifiers of a plain type's kind that are used as rows, made rows.
+fun promoted (quant : [VarKind]) (rows : [Int]) : [VarKind] =
+  V.map
+    (\i ->
+      let k = V.getOr VarKind.Plain quant i in
+      if k == VarKind.Plain and V.elem i rows then VarKind.Effect else k)
+    (V.range 0 (V.len quant))
+
+-- What a scheme's quantifiers range over: as inference says, but one of a
+-- plain type's kind that its type uses as an effect row is a row
+-- (`kindTable`).
+fun kindsOf (env : Env) (sc : Scheme) : [VarKind] = promoted sc.quant (rowUses env.kinds sc.ty)
+
+-- The quantifiers, by place, that `t` uses as effect rows: as the tail of
+-- a row, or as a data type's argument where its parameter is one.
+fun rowUses (table : HashMap String [VarKind]) (t : Type) : [Int] =
+  match t with
+  | Fun ps ret eff ->
+      V.concat [V.concatMap (rowUses table) ps, rowUses table ret, rowUsesAsRow table eff]
+  | Con name args ->
+      let kinds = M.unwrapOr [] (H.lookup name table) in
+      V.concatMap
+        (\j ->
+          let arg = V.getOr Error args j in
+          if V.getOr VarKind.Plain kinds j == VarKind.Effect then rowUsesAsRow table arg
+          else rowUses table arg)
+        (V.range 0 (V.len args))
+  | Tuple ts -> V.concatMap (rowUses table) ts
+  | Record r -> rowUses table r
+  | RowExtend _ f rest -> V.append (rowUses table f) (rowUses table rest)
+  | _ -> []
+
+fun rowUsesAsRow (table : HashMap String [VarKind]) (t : Type) : [Int] =
+  match splitRow t [] with
+  | (labels, rest) ->
+      V.append
+        (V.concatMap (\l -> rowUses table (snd l)) labels)
+        (match rest with
+         | Bound q -> [q]
+         | other -> rowUses table other)
 
 -- A closed record's fields, sorted by label; nothing for an open one.
 fun recordFields (r : Type) : Maybe [(String, Type)] =
@@ -500,6 +598,9 @@ fun rowTail (env : Env) (ctx : [Slot]) (rest : Type) : [Core] =
       (match innermost ctx (isVarQuant v) with
        | Just (i, s) -> [Core.Var i (slotName s)]
        | None -> [])
+  -- (what a quantifier nothing constrains is, `()`: at one that is a row
+  -- only by `kindsOf`, the empty row)
+  | Con n [] if n == "Unit" -> []
   | other -> [typeOf env ctx other]
 
 fun splitRow (t : Type) (acc : [(String, Type)]) : ([(String, Type)], Type) =
@@ -534,16 +635,17 @@ fun isNumKind (k : VarKind) : Bool = k == VarKind.Num or k == VarKind.Frac
 
 -- A scheme's type: an implicit Pi for each quantifier, an auto Pi for each
 -- trait it asks for and for each variable over number types, and its type.
-fun schemeType (env : Env) (ctx : [Slot]) (sc : Scheme) : Core = quantPis env ctx sc 0
+fun schemeType (env : Env) (ctx : [Slot]) (sc : Scheme) : Core =
+  quantPis env ctx sc (kindsOf env sc) 0
 
-fun quantPis (env : Env) (ctx : [Slot]) (sc : Scheme) (i : Int) : Core =
-  match V.get sc.quant i with
+fun quantPis (env : Env) (ctx : [Slot]) (sc : Scheme) (kinds : [VarKind]) (i : Int) : Core =
+  match V.get kinds i with
   | Just k ->
       pi
         (letter i)
         Icit.Implicit
         (kindOf k)
-        (quantPis env (V.pushBack ctx (Quant (0 - 1) i (letter i) (kindOf k))) sc (i + 1))
+        (quantPis env (V.pushBack ctx (Quant (0 - 1) i (letter i) (kindOf k))) sc kinds (i + 1))
   | None -> predPis env ctx sc 0
 
 fun predPis (env : Env) (ctx : [Slot]) (sc : Scheme) (k : Int) : Core =
@@ -598,7 +700,7 @@ fun takeLabel (t : Type) (l : String) : Maybe (Type, Type) =
 fun generic (env : Env) (ctx : [Slot]) (id : Int) (body : [Slot] -> Core) : Core =
   let g = H.lookup id env.generics in
   let vars = M.unwrapOr [] (M.map (\(x : Generalized) -> x.vars) g) in
-  let quant = M.unwrapOr [] (M.map (\(x : Generalized) -> x.scheme.quant) g) in
+  let quant = M.unwrapOr [] (M.map (\(x : Generalized) -> kindsOf env x.scheme) g) in
   -- (its traits at the variables it is generic in, as the typed tree's
   -- types are written)
   let at = V.map (\v -> Var v) vars in
@@ -796,11 +898,11 @@ fun expr (env : Env) (ctx : [Slot]) (e : TypedExpr) : Core =
       in ascribed (typeOf env ctx t) (Core.Handle (expr env ctx r.body) ret ops)
   | _ -> unmapped "expression"
 
--- `c`, said to be of type `t`: `(\(it : t) -> it) c`, which is what the
--- core has for an ascription. A `handle` is said to be of its type, which a
--- checker cannot read off its `return` clause: what its body answers may be
--- a function that performs what its clauses do.
-fun ascribed (t : Core) (c : Core) : Core = Core.App (lam "it" (Just t) (Core.Var 0 "it")) c
+-- `c`, said to be of type `t`: an ascription, `Note.Has`. A `handle` is
+-- said to be of its type, which a checker cannot read off its `return`
+-- clause: what its body answers may be a function that performs what its
+-- clauses do.
+fun ascribed (t : Core) (c : Core) : Core = Core.Runtime (Note.Has t) c
 
 -- `case target of { C x y z -> y }`: field `j` of a value of one
 -- constructor.
@@ -996,9 +1098,10 @@ fun instantiated
     (tys : [Type])
     (dicts : [Core])
     : Core =
+  let kinds = kindsOf env sc in
   let types =
     V.map
-      (\k -> typeAtKind env ctx (V.getOr VarKind.Plain sc.quant k) (V.getOr Error tys k))
+      (\k -> typeAtKind env ctx (V.getOr VarKind.Plain kinds k) (V.getOr Error tys k))
       (V.range 0 (V.len sc.quant))
   in
   let nums =
@@ -1399,7 +1502,13 @@ fun collectNodes (c : Core) (f : Core -> [a]) : [a] =
         V.append
           (go s)
           (V.concatMap (\alt -> match alt with | CaseAlt.CaseAlt _ _ _ b -> go b) alts)
-    | Core.Runtime n x -> V.append (match n with | Note.Binds _ (Just t) -> go t | _ -> []) (go x)
+    | Core.Runtime n x ->
+        V.append
+          (match n with
+           | Note.Binds _ (Just t) -> go t
+           | Note.Has t -> go t
+           | _ -> [])
+          (go x)
     | Core.Comp x y -> V.append (go x) (go y)
     | Core.Code x -> go x
     | Core.Quote x -> go x
@@ -2255,7 +2364,7 @@ fun typeDefs (env : Env) (types : TypeEnv) (items : [Item]) : [Def] =
   let datas =
     V.concatMap
       (\(e : Entry [VariantSig]) ->
-        let kinds = dataKinds env e.value in
+        let kinds = dataKinds env e.key in
         V.append
           [Def {
              kind = "data",
@@ -2348,10 +2457,7 @@ fun typeDefs (env : Env) (types : TypeEnv) (items : [Item]) : [Def] =
           kind = "trait",
           name = e.key,
           unique = 0 - 1,
-          ty =
-            constructorType
-              (M.unwrapOr [] (M.map (dataKinds env) (H.lookup e.key env.variants)))
-              (Core.Type 0),
+          ty = constructorType (dataKinds env e.key) (Core.Type 0),
           term = None
         })
       types.shapes
@@ -2398,14 +2504,8 @@ fun methodId (items : [Item]) (tr : String) (m : String) : Int =
        (\(it : Item) -> it.id)
        (V.find (\(it : Item) -> it.kind == "v" and it.owner == lastOf tr and it.name == m) items))
 
--- What a data type's parameters range over, by its constructors' schemes.
-fun dataKinds (env : Env) (vs : [VariantSig]) : [Core] =
-  match V.get vs 0 with
-  | Just (v : VariantSig) ->
-      (match H.lookup v.name env.ctorSchemes with
-       | Just (s : Scheme) -> V.map kindOf s.quant
-       | None -> [])
-  | None -> []
+-- What a data type's parameters range over (`kindTable`).
+fun dataKinds (env : Env) (name : String) : [Core] = V.map kindOf (paramKinds env name)
 
 -- A constructor's type: its scheme's, but for a trait's dictionary's, whose
 -- field for a method generic in more than its trait is generic in the rest.
@@ -2557,6 +2657,7 @@ fun selector (env : Env) (tr : String) (shape : Maybe TraitShape) (m : String) (
             V.foldl (\g (e : Entry Scheme) -> H.insert e.key e.value g) h t.ctors)
           H.empty
           all,
+      kinds = H.empty,
       schemes = allSchemes r done deps depSchemes,
       generics = done.generics,
       wheres =
@@ -2633,6 +2734,7 @@ fun selector (env : Env) (tr : String) (shape : Maybe TraitShape) (m : String) (
       lifting = []
     }
   in
+  let env = { env | kinds = kindTable env.variants env.ctorSchemes env.shapes } in
   let firstDict = firstDictOfTheirs theirs in
   let own =
     fst

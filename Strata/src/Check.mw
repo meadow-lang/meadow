@@ -1,0 +1,898 @@
+-- Strata.Check: a checker of whole Core terms, made of the kernel's parts,
+-- which any front end can run over the Core it elaborates.
+--
+-- The kernel had no function that checks a Core term against a type:
+-- Idyll's bidirectional checking is its front end's, which elaborates
+-- Idyll's syntax into Core, and Meadow's is inference first. What a front
+-- end hands this is Core already, explicit throughout -- every mention
+-- applied to its types and dictionaries, every lambda's binder typed where
+-- its type is to be inferred -- so this is a small bidirectional checker
+-- of Core's forms: `Eval` for values, `Unify` for conversion (`unify`), for
+-- a value where another is wanted (`subtype`) and for effects
+-- (`effectsFit`), `Ctx` for the context, and `Cases` for what a `case`
+-- learns of the indices. It is generic in the front end's own state, `f`,
+-- and in its places, `p`, as the kernel is (`Tc s f p`): what it keeps of
+-- its own is a `Checker` beside the kernel's state.
+--
+-- It is blind to grades: every binder is checked as if of grade ω, and a
+-- grade is checked only to be a grade. How often a variable is used is
+-- `Usage`'s, a pass of its own.
+--
+-- - A type is inferred and checked bidirectionally. A lambda is checked
+--   against a Pi, or inferred where its binder's type is written; an
+--   application's head is inferred and its argument checked; an ascription,
+--   `Runtime (Note.Has t) e`, checks `e` against `t` and is of type `t`.
+-- - A `case` binds each constructor's arguments at the scrutinee's type and
+--   has an alternative for every constructor that can be there. Its
+--   alternatives bind either the constructor's fields, its parameters
+--   given by the scrutinee's type (as Meadow writes them), or every
+--   argument, the parameters and indices too (as Idyll writes them, from
+--   `Cases`); then the indices are unified, as dependent matching does, and
+--   what that learns refines the context and the type wanted. A
+--   constructor whose indices cannot be the scrutinee's needs no
+--   alternative.
+-- - A box, `[e]`, is of type `a [r]` for `e` of type `a`, whatever `r`;
+--   `unbox` takes it apart.
+-- - Effects are those an application performs: a function's type says them
+--   where its last arrow is a `Comp`, and they are gathered as a term is
+--   checked, for the function around it, or the `handle`, to allow. What a
+--   `handle` handles is what its clauses' operations' types say. A clause
+--   binds the operation's own implicit arguments it says it erases, then
+--   its explicit ones, then the resumption.
+--
+-- A form this cannot check soundly yet is refused, and the declaration's
+-- verdict says which (`Unsupported`), rather than rejected: a declaration
+-- with such a form in it is not judged. Otherwise a declaration is
+-- accepted, or rejected with the first thing found wrong.
+
+use Std.St (StRef, newRef, getRef, setRef)
+use Strata.Core (
+  Core, CaseAlt, OpClause, Note, Head, Builtin, Prim, literalBuiltin, shown, transform
+)
+use Strata.Cases (Unified, mentions, unifyIndices, refineGoal)
+use Strata.Hir (Icit)
+use Strata.Value (Value, Elim, Closure, Row)
+use Strata.Value as Va
+use Strata.Tc (Tc, MetaInfo, Origin, CtorInfo)
+use Strata.Tc as T
+use Strata.Ctx (Ctx, Info)
+use Strata.Ctx as X
+use Strata.Eval (eval, force, apply, quote, row, rowParts, effectKey)
+use Strata.Unify (unify, subtype, effectsFit, rowKind)
+use Strata.Grade (Grade)
+use Strata.Grade as G
+use Std.Collections.Vector as V
+use Std.Collections.HashMap as H
+use Std.Collections.HashMap (HashMap)
+use Std.Sort (sortOn)
+use Std.Maybe as M
+use Std.Maybe.Maybe.*
+
+-- What the checker keeps beside the kernel's state: each data type's
+-- constructors, by unique, in order; the effects performed by what is
+-- being checked, as it is checked; the first thing found wrong with the
+-- declaration; and the first form found that this cannot check yet.
+@pub record Checker s f p = {
+  tc : Tc s f p,
+  ctorsOf : HashMap Int [Int],
+  performed : StRef s [Value],
+  failure : StRef s (Maybe (String, String)),
+  refused : StRef s (Maybe String)
+}
+
+-- What the checker said of a declaration: that it checks, what was wrong
+-- with it first (the kind of fault, and what it was found in), or a form
+-- in it that this does not check yet.
+@pub data Verdict
+  = Accepted
+  | Rejected String String
+  | Unsupported String
+
+-- A checker over the kernel's state `tc`, with each data type's
+-- constructors, by unique.
+@pub fun checker (tc : Tc s f p) (ctorsOf : HashMap Int [Int]) : Checker s f p ! { St s | e } =
+  Checker { tc, ctorsOf, performed = newRef [], failure = newRef None, refused = newRef None }
+
+-- Each data type's constructors, in order, as the kernel's state knows them
+-- (`Tc.ctors`): for a front end that keeps them there, as Idyll's does.
+@pub fun ctorsFromTc (tc : Tc s f p) : HashMap Int [Int] ! { St s | e } =
+  let infos = H.toVec (getRef tc.ctors) in
+  let byData =
+    V.foldl
+      (\h kv ->
+        match snd kv with
+        | CtorInfo.CtorInfo _ d place _ _ ->
+            H.insert d (V.pushBack (M.unwrapOr [] (H.lookup d h)) (place, fst kv)) h)
+      H.empty
+      infos
+  in H.fromVec (V.map (\kv -> (fst kv, V.map snd (sortOn fst (snd kv)))) (H.toVec byData))
+
+-- A verdict in words, as a front end's report may give it.
+@pub fun verdictText (v : Verdict) : String =
+  match v with
+  | Verdict.Accepted -> "accepted"
+  | Verdict.Rejected why detail -> "rejected, ${why}: ${detail}"
+  | Verdict.Unsupported form -> "not supported yet: ${form}"
+
+-- Something wrong: the first is what the declaration is rejected for. An
+-- error value agrees with everything, so nothing after it is said twice.
+fun fail (cx : Checker s f p) (why : String) (detail : String) : Value ! { St s | e } =
+  let w =
+    (match getRef cx.failure with
+     | None -> setRef cx.failure (Just (why, detail))
+     | Just _ -> ())
+  in Value.Error
+
+fun failed (cx : Checker s f p) (why : String) (detail : String) : () ! { St s | e } =
+  let v = fail cx why detail in ()
+
+-- A form this does not check yet: the declaration is not judged.
+fun refuse (cx : Checker s f p) (form : String) : Value ! { St s | e } =
+  let w =
+    (match getRef cx.refused with
+     | None -> setRef cx.refused (Just form)
+     | Just _ -> ())
+  in Value.Error
+
+-- A value as a verdict shows it, at a context of `l` slots.
+fun shownAt (cx : Checker s f p) (l : Int) (v : Value) : String ! { St s | e } =
+  let text = shown False (quote cx.tc l v) in
+  if stringByteLength text > 160 then stringSlice text 0 160 ++ "…" else text
+
+def omegaCore : Core = Core.GradeLit G.any
+
+fun omega (cx : Checker s f p) : Value ! { St s | e } = eval cx.tc (Va.emptyEnv ()) omegaCore
+
+fun gradeValue (cx : Checker s f p) (g : Maybe Grade) : Value ! { St s | e } =
+  match g with
+  | Just x -> eval cx.tc (Va.emptyEnv ()) (Core.GradeLit x)
+  | None -> omega cx
+
+-- Effects performed here.
+fun perform (cx : Checker s f p) (e : Value) : () ! { St s | e2 } =
+  setRef cx.performed (V.pushBack (getRef cx.performed) e)
+
+-- What `act` performs, apart from what was performed before it: its result,
+-- and its effects as a row.
+fun apart (cx : Checker s f p) act =
+  let saved = getRef cx.performed in
+  let w = setRef cx.performed [] in
+  let x = act () in
+  let done = getRef cx.performed in
+  let w2 = setRef cx.performed saved in
+  (x, row cx.tc done)
+
+-- What a function's application answers, performing its effects.
+fun answered (cx : Checker s f p) (v : Value) : Value ! { St s | e } =
+  match force cx.tc v with
+  | Value.Comp t eff -> let w = perform cx eff in t
+  | other -> other
+
+fun bindVar (ctx : Ctx) (x : String) (ty : Value) : Ctx =
+  X.extend ctx None x ty Info.Bound (Va.vvar ctx.lvl x)
+
+fun defineVar (ctx : Ctx) (x : String) (ty : Value) (v : Value) : Ctx =
+  X.extend ctx None x ty Info.Defined v
+
+-- A new metavariable, in context `ctx`, applied to its bound variables.
+fun fresh (cx : Checker s f p) (ctx : Ctx) (what : String) : Value ! { St s | e } =
+  let tc = cx.tc in
+  let m = T.newMeta tc (MetaInfo.MetaInfo (getRef tc.at) (Origin.Inferred what) None) in
+  Value.Flex m (V.map (\l -> Elim.App (Va.vvar l (X.nameAt ctx l))) (X.boundLevels ctx))
+
+-- The type of a primitive operation.
+fun primType (p : Prim) : Core =
+  let arrow = \a b -> Core.Pi "_" Icit.Explicit omegaCore omegaCore a b in
+  let int = Core.LitTy Builtin.Int in
+  let str = Core.LitTy Builtin.Str in
+  match p with
+  | Prim.IntLt -> arrow int (arrow int (Core.LitTy Builtin.Bool))
+  | Prim.IntEq -> arrow int (arrow int (Core.LitTy Builtin.Bool))
+  | Prim.StrAppend -> arrow str (arrow str str)
+  | _ -> arrow int (arrow int int)
+
+-- A binder's icit, as an inferred lambda has it: implicit over a kind.
+fun icitOf (cx : Checker s f p) (dom : Value) : Icit ! { St s | e } =
+  match force cx.tc dom with
+  | Value.Type _ -> Icit.Implicit
+  | Value.LitTy Builtin.Effect -> Icit.Implicit
+  | _ -> Icit.Explicit
+
+-- The universe a type is in.
+fun universe (cx : Checker s f p) (ctx : Ctx) (ty : Core) : Int ! { St s | e } =
+  match force cx.tc (infer cx ctx ty) with
+  | Value.Type n -> n
+  | Value.MetaType n -> n
+  | Value.Error -> 0
+  | other ->
+      (let v = fail cx "not-a-type" (shown False ty ++ " : " ++ shownAt cx ctx.lvl other) in 0)
+
+-- An effect, or a row of them: of kind `Effect`, or `Effect []`, a row
+-- that may hold operations resumed more than once.
+fun isEffect (cx : Checker s f p) (ctx : Ctx) (c : Core) : () ! { St s | e } =
+  let k = force cx.tc (infer cx ctx c) in
+  match k with
+  | Value.LitTy Builtin.Effect -> ()
+  | Value.Error -> ()
+  | _ ->
+      if M.isSome (rowKind cx.tc k) then ()
+      else failed cx "not-an-effect" (shown False c ++ " : " ++ shownAt cx ctx.lvl k)
+
+-- A grade.
+fun isGrade (cx : Checker s f p) (ctx : Ctx) (c : Core) : () ! { St s | e } =
+  match force cx.tc (infer cx ctx c) with
+  | Value.LitTy Builtin.Grade -> ()
+  | Value.Error -> ()
+  | other -> failed cx "not-a-grade" (shown False c ++ " : " ++ shownAt cx ctx.lvl other)
+
+fun aGrade (cx : Checker s f p) (ctx : Ctx) (cs : [Core]) : Value ! { St s | e } =
+  let w = V.foldl (\acc c -> isGrade cx ctx c) () cs in
+  Value.LitTy Builtin.Grade
+
+-- An ascription, `e` said to be of type `t`.
+fun ascription (cx : Checker s f p) (ctx : Ctx) (t : Core) (e : Core) : Value ! { St s | e2 } =
+  let u = universe cx ctx t in
+  let tv = eval cx.tc ctx.env t in
+  let w = check cx ctx e tv in
+  tv
+
+-- The type of `c`.
+@pub fun infer (cx : Checker s f p) (ctx : Ctx) (c : Core) : Value ! { St s | e } =
+  let tc = cx.tc in
+  match c with
+  | Core.Type n -> Value.Type (n + 1)
+  | Core.LitTy Builtin.Div -> Value.LitTy Builtin.Effect
+  | Core.LitTy _ -> Value.Type 0
+  | Core.Lit l -> Value.LitTy (literalBuiltin l)
+  | Core.Prim p -> eval tc (Va.emptyEnv ()) (primType p)
+  | Core.Var i _ -> X.typeAt ctx (ctx.lvl - i - 1)
+  | Core.Opaque u n ->
+      (match H.lookup u (getRef tc.constants) with
+       | Just t -> t
+       | None -> fail cx "unknown-constant" n)
+  | Core.Meta _ -> fail cx "metavariable" ""
+  | Core.Pi x _ g r dom cod ->
+      let w = isGrade cx ctx g in
+      let w2 = isGrade cx ctx r in
+      let a = universe cx ctx dom in
+      let b = universe cx (bindVar ctx x (eval tc ctx.env dom)) cod in
+      Value.Type (if a > b then a else b)
+  | Core.Runtime (Note.Binds g (Just dom)) (Core.Lam x body) ->
+      let u = universe cx ctx dom in
+      let dv = eval tc ctx.env dom in
+      let inner = bindVar ctx x dv in
+      (match apart cx (\() -> infer cx inner body) with
+       | (bt, done) ->
+           let cod =
+             (match force tc done with
+              | Value.Row r -> if Va.rowIsEmpty r then bt else Value.Comp bt done
+              | _ -> Value.Comp bt done)
+           in Value.Pi
+                x
+                (icitOf cx dv)
+                (gradeValue cx g)
+                (omega cx)
+                dv
+                (Closure.Closure ctx.env (quote tc inner.lvl cod)))
+  -- a binder's type said of what is not a lambda (an `unbox`, as Idyll
+  -- writes one) says the type of what it is said of
+  | Core.Runtime (Note.Binds _ (Just dom)) inner -> ascription cx ctx dom inner
+  | Core.Runtime (Note.Has t) e -> ascription cx ctx t e
+  -- a goal stands for a term of whatever type is wanted
+  | Core.Runtime (Note.Goal _) _ -> Value.Error
+  | Core.Runtime _ inner -> infer cx ctx inner
+  | Core.Lam _ _ -> fail cx "unannotated-lambda" (shown False c)
+  | Core.App f a ->
+      (match force tc (infer cx ctx f) with
+       | Value.Pi _ _ _ _ dom cod ->
+           let w = check cx ctx a dom in
+           answered cx (apply tc cod (eval tc ctx.env a))
+       | Value.Error -> let w = infer cx ctx a in Value.Error
+       | other -> fail cx "not-a-function" (shown False f ++ " : " ++ shownAt cx ctx.lvl other))
+  | Core.Let x e b ->
+      let te = infer cx ctx e in
+      infer cx (defineVar ctx x te (eval tc ctx.env e)) b
+  | Core.Case s alts ->
+      let sv = eval tc ctx.env s in
+      let st = force tc (infer cx ctx s) in
+      let w = covered cx ctx sv st alts in
+      let types =
+        V.concatMap
+          (\alt ->
+            inAlt cx ctx sv st alt (\(inner : Ctx) body refined ->
+              (inner.lvl, infer cx inner body, M.isSome refined)))
+          alts
+      in (match V.get types 0 with
+          | Just (l, t, r) ->
+              -- (each alternative's type, at a context of its own, read back to
+              -- the scrutinee's)
+              let first = eval tc ctx.env (lowered cx l ctx.lvl t r) in
+              let w2 =
+                V.foldl
+                  (\acc x ->
+                    match x with
+                    | (l2, t2, r2) ->
+                        let other = eval tc ctx.env (lowered cx l2 ctx.lvl t2 r2) in
+                        if subtype tc ctx.lvl other first then ()
+                        else
+                          failed
+                            cx
+                            "alternatives-disagree"
+                            (shownAt cx ctx.lvl other ++ " and " ++ shownAt cx ctx.lvl first))
+                  ()
+                  (V.drop types 1)
+              in first
+          | None -> Value.Error)
+  | Core.Comp t eff ->
+      let n = universe cx ctx t in
+      let w = isEffect cx ctx eff in
+      Value.Type n
+  | Core.Row ls ts ->
+      let w = V.foldl (\acc x -> isEffect cx ctx x) () (V.append ls ts) in
+      Value.LitTy Builtin.Effect
+  | Core.Handle b r ops -> handled cx ctx b r ops None
+  | Core.Error -> Value.Error
+  -- the graded modality: `a [r]` is a type where `a` is, and `[e]` is of
+  -- type `a [r]` for `e` of type `a`, whatever grade is wanted
+  | Core.BoxTy g a -> let w = isGrade cx ctx g in Value.Type (universe cx ctx a)
+  | Core.BoxIntro e -> Value.BoxTy (fresh cx ctx "the grade of a box") (infer cx ctx e)
+  | Core.Unbox e ->
+      (match force tc (infer cx ctx e) with
+       | Value.BoxTy _ a -> a
+       | Value.Error -> Value.Error
+       | other -> fail cx "not-a-box" (shown False e ++ " : " ++ shownAt cx ctx.lvl other))
+  -- The compile-time level: `MetaType n` is in `MetaType (n + 1)`, `Code a`
+  -- in `MetaType n` for `a` in `Type n`, a quote of a term of type `a` is
+  -- of type `Code a`, and a splice of one of type `Code a` is of type `a`.
+  | Core.MetaType n -> Value.MetaType (n + 1)
+  | Core.Code a -> Value.MetaType (universe cx ctx a)
+  | Core.Quote t -> Value.Code (infer cx ctx t)
+  | Core.Splice x ->
+      (match force tc (infer cx ctx x) with
+       | Value.Code a -> a
+       | Value.Error -> Value.Error
+       | other -> fail cx "splice-of-no-code" (shownAt cx ctx.lvl other))
+  | Core.GradeLit _ -> Value.LitTy Builtin.Grade
+  | Core.GradeAdd a b -> aGrade cx ctx [a, b]
+  | Core.GradeMul a b -> aGrade cx ctx [a, b]
+  | Core.GradeRange a b -> aGrade cx ctx [a, b]
+
+-- A type found in an alternative's context, of `from` slots, read back to
+-- the context of `to` it is in: one that mentions a field is an error, or,
+-- where the alternative refined the context, a form not checked yet.
+fun lowered (cx : Checker s f p) (from : Int) (to : Int) (t : Value) (refined : Bool)
+    : Core ! { St s | e } =
+  let c = quote cx.tc from t in
+  let k = from - to in
+  if k == 0 then c
+  else if V.any (\i -> mentions c i) (V.range 0 k) then
+    (let v =
+       if refined then refuse cx "an inferred case whose type mentions what it learned"
+       else fail cx "field-escapes" (shown False c)
+     in Core.Error)
+  else down c k
+
+fun down (c : Core) (k : Int) : Core =
+  transform c 0 (\x d ->
+    match x with
+    | Core.Var i n -> if i >= d then Just (Core.Var (i - k) n) else None
+    | _ -> None)
+
+-- `c` checked against `expected`.
+@pub fun check (cx : Checker s f p) (ctx : Ctx) (c : Core) (expected : Value) : () ! { St s | e } =
+  let tc = cx.tc in
+  match c with
+  | Core.Runtime (Note.Binds _ dom) (Core.Lam x body) -> lambda cx ctx x dom body expected
+  | Core.Lam x body -> lambda cx ctx x None body expected
+  | Core.Runtime (Note.Goal _) _ -> ()
+  | Core.Runtime (Note.Binds _ (Just _)) _ -> conform cx ctx (infer cx ctx c) expected c
+  | Core.Runtime (Note.Has _) _ -> conform cx ctx (infer cx ctx c) expected c
+  | Core.Runtime _ inner -> check cx ctx inner expected
+  | Core.Let x e b ->
+      let te = infer cx ctx e in
+      check cx (defineVar ctx x te (eval tc ctx.env e)) b expected
+  | Core.Case s alts ->
+      let sv = eval tc ctx.env s in
+      let st = force tc (infer cx ctx s) in
+      let w = covered cx ctx sv st alts in
+      V.foldl
+        (\acc alt ->
+          let r =
+            inAlt cx ctx sv st alt (\(inner : Ctx) body refined ->
+              check cx inner body (refineGoal tc inner.lvl refined expected))
+          in ())
+        ()
+        alts
+  | Core.Handle b r ops -> let t = handled cx ctx b r ops (Just expected) in ()
+  | Core.BoxIntro e ->
+      (match force tc expected with
+       | Value.BoxTy _ a -> check cx ctx e a
+       | _ -> conform cx ctx (infer cx ctx c) expected c)
+  | _ -> conform cx ctx (infer cx ctx c) expected c
+
+fun conform (cx : Checker s f p) (ctx : Ctx) (t : Value) (expected : Value) (c : Core)
+    : () ! { St s | e } =
+  if subtype cx.tc ctx.lvl t expected then ()
+  else
+    failed
+      cx
+      "mismatch"
+      (shownAt cx ctx.lvl t
+         ++ " where "
+         ++ shownAt cx ctx.lvl expected
+         ++ " was wanted, of "
+         ++ (let text = shown False c in
+          if stringByteLength text > 120 then stringSlice text 0 120 ++ "…" else text))
+
+-- A lambda checked against a Pi: its body against the Pi's codomain, and
+-- what the body performs within what the codomain allows.
+fun lambda
+    (cx : Checker s f p)
+    (ctx : Ctx)
+    (x : String)
+    (dom : Maybe Core)
+    (body : Core)
+    (expected : Value)
+    : () ! { St s | e } =
+  let tc = cx.tc in
+  match force tc expected with
+  | Value.Pi _ _ _ _ edom cod ->
+      let w =
+        (match dom with
+         | Just d ->
+             let u = universe cx ctx d in
+             let dv = eval tc ctx.env d in
+             if unify tc ctx.lvl dv edom then ()
+             else
+               failed
+                 cx
+                 "annotation"
+                 (shownAt cx ctx.lvl dv ++ " where " ++ shownAt cx ctx.lvl edom ++ " was wanted")
+         | None -> ())
+      in
+      let inner = bindVar ctx x edom in
+      let res = apply tc cod (Va.vvar ctx.lvl x) in
+      let parts =
+        (match force tc res with
+         | Value.Comp t eff -> (t, eff)
+         | other -> (other, Va.emptyRow ()))
+      in (match apart cx (\() -> check cx inner body (fst parts)) with
+          | (_, done) ->
+              if effectsFit tc inner.lvl done (snd parts) then ()
+              else
+                failed
+                  cx
+                  "effects"
+                  (shownAt cx inner.lvl done ++ " not within " ++ shownAt cx inner.lvl (snd parts)))
+  | Value.Error ->
+      let dv =
+        (match dom with
+         | Just d -> eval tc ctx.env d
+         | None -> Value.Error)
+      in
+      let t = infer cx (bindVar ctx x dv) body in
+      ()
+  | other -> failed cx "lambda-not-a-function" (shownAt cx ctx.lvl other)
+
+-- --- cases -------------------------------------------------------------------
+
+-- Whether a `case` on `sv`, a value of type `st`, has an alternative for
+-- every constructor of it that can be there, and for no other, each once.
+fun covered (cx : Checker s f p) (ctx : Ctx) (sv : Value) (st : Value) (alts : [CaseAlt])
+    : () ! { St s | e } =
+  let heads = V.map (\alt -> match alt with | CaseAlt.CaseAlt h _ _ _ -> h) alts in
+  let wanted =
+    (match st with
+     | Value.LitTy Builtin.Bool -> Just [Head.BoolLit True, Head.BoolLit False]
+     | Value.Opaque d _ _ -> M.map (\cs -> V.map (\c -> Head.Con c) cs) (H.lookup d cx.ctorsOf)
+     | _ -> None)
+  in match wanted with
+     | Just ws ->
+         let once =
+           V.all (\h -> V.elem h ws and V.len (V.filter (\h2 -> h2 == h) heads) == 1) heads
+         in
+         let missing = V.filter (\w -> not (V.elem w heads)) ws in
+         if once and V.all (\w -> impossible cx ctx sv st w) missing then ()
+         else
+           failed
+             cx
+             "case-not-covering"
+             "${show (V.len heads)} alternatives for ${show (V.len ws)} constructors of ${shownAt cx ctx.lvl st}"
+     | None ->
+         (match st with
+          | Value.Error -> ()
+          | Value.Opaque _ n _ -> failed cx "case-on-unknown-data" n
+          | _ -> failed cx "case-on-non-data" (shownAt cx ctx.lvl st))
+
+-- Whether a constructor cannot build a value of the scrutinee's type: its
+-- indices cannot be the type's.
+fun impossible (cx : Checker s f p) (ctx : Ctx) (sv : Value) (st : Value) (h : Head)
+    : Bool ! { St s | e } =
+  match h with
+  | Head.Con c ->
+      let tc = cx.tc in
+      (match H.lookup c (getRef tc.constants) with
+       | Just cty ->
+           let n = snd (shapeOf cx ctx.lvl cty 0 0 True) in
+           (match split cx ctx sv st c "" (V.map (\i -> "_") (V.range 0 n)) cty with
+            | (_, Unified.Absurd) -> True
+            | _ -> False)
+       | None -> False)
+  | _ -> False
+
+-- How many implicit binders a type starts with, and how many binders it
+-- has in all.
+fun shapeOf (cx : Checker s f p) (l : Int) (ty : Value) (leading : Int) (all : Int) (open : Bool)
+    : (Int, Int) ! { St s | e } =
+  match force cx.tc ty with
+  | Value.Pi x icit _ _ _ cod ->
+      let lead = open and icit == Icit.Implicit in
+      shapeOf
+        cx
+        (l + 1)
+        (apply cx.tc cod (Va.vvar l x))
+        (if lead then leading + 1 else leading)
+        (all + 1)
+        lead
+  | _ -> (leading, all)
+
+-- `k` of an alternative's context and its body, and of what the
+-- alternative learned of the context's variables, if anything: nothing for
+-- an alternative whose constructor cannot be there.
+fun inAlt (cx : Checker s f p) (ctx : Ctx) (sv : Value) (st : Value) (alt : CaseAlt) k =
+  let tc = cx.tc in
+  match alt with
+  | CaseAlt.CaseAlt (Head.BoolLit _) _ vars body ->
+      [k (V.foldl (\c x -> bindVar c x (Value.LitTy Builtin.Bool)) ctx vars) body None]
+  | CaseAlt.CaseAlt (Head.Con c) name vars body ->
+      (match st with
+       | Value.Opaque _ _ spine ->
+           (match H.lookup c (getRef tc.constants) with
+            | Just cty ->
+                let args = V.concatMap (\e -> match e with | Elim.App a -> [a] | _ -> []) spine in
+                let shape = shapeOf cx ctx.lvl cty 0 0 True in
+                let fieldsOnly = V.len vars == snd shape - fst shape and V.len args == fst shape in
+                if fieldsOnly or V.len vars != snd shape then
+                  [k (fields cx ctx st spine cty vars name) body None]
+                else
+                  (match split cx ctx sv st c name vars cty with
+                   | (_, Unified.Refined inner sigma) -> [k inner body sigma]
+                   | (_, Unified.Absurd) -> []
+                   | (inner, Unified.Stuck _ _) ->
+                       let v = refuse cx "a case whose indices do not unify as patterns" in
+                       [k inner body None])
+            | None ->
+                let v = fail cx "unknown-constant" name in
+                [k (V.foldl (\c2 x -> bindVar c2 x Value.Error) ctx vars) body None])
+       | _ -> [k (V.foldl (\c2 x -> bindVar c2 x Value.Error) ctx vars) body None])
+
+-- A constructor of type `cty`'s fields, bound as `vars`, for a scrutinee
+-- of type `st`, a data type applied to `spine`, which gives the
+-- constructor's parameters, its first implicit binders.
+fun fields
+    (cx : Checker s f p)
+    (ctx : Ctx)
+    (st : Value)
+    (spine : [Elim])
+    (cty : Value)
+    (vars : [String])
+    (name : String)
+    : Ctx ! { St s | e } =
+  let tc = cx.tc in
+  let args = V.concatMap (\e -> match e with | Elim.App a -> [a] | _ -> []) spine in
+  let applied =
+    V.foldl
+      (\t a ->
+        match force tc t with
+        | Value.Pi _ Icit.Implicit _ _ _ cod -> apply tc cod a
+        | _ -> fail cx "constructor-parameters" name)
+      cty
+      args
+  in
+  let bound =
+    V.foldl
+      (\acc x ->
+        match acc with
+        | (c, t) ->
+            (match force tc t with
+             | Value.Pi _ _ _ _ dom cod -> (bindVar c x dom, apply tc cod (Va.vvar c.lvl x))
+             | Value.Error -> (bindVar c x Value.Error, Value.Error)
+             | _ -> (bindVar c x Value.Error, fail cx "constructor-arity" name)))
+      (ctx, applied)
+      vars
+  in match bound with
+     | (inner, result) ->
+         if unify tc inner.lvl result st then inner
+         else
+           (let v =
+              fail cx "constructor-result" (name ++ " builds " ++ shownAt cx inner.lvl result)
+            in inner)
+
+-- Every argument of constructor `c`, of type `cty`, bound as `vars`, and
+-- its type's indices unified with the scrutinee's, and the scrutinee with
+-- the constructor applied to them if it is a variable nothing has defined
+-- (`Cases`): the context they are bound in, and what unifying learned.
+fun split
+    (cx : Checker s f p)
+    (ctx : Ctx)
+    (sv : Value)
+    (st : Value)
+    (c : Int)
+    (name : String)
+    (vars : [String])
+    (cty : Value)
+    : (Ctx, Unified) ! { St s | e } =
+  let tc = cx.tc in
+  let bound =
+    V.foldl
+      (\acc x ->
+        match acc with
+        | (inner, t) ->
+            (match force tc t with
+             | Value.Pi _ _ _ _ dom cod -> (bindVar inner x dom, apply tc cod (Va.vvar inner.lvl x))
+             | _ -> (bindVar inner x Value.Error, fail cx "constructor-arity" name)))
+      (ctx, cty)
+      vars
+  in
+  let inner = fst bound in
+  let apps = \sp -> V.concatMap (\e -> match e with | Elim.App a -> [a] | _ -> []) sp in
+  match (force tc st, force tc (snd bound)) with
+  | (Value.Opaque _ _ wanted, Value.Opaque _ _ built) ->
+      let made =
+        Value.Opaque
+          c
+          name
+          (V.map (\l -> Elim.App (Va.vvar l (X.nameAt inner l))) (V.range ctx.lvl inner.lvl))
+      in
+      let itself =
+        (match force tc sv with
+         | Value.Rigid l _ [] ->
+             if X.unknownAt ctx l then [(Value.Rigid l (X.nameAt ctx l) [], made)] else []
+         | _ -> [])
+      in (inner, unifyIndices tc inner (V.append (V.zip (apps wanted) (apps built)) itself))
+  | (Value.Error, _) -> (inner, Unified.Refined inner None)
+  | (_, Value.Error) -> (inner, Unified.Refined inner None)
+  | (_, other) ->
+      let v = fail cx "constructor-result" (name ++ " builds " ++ shownAt cx inner.lvl other) in
+      (inner, Unified.Refined inner None)
+
+-- --- handlers ----------------------------------------------------------------
+
+-- A `handle`: its body's effects, but those its clauses handle, are
+-- performed; each clause is a function of its operation's arguments and of
+-- its resumption, which answers what the `handle` does; and what the
+-- `handle` answers is what its `return` clause does with the body's. What
+-- resuming performs is what the rest of the body does, under the `handle`,
+-- which the `handle` performs already: a resumption is checked as a
+-- function that performs nothing, and what the clauses perform besides is
+-- the `handle`'s.
+fun handled
+    (cx : Checker s f p)
+    (ctx : Ctx)
+    (body : Core)
+    (ret : Core)
+    (ops : [OpClause])
+    (expected : Maybe Value)
+    : Value ! { St s | e } =
+  let tc = cx.tc in
+  match apart cx (\() -> infer cx ctx body) with
+  | (tb, done) ->
+      let sigs =
+        V.map
+          (\o ->
+            match o with
+            | OpClause.OpClause u n erased _ -> operation cx ctx u n erased)
+          ops
+      in
+      -- the effects handled, at what the body performs of them
+      let handledFx = V.concatMap snd sigs in
+      let parts = rowParts tc done in
+      let ls = (match parts with | Row.Row x _ -> x) in
+      let ts = (match parts with | Row.Row _ x -> x) in
+      let w =
+        V.foldl
+          (\acc h ->
+            let mine = V.filter (\kv -> sameHead cx (snd kv) h) ls in
+            match V.get mine 0 with
+            | Just kv -> (let ok = unify tc ctx.lvl (snd kv) h in ())
+            | None -> ())
+          ()
+          handledFx
+      in
+      let keys = V.map (\h -> effectKey tc h) handledFx in
+      let left = V.filter (\kv -> not (V.elem (effectKey tc (snd kv)) keys)) ls in
+      let w2 = perform cx (row tc (V.append (V.map snd left) (V.map snd ts))) in
+      let result =
+        (match (expected, lambdaOf ret) with
+         -- (checked against what the `handle` is said to answer)
+         | (Just want, Just (x, dom, inner)) ->
+             let w4 = annotated cx ctx dom tb in
+             let c1 = bindVar ctx x tb in
+             let w5 = check cx c1 inner want in
+             want
+         | (Just want, None) -> want
+         | (None, _) ->
+             (match ret with
+              | Core.Runtime (Note.Binds _ (Just _)) (Core.Lam _ _) ->
+                  (match force tc (infer cx ctx ret) with
+                   | Value.Pi _ _ _ _ dom cod ->
+                       let u =
+                         if subtype tc ctx.lvl tb dom then ()
+                         else failed cx "return-clause" (shownAt cx ctx.lvl tb)
+                       in answered cx (apply tc cod tb)
+                   | _ -> Value.Error)
+              | _ -> tb))
+      in
+      let w3 =
+        V.foldl
+          (\acc pair ->
+            match pair with
+            | (OpClause.OpClause _ _ erased c, (opened, _)) -> clause cx ctx c opened erased result)
+          ()
+          (V.zip ops sigs)
+      in result
+
+-- Whether two effects are the same effect, perhaps at other arguments.
+fun sameHead (cx : Checker s f p) (a : Value) (b : Value) : Bool ! { St s | e } =
+  match (force cx.tc a, force cx.tc b) with
+  | (Value.Opaque x _ _, Value.Opaque y _ _) -> x == y
+  | _ -> False
+
+-- Operation `u`'s type, with its implicit binders but the last `erased`
+-- each a new metavariable -- the effect's parameters, which the body's
+-- effects decide -- and the effects it performs.
+fun operation (cx : Checker s f p) (ctx : Ctx) (u : Int) (name : String) (erased : Int)
+    : (Value, [Value]) ! { St s | e } =
+  let tc = cx.tc in
+  match H.lookup u (getRef tc.constants) with
+  | None -> (fail cx "unknown-operation" name, [])
+  | Just ty ->
+      let leading = fst (shapeOf cx ctx.lvl ty 0 0 True) in
+      let opened = instantiated cx ctx ty (leading - erased) in
+      (match force tc (instantiated cx ctx opened erased) with
+       | Value.Pi _ _ _ _ _ cod ->
+           (opened, performedBy cx ctx.lvl (apply tc cod (Va.vvar ctx.lvl "_")))
+       | _ -> (fail cx "not-an-operation" name, []))
+
+-- The effects an operation's type says it performs, after its explicit
+-- arguments, at a context of `l` slots.
+fun performedBy (cx : Checker s f p) (l : Int) (t : Value) : [Value] ! { St s | e } =
+  match force cx.tc t with
+  | Value.Comp _ eff -> (match rowParts cx.tc eff with | Row.Row ls _ -> V.map snd ls)
+  | Value.Pi x _ _ _ _ cod -> performedBy cx (l + 1) (apply cx.tc cod (Va.vvar (l + 1) x))
+  | _ -> []
+
+-- A type with its first `n` implicit binders each a new metavariable.
+fun instantiated (cx : Checker s f p) (ctx : Ctx) (ty : Value) (n : Int) : Value ! { St s | e } =
+  if n <= 0 then ty
+  else
+    match force cx.tc ty with
+    | Value.Pi _ Icit.Implicit _ _ _ cod ->
+        instantiated cx ctx (apply cx.tc cod (fresh cx ctx "an operation's parameter")) (n - 1)
+    | other -> other
+
+-- A handler's clause, for an operation of type `opened`: a lambda for each
+-- of the operation's own implicit arguments it erases (`erased`), each of
+-- its explicit ones, and its resumption, `k`, which takes what the
+-- operation answers and answers what the `handle` does, as the clause's
+-- body does.
+fun clause
+    (cx : Checker s f p)
+    (ctx : Ctx)
+    (c : Core)
+    (opened : Value)
+    (erased : Int)
+    (result : Value)
+    : () ! { St s | e } =
+  match arguments cx ctx c opened erased with
+  | Just (c1, rest, res) ->
+      (match lambdaOf rest with
+       | Just (k, kdom, body) ->
+           let tc = cx.tc in
+           let kty =
+             Value.Pi
+               "_"
+               Icit.Explicit
+               (omega cx)
+               (omega cx)
+               res
+               (Closure.Closure c1.env (quote tc (c1.lvl + 1) result))
+           in
+           let w = resumption cx c1 kdom res result in
+           let c2 = bindVar c1 k kty in
+           check cx c2 body result
+       | None -> failed cx "clause" (shown False rest))
+  | None -> ()
+
+-- A clause's lambdas for its operation's arguments, `erased` implicit ones
+-- and then the explicit ones, bound at their types: the context, what is
+-- left of the clause, and what the operation answers.
+fun arguments (cx : Checker s f p) (ctx : Ctx) (c : Core) (ty : Value) (erased : Int)
+    : Maybe (Ctx, Core, Value) ! { St s | e } =
+  let tc = cx.tc in
+  match force tc ty with
+  | Value.Comp t _ ->
+      if erased > 0 then (let v = failed cx "clause" (shown False c) in None) else Just (ctx, c, t)
+  | Value.Pi _ icit _ _ dom cod ->
+      if erased > 0 and icit != Icit.Implicit then
+        (let v = failed cx "clause" (shown False c) in None)
+      else
+        (match lambdaOf c with
+         | Just (x, xdom, inner) ->
+             let w = annotated cx ctx xdom dom in
+             arguments cx (bindVar ctx x dom) inner (apply tc cod (Va.vvar ctx.lvl x)) (erased - 1)
+         | None -> (let v = failed cx "clause" (shown False c) in None))
+  | Value.Error -> None
+  | other ->
+      if erased > 0 then (let v = failed cx "clause" (shown False c) in None)
+      else Just (ctx, c, other)
+
+-- A resumption's binder, where its type is written: a function of what the
+-- operation answers, to what the `handle` does, perhaps with effects.
+fun resumption (cx : Checker s f p) (ctx : Ctx) (kdom : Maybe Core) (res : Value) (result : Value)
+    : () ! { St s | e } =
+  match kdom with
+  | Just d ->
+      let tc = cx.tc in
+      let dv = eval tc ctx.env d in
+      let fits =
+        (match force tc dv with
+         | Value.Pi y _ _ _ dom cod ->
+             unify tc ctx.lvl dom res
+               and (let r = apply tc cod (Va.vvar ctx.lvl y) in
+                let t = (match force tc r with | Value.Comp t _ -> t | other -> other) in
+                unify tc (ctx.lvl + 1) t result)
+         | Value.Error -> True
+         | _ -> False)
+      in if fits then ()
+         else
+           failed
+             cx
+             "resumption"
+             (shownAt cx ctx.lvl dv ++ " for what answers " ++ shownAt cx ctx.lvl result)
+  | None -> ()
+
+fun annotated (cx : Checker s f p) (ctx : Ctx) (dom : Maybe Core) (want : Value)
+    : () ! { St s | e } =
+  match dom with
+  | Just d ->
+      let tc = cx.tc in
+      let dv = eval tc ctx.env d in
+      if unify tc ctx.lvl dv want then ()
+      else
+        failed
+          cx
+          "annotation"
+          (shownAt cx ctx.lvl dv ++ " where " ++ shownAt cx ctx.lvl want ++ " was wanted")
+  | None -> ()
+
+fun lambdaOf (c : Core) : Maybe (String, Maybe Core, Core) =
+  match c with
+  | Core.Runtime (Note.Binds _ dom) (Core.Lam x body) -> Just (x, dom, body)
+  | Core.Lam x body -> Just (x, None, body)
+  | Core.Runtime _ inner -> lambdaOf inner
+  | _ -> None
+
+-- --- declarations ------------------------------------------------------------
+
+-- A declaration checked, in context `ctx`: its type is a type, and its
+-- definition, if it has one, is of its type and performs nothing.
+@pub fun definition (cx : Checker s f p) (ctx : Ctx) (ty : Core) (term : Maybe Core)
+    : Verdict ! { St s | e } =
+  let tc = cx.tc in
+  let w0 = setRef cx.failure None in
+  let w1 = setRef cx.performed [] in
+  let w2 = setRef cx.refused None in
+  let n = universe cx ctx ty in
+  let w3 =
+    (match term with
+     | Just t ->
+         (match apart cx (\() -> check cx ctx t (eval tc ctx.env ty)) with
+          | (_, done) ->
+              if effectsFit tc ctx.lvl done (Va.emptyRow ()) then ()
+              else failed cx "effects" (shownAt cx ctx.lvl done ++ " performed by a definition"))
+     | None -> ())
+  in (match (getRef cx.refused, getRef cx.failure) with
+      | (Just form, _) -> Verdict.Unsupported form
+      | (None, Just (why, detail)) -> Verdict.Rejected why detail
+      | (None, None) -> Verdict.Accepted)
