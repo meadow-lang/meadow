@@ -76,11 +76,13 @@ use Vis.*
 }
 
 -- One module of a unit: where it is in the unit, its file as a dump names
--- it, and its syntax.
+-- it, and its syntax. And what each `includeStr` in it is, by the path it
+-- wrote: the file's text, or why it cannot be embedded.
 @pub record Source = {
   path : [String],
   file : String,
-  ast : AstProgram
+  ast : AstProgram,
+  embeds : HashMap String (Result String String)
 }
 
 -- A module, declared: its source, what it declares, and its `use`s -- each
@@ -839,7 +841,8 @@ fun scopeOf (cx : UnitCx) (sh : Shared) (m : ModFrame) : (Scope, [Item], [(Meta,
       builtinCtor = sh.builtinCtor,
       bools = sh.bools,
       traitAssocs = sh.traitAssocs,
-      vectorEmpty = sh.vectorEmpty
+      vectorEmpty = sh.vectorEmpty,
+      embeds = m.src.embeds
     }
   in (scope, used.reexports, used.refs)
 

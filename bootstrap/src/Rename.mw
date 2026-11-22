@@ -106,7 +106,8 @@ use Std.Sort (sortOn, sort)
 -- top-level values, which a top-level binding of that name is; the module
 -- layer and the base; the modules it named with `as`; and the types and
 -- constructors it may write bare, and every constructor of every type it
--- knows, which `T.C` reaches.
+-- knows, which `T.C` reaches. And what each `includeStr` the module writes
+-- is, by the path it wrote: the file's text, or why it cannot be embedded.
 @pub record Scope = {
   file : String,
   top : HashMap String Int,
@@ -124,7 +125,8 @@ use Std.Sort (sortOn, sort)
   builtinCtor : Int,
   bools : HashMap String Int,
   traitAssocs : HashMap Int (HashMap String Int),
-  vectorEmpty : Int
+  vectorEmpty : Int,
+  embeds : HashMap String (Result String String)
 }
 
 -- The context `rename` carries down: the module's scope, what is bound
@@ -310,7 +312,14 @@ pass! {
               (nameMeta out name)
         }
     | Qual { qual, name } -> qualified out env here qual name []
-    | App { func, args } -> applied out here func args
+    -- `includeStr "path"`, which is read at compile time. Only when nothing
+    -- of that name is in scope: a binding of one's own wins, as it does over
+    -- anything else.
+    | App { raw func, raw args } ->
+        if includes src env func then included src out env here args
+        else
+          (let f = renameExpr src out env func in
+           applied out here f (V.map (\a -> renameExpr src out env a) args))
     | Expr.Cons { name, args } ->
         (let n = textOf out name in
          match (H.lookup (unmarked n) env.scope.ctors, lookupValue env "$b${n}") with
@@ -672,6 +681,45 @@ fun applied out (m : Meta) (func : Int) (args : [Int]) =
   if kindHirExpr out func == HirExprKind.Cons and V.isEmpty (hirExprConsArgs out func) then
     newHirExprCons out m (hirExprConsRef out func) args
   else newHirExprApp out m func args
+
+-- Whether `func`, applied, is `includeStr`: the name, with nothing of that
+-- name in scope.
+fun includes src (env : Env) (func : Int) : Bool =
+  kindAstExpr src func == AstExprKind.Var
+    and astNameText src (astExprVarName src func) == "includeStr"
+    and V.isEmpty (valueCandidates env "includeStr")
+
+-- `includeStr "path"`, spanning `m`, as the text of that file: a string
+-- literal, with no trace at run time that it came from anywhere. The file
+-- was read with the unit, beside the module that wrote it (`Unit.beside`),
+-- and what it says is in the module's scope by the path as written
+-- (`meadow-rename`'s `include_str`).
+fun included src out (env : Env) (m : Meta) (args : [Int]) =
+  if V.len args != 1 then unembedded out env "`includeStr` takes one argument: the file to embed" m
+  else
+    let only = V.getOr 0 args 0 in
+    let at = metaAstExpr src only in
+    match writtenPath src only with
+    | None -> unembedded out env "`includeStr` takes a path written out in full" at
+    | Just path ->
+        (match H.lookup path env.scope.embeds with
+         | Just (Ok text) -> newHirExprLit out m (newHirLitString out m text)
+         | Just (Err why) -> unembedded out env why at
+         | None -> unembedded out env "cannot embed `${path}`: it was not read with the unit" at)
+
+-- The text of a string literal, if `e` is one.
+fun writtenPath src (e : Int) : Maybe String =
+  if kindAstExpr src e == AstExprKind.Lit then
+    (let l = astExprLitLit src e in
+     if kindAstLit src l == AstLitKind.String then Just (astLitStringText src l) else None)
+  else None
+
+-- A file that cannot be embedded, saying `why` at `m`: a value nothing binds,
+-- as an undefined name is, whose binder says why rather than what it is
+-- called -- declared at `?!`, which the compiler reports as it is.
+fun unembedded out (env : Env) (why : String) (m : Meta) =
+  let id = declareBinder why "v" "?!" in
+  newHirExprVar out m (refTo out env id m)
 
 -- `"a ${x} b"`: `concatStrings #["a ", display x, " b"]` -- `display` and
 -- `debug` as the base has them, each call spanning its hole.

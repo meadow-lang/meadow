@@ -4451,6 +4451,229 @@ fn a_program_that_is_wrong_is_refused_by_meadowboot_with_what_is_wrong() {
     );
 }
 
+/// A package for `includeStr`, its `src/Main.mw` being `main`: beside it
+/// `src/note.txt`, in `src/Deep` a module of its own with a `note.txt` of
+/// its own, and outside `src` the files `notes/far.txt` and `notes/odd.txt`,
+/// the last of characters a string literal escapes. Each compiler shows those
+/// in an answer its own way, so a program compares them with a literal.
+fn embedding(name: &str, main: &str) -> meadow_scratch::Scratch {
+    let dir = meadow_scratch::scratch!("meadowboot-embed-{name}-{}", std::process::id());
+    let put = |rel: &str, text: &str| {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().expect("a directory")).expect("a directory");
+        std::fs::write(path, text).expect("a file");
+    };
+    put(
+        "Meadow.toml",
+        "[package]\nname = \"Embed\"\nversion = \"0.1.0\"\n",
+    );
+    put("src/Main.mw", main);
+    put("src/note.txt", "beside the module");
+    put(
+        "src/Deep.mw",
+        "@pub def deep = includeStr \"Deep/note.txt\"\n",
+    );
+    put(
+        "src/Deep/Inner.mw",
+        "@pub def inner = includeStr \"note.txt\"\n",
+    );
+    put("src/Deep/note.txt", "deeper");
+    put("notes/far.txt", "outside src");
+    put(
+        "notes/odd.txt",
+        "\"quoted\", a \\ and\na new line\r\n\tand é\n",
+    );
+    dir
+}
+
+/// What the Rust compiler answers of the package at `root`, or its
+/// diagnostics' messages.
+fn rust_embedding(root: &Path) -> Result<String, Vec<String>> {
+    let out = meadow::pipeline::build(root, as_meadowboot_builds());
+    if !out.diagnostics.is_empty() {
+        return Err(out.diagnostics.iter().map(|d| d.msg.clone()).collect());
+    }
+    let linked = out.linked.expect("a linked program");
+    Ok(meadow_eval::run(&linked.program)
+        .expect("the program runs")
+        .to_string())
+}
+
+/// What MeadowBoot answers of the package at `root`, lowered to Cut and run
+/// by the AxCut machine -- or, where it compiled nothing, all it said.
+fn boot_embedding(root: &Path) -> Result<String, String> {
+    let out = Command::new(meadowboot_exe())
+        .arg("lower")
+        .arg(root.join("src").join("Main.mw"))
+        .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+        .env_remove("MEADOWBOOT_EXPANSIONS")
+        .output()
+        .expect("MeadowBoot runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    match stdout.split_once("\ncut 0\n") {
+        Some((_, rest)) => Ok(axcut_answer(&format!("cut 0\n{rest}"))),
+        None => Err(format!("{stdout}{}", String::from_utf8_lossy(&out.stderr))),
+    }
+}
+
+/// `includeStr` answers in MeadowBoot what it answers in the Rust compiler:
+/// the file beside the module that wrote it, wherever that module is; a file
+/// outside `src`, or named from the root of the file system; and, where a
+/// binding of that name is in scope, the binding, which wins.
+#[test]
+fn a_file_meadowboot_embeds_answers_as_the_rust_compiler_has_it() {
+    let far = |root: &Path| {
+        let full = root.join("notes").join("far.txt");
+        let full = full.to_string_lossy().replace('\\', "/");
+        full.trim_start_matches("//?/").to_string()
+    };
+    let cases: [(&str, String); 9] = [
+        ("beside", "def result = includeStr \"note.txt\"\n".into()),
+        (
+            "exact",
+            "def result = (includeStr \"../notes/odd.txt\" == \
+             \"\\\"quoted\\\", a \\\\ and\\na new line\\r\\n\\tand é\\n\", \
+             stringByteLength (includeStr \"../notes/odd.txt\"))\n"
+                .into(),
+        ),
+        (
+            "outside",
+            "def result = includeStr \"../notes/far.txt\"\n".into(),
+        ),
+        (
+            "parenthesised",
+            "def result = includeStr (\"note.txt\")\n".into(),
+        ),
+        ("absolute", String::new()),
+        (
+            "modules",
+            "use Embed.Deep (deep)\nuse Embed.Deep.Inner (inner)\n\n\
+             def result = (deep, inner, includeStr \"note.txt\")\n"
+                .into(),
+        ),
+        (
+            "twice",
+            "def a = includeStr \"note.txt\"\n\ndef result = a ++ includeStr \"note.txt\"\n".into(),
+        ),
+        (
+            "own",
+            "fun includeStr s = \"mine: ${s}\"\n\ndef result = includeStr \"note.txt\"\n".into(),
+        ),
+        (
+            "local",
+            "def result = let includeStr = \\s -> \"local: ${s}\" in includeStr \"note.txt\"\n"
+                .into(),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, main) in cases {
+        let dir = embedding(name, "def result = 1\n");
+        let main = if main.is_empty() {
+            format!("def result = includeStr \"{}\"\n", far(&dir))
+        } else {
+            main
+        };
+        std::fs::write(dir.join("src").join("Main.mw"), main).expect("a source");
+        let rust = rust_embedding(&dir).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        if name == "exact" {
+            assert!(rust.starts_with("(True, "), "{name}: {rust}");
+        }
+        let boot = boot_embedding(&dir);
+        if boot.as_ref() != Ok(&rust) {
+            wrong.push(format!(
+                "{name}: the Rust compiler {rust}, MeadowBoot {boot:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// What `includeStr` refuses, MeadowBoot refuses with the Rust compiler's
+/// words, where it is written: a file that is not there, a path that is not
+/// written out, and more than the one argument.
+#[test]
+fn what_meadowboot_cannot_embed_is_said_as_the_rust_compiler_says_it() {
+    let cases = [
+        (
+            "missing",
+            "def result = includeStr \"nope.txt\"\n",
+            "Main.mw:1:25: ",
+        ),
+        (
+            "computed",
+            "def place = \"note.txt\"\n\ndef result = includeStr place\n",
+            "Main.mw:3:25: ",
+        ),
+        (
+            "arity",
+            "def result = includeStr \"note.txt\" \"more.txt\"\n",
+            "Main.mw:1:14: ",
+        ),
+    ];
+    for (name, main, at) in cases {
+        let dir = embedding(&format!("refused-{name}"), main);
+        let rust = rust_embedding(&dir).expect_err(name);
+        let said = boot_embedding(&dir).expect_err(name);
+        assert_eq!(rust.len(), 1, "{name}: {rust:?}");
+        let rust = rust[0].as_str();
+        let line = said
+            .lines()
+            .find(|l| l.contains(at))
+            .unwrap_or_else(|| panic!("{name}: nothing at {at}:\n{said}"));
+        let boot = &line[line.find(at).expect("the place") + at.len()..];
+        if name == "missing" {
+            // The path is the file's, written as each compiler writes a
+            // path; what the system said of it is the same.
+            let reason = |s: &str| {
+                s.strip_prefix("cannot embed `")
+                    .and_then(|s| s.rsplit_once("`: "))
+                    .map(|(path, why)| (path.ends_with("nope.txt"), why.to_string()))
+            };
+            assert_eq!(reason(boot), reason(rust), "{name}: {boot} / {rust}");
+            assert_eq!(reason(boot).map(|r| r.0), Some(true), "{name}: {boot}");
+        } else {
+            assert_eq!(boot, rust, "{name}");
+        }
+        assert!(said.contains("not compiled"), "{name}: {said}");
+    }
+}
+
+/// A file a package embeds is an input of its build: edited, the package is
+/// compiled again, though none of its modules changed, and the program has
+/// the file as it is now. MeadowBoot keeps what it built between runs, as the
+/// Rust compiler does; without the embedded file among what a build is
+/// fingerprinted by, the second run would answer what the first did.
+#[test]
+fn editing_a_file_meadowboot_embedded_is_a_rebuild() {
+    let dir = embedding(
+        "rebuild",
+        "def result = (includeStr \"note.txt\", includeStr \"../notes/far.txt\")\n",
+    );
+    let rust = || rust_embedding(&dir).map_err(|e| e.join("\n"));
+    std::fs::write(dir.join("src").join("note.txt"), "first").expect("a note");
+    let first = boot_embedding(&dir);
+    assert_eq!(first, rust());
+    std::fs::write(dir.join("src").join("note.txt"), "second").expect("a note");
+    let second = boot_embedding(&dir);
+    assert_eq!(second, rust());
+    std::fs::write(dir.join("notes").join("far.txt"), "further").expect("a note");
+    let third = boot_embedding(&dir);
+    assert_eq!(third, rust());
+    assert!(
+        first != second && second != third && third.as_ref().is_ok_and(|t| t.contains("further")),
+        "{first:?} / {second:?} / {third:?}"
+    );
+    // And a file that was not there is embedded once it is.
+    std::fs::write(
+        dir.join("src").join("Main.mw"),
+        "def result = includeStr \"later.txt\"\n",
+    )
+    .expect("a source");
+    assert!(boot_embedding(&dir).is_err());
+    std::fs::write(dir.join("src").join("later.txt"), "here now").expect("a note");
+    assert_eq!(boot_embedding(&dir), rust());
+}
+
 /// How many glade cases MeadowBoot has to lower to Cut so that the reference
 /// interpreter answers as the Rust compiler does. The rest wait on primitives
 /// the interpreter does not have -- the sized integers', the floats', `show`
