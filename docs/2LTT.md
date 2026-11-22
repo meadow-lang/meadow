@@ -214,7 +214,8 @@ Meadow. Measured against `front/`'s imports, the kernel split as follows.
 
   Strata does not take Idyll's elaborator. Meadow's elaboration is
   inference first, and Idyll's is not, so each front end keeps its own.
-  The kernel is thirteen modules: the twelve above and `Cases`.
+  The kernel is thirteen modules: the twelve above and `Cases`. Strata
+  has a fourteenth of its own, `Check`, made of them (below).
 - **`Core` is more than a dependent core.** It includes Idyll's effect rows,
   handlers (`OpClause`), effect keys, and its set of builtins and
   primitives. Its `Prim` names eight integer and string operations; the rest
@@ -252,6 +253,41 @@ modules only.
 `front/` (Idyll's compiler in Meadow, a Meadow package) depends on Strata as
 a git dependency with `subdir = "Strata"`. Idyll's Rust compiler does not use
 Strata.
+
+**`Strata.Check`, a checker of whole Core terms.** The kernel had no
+function that checks a Core term against a type: each front end's
+elaborator is its own. `Strata.Check` is one both can run over the Core they
+elaborate, explicit as it is by then. It began as MeadowBoot's checker of
+what `ToStrata` writes and moved into Strata, generic in the front end's
+state and places (`Tc s f p`) and importing nothing from either front end.
+It is bidirectional, made of `Eval`, `Unify`, `Ctx` and `Cases`, and blind
+to grades: it checks every binder as if of grade ω, and a grade only to be a
+grade, since usage is a pass of its own (`Usage`). Besides the forms
+MeadowBoot writes it checks those Idyll's Core has: boxes (`BoxTy`,
+`BoxIntro`, `Unbox`), grade terms, `Div`, every `Runtime` note, handlers
+whose clauses bind an operation's erased implicit arguments and its explicit
+ones before the resumption, and `case`s whose alternatives bind every
+argument of a constructor, parameters and indices too. Such a `case` unifies
+the constructor's indices with the scrutinee's, as dependent matching does,
+refining the context and the type wanted; a constructor whose indices cannot
+be the scrutinee's needs no alternative. What it cannot check soundly yet,
+such as indices that do not unify as patterns, it refuses with a verdict of
+its own, "not supported yet", and does not judge the declaration. Idyll
+means to run it as a third check of `front/`'s elaborated Core over its
+corpus, beside its parity suite.
+
+**An ascription is a note.** `Note.Has t` says what is under it is of type
+`t`: `Core.Runtime (Note.Has t) e`. Evaluation sees through it, as through
+every note, and `Strata.Check` checks `e` against `t` and gives `t`. Before
+it, the core said an ascription with an annotated identity,
+`(\(it : t) -> it) e`.
+
+**Uniques for what a front end declares itself.** A front end that declares
+constants no package declares, as `ToStrata` does for Meadow's own types,
+tuples and records, needs uniques no binder has. The ranges are fixed, so
+that two front ends' constants never meet: Idyll's binders are in [0, 2^60);
+Idyll's own fixed constants, if it ever has any, go in [2^60, 2^61); and
+Meadow's are from 2^61 up.
 
 **Idyll's parity suite is an independent check of Strata's kernel.** Idyll
 keeps its Rust compiler, checked pass by pass against `front/`
@@ -793,6 +829,15 @@ dependencies are checked at the border, or erased there with a run-time
 check. The border format has to be designed for size: Idyll's interfaces
 carry normal forms, which once made its Std's export 18 MB until it was
 trimmed.
+
+Still open for those interfaces: both languages number a package's uniques
+per build, so the same declaration has one unique in one build and another
+in the next, and a Strata type in an interface names its constants by them.
+An interface carrying Strata types will need a translation from the
+numbering of the build that wrote it to that of the build that reads it.
+The fixed ranges for what a front end declares itself (see
+[Strata](#strata-the-kernel)) keep two front ends' own constants apart, but
+do nothing for this.
 Idyll's repository is Idyll's. Nothing here edits it.
 
 ### The `Mem` effect
@@ -1027,25 +1072,29 @@ declarations in Std and 395 in MeadowBoot, besides the dictionaries.
   a `case` on the one requiring it. A trait's associated types are
   parameters of its dictionary's type. A method generic in more than its
   trait, in associated types or effects, is a field generic in those.
-- **Handlers.** A `handle` is said to be of its type, by an annotated
-  identity, `(\(it : t) -> it) (handle …)`, which is what Core has for an
-  ascription: what its body answers may be a function that performs what its
-  clauses do, which a checker cannot read off its `return` clause.
+- **Handlers.** A `handle` is said to be of its type, by an ascription,
+  `Core.Runtime (Note.Has t) (handle …)`: what its body answers may be a
+  function that performs what its clauses do, which a checker cannot read off
+  its `return` clause. Until Core had `Note.Has` this was an annotated
+  identity, `(\(it : t) -> it) (handle …)`.
 
 **What is left.** Row-polymorphic records (19 in Std, 851 in MeadowBoot, in
 77 declarations); one `BigInt` literal in each; and in Std two `impl`s that
 leave out a method their trait has no default for, which inference allows.
 
-**The checker.** Strata has no function that checks a whole Core term:
+**The checker.** Strata had no function that checks a whole Core term:
 Idyll's bidirectional checking is its front end's, `Elab`, which elaborates
 Idyll's syntax into Core. What the translation writes is Core already, and
-explicit throughout, so MeadowBoot checks it with a small checker of the Core
-forms it writes, `StrataCheck`, made of the kernel's parts: `Eval` for
+explicit throughout, so MeadowBoot checked it with a small checker of the
+Core forms it writes, `StrataCheck`, made of the kernel's parts: `Eval` for
 values, `Unify` for conversion (`unify`), for a value where another is
 wanted (`subtype`) and for effects (`effectsFit`), and `Ctx` for the
-context. Its state is Strata's `Tc s f p`, with MeadowBoot's own part in
-`f` (each data type's constructors, the effects performed by what is being
-checked, and the first thing found wrong) and declarations' names for `p`.
+context. That checker is now Strata's, `Strata.Check` (see
+[Strata](#strata-the-kernel)), and `StrataCheck` is MeadowBoot's driver of
+it: it gives the kernel's state (`Tc s f p`, with nothing of MeadowBoot's in
+`f` and declarations' names for `p`) the unit's constants, the definitions
+types may see, Meadow's own types and effects as natives, and each data
+type's constructors.
 A lambda is checked against a Pi, or inferred where its binder's type is
 written; an application's argument is checked against its head's domain;
 a `case` binds each constructor's fields at the scrutinee's type and must
@@ -1059,7 +1108,11 @@ whether it was accepted, rejected and why, or skipped.
 | | accepted | rejected | skipped |
 | --- | --- | --- | --- |
 | Std | 2,975 | 0 | 8 |
-| MeadowBoot | 15,326 | 1 | 78 |
+| MeadowBoot | 15,300 | 0 | 78 |
+
+MeadowBoot's declarations are fewer by 27, as its sources changed: most of
+the checker's are now `Strata.Check`'s, in Strata's unit. Std's are as they
+were. The one rejection there was is gone (below).
 
 The first run rejected most of Std, and the classes of rejection were these.
 
@@ -1087,31 +1140,46 @@ The first run rejected most of Std, and the classes of rejection were these.
     package and binder of each dependency's `linked.dicts`), so where two
     dependencies' binders meet, one may stand for the other there too. That
     was not looked into here.
-  - A quantifier that is an effect only as the argument of a data type, and
-    never in a row, is a type variable in its scheme (`Plain`). The one
-    rejection left is that: `MeadowBoot.Dap.machineAdapter` passes an effect
-    row where `Lingua.Dap.machine`'s scheme says a type.
+  - Inference gives every parameter of a data type or record a plain
+    type's kind, as the Rust compiler does, so a parameter its fields use as
+    an effect row is a type variable in its constructors' schemes (`Plain`),
+    and so is a quantifier of a generic definition that is a row only as
+    such a data type's argument. That was the last rejection:
+    `MeadowBoot.Dap.machineAdapter` passed an effect row where
+    `Lingua.Dap.machine`'s scheme said a type, `Lingua.Dap.Machine m e`
+    using `e` as the effects of its fields. It is fixed in the translation,
+    not by letting a variable of kind `Type` stand in a row, which would let
+    a type such as `Int` be a row's tail: each data type's parameter is
+    given the kind its uses demand, `Effect` where a field uses it as a
+    row's tail or passes it where another data type's parameter is a row,
+    found by going over the data types until nothing changes, and a
+    definition's quantifier likewise where its scheme uses it as a row. A
+    row's tail is of kind `Effect` in the core anyway, so nothing well
+    kinded before is ill kinded now, and inference's types are as they
+    were. The golden package `Kinds` shows it. It also took Lingua's
+    rejections from 34 to 1 and LineEditor's from 17 to 0; the one left in
+    Lingua is a handler of an operation the translation does not find among
+    the constants (`withoutTerminal`'s `rawMode`), not looked into here.
 - **The kernel's assumptions.** None was wrong. One was learned: a
   metavariable made for an operation's parameter must be applied to the
   context's bound variables, as Idyll's are, or pattern unification cannot
   solve it with them.
 
-**What Core would need for Meadow.** For Idyll to weigh; nothing here is
-changed in the moved kernel, and nothing above needed it to be.
+**What Core would need for Meadow.** For Idyll to weigh. Two of these
+have landed: a checker of whole Core terms in the kernel, `Strata.Check`,
+and an ascription, `Note.Has` (see [Strata](#strata-the-kernel)).
 
-- A function that checks a whole Core term against a type, in the kernel,
-  so that front ends share one; `StrataCheck` could move there.
 - A default alternative in `Case`, and literal heads beyond `Bool`: a match
   of literals would be one `case` and not a chain of equality tests, and a
   tree split on a view would need no function of `()` for its other rows,
   nor have leaves no arm is left for.
-- An ascription, `(e : t)`, for what an annotated identity stands in for.
 - Rows of fields, for Meadow's row-polymorphic records, or agreement that a
   front end keeps them out of the core.
 - A recursive `let`, for local functions that call each other, or agreement
   that a front end lifts them, as this one does.
-- Agreement on encodings both front ends share: tuples as `TupleN`, records
-  as `#rec{…}`, and a range of uniques for what a front end declares itself.
+- Agreement on encodings both front ends share: tuples as `TupleN` and
+  records as `#rec{…}`. The ranges of uniques for what a front end declares
+  itself are agreed (see [Strata](#strata-the-kernel)).
 
 ### L2. Div, totality and coverage
 
