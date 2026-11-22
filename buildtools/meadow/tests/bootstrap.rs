@@ -4179,6 +4179,8 @@ fn a_program_meadowboot_builds_is_where_meadow_puts_it() {
                 .join(profile)
                 .join("link")
                 .join("target")
+                .join("release")
+                .join("native")
                 .exists(),
             "{flags:?}: MeadowBoot built under its link:\n{boot}"
         );
