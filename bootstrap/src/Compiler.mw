@@ -14,7 +14,7 @@ use Lingua (database!, make!)
 use Lingua.Make (
   Given, Linking, unitSources, unitImports, unitOut, unitDir, linkUnits, linkOut, linkDir
 )
-use Std.Fs (Fs, readToString, writeString)
+use Std.Fs (Fs, readToString, writeString, exists, removeFile, createDirAll)
 use Std.Time (monotonic)
 use Std.Thread (parMap)
 use Std.Console (writeError)
@@ -973,11 +973,12 @@ fun objectIn (out : String) (pkg : String) : String = Path.join out "${pkg}.cut"
 -- units' objects, in the order they were made in, how it opens and the roles
 -- its types play; after them, the definition it is entered at -- the root
 -- unit's `result`, or its `main` -- and what that shows a value with. A
--- root with neither is a library, and has no program.
+-- root with neither is a library, and has no program unless it exports
+-- functions to C.
 fun linkProgram (o : UnitsOptions) (l : Linking Interface) : Result String () ! { Fs | e } =
   let units = linkUnits l in
   match V.get units (V.len units - 1) with
-  | None -> Ok ()
+  | None -> noProgram l
   | Just (_, (root : Interface), _) ->
       let named =
         \n ->
@@ -1009,7 +1010,7 @@ fun linkProgram (o : UnitsOptions) (l : Linking Interface) : Result String () ! 
          -- stands for one: nothing calls it.
          | (Ok None, None) ->
              (match V.get exports 0 with
-              | None -> Ok ()
+              | None -> noProgram l
               | Just (pkg, (c : CExport)) ->
                   linkAt o l units root exports pkg c.binder (Con "Unit" []) 0 False)
          | (Ok (Just (e : Export)), None) ->
@@ -1029,6 +1030,21 @@ fun linkProgram (o : UnitsOptions) (l : Linking Interface) : Result String () ! 
                    -- run as a `main` is, `start = main ()`, by what they
                    -- are and not what their types were inferred to be.
                    (e.name == "main" or e.name == Tests.runner))
+
+-- A link with no program: none is written, and one an earlier build wrote,
+-- when the root still had an entry, is taken away, so that what runs the
+-- build's program does not run that one in its place. The link's directory
+-- is made all the same: it is what tells the next build, with nothing
+-- changed, that this link is fresh.
+fun noProgram (l : Linking Interface) : Result String () ! { Fs | e } =
+  let out = linkOut l in
+  let stale = Path.join out "program.cut" in
+  match (if exists stale then removeFile stale else Ok ()) with
+  | Err why -> Err "the program an earlier build linked could not be removed: ${why}\n"
+  | Ok _ ->
+      (match createDirAll out with
+       | Ok _ -> Ok ()
+       | Err why -> Err "the link's directory could not be made: ${why}\n")
 
 -- Each unit's functions C may call, with its package: each package once,
 -- however many names it was reached by.

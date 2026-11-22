@@ -4008,6 +4008,113 @@ fn meadowboot_calls_the_back_end_in_its_own_process() {
     assert_eq!(code, Some(0), "{out}{err}");
 }
 
+/// `args` run by the Rust `meadow` and by MeadowBoot, as [`both_say`] runs
+/// them: each one's status, standard output and standard error.
+fn both_said(args: &[&std::ffi::OsStr]) -> [(Option<i32>, String, String); 2] {
+    let rust = Command::new(meadow())
+        .args(args)
+        .output()
+        .expect("meadow runs");
+    let boot = Command::new(meadowboot_exe())
+        .args(args)
+        .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+        .env("MEADOW_HOST", meadow_host())
+        .env_remove("MEADOW")
+        .env_remove("MEADOWBOOT_EXPANSIONS")
+        .output()
+        .expect("MeadowBoot runs");
+    [rust, boot].map(|o| {
+        (
+            o.status.code(),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+        )
+    })
+}
+
+/// A library -- a package with a `src/Lib.mw` and no `main`, exporting
+/// nothing to C -- built from nothing by MeadowBoot as `meadow` builds it:
+/// compiled and checked, and nothing more, with no program linked and no
+/// error, built again the same way, and with nothing to run. MeadowBoot
+/// handed the back end a `program.cut` its link never wrote, and failed with
+/// a path that was not there. And once the root of a package that had a
+/// `main` loses it, the program an earlier build linked is not run in its
+/// place.
+#[test]
+fn a_library_with_no_main_is_built_by_meadowboot_as_meadow_builds_it() {
+    let dir = meadow_scratch::scratch!("meadowboot-lib-build-{}", std::process::id());
+    let lib = dir.join("Shelf");
+    std::fs::create_dir_all(lib.join("src")).expect("a package directory");
+    std::fs::write(
+        lib.join("Meadow.toml"),
+        "[package]\nname = \"Shelf\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("a manifest");
+    std::fs::write(
+        lib.join("src").join("Lib.mw"),
+        "fun twice (x : Int) : Int = x * 2\n",
+    )
+    .expect("the library's module");
+    let program = |root: &Path| root.join("target/debug/link/program.cut");
+    let offline: &std::ffi::OsStr = "--offline".as_ref();
+    for round in ["fresh", "again"] {
+        let [(rust_code, _, rust_err), (boot_code, boot_out, boot_err)] =
+            both_said(&["build".as_ref(), offline, lib.as_os_str()]);
+        assert_eq!(rust_code, Some(0), "{round}: meadow:\n{rust_err}");
+        assert_eq!(
+            boot_code,
+            Some(0),
+            "{round}: MeadowBoot:\n{boot_out}{boot_err}"
+        );
+        assert!(
+            !boot_err.contains("error") && !boot_err.contains("meadowboot:"),
+            "{round}: MeadowBoot:\n{boot_out}{boot_err}"
+        );
+        assert!(
+            !program(&lib).exists(),
+            "{round}: a library links no program"
+        );
+    }
+    let [(rust_code, _, rust_err), (boot_code, boot_out, boot_err)] =
+        both_said(&["run".as_ref(), offline, lib.as_os_str()]);
+    assert_eq!(rust_code, Some(1), "meadow:\n{rust_err}");
+    assert_eq!(boot_code, Some(1), "MeadowBoot:\n{boot_out}{boot_err}");
+    assert!(
+        rust_err.ends_with("program has no entry point\n"),
+        "meadow:\n{rust_err}"
+    );
+    assert!(
+        boot_err.ends_with("program has no entry point\n"),
+        "MeadowBoot:\n{boot_out}{boot_err}"
+    );
+
+    // A program, run, and then its `main` taken away.
+    let was = dir.join("Was");
+    std::fs::create_dir_all(was.join("src")).expect("a package directory");
+    std::fs::write(
+        was.join("Meadow.toml"),
+        "[package]\nname = \"Was\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("a manifest");
+    let main = was.join("src").join("Main.mw");
+    std::fs::write(
+        &main,
+        "fun twice (x : Int) : Int = x * 2\n\nfun main () = println \"from the program\"\n",
+    )
+    .expect("the root module");
+    let [_, (code, out, err)] = both_said(&["run".as_ref(), offline, was.as_os_str()]);
+    assert_eq!(code, Some(0), "{out}{err}");
+    assert!(out.ends_with("from the program\n"), "{out}{err}");
+    std::fs::write(&main, "fun twice (x : Int) : Int = x * 2\n").expect("the root module");
+    let [(rust_code, _, rust_err), (code, out, err)] =
+        both_said(&["run".as_ref(), offline, was.as_os_str()]);
+    assert_eq!(rust_code, Some(1), "meadow:\n{rust_err}");
+    assert_eq!(code, Some(1), "{out}{err}");
+    assert!(!out.contains("from the program"), "{out}{err}");
+    assert!(err.ends_with("program has no entry point\n"), "{out}{err}");
+    assert!(!program(&was).exists(), "what was linked before is gone");
+}
+
 /// A constructor written through the module a `use … as` names, as MeadowBoot
 /// builds it: `A.App` where one of the module's types has that constructor,
 /// and `A.Term.Var` where two do -- in a pattern and in an expression -- with

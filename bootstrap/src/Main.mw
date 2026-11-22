@@ -1083,7 +1083,9 @@ fun nurseryBytes (text : String) : Result String Int =
 fun pow2 (k : Int) : Int = if k <= 0 then 1 else 2 * pow2 (k - 1)
 
 -- The program at `r`, built, handed to the back end: built, or run with
--- `theirs` where `args` asks for a run, as `asked` says to run it.
+-- `theirs` where `args` asks for a run, as `asked` says to run it. A library
+-- that exports nothing to C has no program: building it is compiling and
+-- checking it, as `meadow`'s build of one is, and there is nothing to run.
 fun handedBack
     (r : String)
     (profile : String)
@@ -1094,6 +1096,23 @@ fun handedBack
     (theirs : [String])
     (asked : BuildAsked) =
   let program = Path.join (linkDirIn r profile) "program.cut" in
+  if exists program then handedBuilt program r profile level goal b args theirs asked
+  else
+    match args with
+    | None -> exit 0
+    | Just _ -> (let u = writeError "program has no entry point\n" in exit 1)
+
+-- `handedBack`, of the program the build linked, at `program`.
+fun handedBuilt
+    (program : String)
+    (r : String)
+    (profile : String)
+    (level : Int)
+    (goal : Goal)
+    (b : CliBuild)
+    (args : Maybe [String])
+    (theirs : [String])
+    (asked : BuildAsked) =
   -- Training is the JIT watching, whatever the profile would run.
   let ahead =
     not asked.train
