@@ -13,8 +13,8 @@
 -- "text"`, and inline tables of those, `Name = { path = "../x" }`.
 
 use Std.Fs (
-  Fs, FileMeta, readToString, readBytes, writeString, rename, removeFile, readDir, isDir, exists,
-  metadata
+  Fs, FileMeta, readToString, readBytes, writeString, rename, removeFile, readDir, isDir, isFile,
+  exists, metadata
 )
 use Std.Process (Process, getEnv, setEnv, currentExe, currentPid)
 use Std.Path as Path
@@ -25,6 +25,7 @@ use Std.Maybe as M
 use Std.Maybe.Maybe.*
 use Std.Result.Result.*
 use Std.Result as Res
+use MeadowBoot.Lex (lex, Lexed, Token)
 
 -- `path` without Windows' `\\?\`, which asks for a path to be taken exactly as
 -- written and which nothing here needs.
@@ -64,7 +65,73 @@ fun fromShell (p : String) : String =
 -- What a unit is compiled from: its manifest, which names its package, and
 -- its sources.
 @pub fun unitFilesOf (dir : String) : [String] ! { Fs, Process | e } =
-  V.concat [[manifestOf dir], sourcesOf dir, expansionsOf dir, precompiledOf dir]
+  let regular = V.concat [[manifestOf dir], sourcesOf dir, expansionsOf dir, precompiledOf dir] in
+  V.append regular (embeddedOf regular)
+
+-- --- embedded files ----------------------------------------------------------
+--
+-- `includeStr "path"` is the text of that file, read while the program is
+-- compiled. A file a unit embeds is an input of its build as its sources are:
+-- the build reads it, a change to it compiles the unit again, and the compile
+-- -- which may read only its unit's inputs -- finds it among them. So which
+-- files a unit embeds is read off its sources before it is compiled, from
+-- their tokens: each string literal written right after the name.
+
+-- The files a unit's `sources` embed that are not already among them, each
+-- once, where it is: those there are. One that is not is no input, and the
+-- compile says it cannot embed it -- as it does of a `.mw` file that is not
+-- one of the unit's modules, which the compile would take for one.
+fun embeddedOf (sources : [String]) : [String] ! { Fs | e } =
+  let wanted =
+    V.concatMap
+      (\f ->
+        if S.endsWith ".mw" f then
+          (match readToString f with
+           | Ok text -> V.map (\p -> Path.normalize (beside f p)) (embedsIn text)
+           | Err _ -> [])
+        else [])
+      sources
+  in V.foldl
+       (\acc p ->
+         if V.elem p acc or V.elem p sources or S.endsWith ".mw" p or not (isFile p) then acc
+         else V.pushBack acc p)
+       []
+       wanted
+
+-- The paths `text` embeds, as written: each string literal that follows
+-- `includeStr`, past any parentheses -- `includeStr ("a.txt")` is the call of
+-- one. A source that never says the name is not lexed for it.
+@pub fun embedsIn (text : String) : [String] =
+  if not (S.contains "includeStr" text) then []
+  else
+    let tokens = (lex text).tokens in
+    V.concatMap
+      (\i ->
+        match V.get tokens i with
+        | Just (t : Lexed) ->
+            (match t.token with
+             | Token.LowerIdent n -> if n == "includeStr" then literalAt tokens (i + 1) else []
+             | _ -> [])
+        | None -> [])
+      (V.range 0 (V.len tokens))
+
+fun literalAt (tokens : [Lexed]) (i : Int) : [String] =
+  match V.get tokens i with
+  | Just (t : Lexed) ->
+      (match t.token with
+       | Token.LParen -> literalAt tokens (i + 1)
+       | Token.Str s -> [s]
+       | _ -> [])
+  | None -> []
+
+-- `path` as `includeStr` takes it in the file `file`: beside that file, or as
+-- it is if it is absolute (`meadow-rename`'s `beside`).
+@pub fun beside (file : String) (path : String) : String =
+  if Path.isAbsolute path then path
+  else
+    match Path.parent file with
+    | Just d -> Path.join d path
+    | None -> path
 
 -- The standard library compiled ahead of time, for the unit that is the
 -- standard library, if there is one (`Compiler.precompiledFor`): where
