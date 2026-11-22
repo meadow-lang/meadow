@@ -1,0 +1,17 @@
+-- A result's type named through the module a `use ... as` names, with its
+-- effects after it, `S.Shape ! { Ask | e }`: the `!` must not take the
+-- type's name for a macro's.
+
+use Shapes as S
+use Shapes (Ask, ask)
+use Shapes.Shape.*
+
+@pub fun withRow (n : Int) : S.Shape ! { Ask | e } = Dot (n + ask ())
+
+@pub fun noRow (n : Int) : S.Shape = Dot n
+
+@pub fun rowVar (n : Int) : S.Shape ! e = Dot n
+
+@pub fun inParam (f : Int -> S.Shape ! { Ask | e }) : S.Shape ! { Ask | e } = f 1
+
+@pub fun nested (n : Int) : Maybe S.Shape ! { Ask | e } = Just (Dot (ask () + n))

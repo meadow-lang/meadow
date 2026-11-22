@@ -1986,6 +1986,7 @@ fun lowered
         out
         sh
         True
+        False
         pkg
         entry
         answerTy
@@ -1999,63 +2000,100 @@ fun lowered
           out
           C.nowhere
           "${package}\"#entry\""
-          (answering True answerTy)
+          (answering True False (M.unwrapOr 0 (M.map V.len (H.lookup entry generics))) answerTy)
           (V.concat [sources, declared, effects, vals, [entered], showers])
     in (C.finished out root, V.concat [sources, declared, effects], parts))
 
 -- The definition a program is entered at: the value of definition `entry`
 -- of package `pkg`, of type `answerTy` and generic in `types` types, turned
--- into the text the CEK machine would display -- a `main` run first, and
--- what it answers shown, where `mains` says a function of `()` is one.
-fun enteredAt out sh (mains : Bool) (pkg : String) (entry : Int) (answerTy : Type) (types : Int) =
-  C.defDecl
+-- into the text the CEK machine would display -- or a `main` run, and
+-- nothing shown (`runs`).
+fun enteredAt
     out
-    C.nowhere
-    "${package}\"#entry\""
-    []
-    [C.param out C.nowhere "k" "ptr"]
-    (if types > 0 then
-       C.invoke
-         out
-         C.nowhere
-         (topSymbol pkg entry)
-         (V.map (\v -> C.desc out C.nowhere "ptr") (V.range 0 types))
-         [C.binding
-            out
-            C.nowhere
-            "r"
-            (repOf answerTy)
-            (shownTo sh (C.var out C.nowhere "r") answerTy (C.cont out C.nowhere "k"))]
-     else
-       (match (if mains then mainOf answerTy else None) with
-        -- A `main` is run for what it does: what it answers is the
-        -- program's, and nothing is shown of it.
+    sh
+    (mains : Bool)
+    (main : Bool)
+    (pkg : String)
+    (entry : Int)
+    (answerTy : Type)
+    (types : Int) =
+  let k = C.cont out C.nowhere "k" in
+  -- Whatever a `main` answers is let go, and the program's answer is `unit`.
+  let ran =
+    \(result : Type) ->
+      C.binding out C.nowhere "r" (repOf result) (C.give out C.nowhere (C.unit out C.nowhere) k)
+  in C.defDecl
+       out
+       C.nowhere
+       "${package}\"#entry\""
+       []
+       [C.param out C.nowhere "k" "ptr"]
+       (match runs mains main types answerTy with
+        -- A `main` is run for what it does: what it answers is the program's,
+        -- and nothing is shown of it. One generic in a type -- what runs a
+        -- package's tests, when a test performs `St s` -- is asked for at
+        -- descriptors first, as any generic definition is, and the function
+        -- that answers is run.
         | Just result ->
-            C.applied
-              out
-              C.nowhere
-              (C.sym out C.nowhere (topSymbol pkg entry))
-              (C.unit out C.nowhere)
-              -- Whatever it answers is let go, and the program's answer is
-              -- `unit`.
-              (C.binding
-                 out
-                 C.nowhere
-                 "r"
-                 (repOf result)
-                 (C.give out C.nowhere (C.unit out C.nowhere) (C.cont out C.nowhere "k")))
+            if types > 0 then
+              C.invoke
+                out
+                C.nowhere
+                (topSymbol pkg entry)
+                (V.map (\v -> C.desc out C.nowhere "ptr") (V.range 0 types))
+                [C.binding
+                   out
+                   C.nowhere
+                   "m"
+                   (repOf answerTy)
+                   (C.applied
+                      out
+                      C.nowhere
+                      (C.var out C.nowhere "m")
+                      (C.unit out C.nowhere)
+                      (ran result))]
+            else
+              C.applied
+                out
+                C.nowhere
+                (C.sym out C.nowhere (topSymbol pkg entry))
+                (C.unit out C.nowhere)
+                (ran result)
         | None ->
-            shownTo
-              sh
-              (C.sym out C.nowhere (topSymbol pkg entry))
-              answerTy
-              (C.cont out C.nowhere "k")))
+            if types > 0 then
+              C.invoke
+                out
+                C.nowhere
+                (topSymbol pkg entry)
+                (V.map (\v -> C.desc out C.nowhere "ptr") (V.range 0 types))
+                [C.binding
+                   out
+                   C.nowhere
+                   "r"
+                   (repOf answerTy)
+                   (shownTo sh (C.var out C.nowhere "r") answerTy k)]
+            else shownTo sh (C.sym out C.nowhere (topSymbol pkg entry)) answerTy k)
+
+-- What a program's entry answers, if it is a `main`: run for what it does,
+-- and nothing shown. One is what `main` says it is -- the root's `main`, or
+-- what runs a package's tests -- whatever its type was inferred to be: a
+-- test may perform `St s`, which leaves what runs it generic in `s`, and it
+-- is a `main` all the same, as the Rust `meadow test` runs such a test.
+-- Another entry is one only where `mains` says a function of `()` is, and
+-- it is generic in no type: one that is is a value, shown.
+fun runs (mains : Bool) (main : Bool) (types : Int) (t : Type) : Maybe Type =
+  if not mains then None
+  else
+    match mainOf t with
+    | Just result -> if main or types == 0 then Just result else None
+    | None -> None
 
 -- What goes around the declarations of a program's units to make it one:
 -- before them, how it opens and the roles its types play; after them, the
 -- definition it is entered at and what that shows a value with. `known`
 -- are the types the units declare.
 @pub fun around
+    (main : Bool)
     (pkg : String)
     (entry : Int)
     (answerTy : Type)
@@ -2063,7 +2101,7 @@ fun enteredAt out sh (mains : Bool) (pkg : String) (entry : Int) (answerTy : Typ
     (known : [(String, Int, [(String, [Type])])])
     (packages : [String])
     : (String, String) =
-  aroundWith True pkg entry answerTy types known packages
+  aroundWith True main pkg entry answerTy types known packages
 
 -- The same for a prompt's entry, whose value is shown whatever it is -- a
 -- function of `()` too, which a program would take for its `main` and run
@@ -2076,10 +2114,11 @@ fun enteredAt out sh (mains : Bool) (pkg : String) (entry : Int) (answerTy : Typ
     (known : [(String, Int, [(String, [Type])])])
     (packages : [String])
     : (String, String) =
-  aroundWith False pkg entry answerTy types known packages
+  aroundWith False False pkg entry answerTy types known packages
 
 fun aroundWith
     (mains : Bool)
+    (main : Bool)
     (pkg : String)
     (entry : Int)
     (answerTy : Type)
@@ -2102,7 +2141,7 @@ fun aroundWith
           next = stNewRef 0
         }
       in
-      let shown = enteredAt out sh mains pkg entry answerTy types in
+      let shown = enteredAt out sh mains main pkg entry answerTy types in
       let showers = showersOf sh [] in
       C.finished
         out
@@ -2110,7 +2149,7 @@ fun aroundWith
            out
            C.nowhere
            "${package}\"#entry\""
-           (answering mains answerTy)
+           (answering mains main types answerTy)
            (V.pushFront showers shown)))
   in (C.header cut ++ roles known, C.body cut ++ C.showInt package)
 
@@ -2118,8 +2157,8 @@ fun fst3 (t : (a, b, c)) : a = match t with | (x, _, _) -> x
 
 -- What becomes of a program's answer: a `main`'s is nothing to show, and
 -- anything else is the text its entry made of it.
-fun answering (mains : Bool) (t : Type) : String =
-  if mains and M.isSome (mainOf t) then "none" else "str"
+fun answering (mains : Bool) (main : Bool) (types : Int) (t : Type) : String =
+  if M.isSome (runs mains main types t) then "none" else "str"
 
 -- What a function of `()` answers, if `t` is one: a program's `main`.
 fun mainOf (t : Type) : Maybe Type =

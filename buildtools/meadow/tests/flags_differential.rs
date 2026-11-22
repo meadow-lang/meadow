@@ -793,7 +793,11 @@ fn a_profile_s_strictness_warning_and_sampling_are_meadow_s() {
     assert!(warning(&theirs).is_some(), "{theirs}");
     assert_eq!(warning(&ours), warning(&theirs), "{ours}");
 
-    let p = pair("Sampled", &[("Main.mw", &busy(3000))]);
+    // Sampled on time, at the system's timer (every 15.6 ms on Windows), and
+    // only where the JIT's code comes back to the interpreter: busy enough
+    // that a fast machine still takes a sample (`busy(3000)` ran in less on
+    // a Windows runner, and its profile was empty).
+    let p = pair("Sampled", &[("Main.mw", &busy(30000))]);
     p.manifest("\n[profile.debug]\nprofile = true\n");
     for (side, said) in [
         (p.rust_root(), p.rust("run", &[])),

@@ -3351,6 +3351,67 @@ fn a_package_s_tests_are_run_by_meadowboot_as_meadow_test_runs_them() {
     assert_eq!(code, Some(0), "{said}");
 }
 
+/// A test may perform `St s` with no `runSt` around it -- a helper that
+/// works on an `StRef` it is handed -- as `meadow test`, which calls each
+/// test with `()` and checks nothing of what it performs, lets it. What runs
+/// the tests is then generic in `s`, and MeadowBoot took it for a value
+/// entry, not a `main`: every test stopped, "with status 0", on Glade and
+/// Silo alike. It is run as a `main` is now, by what it is, and its tests
+/// say what `meadow test` says of them on both.
+#[test]
+fn a_test_that_performs_st_runs_as_meadow_test_runs_it() {
+    let dir = meadow_scratch::scratch!("meadowboot-test-st-{}", std::process::id());
+    std::fs::create_dir_all(dir.join("src")).expect("a package directory");
+    std::fs::write(
+        dir.join("Meadow.toml"),
+        "[package]\nname = \"Ts\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("a manifest");
+    std::fs::write(
+        dir.join("src").join("Main.mw"),
+        "use Std.St as St\nuse Std.Test (assert, assertEq)\n\n\
+         fun bump (r : StRef s Int) : () ! { St s | e } = St.modifyRef r (\\x -> x + 1)\n\n\
+         @test fun bumps () =\n  let r = St.newRef 1 in\n  let u = bump r in\n  \
+         assertEq (St.getRef r) 2 \"bumped\"\n\n\
+         @test fun isWrong () =\n  let r = St.newRef 0 in\n  \
+         assertEq (St.getRef r) 1 \"zero is not one\"\n\n\
+         @test fun plain () = assert (1 + 1 == 2) \"sums\"\n\n\
+         fun main () = println \"hi\"\n",
+    )
+    .expect("the root module");
+    let path = dir.as_os_str();
+    let ((rust_code, rust), (boot_code, boot)) = both_say(&["test".as_ref(), path]);
+    for line in [
+        "running 3 tests",
+        "test bumps ... ok",
+        "test isWrong ... FAILED",
+        "test plain ... ok",
+        "test result: FAILED. 2 passed; 1 failed",
+    ] {
+        assert!(rust.contains(line), "no `{line}` in `meadow test`:\n{rust}");
+    }
+    assert_eq!(
+        (rust_code, test_report(&rust)),
+        (boot_code, test_report(&boot)),
+        "on Glade"
+    );
+    let silo = Command::new(meadowboot_exe())
+        .args(["test".as_ref(), "--runtime".as_ref(), "silo".as_ref(), path])
+        .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+        .env("MEADOW_HOST", meadow_host())
+        .env_remove("MEADOW")
+        .env_remove("MEADOWBOOT_EXPANSIONS")
+        .output()
+        .expect("MeadowBoot runs");
+    let said = String::from_utf8_lossy(&silo.stdout).into_owned();
+    assert_eq!(
+        (rust_code, test_report(&rust)),
+        (silo.status.code(), test_report(&said)),
+        "on Silo:\n{said}{}",
+        String::from_utf8_lossy(&silo.stderr)
+    );
+}
+
 /// What `meadow test` says, from `running N tests` on, set out so that two
 /// runs can be compared whatever order their tests finished in: the line
 /// saying how many, each test's line sorted, each failure -- its message and

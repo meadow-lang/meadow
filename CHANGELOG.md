@@ -496,6 +496,15 @@ last release is under _Unreleased_.
   depends on both now gives the later one a binder of its own; each keeps
   its symbol, and a program whose packages number their `impl`s apart is
   compiled to the same Cut as before.
+- MeadowBoot's `meadow test` runs a package whose tests perform `St s`
+  with no `runSt` around them -- a test that calls a helper working on an
+  `StRef` it is handed -- as the Rust `meadow test` runs it. What runs the
+  tests was then generic in `s`, and MeadowBoot decided from that type that
+  it was a value to show rather than a `main` to run, so on Glade and Silo
+  every test of the package stopped "with status 0" (`--cek` was right).
+  The root's `main` and what runs a package's tests are entered as a `main`
+  is, `start = main ()`, by what they are, whatever their types were
+  inferred to be.
 - `meadow build`, `run`, `test` and `dis` in a directory with no
   `Meadow.toml` no longer take it for a package. They took one named after
   the directory (`.`, given `.`) and swept every `.mw` file below it into
@@ -731,6 +740,17 @@ last release is under _Unreleased_.
   it died with a segmentation fault as `main` answered, or ran on through
   memory given to something else until it ran out. A trace now scans every
   frame the program has.
+- MeadowBoot parses a qualified type with effects after it, `O.Meta ! { St s
+  | e }`, wherever a type goes: a result, an arrow's, a type's argument. It
+  failed with "expected `upper`" at the type's last name, since a `!` makes
+  every name on the path before it a macro's to the lexer and a qualified
+  type's `.Name` took only an ordinary one, as it has since `M.Ty` was
+  added.
+- A unit MeadowBoot cannot compile has what is wrong with it written to
+  standard error, as the Rust compiler writes its diagnostics, with the
+  `Failed` line alone on standard output. Both went to standard output, so
+  a harness that shows a failed build's standard error -- `meadow test` run
+  from a test in CI -- showed no reason at all.
 
 ## 0.4.0 - 2026-10-24
 
