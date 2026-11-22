@@ -273,8 +273,10 @@ and the scrutinee, where it is a variable, with the constructor applied to
 them. What that learns refines the whole context, as `Cases.refine` does,
 the types of the variables bound before too, and the type wanted, so that a
 split on an index reaches a `case` on a vector inside it, through `Forced`
-and the other notes. A constructor whose indices cannot be the scrutinee's
-needs no alternative. What it cannot check soundly yet, such as indices that
+and the other notes, and the type wanted where the type has no indices too
+(`plusZero Z = Refl`). A constructor whose indices cannot be the scrutinee's
+needs no alternative, and an empty `case` covers a data type of no
+constructors. What it cannot check soundly yet, such as indices that
 do not unify as patterns, it refuses with a verdict of its own, "not
 supported yet", and does not judge the declaration. A definition is checked
 to perform nothing (`definition`), or what a row allows

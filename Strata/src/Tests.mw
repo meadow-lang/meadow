@@ -276,8 +276,56 @@ fun world () : [(Int, Core)] =
     ),
     (7, to (nat ()) (nat ())),
     (10, Core.LitTy Builtin.Effect),
-    (11, to (unitTy ()) (Core.Comp (int ()) (askRow ())))
+    (11, to (unitTy ()) (Core.Comp (int ()) (askRow ()))),
+    -- equality of naturals, `Refl : {x} -> EqN x x`, and addition, which
+    -- unfolds in types (`plusCase`)
+    (20, to (nat ()) (to (nat ()) (Core.Type 0))),
+    (21, pi "x" Icit.Implicit (nat ()) (eqN (Core.Var 0 "x") (Core.Var 0 "x"))),
+    (22, to (nat ()) (to (nat ()) (nat ()))),
+    -- `plusZero : (n : Nat) -> EqN (plus n Z) n`, recursive
+    (23, pi "n" Icit.Explicit (nat ()) (eqN (plus2 (Core.Var 0 "n") (zero ())) (Core.Var 0 "n"))),
+    -- `congS : {a} -> {b} -> EqN a b -> EqN (S a) (S b)`
+    (
+      24,
+      pi
+        "a"
+        Icit.Implicit
+        (nat ())
+        (pi
+           "b"
+           Icit.Implicit
+           (nat ())
+           (to
+              (eqN (Core.Var 1 "a") (Core.Var 0 "b"))
+              (eqN (succ (Core.Var 2 "a")) (succ (Core.Var 1 "b")))))
+    ),
+    -- `replicate : (n : Nat) -> Vec Int n`, recursive
+    (25, pi "n" Icit.Explicit (nat ()) (vec (int ()) (Core.Var 0 "n"))),
+    -- `Void`, of no constructors
+    (26, Core.Type 0),
+    -- `Sized`, a record of a length and a vector of it, and its projection
+    -- `sizeOf`, which unfolds in types
+    (27, Core.Type 0),
+    (28, pi "size" Icit.Explicit (nat ()) (to (vec (int ()) (Core.Var 0 "size")) (sized ()))),
+    (29, to (sized ()) (nat ()))
   ]
+
+fun eqN (a : Core) (b : Core) : Core = Core.App (Core.App (Core.Opaque 20 "EqN") a) b
+
+fun plus2 (a : Core) (b : Core) : Core = Core.App (Core.App (Core.Opaque 22 "plus") a) b
+
+fun sized () : Core = Core.Opaque 27 "Sized"
+
+-- `plus n m`'s case tree, under `n` and `m`.
+fun plusCase () : Core =
+  Core.Case (Core.Var 1 "n") [
+    alt 2 "Z" [] (Core.Var 0 "m"),
+    alt 3 "S" ["k"] (succ (plus2 (Core.Var 0 "k") (Core.Var 1 "m")))
+  ]
+
+-- `sizeOf self`'s, under `self`.
+fun sizeOfCase () : Core =
+  Core.Case (Core.Var 0 "self") [alt 28 "Sized" ["size", "items"] (Core.Var 1 "size")]
 
 -- What the checker says of a definition of type `ty` and term `term`.
 fun said (ty : Core) (term : Core) : String ! { St s | e } = saidAllowing ty term (Core.Row [] [])
@@ -300,7 +348,18 @@ fun saidAllowing (ty : Core) (term : Core) (allowed : Core) : String ! { St s | 
          (2, CtorInfo.CtorInfo "Z" 1 0 0 0),
          (3, CtorInfo.CtorInfo "S" 1 1 0 1),
          (5, CtorInfo.CtorInfo "VNil" 4 0 1 0),
-         (6, CtorInfo.CtorInfo "VCons" 4 1 2 2)
+         (6, CtorInfo.CtorInfo "VCons" 4 1 2 2),
+         (21, CtorInfo.CtorInfo "Refl" 20 0 1 0),
+         (28, CtorInfo.CtorInfo "Sized" 27 0 0 2)
+       ])
+  in
+  let w3 = setRef tc.datas (Hm.fromVec [(1, []), (4, []), (20, []), (26, []), (27, [])]) in
+  let w4 =
+    setRef
+      tc.transparent
+      (Hm.fromVec [
+         (22, (Va.emptyEnv (), 2, plusCase ())),
+         (29, (Va.emptyEnv (), 1, sizeOfCase ()))
        ])
   in
   let cx = checker tc (ctorsFromTc tc) in
@@ -503,3 +562,87 @@ fun aSplitRefinesWhatWasBoundBefore () =
   assertTrue
     (rejectedFor "case-not-covering" (said ty (whole (splitN consAtZero (zero ())))))
     "a split on a zero length still needs VNil"
+
+-- A split on a variable of a type with no indices refines the type wanted:
+-- `plusZero Z = Refl`, where `EqN (plus Z Z) Z` is wanted, and `plus`
+-- unfolds; and `replicate`, whose `Z` alternative is a `Vec Int Z`.
+@test
+fun aSplitRefinesTheTypeWanted () =
+  let plusZero =
+    lam
+      "n"
+      (Core.Case (Core.Var 0 "n") [
+         alt 2 "Z" [] (Core.App (Core.Opaque 21 "Refl") (zero ())),
+         alt
+           3
+           "S"
+           ["k"]
+           (Core.App
+              (Core.App
+                 (Core.App (Core.Opaque 24 "congS") (plus2 (Core.Var 0 "k") (zero ())))
+                 (Core.Var 0 "k"))
+              (Core.App (Core.Opaque 23 "plusZero") (Core.Var 0 "k")))
+       ])
+  in
+  let plusZeroTy =
+    pi "n" Icit.Explicit (nat ()) (eqN (plus2 (Core.Var 0 "n") (zero ())) (Core.Var 0 "n"))
+  in
+  let a = assertEq (said plusZeroTy plusZero) "accepted" "plusZero" in
+  let wrong =
+    lam
+      "n"
+      (Core.Case (Core.Var 0 "n") [
+         alt 2 "Z" [] (Core.App (Core.Opaque 21 "Refl") (succ (zero ()))),
+         alt 3 "S" ["k"] (Core.Runtime (Note.Goal "later") Core.Error)
+       ])
+  in
+  let b = assertTrue (rejectedFor "mismatch" (said plusZeroTy wrong)) "Refl at S Z is no EqN Z Z" in
+  let replicate =
+    lam
+      "n"
+      (Core.Case (Core.Var 0 "n") [
+         alt 2 "Z" [] (Core.App (Core.Opaque 5 "VNil") (int ())),
+         alt
+           3
+           "S"
+           ["m"]
+           (Core.App
+              (Core.App
+                 (Core.App (Core.App (Core.Opaque 6 "VCons") (int ())) (Core.Var 0 "m"))
+                 (lit 0))
+              (Core.App (Core.Opaque 25 "replicate") (Core.Var 0 "m")))
+       ])
+  in assertEq
+       (said (pi "n" Icit.Explicit (nat ()) (vec (int ()) (Core.Var 0 "n"))) replicate)
+       "accepted"
+       "replicate"
+
+-- A record's projection: where `self` is `Sized size items`, `items` is a
+-- `Vec Int size`, and the type wanted, `Vec Int (sizeOf self)`, unfolds to
+-- that.
+@test
+fun aProjectionMeetsItsTypeThroughTheSplit () =
+  let ty =
+    pi
+      "self"
+      Icit.Explicit
+      (sized ())
+      (vec (int ()) (Core.App (Core.Opaque 29 "sizeOf") (Core.Var 0 "self")))
+  in
+  let items =
+    lam
+      "self"
+      (Core.Case (Core.Var 0 "self") [alt 28 "Sized" ["size", "items"] (Core.Var 0 "items")])
+  in assertEq (said ty items) "accepted" "items"
+
+-- An empty `case` covers a data type of no constructors.
+@test
+fun anEmptyCaseCoversVoid () =
+  let void = Core.Opaque 26 "Void" in
+  let a =
+    assertEq (said (to void (nat ())) (lam "v" (Core.Case (Core.Var 0 "v") []))) "accepted" "absurd"
+  in assertTrue
+       (rejectedFor
+          "case-not-covering"
+          (said (to (nat ()) (nat ())) (lam "k" (Core.Case (Core.Var 0 "k") []))))
+       "but not Nat"

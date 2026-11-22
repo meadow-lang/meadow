@@ -96,16 +96,25 @@ use Std.Maybe.Maybe.*
   Checker { tc, ctorsOf, performed = newRef [], failure = newRef None, refused = newRef None }
 
 -- Each data type's constructors, in order, as the kernel's state knows them
--- (`Tc.ctors`): for a front end that keeps them there, as Idyll's does.
+-- (`Tc.datas` and `Tc.ctors`): for a front end that keeps them there, as
+-- Idyll's does. A data type with no constructors has none, so an empty
+-- `case` covers it; a native type is no data type here, and has no entry.
 @pub fun ctorsFromTc (tc : Tc s f p) : HashMap Int [Int] ! { St s | e } =
   let infos = H.toVec (getRef tc.ctors) in
+  let natives = getRef tc.natives in
+  let empty =
+    V.foldl
+      (\h kv -> if M.isSome (H.lookup (fst kv) natives) then h else H.insert (fst kv) [] h)
+      H.empty
+      (H.toVec (getRef tc.datas))
+  in
   let byData =
     V.foldl
       (\h kv ->
         match snd kv with
         | CtorInfo.CtorInfo _ d place _ _ ->
             H.insert d (V.pushBack (M.unwrapOr [] (H.lookup d h)) (place, fst kv)) h)
-      H.empty
+      empty
       infos
   in H.fromVec (V.map (\kv -> (fst kv, V.map snd (sortOn fst (snd kv)))) (H.toVec byData))
 
