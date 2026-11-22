@@ -28,9 +28,11 @@
 --   given by the scrutinee's type (as Meadow writes them), or every
 --   argument, the parameters and indices too (as Idyll writes them, from
 --   `Cases`); then the indices are unified, as dependent matching does, and
---   what that learns refines the context and the type wanted. A
---   constructor whose indices cannot be the scrutinee's needs no
---   alternative.
+--   so is the scrutinee, where it is a variable, with the constructor
+--   applied to them. What that learns refines the whole context, the types
+--   of the variables bound before as well, and the type wanted, so that a
+--   `case` inside sees it. A constructor whose indices cannot be the
+--   scrutinee's needs no alternative.
 -- - A box, `[e]`, is of type `a [r]` for `e` of type `a`, whatever `r`;
 --   `unbox` takes it apart.
 -- - Effects are those an application performs: a function's type says them
@@ -549,11 +551,11 @@ fun inAlt (cx : Checker s f p) (ctx : Ctx) (sv : Value) (st : Value) (alt : Case
        | Value.Opaque _ _ spine ->
            (match H.lookup c (getRef tc.constants) with
             | Just cty ->
-                let args = V.concatMap (\e -> match e with | Elim.App a -> [a] | _ -> []) spine in
                 let shape = shapeOf cx ctx.lvl cty 0 0 True in
-                let fieldsOnly = V.len vars == snd shape - fst shape and V.len args == fst shape in
-                if fieldsOnly or V.len vars != snd shape then
-                  [k (fields cx ctx st spine cty vars name) body None]
+                -- (every argument bound, or a constructor that has no
+                -- parameters, where the two ways agree: split, so that what
+                -- is learned of the scrutinee reaches the context)
+                if V.len vars != snd shape then [k (fields cx ctx st spine cty vars name) body None]
                 else
                   (match split cx ctx sv st c name vars cty with
                    | (_, Unified.Refined inner sigma) -> [k inner body sigma]
@@ -637,7 +639,7 @@ fun split
   let inner = fst bound in
   let apps = \sp -> V.concatMap (\e -> match e with | Elim.App a -> [a] | _ -> []) sp in
   match (force tc st, force tc (snd bound)) with
-  | (Value.Opaque _ _ wanted, Value.Opaque _ _ built) ->
+  | (Value.Opaque d1 _ wanted, Value.Opaque d2 _ built) if d1 == d2 ->
       let made =
         Value.Opaque
           c
@@ -879,6 +881,18 @@ fun lambdaOf (c : Core) : Maybe (String, Maybe Core, Core) =
 -- definition, if it has one, is of its type and performs nothing.
 @pub fun definition (cx : Checker s f p) (ctx : Ctx) (ty : Core) (term : Maybe Core)
     : Verdict ! { St s | e } =
+  definitionAllowing cx ctx ty term (Va.emptyRow ())
+
+-- The same, but its definition may perform what `allowed`, a row, says: a
+-- program's expression, say, what the run time handles (Idyll's prelude's
+-- `Eff`, or `Div`).
+@pub fun definitionAllowing
+    (cx : Checker s f p)
+    (ctx : Ctx)
+    (ty : Core)
+    (term : Maybe Core)
+    (allowed : Value)
+    : Verdict ! { St s | e } =
   let tc = cx.tc in
   let w0 = setRef cx.failure None in
   let w1 = setRef cx.performed [] in
@@ -889,8 +903,17 @@ fun lambdaOf (c : Core) : Maybe (String, Maybe Core, Core) =
      | Just t ->
          (match apart cx (\() -> check cx ctx t (eval tc ctx.env ty)) with
           | (_, done) ->
-              if effectsFit tc ctx.lvl done (Va.emptyRow ()) then ()
-              else failed cx "effects" (shownAt cx ctx.lvl done ++ " performed by a definition"))
+              if effectsFit tc ctx.lvl done allowed then ()
+              else
+                failed
+                  cx
+                  "effects"
+                  (shownAt cx ctx.lvl done
+                     ++ (match force tc allowed with
+                      | Value.Row r ->
+                          if Va.rowIsEmpty r then " performed by a definition"
+                          else " not within " ++ shownAt cx ctx.lvl allowed
+                      | _ -> " not within " ++ shownAt cx ctx.lvl allowed)))
      | None -> ())
   in (match (getRef cx.refused, getRef cx.failure) with
       | (Just form, _) -> Verdict.Unsupported form

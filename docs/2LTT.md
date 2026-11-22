@@ -269,12 +269,19 @@ whose clauses bind an operation's erased implicit arguments and its explicit
 ones before the resumption, and `case`s whose alternatives bind every
 argument of a constructor, parameters and indices too. Such a `case` unifies
 the constructor's indices with the scrutinee's, as dependent matching does,
-refining the context and the type wanted; a constructor whose indices cannot
-be the scrutinee's needs no alternative. What it cannot check soundly yet,
-such as indices that do not unify as patterns, it refuses with a verdict of
-its own, "not supported yet", and does not judge the declaration. Idyll
-means to run it as a third check of `front/`'s elaborated Core over its
-corpus, beside its parity suite.
+and the scrutinee, where it is a variable, with the constructor applied to
+them. What that learns refines the whole context, as `Cases.refine` does,
+the types of the variables bound before too, and the type wanted, so that a
+split on an index reaches a `case` on a vector inside it, through `Forced`
+and the other notes. A constructor whose indices cannot be the scrutinee's
+needs no alternative. What it cannot check soundly yet, such as indices that
+do not unify as patterns, it refuses with a verdict of its own, "not
+supported yet", and does not judge the declaration. A definition is checked
+to perform nothing (`definition`), or what a row allows
+(`definitionAllowing`): a program's expression may perform what the run
+time handles, which for Idyll is its prelude's `Eff`, or `Div`. Idyll runs
+it as a third check of `front/`'s elaborated Core over its corpus, beside
+its parity suite (`front/`'s `recheck`).
 
 **An ascription is a note.** `Note.Has t` says what is under it is of type
 `t`: `Core.Runtime (Note.Has t) e`. Evaluation sees through it, as through

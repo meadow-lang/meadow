@@ -15,7 +15,7 @@ use Strata.Unify (unify, subtype)
 use Strata.Tc (MetaInfo, Origin, CtorInfo)
 use Strata.Tc as T
 use Strata.Ctx as X
-use Strata.Check (checker, ctorsFromTc, definition, verdictText)
+use Strata.Check (checker, ctorsFromTc, definitionAllowing, verdictText)
 use Std.St (setRef)
 use Std.Collections.HashMap as Hm
 use Std.String as S
@@ -280,7 +280,10 @@ fun world () : [(Int, Core)] =
   ]
 
 -- What the checker says of a definition of type `ty` and term `term`.
-fun said (ty : Core) (term : Core) : String ! { St s | e } =
+fun said (ty : Core) (term : Core) : String ! { St s | e } = saidAllowing ty term (Core.Row [] [])
+
+-- The same, of a definition that may perform `allowed`, a row.
+fun saidAllowing (ty : Core) (term : Core) (allowed : Core) : String ! { St s | e } =
   let tc = T.new () 0 in
   let w =
     setRef
@@ -301,7 +304,7 @@ fun said (ty : Core) (term : Core) : String ! { St s | e } =
        ])
   in
   let cx = checker tc (ctorsFromTc tc) in
-  verdictText (definition cx (X.empty ()) ty (Just term))
+  verdictText (definitionAllowing cx (X.empty ()) ty (Just term) (eval tc (Va.emptyEnv ()) allowed))
 
 fun lam (x : String) (body : Core) : Core = Core.Lam x body
 
@@ -446,3 +449,57 @@ fun theCheckerChecksHandlers () =
        (said (int ()) (Core.Runtime (Note.Has (int ())) handler))
        "accepted"
        "a handler said to be of its type"
+
+@test
+fun aDefinitionMayPerformWhatItIsAllowed () =
+  let performs = Core.App (ask ()) (Core.Lit Literal.Unit) in
+  let a =
+    assertEq (saidAllowing (int ()) performs (askRow ())) "accepted" "ask, where Ask is allowed"
+  in
+  let b =
+    assertTrue
+      (rejectedFor
+         "effects"
+         (saidAllowing (int ()) performs (Core.Row [Core.LitTy Builtin.Div] [])))
+      "ask, where only Div is"
+  in assertEq
+       (saidAllowing (int ()) (lit 1) (Core.Row [Core.LitTy Builtin.Div] []))
+       "accepted"
+       "nothing performed, where Div is allowed"
+
+-- A split on an index refines the types of what was bound before it: in
+-- `S m`'s alternative the vector is a `Vec a (S m)`, which cannot be
+-- `VNil` (Idyll's corpus, #127, there by `toList`). The outer split is
+-- forced, as Idyll writes a split on an erased index.
+@test
+fun aSplitRefinesWhatWasBoundBefore () =
+  let ty =
+    pi
+      "a"
+      Icit.Implicit
+      (Core.Type 0)
+      (pi "n" Icit.Implicit (nat ()) (to (vec (Core.Var 1 "a") (Core.Var 0 "n")) (nat ())))
+  in
+  let splitN =
+    \(z : Core) (s : Core) -> Core.Case (Core.Var 1 "n") [alt 2 "Z" [] z, alt 3 "S" ["m"] s]
+  in
+  let whole = \(body : Core) -> lam "a" (lam "n" (lam "v" body)) in
+  -- (the vector is `Var 0` in `Z`'s alternative, and `Var 1` under `S`'s `m`)
+  let nilOnly = Core.Case (Core.Var 0 "v") [alt 5 "VNil" ["a2"] (zero ())] in
+  let consOnly =
+    Core.Case (Core.Var 1 "v") [alt 6 "VCons" ["a2", "k", "x", "xs"] (Core.Var 4 "m")]
+  in
+  let a =
+    assertEq (said ty (whole (splitN nilOnly consOnly))) "accepted" "each length's own constructor"
+  in
+  let b =
+    assertEq
+      (said ty (whole (Core.Runtime Note.Forced (splitN nilOnly consOnly))))
+      "accepted"
+      "through a forced split"
+  in
+  -- in `Z`'s alternative the vector is empty: `VCons` alone does not cover it
+  let consAtZero = Core.Case (Core.Var 0 "v") [alt 6 "VCons" ["a2", "k", "x", "xs"] (zero ())] in
+  assertTrue
+    (rejectedFor "case-not-covering" (said ty (whole (splitN consAtZero (zero ())))))
+    "a split on a zero length still needs VNil"
