@@ -5,15 +5,20 @@ use Std.St (getRef)
 use Std.Collections.Vector as V
 use Strata.Level (Level, levelOf, compTime, notYet)
 use Strata.Level.Level.*
-use Strata.Core (Core, Builtin, Prim, shown)
+use Strata.Core (Core, Builtin, Prim, Note, Head, CaseAlt, OpClause, shown)
 use Strata.Hir (Icit, Literal)
 use Strata.Grade as G
 use Strata.Value (Value, Elim)
 use Strata.Value as Va
 use Strata.Eval (eval, quote, vsplice)
 use Strata.Unify (unify, subtype)
-use Strata.Tc (MetaInfo, Origin)
+use Strata.Tc (MetaInfo, Origin, CtorInfo)
 use Strata.Tc as T
+use Strata.Ctx as X
+use Strata.Check (checker, ctorsFromTc, definitionAllowing, verdictText)
+use Std.St (setRef)
+use Std.Collections.HashMap as Hm
+use Std.String as S
 
 @test
 fun unmarkedIsRunTime () = assertEq (levelOf []) Run "a definition with no attributes"
@@ -212,3 +217,432 @@ fun codeUnifies () =
   in
   let o = assertEq (shown False (quote tc 0 (Va.vmeta k))) "$code" "solves ?k as the splice" in
   assertEq (shown False (quote tc 0 waiting)) "code" "and quote { ?k } is code from then on"
+
+-- --- the checker of Core terms -----------------------------------------------
+
+-- A small world for `Strata.Check`: the naturals, vectors indexed by them,
+-- a function on naturals that is no constructor, and an effect `Ask` with
+-- one operation, `ask : () -> Int ! {Ask}`.
+fun nat () : Core = Core.Opaque 1 "Nat"
+
+fun zero () : Core = Core.Opaque 2 "Z"
+
+fun succ (n : Core) : Core = Core.App (Core.Opaque 3 "S") n
+
+fun vec (a : Core) (n : Core) : Core = Core.App (Core.App (Core.Opaque 4 "Vec") a) n
+
+fun boolTy () : Core = Core.LitTy Builtin.Bool
+
+fun unitTy () : Core = Core.LitTy Builtin.Unit
+
+fun grade1 () : Core = Core.GradeLit G.one
+
+fun to (dom : Core) (cod : Core) : Core =
+  Core.Pi "_" Icit.Explicit (Core.GradeLit G.any) (Core.GradeLit G.any) dom cod
+
+fun pi (x : String) (icit : Icit) (dom : Core) (cod : Core) : Core =
+  Core.Pi x icit (Core.GradeLit G.any) (Core.GradeLit G.any) dom cod
+
+fun ask () : Core = Core.Opaque 11 "ask"
+
+fun askRow () : Core = Core.Row [Core.Opaque 10 "Ask"] []
+
+fun world () : [(Int, Core)] =
+  [
+    (1, Core.Type 0),
+    (2, nat ()),
+    (3, to (nat ()) (nat ())),
+    (4, to (Core.Type 0) (to (nat ()) (Core.Type 0))),
+    (5, pi "a" Icit.Implicit (Core.Type 0) (vec (Core.Var 0 "a") (zero ()))),
+    (
+      6,
+      pi
+        "a"
+        Icit.Implicit
+        (Core.Type 0)
+        (pi
+           "n"
+           Icit.Implicit
+           (nat ())
+           (pi
+              "x"
+              Icit.Explicit
+              (Core.Var 1 "a")
+              (pi
+                 "xs"
+                 Icit.Explicit
+                 (vec (Core.Var 2 "a") (Core.Var 1 "n"))
+                 (vec (Core.Var 3 "a") (succ (Core.Var 2 "n"))))))
+    ),
+    (7, to (nat ()) (nat ())),
+    (10, Core.LitTy Builtin.Effect),
+    (11, to (unitTy ()) (Core.Comp (int ()) (askRow ()))),
+    -- equality of naturals, `Refl : {x} -> EqN x x`, and addition, which
+    -- unfolds in types (`plusCase`)
+    (20, to (nat ()) (to (nat ()) (Core.Type 0))),
+    (21, pi "x" Icit.Implicit (nat ()) (eqN (Core.Var 0 "x") (Core.Var 0 "x"))),
+    (22, to (nat ()) (to (nat ()) (nat ()))),
+    -- `plusZero : (n : Nat) -> EqN (plus n Z) n`, recursive
+    (23, pi "n" Icit.Explicit (nat ()) (eqN (plus2 (Core.Var 0 "n") (zero ())) (Core.Var 0 "n"))),
+    -- `congS : {a} -> {b} -> EqN a b -> EqN (S a) (S b)`
+    (
+      24,
+      pi
+        "a"
+        Icit.Implicit
+        (nat ())
+        (pi
+           "b"
+           Icit.Implicit
+           (nat ())
+           (to
+              (eqN (Core.Var 1 "a") (Core.Var 0 "b"))
+              (eqN (succ (Core.Var 2 "a")) (succ (Core.Var 1 "b")))))
+    ),
+    -- `replicate : (n : Nat) -> Vec Int n`, recursive
+    (25, pi "n" Icit.Explicit (nat ()) (vec (int ()) (Core.Var 0 "n"))),
+    -- `Void`, of no constructors
+    (26, Core.Type 0),
+    -- `Sized`, a record of a length and a vector of it, and its projection
+    -- `sizeOf`, which unfolds in types
+    (27, Core.Type 0),
+    (28, pi "size" Icit.Explicit (nat ()) (to (vec (int ()) (Core.Var 0 "size")) (sized ()))),
+    (29, to (sized ()) (nat ()))
+  ]
+
+fun eqN (a : Core) (b : Core) : Core = Core.App (Core.App (Core.Opaque 20 "EqN") a) b
+
+fun plus2 (a : Core) (b : Core) : Core = Core.App (Core.App (Core.Opaque 22 "plus") a) b
+
+fun sized () : Core = Core.Opaque 27 "Sized"
+
+-- `plus n m`'s case tree, under `n` and `m`.
+fun plusCase () : Core =
+  Core.Case (Core.Var 1 "n") [
+    alt 2 "Z" [] (Core.Var 0 "m"),
+    alt 3 "S" ["k"] (succ (plus2 (Core.Var 0 "k") (Core.Var 1 "m")))
+  ]
+
+-- `sizeOf self`'s, under `self`.
+fun sizeOfCase () : Core =
+  Core.Case (Core.Var 0 "self") [alt 28 "Sized" ["size", "items"] (Core.Var 1 "size")]
+
+-- What the checker says of a definition of type `ty` and term `term`.
+fun said (ty : Core) (term : Core) : String ! { St s | e } = saidAllowing ty term (Core.Row [] [])
+
+-- The same, of a definition that may perform `allowed`, a row.
+fun saidAllowing (ty : Core) (term : Core) (allowed : Core) : String ! { St s | e } =
+  let tc = T.new () 0 in
+  let w =
+    setRef
+      tc.constants
+      (V.foldl
+         (\h kv -> Hm.insert (fst kv) (eval tc (Va.emptyEnv ()) (snd kv)) h)
+         Hm.empty
+         (world ()))
+  in
+  let w2 =
+    setRef
+      tc.ctors
+      (Hm.fromVec [
+         (2, CtorInfo.CtorInfo "Z" 1 0 0 0),
+         (3, CtorInfo.CtorInfo "S" 1 1 0 1),
+         (5, CtorInfo.CtorInfo "VNil" 4 0 1 0),
+         (6, CtorInfo.CtorInfo "VCons" 4 1 2 2),
+         (21, CtorInfo.CtorInfo "Refl" 20 0 1 0),
+         (28, CtorInfo.CtorInfo "Sized" 27 0 0 2)
+       ])
+  in
+  let w3 = setRef tc.datas (Hm.fromVec [(1, []), (4, []), (20, []), (26, []), (27, [])]) in
+  let w4 =
+    setRef
+      tc.transparent
+      (Hm.fromVec [
+         (22, (Va.emptyEnv (), 2, plusCase ())),
+         (29, (Va.emptyEnv (), 1, sizeOfCase ()))
+       ])
+  in
+  let cx = checker tc (ctorsFromTc tc) in
+  verdictText (definitionAllowing cx (X.empty ()) ty (Just term) (eval tc (Va.emptyEnv ()) allowed))
+
+fun lam (x : String) (body : Core) : Core = Core.Lam x body
+
+fun typedLam (x : String) (dom : Core) (body : Core) : Core =
+  Core.Runtime (Note.Binds None (Just dom)) (Core.Lam x body)
+
+fun alt (c : Int) (name : String) (vars : [String]) (body : Core) : CaseAlt =
+  CaseAlt.CaseAlt (Head.Con c) name vars body
+
+fun rejectedFor (why : String) (v : String) : Bool = S.startsWith ("rejected, " ++ why ++ ":") v
+
+@test
+fun theCheckerChecksFunctionsAndAscriptions () =
+  let idTy = pi "a" Icit.Implicit (Core.Type 0) (to (Core.Var 0 "a") (Core.Var 1 "a")) in
+  let a = assertEq (said idTy (lam "a" (lam "x" (Core.Var 0 "x")))) "accepted" "the identity" in
+  let b =
+    assertTrue
+      (rejectedFor "mismatch" (said (int ()) (Core.Lit (Literal.Bool True))))
+      "True is no Int"
+  in
+  let c =
+    assertEq (said (int ()) (Core.Runtime (Note.Has (int ())) (lit 1))) "accepted" "(1 : Int)"
+  in
+  let d =
+    assertTrue
+      (rejectedFor "mismatch" (said (int ()) (Core.Runtime (Note.Has (boolTy ())) (lit 1))))
+      "(1 : Bool)"
+  in
+  let e =
+    assertTrue
+      (rejectedFor "mismatch" (said (boolTy ()) (Core.Runtime (Note.Has (int ())) (lit 1))))
+      "(1 : Int) where a Bool is wanted"
+  in
+  let applied = Core.App (typedLam "x" (int ()) (plus (Core.Var 0 "x") (lit 1))) (lit 2) in
+  let f = assertEq (said (int ()) applied) "accepted" "an inferred lambda applied" in
+  assertEq
+    (shown False (Core.Runtime (Note.Has (int ())) (lit 1)))
+    "(1 : Int)"
+    "an ascription printed"
+
+@test
+fun theCheckerChecksBoxesAndGrades () =
+  let boxed = Core.BoxTy (grade1 ()) (int ()) in
+  let a =
+    assertEq (said (to boxed (int ())) (lam "b" (Core.Unbox (Core.Var 0 "b")))) "accepted" "unbox"
+  in
+  let b = assertEq (said boxed (Core.BoxIntro (lit 1))) "accepted" "[1] : Int [1]" in
+  let c =
+    assertTrue
+      (rejectedFor "mismatch" (said boxed (Core.BoxIntro (Core.Lit (Literal.Bool True)))))
+      "[True] : Int [1]"
+  in
+  let d = assertTrue (rejectedFor "not-a-box" (said (int ()) (Core.Unbox (lit 1)))) "unbox 1" in
+  let e =
+    assertEq
+      (said (Core.LitTy Builtin.Grade) (Core.GradeAdd (grade1 ()) (grade1 ())))
+      "accepted"
+      "1 + 1 : Grade"
+  in assertTrue
+       (rejectedFor
+          "not-a-grade"
+          (said (Core.LitTy Builtin.Grade) (Core.GradeAdd (grade1 ()) (lit 1))))
+       "1 + an Int"
+
+@test
+fun theCheckerMatchesDependently () =
+  -- `head : {a} -> {n} -> Vec a (S n) -> a`, binding every argument of
+  -- `VCons`, as Idyll does, and with no alternative for `VNil`, which
+  -- cannot be there
+  let headTy =
+    pi
+      "a"
+      Icit.Implicit
+      (Core.Type 0)
+      (pi
+         "n"
+         Icit.Implicit
+         (nat ())
+         (to (vec (Core.Var 1 "a") (succ (Core.Var 0 "n"))) (Core.Var 3 "a")))
+  in
+  let headBody =
+    Core.Case (Core.Var 0 "v") [alt 6 "VCons" ["a2", "m", "x", "xs"] (Core.Var 1 "x")]
+  in
+  let a = assertEq (said headTy (lam "a" (lam "n" (lam "v" headBody)))) "accepted" "head" in
+  -- `pred`, binding only the fields, as Meadow does
+  let predBody =
+    Core.Case (Core.Var 0 "k") [alt 2 "Z" [] (zero ()), alt 3 "S" ["j"] (Core.Var 0 "j")]
+  in
+  let b = assertEq (said (to (nat ()) (nat ())) (lam "k" predBody)) "accepted" "pred" in
+  let anyVec =
+    pi
+      "a"
+      Icit.Implicit
+      (Core.Type 0)
+      (pi "n" Icit.Implicit (nat ()) (to (vec (Core.Var 1 "a") (Core.Var 0 "n")) (nat ())))
+  in
+  let tailBody = Core.Case (Core.Var 0 "v") [alt 6 "VCons" ["a2", "m", "x", "xs"] (zero ())] in
+  let c =
+    assertTrue
+      (rejectedFor "case-not-covering" (said anyVec (lam "a" (lam "n" (lam "v" tailBody)))))
+      "a vector of any length may be empty"
+  in
+  -- indices that are no pattern: `Vec a (f n)` against `Vec a Z`
+  let stuckTy =
+    pi
+      "a"
+      Icit.Implicit
+      (Core.Type 0)
+      (pi
+         "n"
+         Icit.Implicit
+         (nat ())
+         (to (vec (Core.Var 1 "a") (Core.App (Core.Opaque 7 "f") (Core.Var 0 "n"))) (nat ())))
+  in
+  let stuckBody =
+    Core.Case (Core.Var 0 "v") [
+      alt 5 "VNil" ["a2"] (zero ()),
+      alt 6 "VCons" ["a2", "m", "x", "xs"] (zero ())
+    ]
+  in assertTrue
+       (S.startsWith "not supported yet: " (said stuckTy (lam "a" (lam "n" (lam "v" stuckBody)))))
+       "refused, not rejected"
+
+@test
+fun theCheckerChecksHandlers () =
+  let performs = Core.App (ask ()) (Core.Lit Literal.Unit) in
+  let clause = lam "u" (lam "k" (Core.App (Core.Var 0 "k") (lit 42))) in
+  let handler =
+    Core.Handle
+      performs
+      (typedLam "x" (int ()) (Core.Var 0 "x"))
+      [OpClause.OpClause 11 "ask" 0 clause]
+  in
+  let a = assertEq (said (int ()) handler) "accepted" "ask, handled" in
+  let b = assertTrue (rejectedFor "effects" (said (int ()) performs)) "ask, not handled" in
+  let c =
+    assertEq
+      (said (to (unitTy ()) (Core.Comp (int ()) (askRow ()))) (lam "u" performs))
+      "accepted"
+      "ask, in a function that may"
+  in assertEq
+       (said (int ()) (Core.Runtime (Note.Has (int ())) handler))
+       "accepted"
+       "a handler said to be of its type"
+
+@test
+fun aDefinitionMayPerformWhatItIsAllowed () =
+  let performs = Core.App (ask ()) (Core.Lit Literal.Unit) in
+  let a =
+    assertEq (saidAllowing (int ()) performs (askRow ())) "accepted" "ask, where Ask is allowed"
+  in
+  let b =
+    assertTrue
+      (rejectedFor
+         "effects"
+         (saidAllowing (int ()) performs (Core.Row [Core.LitTy Builtin.Div] [])))
+      "ask, where only Div is"
+  in assertEq
+       (saidAllowing (int ()) (lit 1) (Core.Row [Core.LitTy Builtin.Div] []))
+       "accepted"
+       "nothing performed, where Div is allowed"
+
+-- A split on an index refines the types of what was bound before it: in
+-- `S m`'s alternative the vector is a `Vec a (S m)`, which cannot be
+-- `VNil` (Idyll's corpus, #127, there by `toList`). The outer split is
+-- forced, as Idyll writes a split on an erased index.
+@test
+fun aSplitRefinesWhatWasBoundBefore () =
+  let ty =
+    pi
+      "a"
+      Icit.Implicit
+      (Core.Type 0)
+      (pi "n" Icit.Implicit (nat ()) (to (vec (Core.Var 1 "a") (Core.Var 0 "n")) (nat ())))
+  in
+  let splitN =
+    \(z : Core) (s : Core) -> Core.Case (Core.Var 1 "n") [alt 2 "Z" [] z, alt 3 "S" ["m"] s]
+  in
+  let whole = \(body : Core) -> lam "a" (lam "n" (lam "v" body)) in
+  -- (the vector is `Var 0` in `Z`'s alternative, and `Var 1` under `S`'s `m`)
+  let nilOnly = Core.Case (Core.Var 0 "v") [alt 5 "VNil" ["a2"] (zero ())] in
+  let consOnly =
+    Core.Case (Core.Var 1 "v") [alt 6 "VCons" ["a2", "k", "x", "xs"] (Core.Var 4 "m")]
+  in
+  let a =
+    assertEq (said ty (whole (splitN nilOnly consOnly))) "accepted" "each length's own constructor"
+  in
+  let b =
+    assertEq
+      (said ty (whole (Core.Runtime Note.Forced (splitN nilOnly consOnly))))
+      "accepted"
+      "through a forced split"
+  in
+  -- in `Z`'s alternative the vector is empty: `VCons` alone does not cover it
+  let consAtZero = Core.Case (Core.Var 0 "v") [alt 6 "VCons" ["a2", "k", "x", "xs"] (zero ())] in
+  assertTrue
+    (rejectedFor "case-not-covering" (said ty (whole (splitN consAtZero (zero ())))))
+    "a split on a zero length still needs VNil"
+
+-- A split on a variable of a type with no indices refines the type wanted:
+-- `plusZero Z = Refl`, where `EqN (plus Z Z) Z` is wanted, and `plus`
+-- unfolds; and `replicate`, whose `Z` alternative is a `Vec Int Z`.
+@test
+fun aSplitRefinesTheTypeWanted () =
+  let plusZero =
+    lam
+      "n"
+      (Core.Case (Core.Var 0 "n") [
+         alt 2 "Z" [] (Core.App (Core.Opaque 21 "Refl") (zero ())),
+         alt
+           3
+           "S"
+           ["k"]
+           (Core.App
+              (Core.App
+                 (Core.App (Core.Opaque 24 "congS") (plus2 (Core.Var 0 "k") (zero ())))
+                 (Core.Var 0 "k"))
+              (Core.App (Core.Opaque 23 "plusZero") (Core.Var 0 "k")))
+       ])
+  in
+  let plusZeroTy =
+    pi "n" Icit.Explicit (nat ()) (eqN (plus2 (Core.Var 0 "n") (zero ())) (Core.Var 0 "n"))
+  in
+  let a = assertEq (said plusZeroTy plusZero) "accepted" "plusZero" in
+  let wrong =
+    lam
+      "n"
+      (Core.Case (Core.Var 0 "n") [
+         alt 2 "Z" [] (Core.App (Core.Opaque 21 "Refl") (succ (zero ()))),
+         alt 3 "S" ["k"] (Core.Runtime (Note.Goal "later") Core.Error)
+       ])
+  in
+  let b = assertTrue (rejectedFor "mismatch" (said plusZeroTy wrong)) "Refl at S Z is no EqN Z Z" in
+  let replicate =
+    lam
+      "n"
+      (Core.Case (Core.Var 0 "n") [
+         alt 2 "Z" [] (Core.App (Core.Opaque 5 "VNil") (int ())),
+         alt
+           3
+           "S"
+           ["m"]
+           (Core.App
+              (Core.App
+                 (Core.App (Core.App (Core.Opaque 6 "VCons") (int ())) (Core.Var 0 "m"))
+                 (lit 0))
+              (Core.App (Core.Opaque 25 "replicate") (Core.Var 0 "m")))
+       ])
+  in assertEq
+       (said (pi "n" Icit.Explicit (nat ()) (vec (int ()) (Core.Var 0 "n"))) replicate)
+       "accepted"
+       "replicate"
+
+-- A record's projection: where `self` is `Sized size items`, `items` is a
+-- `Vec Int size`, and the type wanted, `Vec Int (sizeOf self)`, unfolds to
+-- that.
+@test
+fun aProjectionMeetsItsTypeThroughTheSplit () =
+  let ty =
+    pi
+      "self"
+      Icit.Explicit
+      (sized ())
+      (vec (int ()) (Core.App (Core.Opaque 29 "sizeOf") (Core.Var 0 "self")))
+  in
+  let items =
+    lam
+      "self"
+      (Core.Case (Core.Var 0 "self") [alt 28 "Sized" ["size", "items"] (Core.Var 0 "items")])
+  in assertEq (said ty items) "accepted" "items"
+
+-- An empty `case` covers a data type of no constructors.
+@test
+fun anEmptyCaseCoversVoid () =
+  let void = Core.Opaque 26 "Void" in
+  let a =
+    assertEq (said (to void (nat ())) (lam "v" (Core.Case (Core.Var 0 "v") []))) "accepted" "absurd"
+  in assertTrue
+       (rejectedFor
+          "case-not-covering"
+          (said (to (nat ()) (nat ())) (lam "k" (Core.Case (Core.Var 0 "k") []))))
+       "but not Nat"

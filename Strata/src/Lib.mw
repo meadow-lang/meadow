@@ -17,7 +17,8 @@
 -- (`Unify`), termination (`Termination`), strict positivity (`Positivity`),
 -- usage (`Usage`), strongly connected components (`Graph`), and the
 -- splitting of a variable into its constructors that dependent matching is
--- built on (`Cases`).
+-- built on (`Cases`); and a checker of whole Core terms made of these
+-- parts, which a front end can run over the Core it elaborates (`Check`).
 
 @pub mod Level
 @pub mod Grade
@@ -33,6 +34,7 @@
 @pub mod Usage
 @pub mod Graph
 @pub mod Cases
+@pub mod Check
 
 @cfg(test)
 mod Tests

@@ -15,7 +15,7 @@
 -- splits with.
 
 use Std.St (getRef)
-use Strata.Core (Core, CaseAlt, OpClause)
+use Strata.Core (Core, CaseAlt, OpClause, Note)
 use Strata.Core as C
 use Strata.Value (Value, Elim, Env)
 use Strata.Value as Va
@@ -48,6 +48,7 @@ use Std.Maybe.Maybe.*
   | Core.Code a -> mentions a i
   | Core.Quote a -> mentions a i
   | Core.Splice a -> mentions a i
+  | Core.Runtime (Note.Has t) a -> mentions t i or mentions a i
   | Core.Runtime _ a -> mentions a i
   | Core.Comp a e -> mentions a i or mentions e i
   | Core.Handle b r ops -> mentions b i or mentions r i or V.any (\o -> match o with | OpClause.OpClause _ _ _ body -> mentions body i) ops
