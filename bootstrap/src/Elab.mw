@@ -23,7 +23,8 @@ use MeadowBoot.Infer
 use MeadowBoot.Infer (Typed!)
 use MeadowBoot.Infer (Inferred)
 use MeadowBoot.Solve (
-  Evidence, TraitShape, ImplDef, Entry, Super, Generalized, TypeEnv, VariantSig, firstDictOf
+  Evidence, TraitShape, ImplDef, Entry, Super, Generalized, TypeEnv, VariantSig, firstDictOf,
+  dictsHere, typesHere
 )
 use MeadowBoot.Traits (methodKey)
 use MeadowBoot.Core
@@ -1066,7 +1067,11 @@ def nowhere : Meta = spanMeta 0 0
     : Maybe (CoreProgram, [Int], [DefaultSig], [Entry String]) =
   let bares = V.map bare done.typed in
   let itemsOf = \k -> M.unwrapOr [] (M.map (\(d : Declared) -> d.items) (V.get r.modules k)) in
-  let allTypes = V.pushBack (V.map (\(d : Imported) -> d.types) deps) done.types in
+  -- Each dependency's dictionaries by the binders they have here, which
+  -- inference gave them too.
+  let here = dictsHere (V.map (\(d : Imported) -> (d.package, d.linked.dicts, d.types)) deps) in
+  let depTypes = V.map (\(d : Imported) -> typesHere (fst here) d.types) deps in
+  let allTypes = V.pushBack depTypes done.types in
   let traitShapes =
     V.foldl
       (\h (t : TypeEnv) ->
@@ -1135,7 +1140,7 @@ def nowhere : Meta = spanMeta 0 0
                H.empty
                allTypes
            in
-           let first = firstDictOf (V.map (\(d : Imported) -> d.types) deps) in
+           let first = firstDictOf depTypes in
            let arities =
              V.foldl
                (\h (d : Imported) ->
@@ -1180,13 +1185,17 @@ def nowhere : Meta = spanMeta 0 0
                  (\(d : Imported) ->
                    V.map
                      (\dict ->
-                       (
-                         dict,
-                         defSymbol d.package dict,
-                         M.unwrapOr
-                           0
-                           (M.map (\(i : ImplDef) -> plains i.scheme) (H.lookup dict impls))
-                       ))
+                       -- Its binder here, and its symbol by the one it has
+                       -- in its unit.
+                       (let id =
+                          M.unwrapOr dict (H.lookup "${d.package}:${show dict}" (snd here))
+                        in (
+                             id,
+                             defSymbol d.package dict,
+                             M.unwrapOr
+                               0
+                               (M.map (\(i : ImplDef) -> plains i.scheme) (H.lookup id impls))
+                           )))
                      d.linked.dicts)
                  deps
              ]

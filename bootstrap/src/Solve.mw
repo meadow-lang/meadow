@@ -24,6 +24,7 @@ use Std.Maybe as M
 use Std.Maybe.Maybe.*
 use Std.Result.Result.*
 use Std.Macro (Reflect)
+use Std.Sort (sortOn)
 
 -- --- what inference knows ----------------------------------------------------
 
@@ -129,12 +130,88 @@ use Std.Macro (Reflect)
 
 -- The binder the first of a unit's own `impl`s' dictionaries has: below
 -- every other binder, and below those of the units it knows the types of,
--- so that a dictionary's binder is its own in a whole program.
+-- so that a dictionary's binder is its own among them (and see
+-- `dictsHere`).
 @pub fun firstDictOf (types : [TypeEnv]) : Int =
   V.foldl
     (\m (t : TypeEnv) -> V.foldl (\n (e : Entry ImplDef) -> min n (e.value.dict - 1)) m t.impls)
     (0 - 2)
     types
+
+-- A dictionary's binder is its own among the units its unit knows the
+-- types of, but two units that do not know each other -- dependencies of
+-- one unit, neither of the other -- may each give one of theirs the same:
+-- each starts below the units it knows. Its symbol names its package, so
+-- only a unit that knows both can take one for the other. There, each
+-- dependency's own dictionaries (`Linked.dicts`, and what it knows of their
+-- `impl`s) keep their binders in the order the dependencies were imported,
+-- and one whose binder a dependency before it has is given another, below
+-- every binder theirs have.
+--
+-- The binder each dependency's own `impl` has here, by its key, and by its
+-- unit's package and the binder it had there (`package:binder`). Where the
+-- dependencies number theirs apart, each keeps its own, and the unit is
+-- lowered as it was. By its key as well, since the types a unit hands on
+-- name its dependencies' `impl`s by the binders they had in it: whichever
+-- dependency's types an `impl` is read from, it is named as this says.
+@pub fun dictsHere (deps : [(String, [Int], TypeEnv)]) : (HashMap String Int, HashMap String Int) =
+  let below = firstDictOf (V.map (\x -> match x with | (_, _, t) -> t) deps) in
+  let start = (H.empty, below, H.empty, H.empty) in
+  match V.foldl (\acc x -> ownDictsHere acc x) start deps with
+  | (_, _, byKey, byOwn) -> (byKey, byOwn)
+
+-- `dictsHere`'s walk, at one dependency: the binders taken so far, each by
+-- the package that has it; the next binder to give; and what was given.
+fun ownDictsHere
+    (acc : (HashMap Int String, Int, HashMap String Int, HashMap String Int))
+    (dep : (String, [Int], TypeEnv))
+    : (HashMap Int String, Int, HashMap String Int, HashMap String Int) =
+  match dep with
+  | (pkg, dicts, (t : TypeEnv)) ->
+      let mine = V.foldl (\h d -> H.insert d True h) H.empty dicts in
+      let own =
+        V.concatMap
+          (\(e : Entry ImplDef) ->
+            if M.isSome (H.lookup e.value.dict mine) then [(e.value.dict, e.key)] else [])
+          t.impls
+      in V.foldl
+           (\acc2 o ->
+             match (acc2, o) with
+             | ((taken, next, byKey, byOwn), (dict, key)) ->
+                 (match H.lookup dict taken with
+                  | Just other ->
+                      if other == pkg then acc2
+                      else
+                        (
+                          taken,
+                          next - 1,
+                          H.insert key next byKey,
+                          H.insert "${pkg}:${show dict}" next byOwn
+                        )
+                  | None ->
+                      (
+                        H.insert dict pkg taken,
+                        next,
+                        H.insert key dict byKey,
+                        H.insert "${pkg}:${show dict}" dict byOwn
+                      )))
+           acc
+           (sortOn (\o -> 0 - fst o) own)
+
+-- `t`, each `impl` named by the binder `byKey` gives it (`dictsHere`).
+@pub fun typesHere (byKey : HashMap String Int) (t : TypeEnv) : TypeEnv =
+  {
+    t
+      | impls =
+        V.map
+          (\(e : Entry ImplDef) ->
+            match H.lookup e.key byKey with
+            | Just d ->
+                if d == e.value.dict then e
+                else Entry { key = e.key, value = ImplDef { dict = d, scheme = e.value.scheme } }
+            | None -> e)
+          t.impls
+  }
 
 -- An associated type's trait, and its place among the trait's; `effect`
 -- for an associated effect, which is a row where the rest are types.

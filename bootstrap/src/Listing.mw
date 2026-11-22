@@ -162,17 +162,19 @@ fun hiddenOf (s : Study) : [(String, String)] =
   let theirs =
     V.foldl
       (\h (i : Interface) ->
-        V.foldl (\g (e : Entry ImplDef) -> H.insert e.value.dict True g) h i.types.impls)
+        V.foldl (\g (e : Entry ImplDef) -> H.insert e.key True g) h i.types.impls)
       H.empty
       s.imported
   in
   -- The unit's own, in the order their dictionaries' binders were made,
-  -- which is the order the `impl`s are written in.
+  -- which is the order the `impl`s are written in. Known by their keys,
+  -- not their binders: a dependency's `impl` may have another binder here
+  -- than in its own unit (`Solve.dictsHere`).
   let own =
     sortOn
       (\(d : ImplDef) -> 0 - d.dict)
       (V.concatMap
-         (\(e : Entry ImplDef) -> if M.isSome (H.lookup e.value.dict theirs) then [] else [e.value])
+         (\(e : Entry ImplDef) -> if M.isSome (H.lookup e.key theirs) then [] else [e.value])
          s.inferred.types.impls)
   in fst
        (V.foldl
