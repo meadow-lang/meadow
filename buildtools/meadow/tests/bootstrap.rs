@@ -2627,6 +2627,72 @@ fn a_program_with_the_standard_library_lowered_by_meadowboot_answers_as_the_rust
     );
 }
 
+/// Two packages that do not know each other, each with an `impl`: the first
+/// `impl` of each has the same binder in its own unit, the first below the
+/// standard library's. A unit that depends on both must still tell the two
+/// dictionaries apart. It took one for the other, and called `Banana`'s
+/// `display` with an `Apple`, which no case of it matches.
+#[test]
+fn the_impls_of_two_packages_that_do_not_know_each_other_are_told_apart() {
+    let dir = meadow_scratch::scratch!("meadowboot-siblings-{}", std::process::id());
+    let package = |name: &str, deps: &str, file: &str, text: &str| {
+        let pkg = dir.join(name);
+        std::fs::create_dir_all(pkg.join("src")).expect("a package directory");
+        std::fs::write(
+            pkg.join("Meadow.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n{deps}"),
+        )
+        .expect("a manifest");
+        let path = pkg.join("src").join(file);
+        std::fs::write(&path, text).expect("a source file");
+        path
+    };
+    for fruit in ["Apple", "Banana"] {
+        let lower = fruit.to_lowercase();
+        package(
+            fruit,
+            "",
+            "Lib.mw",
+            &format!(
+                "@pub data {fruit} = {fruit} Int\n\n\
+                 impl Display {fruit} {{\n  \
+                 fun display x = match x with | {fruit} n -> \"{lower} ${{show n}}\"\n}}\n\n\
+                 @pub fun {lower} (n : Int) : {fruit} = {fruit} n\n"
+            ),
+        );
+    }
+    let main = package(
+        "Bowl",
+        "\n[dependencies]\nApple = { path = \"../Apple\" }\nBanana = { path = \"../Banana\" }\n",
+        "Main.mw",
+        "use Apple (apple)\nuse Banana (banana)\n\n\
+         fun shown x = display x\n\n\
+         def result = (shown (apple 1), display (banana 2), display (apple 3), shown (banana 4))\n",
+    );
+    let out = Command::new(meadowboot_exe())
+        .arg("lower")
+        .arg(&main)
+        .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+        .env_remove("MEADOWBOOT_EXPANSIONS")
+        .output()
+        .expect("MeadowBoot runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let text = stdout
+        .split_once("\ncut 0\n")
+        .map(|(_, rest)| format!("cut 0\n{rest}"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no program:\n{stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+    assert_eq!(
+        axcut_answer(&text),
+        r#"("apple 1", "banana 2", "apple 3", "banana 4")"#
+    );
+}
+
 /// Functions written once for any number type, used at several: one that
 /// calls itself, one that calls another, one over fractions, and one that
 /// hands a function generic in its number to the standard library.
