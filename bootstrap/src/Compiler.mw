@@ -14,7 +14,7 @@ use Lingua (database!, make!)
 use Lingua.Make (
   Given, Linking, unitSources, unitImports, unitOut, unitDir, linkUnits, linkOut, linkDir
 )
-use Std.Fs (Fs, readToString, writeString, exists, removeFile, createDirAll)
+use Std.Fs (Fs, readToString, writeString, createDirAll)
 use Std.Time (monotonic)
 use Std.Thread (parMap)
 use Std.Console (writeError)
@@ -1031,20 +1031,15 @@ fun linkProgram (o : UnitsOptions) (l : Linking Interface) : Result String () ! 
                    -- are and not what their types were inferred to be.
                    (e.name == "main" or e.name == Tests.runner))
 
--- A link with no program: none is written, and one an earlier build wrote,
--- when the root still had an entry, is taken away, so that what runs the
--- build's program does not run that one in its place. The link's directory
--- is made all the same: it is what tells the next build, with nothing
--- changed, that this link is fresh.
+-- A link with no program: none is written, but the link's directory is
+-- made all the same, which is what tells the next build, with nothing
+-- changed, that this link is fresh. A `program.cut` already there is left
+-- alone: it is what a build of the same package with an entry -- its tests
+-- -- linked, and may be running.
 fun noProgram (l : Linking Interface) : Result String () ! { Fs | e } =
-  let out = linkOut l in
-  let stale = Path.join out "program.cut" in
-  match (if exists stale then removeFile stale else Ok ()) with
-  | Err why -> Err "the program an earlier build linked could not be removed: ${why}\n"
-  | Ok _ ->
-      (match createDirAll out with
-       | Ok _ -> Ok ()
-       | Err why -> Err "the link's directory could not be made: ${why}\n")
+  match createDirAll (linkOut l) with
+  | Ok _ -> Ok ()
+  | Err why -> Err "the link's directory could not be made: ${why}\n"
 
 -- Each unit's functions C may call, with its package: each package once,
 -- however many names it was reached by.

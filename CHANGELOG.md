@@ -773,9 +773,7 @@ last release is under _Unreleased_.
   and `run` says the program has no entry point. It handed the back end a
   `program.cut` its link never wrote, and failed after "Linked" saying the
   path was not there. The library the self-build checks exports to C, and
-  so has a program. Once a package's root loses its `main`, the program an
-  earlier build linked is removed, where `run` used to run it in place of
-  the package as it is now.
+  so has a program.
 
 ## 0.4.0 - 2026-10-24
 
