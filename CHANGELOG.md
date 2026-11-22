@@ -759,6 +759,15 @@ last release is under _Unreleased_.
   its build: editing it compiles the package again. MeadowBoot cannot embed
   a `.mw` file from outside its package's `src`, which its build would take
   for a module.
+- MeadowBoot gives `T.C` the constructor of the `T` a module names when that
+  type comes from another package and some other package -- the standard
+  library included -- has a type of the same name with a constructor of the
+  same name. It took the other one: a dependency's `data Report = Report
+  String [Int] [String]`, as `Report.Report` in a pattern or applied, was
+  typed as the constructor of the standard library's record
+  `Std.Bench.Report`, with its nine fields. A dependency's constructors were
+  found by their type's own name, which two packages may share; they are now
+  found by its canonical name.
 
 ## 0.4.0 - 2026-10-24
 

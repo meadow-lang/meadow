@@ -1,0 +1,3 @@
+-- Another package's type and constructor of the same name as
+-- `ReportOwner.Tc`'s, and a constructor not named like the type.
+@pub data Report = Report Int Bool | Blank

@@ -1,0 +1,9 @@
+-- The same, of the other package's `Report`: whichever of the two a module
+-- names, its `Report.Report` is that one's.
+use ReportRival (Report)
+
+@pub fun count (r : Report) : Int = match r with | Report.Report n _ -> n | Report.Blank -> 0
+
+@pub def made = Report.Report
+
+@pub def one = count (Report.Report 1 True)
