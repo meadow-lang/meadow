@@ -490,6 +490,15 @@ fun ownedBy (items : [Item]) : HashMap String [Item] =
     H.empty
     items
 
+-- A type's canonical name, or its own where it has none.
+fun typeCanon (t : Item) : String = if S.isEmpty t.canon then t.name else t.canon
+
+-- The canonical name of constructor `c`'s type: its own canonical name but
+-- the last part -- or the name of its type, where it has none.
+fun ctorTypeCanon (c : Item) : String =
+  let parts = S.split "." c.canon in
+  if V.len parts < 2 then c.owner else S.join "." (V.take parts (V.len parts - 1))
+
 -- `withType`, of a module whose items are `by` kind and owner.
 fun withTypeIn (by : HashMap String [Item]) (t : Item) : [Item] =
   let of = \key -> M.unwrapOr [] (H.lookup key by) in
@@ -929,8 +938,18 @@ fun renaming (pkg : String) (isStd : Bool) (sources : [Source]) (deps : [DepExpo
   -- The dependencies' constructors by their type, each kept in the order it
   -- is among them: a dependency's type finds its own here, where reading
   -- every constructor for each type was as many reads as the standard
-  -- library has types times what it exports.
-  let depCtorsOf = ownedBy (V.filter (\(i : Item) -> i.kind == "c") depCtors) in
+  -- library has types times what it exports. By the type's canonical name,
+  -- not its own: two packages may each declare a type of one name, and each
+  -- type has only its own constructors -- a dependency's `Report.Report` is
+  -- not the standard library's `Std.Bench.Report.Report`.
+  let depCtorsOf =
+    V.foldl
+      (\h (c : Item) ->
+        (let key = ctorTypeCanon c in
+         H.insert key (V.pushBack (M.unwrapOr [] (H.lookup key h)) c) h))
+      H.empty
+      (V.filter (\(i : Item) -> i.kind == "c") depCtors)
+  in
   let typeCtors =
     V.foldl
       (\h (items : [Item]) ->
@@ -939,7 +958,7 @@ fun renaming (pkg : String) (isStd : Bool) (sources : [Source]) (deps : [DepExpo
             if t.kind != "t" then g
             else
               let mine =
-                if V.len items == 1 then M.unwrapOr [] (H.lookup t.name depCtorsOf)
+                if V.len items == 1 then M.unwrapOr [] (H.lookup (typeCanon t) depCtorsOf)
                 else ctorsOfType items t.name
               in H.insert t.id (V.foldl (\c (k : Item) -> H.insert k.name k.id c) H.empty mine) g)
           h

@@ -1,0 +1,14 @@
+-- `Report.Report` is the constructor of the `Report` this module names, from
+-- the package that declares it -- not one of the other types of that name the
+-- package's dependencies have: `ReportRival.Report`, the standard library's
+-- `Std.Bench.Report`. In a pattern, applied, and alone.
+use ReportOwner.Tc (Report)
+use Std.Collections.Vector as V
+
+@pub fun kindOf (r : Report) : String =
+  match r with
+  | Report.Report kind types words -> kind ++ " " ++ show (V.len types + V.len words)
+
+@pub def made = Report.Report
+
+@pub def mismatch = kindOf (Report.Report "Mismatch" [1] ["x"])

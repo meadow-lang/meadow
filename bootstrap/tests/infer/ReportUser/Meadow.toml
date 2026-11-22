@@ -1,0 +1,7 @@
+[package]
+name = "ReportUser"
+version = "0.1.0"
+
+[dependencies]
+ReportOwner = { path = "../ReportOwner" }
+ReportRival = { path = "../ReportRival" }

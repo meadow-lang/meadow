@@ -1,0 +1,4 @@
+-- A type with a constructor named as it is, as Strata.Tc's `Report` is --
+-- and as `ReportRival`'s and the standard library's `Std.Bench.Report` are,
+-- each with fields of its own.
+@pub data Report = Report String [Int] [String]
