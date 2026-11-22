@@ -1015,7 +1015,7 @@ fun linkProgram (o : UnitsOptions) (l : Linking Interface) : Result String () ! 
              (match V.get exports 0 with
               | None -> Ok ()
               | Just (pkg, (c : CExport)) ->
-                  linkAt o l units root exports pkg c.binder (Con "Unit" []) 0)
+                  linkAt o l units root exports pkg c.binder (Con "Unit" []) 0 False)
          | (Ok (Just (e : Export)), None) ->
              (let sc =
                 M.unwrapOr (Scheme { quant = [], preds = [], ty = Error, lacks = [] }) e.scheme
@@ -1028,7 +1028,11 @@ fun linkProgram (o : UnitsOptions) (l : Linking Interface) : Result String () ! 
                    root.package
                    e.binder
                    sc.ty
-                   (V.len (V.filter (\k -> k == VarKind.Plain) sc.quant)))
+                   (V.len (V.filter (\k -> k == VarKind.Plain) sc.quant))
+                   -- The root's `main`, and what runs a package's tests, are
+                   -- run as a `main` is, `start = main ()`, by what they
+                   -- are and not what their types were inferred to be.
+                   (e.name == "main" or e.name == Tests.runner))
 
 -- Each unit's functions C may call, with its package: each package once,
 -- however many names it was reached by.
@@ -1066,8 +1070,8 @@ fun clashOf (exports : [(String, CExport)]) : Maybe String =
     exports
 
 -- The program the units link to, entered at `binder` of package `pkg`, of
--- type `ty`, generic in `types` types; and `exports`, what C may call of it,
--- each with its package.
+-- type `ty`, generic in `types` types, and a `main` where `main` says so;
+-- and `exports`, what C may call of it, each with its package.
 fun linkAt
     (o : UnitsOptions)
     (l : Linking Interface)
@@ -1078,6 +1082,7 @@ fun linkAt
     (binder : Int)
     (ty : Type)
     (types : Int)
+    (main : Bool)
     : Result String () ! { Fs | e } =
   -- A package reached by two names is one package: its object
   -- goes in once.
@@ -1100,6 +1105,7 @@ fun linkAt
   let entered = M.unwrapOr binder (M.map fst whole) in
   let (before, after) =
     Seq.around
+      main
       pkg
       entered
       ty
