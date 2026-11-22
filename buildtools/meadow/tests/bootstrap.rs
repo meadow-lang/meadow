@@ -4008,6 +4008,217 @@ fn meadowboot_calls_the_back_end_in_its_own_process() {
     assert_eq!(code, Some(0), "{out}{err}");
 }
 
+/// `args` run by the Rust `meadow` and by MeadowBoot, as [`both_say`] runs
+/// them: each one's status, standard output and standard error.
+fn both_said(args: &[&std::ffi::OsStr]) -> [(Option<i32>, String, String); 2] {
+    let rust = Command::new(meadow())
+        .args(args)
+        .output()
+        .expect("meadow runs");
+    let boot = Command::new(meadowboot_exe())
+        .args(args)
+        .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+        .env("MEADOW_HOST", meadow_host())
+        .env_remove("MEADOW")
+        .env_remove("MEADOWBOOT_EXPANSIONS")
+        .output()
+        .expect("MeadowBoot runs");
+    [rust, boot].map(|o| {
+        (
+            o.status.code(),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+        )
+    })
+}
+
+/// A library -- a package with a `src/Lib.mw` and no `main`, exporting
+/// nothing to C -- built from nothing by MeadowBoot as `meadow` builds it:
+/// compiled and checked, and nothing more, with no program linked and no
+/// error, built again the same way, and with nothing to run. MeadowBoot
+/// handed the back end a `program.cut` its link never wrote, and failed with
+/// a path that was not there. What the library's tests link is a program,
+/// and a build of the library after them leaves it alone.
+#[test]
+fn a_library_with_no_main_is_built_by_meadowboot_as_meadow_builds_it() {
+    let dir = meadow_scratch::scratch!("meadowboot-lib-build-{}", std::process::id());
+    let lib = dir.join("Shelf");
+    std::fs::create_dir_all(lib.join("src")).expect("a package directory");
+    std::fs::write(
+        lib.join("Meadow.toml"),
+        "[package]\nname = \"Shelf\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("a manifest");
+    std::fs::write(
+        lib.join("src").join("Lib.mw"),
+        "fun twice (x : Int) : Int = x * 2\n",
+    )
+    .expect("the library's module");
+    let program = |root: &Path| root.join("target/debug/link/program.cut");
+    let offline: &std::ffi::OsStr = "--offline".as_ref();
+    for round in ["fresh", "again"] {
+        let [(rust_code, _, rust_err), (boot_code, boot_out, boot_err)] =
+            both_said(&["build".as_ref(), offline, lib.as_os_str()]);
+        assert_eq!(rust_code, Some(0), "{round}: meadow:\n{rust_err}");
+        assert_eq!(
+            boot_code,
+            Some(0),
+            "{round}: MeadowBoot:\n{boot_out}{boot_err}"
+        );
+        assert!(
+            !boot_err.contains("error") && !boot_err.contains("meadowboot:"),
+            "{round}: MeadowBoot:\n{boot_out}{boot_err}"
+        );
+        assert!(
+            !program(&lib).exists(),
+            "{round}: a library links no program"
+        );
+    }
+    let [(rust_code, _, rust_err), (boot_code, boot_out, boot_err)] =
+        both_said(&["run".as_ref(), offline, lib.as_os_str()]);
+    assert_eq!(rust_code, Some(1), "meadow:\n{rust_err}");
+    assert_eq!(boot_code, Some(1), "MeadowBoot:\n{boot_out}{boot_err}");
+    assert!(
+        rust_err.ends_with("program has no entry point\n"),
+        "meadow:\n{rust_err}"
+    );
+    assert!(
+        boot_err.ends_with("program has no entry point\n"),
+        "MeadowBoot:\n{boot_out}{boot_err}"
+    );
+
+    // What the library's tests linked -- a program, entered at what runs
+    // them -- is left in place by a build of the library after them, which
+    // may be running beside them.
+    let [(rust_code, _, rust_err), (code, out, err)] =
+        both_said(&["test".as_ref(), offline, lib.as_os_str()]);
+    assert_eq!(rust_code, Some(0), "meadow:\n{rust_err}");
+    assert_eq!(code, Some(0), "{out}{err}");
+    assert!(program(&lib).exists(), "the tests link a program");
+    let [_, (code, out, err)] = both_said(&["build".as_ref(), offline, lib.as_os_str()]);
+    assert_eq!(code, Some(0), "{out}{err}");
+    assert!(
+        program(&lib).exists(),
+        "a build leaves what the tests linked"
+    );
+}
+
+/// What a build of a program package makes, as MeadowBoot and the Rust
+/// `meadow` each build it -- on Glade's JIT, ahead of time on Glade, and on
+/// Silo, debug and release -- is in the same place under the same name: the
+/// image at `target/<profile>/bytecode/<Package>.mbc`, and the executable at
+/// `target/<profile>/native/` (Silo's under `native/silo/`), named for the
+/// package, as each says it is, and it runs. MeadowBoot's went under its
+/// link's own directory, `target/<profile>/link/target/release/...`, named
+/// `program`.
+#[test]
+fn a_program_meadowboot_builds_is_where_meadow_puts_it() {
+    let dir = meadow_scratch::scratch!("meadowboot-placed-{}", std::process::id());
+    // One copy of the package for each compiler, so that neither finds what
+    // the other made.
+    let package = |at: &Path| {
+        std::fs::create_dir_all(at.join("src")).expect("a package directory");
+        std::fs::write(
+            at.join("Meadow.toml"),
+            "[package]\nname = \"Placed\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("a manifest");
+        std::fs::write(
+            at.join("src").join("Main.mw"),
+            "fun main () = println \"placed\"\n",
+        )
+        .expect("the root module");
+        std::fs::canonicalize(at).expect("the package")
+    };
+    let ours = package(&dir.join("Boot"));
+    let theirs = package(&dir.join("Rust"));
+    let exe = format!("Placed{}", std::env::consts::EXE_SUFFIX);
+    let modes: [(&[&str], &str, Option<&str>); 4] = [
+        (&[], "debug", None),
+        (&["--release"], "release", Some("native")),
+        (&["--runtime", "silo"], "debug", Some("native/silo")),
+        (
+            &["--release", "--runtime", "silo"],
+            "release",
+            Some("native/silo"),
+        ),
+    ];
+    for (flags, profile, native) in modes {
+        let run = |boot: bool, root: &Path| {
+            let _ = std::fs::remove_dir_all(root.join("target"));
+            let mut c = Command::new(if boot { meadowboot_exe() } else { meadow() });
+            c.arg("build").arg("--offline").args(flags).arg(root);
+            if boot {
+                c.env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+                    .env("MEADOW_HOST", meadow_host())
+                    .env_remove("MEADOW")
+                    .env_remove("MEADOWBOOT_EXPANSIONS");
+            }
+            let o = c.output().expect("a compiler runs");
+            let said = format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            assert!(o.status.success(), "{flags:?}:\n{said}");
+            said
+        };
+        let rust = run(false, &theirs);
+        let boot = run(true, &ours);
+        let image = |root: &Path| {
+            root.join("target")
+                .join(profile)
+                .join("bytecode")
+                .join("Placed.mbc")
+        };
+        assert!(image(&theirs).is_file(), "{flags:?}: meadow:\n{rust}");
+        assert!(image(&ours).is_file(), "{flags:?}: MeadowBoot:\n{boot}");
+        assert!(
+            !ours
+                .join("target")
+                .join(profile)
+                .join("link")
+                .join("target")
+                .join("release")
+                .join("native")
+                .exists(),
+            "{flags:?}: MeadowBoot built under its link:\n{boot}"
+        );
+        // Where each says the executable is, under its package.
+        let said_at = |said: &str, root: &Path| {
+            said.lines()
+                .find_map(|l| l.trim_start().strip_prefix("Executable "))
+                .map(|at| {
+                    let at = std::fs::canonicalize(at.trim()).unwrap_or_else(|_| PathBuf::from(at));
+                    at.strip_prefix(root)
+                        .unwrap_or(&at)
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+        };
+        let Some(native) = native else {
+            assert_eq!(said_at(&rust, &theirs), None, "{rust}");
+            assert_eq!(said_at(&boot, &ours), None, "{boot}");
+            continue;
+        };
+        let want = format!("target/{profile}/{native}/{exe}");
+        assert_eq!(said_at(&rust, &theirs).as_deref(), Some(&*want), "{rust}");
+        assert_eq!(said_at(&boot, &ours).as_deref(), Some(&*want), "{boot}");
+        assert!(
+            !boot.lines().any(|l| l.trim_start().starts_with("Built ")),
+            "{flags:?}: MeadowBoot said what its link built:\n{boot}"
+        );
+        let ran = Command::new(ours.join(&want))
+            .output()
+            .expect("the executable runs");
+        assert_eq!(
+            String::from_utf8_lossy(&ran.stdout),
+            "placed\n",
+            "{flags:?}"
+        );
+    }
+}
+
 /// A constructor written through the module a `use … as` names, as MeadowBoot
 /// builds it: `A.App` where one of the module's types has that constructor,
 /// and `A.Term.Var` where two do -- in a pattern and in an expression -- with

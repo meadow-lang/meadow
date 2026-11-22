@@ -14,7 +14,7 @@ use Lingua (database!, make!)
 use Lingua.Make (
   Given, Linking, unitSources, unitImports, unitOut, unitDir, linkUnits, linkOut, linkDir
 )
-use Std.Fs (Fs, readToString, writeString)
+use Std.Fs (Fs, readToString, writeString, createDirAll)
 use Std.Time (monotonic)
 use Std.Thread (parMap)
 use Std.Console (writeError)
@@ -973,11 +973,12 @@ fun objectIn (out : String) (pkg : String) : String = Path.join out "${pkg}.cut"
 -- units' objects, in the order they were made in, how it opens and the roles
 -- its types play; after them, the definition it is entered at -- the root
 -- unit's `result`, or its `main` -- and what that shows a value with. A
--- root with neither is a library, and has no program.
+-- root with neither is a library, and has no program unless it exports
+-- functions to C.
 fun linkProgram (o : UnitsOptions) (l : Linking Interface) : Result String () ! { Fs | e } =
   let units = linkUnits l in
   match V.get units (V.len units - 1) with
-  | None -> Ok ()
+  | None -> noProgram l
   | Just (_, (root : Interface), _) ->
       let named =
         \n ->
@@ -1009,7 +1010,7 @@ fun linkProgram (o : UnitsOptions) (l : Linking Interface) : Result String () ! 
          -- stands for one: nothing calls it.
          | (Ok None, None) ->
              (match V.get exports 0 with
-              | None -> Ok ()
+              | None -> noProgram l
               | Just (pkg, (c : CExport)) ->
                   linkAt o l units root exports pkg c.binder (Con "Unit" []) 0 False)
          | (Ok (Just (e : Export)), None) ->
@@ -1029,6 +1030,16 @@ fun linkProgram (o : UnitsOptions) (l : Linking Interface) : Result String () ! 
                    -- run as a `main` is, `start = main ()`, by what they
                    -- are and not what their types were inferred to be.
                    (e.name == "main" or e.name == Tests.runner))
+
+-- A link with no program: none is written, but the link's directory is
+-- made all the same, which is what tells the next build, with nothing
+-- changed, that this link is fresh. A `program.cut` already there is left
+-- alone: it is what a build of the same package with an entry -- its tests
+-- -- linked, and may be running.
+fun noProgram (l : Linking Interface) : Result String () ! { Fs | e } =
+  match createDirAll (linkOut l) with
+  | Ok _ -> Ok ()
+  | Err why -> Err "the link's directory could not be made: ${why}\n"
 
 -- Each unit's functions C may call, with its package: each package once,
 -- however many names it was reached by.

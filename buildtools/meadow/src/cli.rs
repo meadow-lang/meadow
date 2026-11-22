@@ -389,6 +389,24 @@ enum Cmd {
         /// of the same image.
         #[arg(long, value_name = "FILE")]
         calls: Option<PathBuf>,
+        /// With `--no-run`, build into the package at DIR rather than beside
+        /// FILE, as `meadow build` builds a package: under its
+        /// `target/<profile>`, named `--name`, and said as `meadow build`
+        /// says it. What a front end's `build` asks for.
+        #[arg(long, value_name = "DIR", requires_all = ["name", "no_run"])]
+        package: Option<PathBuf>,
+        /// What a build into `--package` is named: the package's name.
+        #[arg(long, value_name = "NAME", requires = "package")]
+        name: Option<String>,
+        /// Which profile a build into `--package` is of: `debug` or
+        /// `release`.
+        #[arg(
+            long,
+            value_name = "NAME",
+            default_value = "release",
+            value_parser = ["debug", "release"]
+        )]
+        profile: String,
         /// What the program is given, after `--`: what its `argv` answers.
         #[arg(last = true, value_name = "ARGS")]
         args: Vec<String>,
@@ -1241,8 +1259,44 @@ fn command(cli: Cli) -> i32 {
             sample_hz,
             train,
             calls,
+            package,
+            name,
+            profile,
             args,
         }) => {
+            // Where what is built goes: into a front end's package, as
+            // `meadow build` puts a package's, or beside the file.
+            let packaged = package.is_some();
+            let place = match (package, name) {
+                (Some(root), Some(name)) => Ok(crate::cut::Place {
+                    root: crate::package::canonical(&root),
+                    name,
+                    profile: if profile == "debug" {
+                        Profile::Debug
+                    } else {
+                        Profile::Release
+                    },
+                }),
+                _ => crate::cut::Place::beside(&file),
+            };
+            let place = exit_on_error(place);
+            // A build into a package writes its image and says where its
+            // executable is, as `meadow build` does.
+            let imaged = |ran: Result<i32, String>| {
+                ran.and_then(|code| {
+                    if packaged {
+                        crate::cut::write_image(&file, &place)?;
+                    }
+                    Ok(code)
+                })
+            };
+            let built = |exe: PathBuf| {
+                if packaged {
+                    status::note("Executable", shown(&exe));
+                } else {
+                    crate::status::status("Built", exe.display().to_string());
+                }
+            };
             let target = match target.as_deref().map(aot::Target::named).transpose() {
                 Ok(t) => t,
                 Err(e) => {
@@ -1313,36 +1367,43 @@ fn command(cli: Cli) -> i32 {
                 Some(aot::Runtime::Glade)
                     if crate::cut::is_library(&file) && !target.is_some_and(|t| !t.is_host()) =>
                 {
-                    crate::cut::build_for_glade(&file, opt, calls.as_deref()).map(|lib| {
+                    crate::cut::build_for_glade(&file, &place, opt, calls.as_deref()).map(|lib| {
                         crate::status::status("Built", lib.display().to_string());
                         0
                     })
                 }
-                Some(aot::Runtime::Glade) if no_run && ahead => {
-                    crate::cut::build_for_glade(&file, opt, calls.as_deref()).map(|_| 0)
-                }
-                Some(aot::Runtime::Glade) if no_run => {
-                    crate::cut::kept_for_glade(&file).map(|()| 0)
-                }
-                Some(aot::Runtime::Silo) if no_run => {
-                    crate::cut::build_for_silo(&file, opt, target).map(|exe| {
-                        crate::status::status("Built", exe.display().to_string());
+                Some(aot::Runtime::Glade) if no_run && ahead => imaged(Ok(0)).and_then(|_| {
+                    crate::cut::build_for_glade(&file, &place, opt, calls.as_deref()).map(|exe| {
+                        if packaged {
+                            built(exe);
+                        }
                         0
                     })
+                }),
+                Some(aot::Runtime::Glade) if no_run => {
+                    imaged(crate::cut::kept_for_glade(&file).map(|()| 0))
                 }
+                Some(aot::Runtime::Silo) if no_run => imaged(Ok(0)).and_then(|_| {
+                    crate::cut::build_for_silo(&file, &place, opt, target).map(|exe| {
+                        built(exe);
+                        0
+                    })
+                }),
                 Some(aot::Runtime::Glade) if target.is_some_and(|t| !t.is_host()) => Err(
                     "Glade builds for this system only: build for another with `--runtime silo`"
                         .to_string(),
                 ),
                 // Training is the JIT watching, whatever the backend.
                 Some(aot::Runtime::Glade) if ahead && !train => {
-                    crate::cut::build_for_glade(&file, opt, calls.as_deref()).and_then(|exe| {
-                        std::process::Command::new(&exe)
-                            .args(&args)
-                            .status()
-                            .map(|s| crate::status::exit_code(&exe, s))
-                            .map_err(|e| format!("{}: {e}", exe.display()))
-                    })
+                    crate::cut::build_for_glade(&file, &place, opt, calls.as_deref()).and_then(
+                        |exe| {
+                            std::process::Command::new(&exe)
+                                .args(&args)
+                                .status()
+                                .map(|s| crate::status::exit_code(&exe, s))
+                                .map_err(|e| format!("{}: {e}", exe.display()))
+                        },
+                    )
                 }
                 Some(aot::Runtime::Glade) => {
                     // The process is `meadow`, not the program: what the
@@ -1351,7 +1412,7 @@ fn command(cli: Cli) -> i32 {
                     crate::cut::run_on_glade(&file, &how).map(|()| 0)
                 }
                 Some(aot::Runtime::Silo) => {
-                    crate::cut::build_for_silo(&file, opt, target).and_then(|exe| {
+                    crate::cut::build_for_silo(&file, &place, opt, target).and_then(|exe| {
                         // A library is built, and there is nothing to run.
                         if matches!(
                             exe.extension().and_then(|e| e.to_str()),

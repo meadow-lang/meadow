@@ -40,7 +40,7 @@ fresh() {
     "$work/$1/MeadowBoot/"
 }
 cut_of() { echo "$work/$1/MeadowBoot/target/release/link/program.cut"; }
-exe_of() { echo "$work/$1/MeadowBoot/target/release/link/target/release/native/silo/program$exe"; }
+exe_of() { echo "$work/$1/MeadowBoot/target/release/native/silo/MeadowBoot$exe"; }
 
 # Stage `$2` compiles MeadowBoot into `$work/$1`, natively on Silo.
 build() {

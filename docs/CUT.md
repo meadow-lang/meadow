@@ -54,6 +54,14 @@ Glade, or, with `--runtime silo`, built as an executable and run. The lowering
 takes everything here but a `μ` where a value is wanted other than as a
 definition's argument, and refuses a program with one, saying so.
 
+What `--no-run` builds goes beside `FILE`, under its `target/release`, and
+is named for the file. A front end's `build` puts it in its package instead,
+as `meadow build` puts a package's: `--package DIR --name NAME --profile
+debug|release` writes the image to `DIR/target/<profile>/bytecode/NAME.mbc`
+and the executable, if there is one, to `DIR/target/<profile>/native/`
+(Silo's under `native/silo/`), named `NAME`. Both go where the Rust `meadow`
+puts a package's build, so a script that runs one runs the other.
+
 `meadow cut FILE --emit axcut` prints what the program is lowered to, and
 `--emit llvm` the LLVM IR a Silo build of it compiles, each unit after the
 first under a `; ---- unit NAME ----` line; neither runs it. They are for a

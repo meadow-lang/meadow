@@ -385,6 +385,19 @@ cli! {
             "What a training run saw each call site enter: `--train` writes it, and an `aot` build on Glade is guided by it"
             value
             "FILE"
+        package
+          : Option
+            String
+            "With `--no-run`, build into the package at DIR rather than beside the file, as `meadow build` builds a package: under its `target/<profile>`, named `--name`"
+            value
+            "DIR"
+        name
+          : Option String "What a build into `--package` is named: the package's name" value "NAME"
+        profile : Option String =
+          "release"
+            "Which profile a build into `--package` is of: `debug` or `release`"
+            value
+            "NAME"
       }
     | clean
       "Remove what a build wrote: the package's `target` directory, with the images, executables and incremental cache in it"
@@ -1083,7 +1096,9 @@ fun nurseryBytes (text : String) : Result String Int =
 fun pow2 (k : Int) : Int = if k <= 0 then 1 else 2 * pow2 (k - 1)
 
 -- The program at `r`, built, handed to the back end: built, or run with
--- `theirs` where `args` asks for a run, as `asked` says to run it.
+-- `theirs` where `args` asks for a run, as `asked` says to run it. A library
+-- that exports nothing to C has no program: building it is compiling and
+-- checking it, as `meadow`'s build of one is, and there is nothing to run.
 fun handedBack
     (r : String)
     (profile : String)
@@ -1094,6 +1109,23 @@ fun handedBack
     (theirs : [String])
     (asked : BuildAsked) =
   let program = Path.join (linkDirIn r profile) "program.cut" in
+  if exists program then handedBuilt program r profile level goal b args theirs asked
+  else
+    match args with
+    | None -> exit 0
+    | Just _ -> (let u = writeError "program has no entry point\n" in exit 1)
+
+-- `handedBack`, of the program the build linked, at `program`.
+fun handedBuilt
+    (program : String)
+    (r : String)
+    (profile : String)
+    (level : Int)
+    (goal : Goal)
+    (b : CliBuild)
+    (args : Maybe [String])
+    (theirs : [String])
+    (asked : BuildAsked) =
   -- Training is the JIT watching, whatever the profile would run.
   let ahead =
     not asked.train
@@ -1138,7 +1170,12 @@ fun handedBack
          else if b.backend == Just "vm" and not asked.train then ["--backend", "vm"]
          else []),
         aimed,
-        (if M.isNone args then ["--no-run"] else V.concat [running, V.pushFront theirs "--"])
+        -- Built and not run, it goes where `meadow build` puts a package's:
+        -- its image, and its executable, under the package's own
+        -- `target/<profile>`, named for it.
+        (if M.isNone args then
+           ["--no-run", "--package", r, "--name", packageNameAt r, "--profile", profile]
+         else V.concat [running, V.pushFront theirs "--"])
       ]
   in match backEnd back with
      | Ok 0 ->
@@ -1153,6 +1190,13 @@ fun handedBack
      | Ok code -> exit code
      | Err why ->
          (let u = writeError "meadowboot: the back end could not be run: ${why}\n" in exit 1)
+
+-- The name of the package at `r`, which what a build of it makes is named
+-- for: its manifest's, or `program` where that cannot be read.
+fun packageNameAt (r : String) : String ! { Fs | e } =
+  match readToString (Path.join r "Meadow.toml") with
+  | Ok text -> packageName text
+  | Err _ -> "program"
 
 -- Where a training run of the package at `r` writes what it saw, and an
 -- `aot` build of it reads it: where `meadow` keeps it (`crate::pgo`).
