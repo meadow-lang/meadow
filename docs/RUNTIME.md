@@ -797,7 +797,10 @@ Marking runs **on other OS threads while the program keeps running**
 
 A cycle starts when the old generation has grown by as much as the previous
 cycle found alive, or by `MEADOW_GC_TRIGGER` slots (default 262,144), whichever
-is larger.
+is larger. "Found alive" means reached by marking. Objects allocated while a
+cycle marks are kept by that cycle (they are black), but they don't count
+toward the next trigger. Counting them made a heap whose marker was starved
+raise its trigger several times over each cycle, with nothing more reachable.
 
 **Evacuation** (`evacuate.rs`) fixes the fragmentation that non-moving marking
 leaves behind. After a cycle, the sparsest blocks are chosen, and during the
