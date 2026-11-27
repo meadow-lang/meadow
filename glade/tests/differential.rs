@@ -2220,6 +2220,22 @@ fn no_handler_in_the_thread_catches_the_cancel() {
 }
 
 #[test]
+fn an_answer_that_comes_after_the_cancel_is_not_taken() {
+    // On eight workers the thread may be making its `await` as the cancel
+    // comes, and `u` ends only after it, with the message `main` sends next:
+    // `t` must fail, not take `u`'s answer. Racing, so a run that gets it
+    // wrong is rare -- one in thousands -- but it was seen.
+    let src = "def result =
+                 let ch = channelNew () in
+                 let u = threadSpawn (\\() -> channelReceive ch) in
+                 let t = threadSpawn (\\() -> threadAwait u) in
+                 let _ = threadCancel t in
+                 let _ = channelSend ch (toInt 41) in
+                 threadAwait t";
+    assert_eq!(threads_agree(src), cancelled());
+}
+
+#[test]
 fn many_threads_cancelled_at_once_all_let_go() {
     // Two hundred readers, waiting or not yet started, all cancelled. If any
     // were still among the channel's receivers, the message would go to it

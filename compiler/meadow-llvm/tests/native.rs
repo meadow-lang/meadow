@@ -748,6 +748,19 @@ fn a_cancelled_thread_fails_and_so_does_its_await() {
            threadAwait waiter",
         cancelled,
     );
+    // On a thread that ends only after the cancel: its answer is not taken,
+    // though the waiter may be making its `await` as the cancel comes.
+    fails_cancelling(
+        "cancel_then_answer",
+        "def result =
+           let gate = channelNew () in
+           let u = threadSpawn (\\() -> channelReceive gate) in
+           let t = threadSpawn (\\() -> threadAwait u) in
+           let _ = threadCancel t in
+           let _ = channelSend gate (toInt 41) in
+           threadAwait t",
+        cancelled,
+    );
     // In a transaction's `retry`, on a `TVar` nobody writes.
     fails_cancelling(
         "cancel_retry",
