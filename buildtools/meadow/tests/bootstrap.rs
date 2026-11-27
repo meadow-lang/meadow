@@ -4211,18 +4211,20 @@ fn a_library_with_no_main_is_built_by_meadowboot_as_meadow_builds_it() {
     );
 
     // What the library's tests linked -- a program, entered at what runs
-    // them -- is left in place by a build of the library after them, which
-    // may be running beside them.
+    // them, in the tests' own tree -- is left in place by a build of the
+    // library after them, which may be running beside them.
+    let tested = lib.join("target/test/link/program.cut");
     let [(rust_code, _, rust_err), (code, out, err)] =
         both_said(&["test".as_ref(), offline, lib.as_os_str()]);
     assert_eq!(rust_code, Some(0), "meadow:\n{rust_err}");
     assert_eq!(code, Some(0), "{out}{err}");
-    assert!(program(&lib).exists(), "the tests link a program");
+    assert!(tested.exists(), "the tests link a program");
     let [_, (code, out, err)] = both_said(&["build".as_ref(), offline, lib.as_os_str()]);
     assert_eq!(code, Some(0), "{out}{err}");
+    assert!(tested.exists(), "a build leaves what the tests linked");
     assert!(
-        program(&lib).exists(),
-        "a build leaves what the tests linked"
+        !program(&lib).exists(),
+        "a build of the library after its tests links no program"
     );
 }
 
