@@ -784,6 +784,15 @@ last release is under _Unreleased_.
   that runs a package's executable found nothing. `meadow cut --no-run`
   takes `--package DIR --name NAME --profile debug|release` to build into a
   front end's package this way.
+- Glade's old generation no longer grows cycle after cycle when its
+  marking threads are busy with other heaps. A cycle the program had to
+  finish itself counted everything allocated while it marked as alive, and
+  set the next cycle's trigger from that: several times higher each cycle,
+  with nothing more reachable. Compact regions are freed only as cycles
+  finish, so dead ones piled up as well, and
+  `regions_nothing_refers_to_are_freed` failed in the collector stress
+  step in about half of all runs on a busy machine. The pace now comes
+  from what marking reached.
 
 ## 0.4.0 - 2026-10-24
 

@@ -36,7 +36,8 @@
 //! A cycle begins when the old generation has grown by as much as the last
 //! cycle found alive (or [`GcConfig::min_trigger`], if that is more): memory
 //! is traded for fewer cycles, and a program that keeps more alive is marked
-//! less often for it.
+//! less often for it. Found alive means reached by marking: what a cycle kept
+//! only because it was allocated while the cycle marked does not count.
 //!
 //! Between cycles, the sparsest blocks are **evacuated** a block or two per
 //! pause: their survivors copied somewhere denser and the blocks given back.
@@ -762,9 +763,29 @@ impl Heap {
         if self.config.collector != Collector::Generational || self.old.is_empty() {
             return false;
         }
-        let live = self.old.live as usize;
-        let trigger = (2 * live).max(self.config.min_trigger);
-        self.old.half_full() || self.old.allocated as usize > 4 * trigger
+        self.old.half_full() || self.old.allocated as usize > 4 * self.trigger()
+    }
+
+    /// Has the program allocated so much since the last cycle finished that
+    /// it should help the marker, whether or not it has threads of its own?
+    fn behind(&self) -> bool {
+        self.old.allocated as usize > 2 * self.trigger()
+    }
+
+    /// The old-generation allocation the collector's pace is measured in:
+    /// twice what the last cycle reached, or [`GcConfig::min_trigger`].
+    ///
+    /// Reached, not kept: what was allocated while that cycle marked is black,
+    /// kept whether or not anything still refers to it, and counting it too
+    /// fed back. A cycle whose marker is starved -- its threads busy with other
+    /// heaps -- is finished by the program once it is [`Heap::behind`], having
+    /// allocated four times what the cycle before found alive; counted alive
+    /// in turn, that set the next trigger about three times higher, and the
+    /// one after that higher again, with nothing more reachable. Regions are
+    /// let go only as cycles finish, so they piled up with it. What the black
+    /// objects hold that really is alive, the next cycle reaches and counts.
+    fn trigger(&self) -> usize {
+        (2 * self.old.reached as usize).max(self.config.min_trigger)
     }
 
     /// Slots held by live regions, in total.
@@ -1486,7 +1507,7 @@ impl Heap {
     /// Has the old generation grown enough since the last cycle to mark it
     /// again?
     fn wants_cycle(&self) -> bool {
-        let live = self.old.live as usize;
+        let live = self.old.reached as usize;
         let growth = live.max(self.config.min_trigger.saturating_sub(live));
         self.old.allocated as usize >= growth || self.region_growth > self.space.len()
     }
@@ -1496,10 +1517,7 @@ impl Heap {
     fn advance(&mut self, roots: &mut [Value]) {
         let job = self.marking.clone().expect("marking");
         self.flush_satb();
-        let live = self.old.live as usize;
-        let trigger = (2 * live).max(self.config.min_trigger);
-        let behind = self.old.allocated as usize > 2 * trigger;
-        if self.config.mark_threads == 0 || behind {
+        if self.config.mark_threads == 0 || self.behind() {
             job.step(ASSIST, self.config.mark_slice);
         }
         if job.is_done() {
@@ -3698,6 +3716,57 @@ mod tests {
             h.old_slots() < 3_000_000,
             "the old generation grew to {} slots",
             h.old_slots()
+        );
+    }
+
+    /// A marker that falls behind -- its threads busy with other heaps'
+    /// cycles -- leaves the program to finish the cycle once it has allocated
+    /// enough to be behind. What it allocated meanwhile is black: kept by that
+    /// cycle, though the cycle never found it reachable. Counting it alive
+    /// when setting the next cycle's pace let each starved cycle allocate
+    /// several times what the one before had, so the old generation, and every
+    /// compact region the cycles kept, grew without bound while what was
+    /// reachable stayed the same.
+    #[test]
+    fn a_starved_marker_does_not_ratchet_the_pace() {
+        let mut h = generational(1 << 10, usize::MAX, 0);
+        h.config.verify = false;
+        let mut roots = Vec::new();
+        let live = rooted_chain(&mut h, &mut roots, 1000);
+        roots.push(live);
+        let big = 1 << 12;
+        let fields = vec![Value::Int(7); big];
+        let mut garbage = |h: &mut Heap| {
+            h.reserve(Heap::size_of(Kind::Array, big));
+            h.alloc(Kind::Array, 0, &fields);
+        };
+        let mut during = Vec::new();
+        for _ in 0..8 {
+            // Garbage until a cycle begins.
+            while h.marking.is_none() {
+                garbage(&mut h);
+                h.collect(&mut roots);
+            }
+            // The marker is starved: nothing is marked until the program is
+            // behind, and then the program finishes the cycle itself.
+            let mut slots = 0;
+            while !h.behind() && slots < 1 << 22 {
+                garbage(&mut h);
+                slots += big;
+            }
+            during.push(slots);
+            while h.marking.is_some() {
+                h.collect(&mut roots);
+            }
+        }
+        assert!(well_formed(&h, roots[0], 1000));
+        // The chain is about 4,000 slots, and that is all any cycle reaches:
+        // the program may allocate a few times that while a cycle marks, the
+        // same every cycle. Counting the garbage, it was 4,096, then 24,576,
+        // 86,016, and on.
+        assert!(
+            during.iter().all(|&s| s > 0 && s <= 16_000),
+            "allocated while each cycle marked: {during:?}"
         );
     }
 }

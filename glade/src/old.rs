@@ -524,6 +524,11 @@ pub struct Old {
     pub allocated: u64,
     black: u64,
     pub live: u64,
+    /// Of `live`, the slots the last cycle reached by marking, leaving out
+    /// what was allocated while it marked. Kept is not the same as found
+    /// reachable: the black objects are garbage as often as not, and the
+    /// collector's pace is set by this -- see `Heap::trigger`.
+    pub reached: u64,
     /// Blocks with memory behind them, and table entries without.
     pub real_blocks: usize,
     empty_entries: usize,
@@ -555,6 +560,7 @@ impl Default for Old {
             allocated: 0,
             black: 0,
             live: 0,
+            reached: 0,
             real_blocks: 0,
             empty_entries: 0,
         }
@@ -709,6 +715,7 @@ impl Old {
     pub fn finish(&mut self, marked: u64) {
         self.live_epoch = self.alloc_epoch;
         self.live = marked + self.black;
+        self.reached = marked;
         self.allocated = 0;
         self.drop_runs();
         self.sweep_block = 0;
