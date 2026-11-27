@@ -3412,6 +3412,129 @@ fn a_test_that_performs_st_runs_as_meadow_test_runs_it() {
     );
 }
 
+/// A build of a package while its tests run leaves the program they run
+/// alone. The tests' program was linked where `build` and `run` link the
+/// package's `main`, and each test is a run of its own that reads it again:
+/// a build finishing while they ran -- the language server's, after a file
+/// changed -- linked `main` there, and every test after that ran the
+/// package's `main`, told where to write how it went, and failed. The test
+/// had said `Fresh link`, as nothing it was built from had changed, and the
+/// next one linked again only because the build had been the last to say
+/// what was linked. Each test here waits for the build to finish before it
+/// answers; then the tests and the build each say `Fresh link` of their own
+/// link, and `Linked` once a test's file changes.
+#[test]
+fn a_build_while_the_tests_run_leaves_their_program_alone() {
+    let dir = meadow_scratch::scratch!("meadowboot-test-tree-{}", std::process::id());
+    std::fs::create_dir_all(dir.join("src")).expect("a package directory");
+    std::fs::write(
+        dir.join("Meadow.toml"),
+        "[package]\nname = \"Tw\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("a manifest");
+    let marker = |name: &str| dir.join(name).to_string_lossy().replace('\\', "/");
+    let (go, started) = (marker("go"), marker("started"));
+    std::fs::write(
+        dir.join("src").join("Main.mw"),
+        format!(
+            "mod Sums\n\nuse Std.Test (assert)\nuse Std.Time (sleep)\n\n\
+             fun waited (n : Int) =\n  if exists \"{go}\" then True\n  \
+             else if n == 0 then False\n  else (let u = sleep 50 in waited (n - 1))\n\n\
+             @test fun waits () =\n  let u = writeString (\"{started}\", \"\") in\n  \
+             assert (waited 6000) \"the build finished\"\n\n\
+             @test fun addsUp () = assert (waited 6000 and 1 + 1 == 2) \"sums\"\n\n\
+             fun main () = println \"the package's own main\"\n"
+        ),
+    )
+    .expect("the root module");
+    let sums = "use Std.Test (assert)\n\nfun double x = x * 2\n\n\
+                @test fun doubles () = assert (double 4 == 8) \"doubles\"\n";
+    std::fs::write(dir.join("src").join("Sums.mw"), sums).expect("a module");
+    let boot = |args: &[&str]| {
+        let mut c = Command::new(meadowboot_exe());
+        c.args(args)
+            .arg(&dir)
+            .env("MEADOWBOOT_STD", repo().join("lib").join("Std"))
+            .env("MEADOW", meadow())
+            .env_remove("MEADOWBOOT_EXPANSIONS")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        c
+    };
+    let said = |c: &mut Command| {
+        let out = c.output().expect("MeadowBoot runs");
+        (
+            out.status.code(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+    let linked = |said: &str| said.lines().any(|l| l.trim_start().starts_with("Linked "));
+    // The tests, once, answering at once.
+    std::fs::write(&go, "").expect("the go-ahead");
+    let (code, out) = said(&mut boot(&["test"]));
+    assert!(
+        code == Some(0) && linked(&out) && out.contains("3 passed"),
+        "{out}"
+    );
+    // Again, nothing changed, each test waiting while the package is built.
+    std::fs::remove_file(&go).expect("the go-ahead taken back");
+    std::fs::remove_file(&started).expect("the first run's start forgotten");
+    let tests = boot(&["test", "--test-threads", "1"])
+        .spawn()
+        .expect("MeadowBoot runs");
+    let since = std::time::Instant::now();
+    while !Path::new(&started).exists() {
+        assert!(
+            since.elapsed() < std::time::Duration::from_secs(300),
+            "no test started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let (code, out) = said(&mut boot(&["build"]));
+    assert!(code == Some(0) && linked(&out), "{out}");
+    std::fs::write(&go, "").expect("the go-ahead");
+    let out = tests.wait_with_output().expect("the tests ran");
+    let ran = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success()
+            && ran.contains("Fresh link")
+            && ran.contains("test result: ok. 3 passed; 0 failed"),
+        "{ran}"
+    );
+    // Each is fresh by its own link: the build linked over no test's program.
+    let (code, out) = said(&mut boot(&["test"]));
+    assert!(
+        code == Some(0) && out.contains("Fresh link") && !linked(&out) && out.contains("3 passed"),
+        "{out}"
+    );
+    let (code, out) = said(&mut boot(&["build"]));
+    assert!(
+        code == Some(0) && out.contains("Fresh link") && !linked(&out),
+        "{out}"
+    );
+    // A test file changed is linked again, for the tests and for the build.
+    std::fs::write(
+        dir.join("src").join("Sums.mw"),
+        format!("{sums}\n@test fun halves () = assert (double 4 / 2 == 4) \"halves\"\n"),
+    )
+    .expect("the module changed");
+    let (code, out) = said(&mut boot(&["test"]));
+    assert!(
+        code == Some(0) && linked(&out) && out.contains("4 passed"),
+        "{out}"
+    );
+    let (code, out) = said(&mut boot(&["build"]));
+    assert!(code == Some(0) && linked(&out), "{out}");
+}
+
 /// What `meadow test` says, from `running N tests` on, set out so that two
 /// runs can be compared whatever order their tests finished in: the line
 /// saying how many, each test's line sorted, each failure -- its message and

@@ -1986,8 +1986,25 @@ make! {
     }
     | profile debug { positions = True }
     | profile release { opt = O2, kind = Release, strict = True }
+    | profile test { positions = True }
+    | profile testRelease { opt = O2, kind = Release, strict = True }
     | pinned = pinnedOf
 }
+
+-- Where a package's tests are built as `profile` -- the debug profile's
+-- options, or the release one's -- which is a tree of its own under
+-- `target`, apart from where `build` and `run` build it. The program that
+-- runs the tests is linked, and is read by every run of a test, at the
+-- tree's link; a `build`, a `run` or the language server's build of the
+-- same package, finishing while the tests ran, linked its `main` over it
+-- there, and every test after that ran the package's `main`. Kept apart,
+-- a build links over no test's program, and a test's link is fresh only by
+-- what a test linked. That a build's and a test's units compile apart
+-- costs the first test of a package its dependencies once more; a test
+-- after a build, and a build after a test, no longer compile its root unit
+-- again.
+@pub fun testTree (profile : String) : String =
+  if profile == "release" then "testRelease" else "test"
 
 -- The system and the processor this compiler was itself built for, which is
 -- what it builds for unless told another: whoever compiled it decided these
