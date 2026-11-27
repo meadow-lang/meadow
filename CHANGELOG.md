@@ -806,6 +806,16 @@ last release is under _Unreleased_.
   between `build` and `test` no longer compiles the package's own unit
   again each time; the first `test` of a package compiles its dependencies
   once more, for its own tree.
+- A cancelled thread no longer takes a message sent after the cancel, or
+  the answer of a thread that ended after it. Both runtimes looked at the
+  cancel before a receive or an `await`, but not under the lock of the
+  channel or the thread it took its answer from, so a cancel and then a send
+  could both come in between, and the thread took the message and went on.
+  With eight workers, an `await` went on this way in about one run in
+  twenty thousand on Glade and one in three hundred on Silo, a receive more
+  rarely, and a receive failed
+  `no_handler_in_the_thread_catches_the_cancel` in CI. Both now look again
+  under that lock.
 
 ## 0.4.0 - 2026-10-24
 

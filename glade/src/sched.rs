@@ -57,7 +57,9 @@
 //! A thread asked to stop (see `meadow_core::thread`) fails at its next
 //! operation the runtime answers: a thread operation, which is a request, so
 //! [`Worker::settle`] looks at the thread's [`Ctl`] before it does what was
-//! asked; or one of the world's, where the machine looks itself
+//! asked -- and again under the lock of the channel or the thread a receive or
+//! an `await` takes its answer from, since an answer that came after the
+//! cancel must not reach it; or one of the world's, where the machine looks itself
 //! (`Vm::cancel`). One that makes neither is ended when it is preempted the
 //! second time after the cancel -- a slice's grace -- unless it has asked and
 //! been told. A thread already waiting has to be found and woken. It said
@@ -1186,6 +1188,11 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
                         return Some(fiber);
                     };
                     let mut t = lock(&slot);
+                    // Looked at again under the lock: see `Request::Receive`.
+                    if fiber.ctl.stops() {
+                        fiber.wake = Wake::Fail(meadow_rt::thread::CANCELLED.into());
+                        return Some(fiber);
+                    }
                     match &t.outcome {
                         Some(Ok(p)) => {
                             fiber.wake = Wake::Deliver(dst, p.clone());
@@ -1303,6 +1310,14 @@ impl<'s, 'p: 's> Worker<'s, 'p> {
                         return Some(fiber);
                     };
                     let mut ch = lock(&slot);
+                    // The look before the request was made without this lock,
+                    // so a cancel, and then the send of the message here, can
+                    // both have come since: taking it would be receiving after
+                    // the cancel. A cancel made before that send is seen here.
+                    if fiber.ctl.stops() {
+                        fiber.wake = Wake::Fail(meadow_rt::thread::CANCELLED.into());
+                        return Some(fiber);
+                    }
                     match ch.messages.pop_front() {
                         Some(message) => {
                             fiber.wake = Wake::Deliver(dst, message);

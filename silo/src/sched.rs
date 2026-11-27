@@ -944,6 +944,11 @@ fn file(mut g: Box<Green>, request: Option<Request>) {
         None | Some(Request::Yield) => ready(g, Wake::Nothing),
         Some(Request::Await(t)) => {
             let mut w = world();
+            // Looked at again under the lock: see `Request::Receive`.
+            if g.ctx.cancel.stops() {
+                wake(&mut w, g, Wake::Fail(meadow_rt::thread::CANCELLED.into()));
+                return;
+            }
             match &w.tasks[t].outcome {
                 Some(Ok(p)) => {
                     let p = (**p).clone();
@@ -964,6 +969,15 @@ fn file(mut g: Box<Green>, request: Option<Request>) {
             let at = c;
             let c = unsafe { &*(c as *const Chan) };
             let mut state = chan_state(c);
+            // The look at the cancel before the operation was made without
+            // this lock, so a cancel, and then the send of the message here,
+            // can both have come since: taking it would be receiving after the
+            // cancel. A cancel made before that send is seen here.
+            if g.ctx.cancel.stops() {
+                drop(state);
+                ready(g, Wake::Fail(meadow_rt::thread::CANCELLED.into()));
+                return;
+            }
             match state.messages.pop_front() {
                 Some(p) => {
                     drop(state);
@@ -1534,6 +1548,11 @@ pub fn prim(p: Prim, args: &[Val]) -> Word {
             let ready = {
                 let w = world();
                 match w.tasks.get(t).map(|t| &t.outcome) {
+                    // Looked at again under the lock: see `file`. Failed
+                    // once the lock is let go.
+                    _ if cx().cancel.stops() => {
+                        Some(Wake::Fail(meadow_rt::thread::CANCELLED.into()))
+                    }
                     None => Some(Wake::Fail(format!("await: there is no thread {t}"))),
                     Some(Some(Ok(p))) => Some(Wake::Value((**p).clone())),
                     Some(Some(Err(m))) => Some(Wake::Fail(m.clone())),
@@ -1573,10 +1592,16 @@ pub fn prim(p: Prim, args: &[Val]) -> Word {
         }
         ChannelReceive => {
             let c = chan(arg(0), "receive");
-            let got = chan_state(c).messages.pop_front();
+            // The cancel looked at again under the lock -- see `file` -- and
+            // failed once it is let go.
+            let got = {
+                let mut state = chan_state(c);
+                (!cx().cancel.stops()).then(|| state.messages.pop_front())
+            };
             match got {
-                Some(p) => p.open(),
-                None => delivered(park(Request::Receive(c as *const Chan as usize))),
+                None => crate::fail(meadow_rt::thread::CANCELLED),
+                Some(Some(p)) => p.open(),
+                Some(None) => delivered(park(Request::Receive(c as *const Chan as usize))),
             }
         }
 
