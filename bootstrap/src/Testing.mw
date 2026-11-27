@@ -5,7 +5,9 @@
 -- The package is built with `@cfg(test)` holding in it, entered at what runs
 -- one test (`Tests`); `--std` builds the standard library by itself the same
 -- way, and its tests are run beside the package's, or alone when no package
--- is named. The back end makes the program ready once -- its bytecode kept,
+-- is named. It is built in a tree of its own (`testTree`), so that a build
+-- or a run of the package links nothing over the program its tests run.
+-- The back end makes the program ready once -- its bytecode kept,
 -- or an executable linked -- and each test is then a run of it of its own,
 -- told which test to run and where to write how it went. So a test that
 -- stops at a runtime error fails alone, with what stopped it, as the Rust
@@ -25,7 +27,7 @@
 use MeadowBoot.Tests as Tests
 use MeadowBoot.Unit (packageOf, absolute, stdDir)
 use MeadowBoot.Compiler (
-  buildUnits, givenUnits, cekDatabase, compilerWhole, compilerInferred, Interface, hostOs
+  buildUnits, givenUnits, cekDatabase, compilerWhole, compilerInferred, Interface, hostOs, testTree
 )
 use MeadowBoot.Core (linkedUnits, CoreProgram, coreFilePackage)
 use MeadowBoot.Cek as Cek
@@ -120,7 +122,7 @@ record Case = {
       V.concat [M.unwrapOr [] (M.map (\s -> [s]) std), M.unwrapOr [] (M.map (\p -> [p]) package)]
     in
     let pairs = V.concat [a.pairs, [("test", "true"), ("entry", Tests.runner)]] in
-    let built = V.all (\r -> buildUnits a.profile pairs r) roots in
+    let built = V.all (\r -> buildUnits (testTree a.profile) pairs r) roots in
     if not built then exit 1
     else
       let runners = V.map (\r -> readied a backEnd program r) roots in
@@ -135,7 +137,7 @@ record Case = {
                  (\k ->
                    let root = V.getOr "" roots k in
                    let names =
-                     (match givenUnits a.profile root root with
+                     (match givenUnits (testTree a.profile) root root with
                       | Ok (u : Given Interface) -> Tests.testNames root (unitSources u)
                       | Err _ -> [])
                    in V.map
@@ -225,7 +227,7 @@ fun paint (text : String) (code : String) =
 -- What runs the tests of the package at `root`, which is built: the CEK
 -- machine over its program, or the program the back end made of it.
 fun readied (a : Asked) backEnd (program : String) (root : String) =
-  let link = linkDirIn root a.profile in
+  let link = linkDirIn root (testTree a.profile) in
   let cut = Path.join link "program.cut" in
   let scratch = Path.join link "tests" in
   let made = createDirAll scratch in
@@ -258,14 +260,14 @@ fun onCek (a : Asked) (root : String) =
   let made =
     V.concatMap
       (\dir ->
-        match givenUnits a.profile root dir with
+        match givenUnits (testTree a.profile) root dir with
         | Ok u ->
             (let db = cekDatabase u (dir == root) a.flags in
              match (compilerWhole db 0, compilerInferred db 0) with
              | (Just core, (_, exports, _, _)) -> [Ok (dir, core, exports)]
              | _ -> [Err "${dir} has no core"])
         | Err why -> [Err "${dir}: ${why}"])
-      (unitsUnder a.profile root [root] [])
+      (unitsUnder (testTree a.profile) root [root] [])
   in
   let missing = V.concatMap (\x -> match x with | Err why -> [why] | Ok _ -> []) made in
   let units = V.concatMap (\x -> match x with | Ok y -> [y] | Err _ -> []) made in

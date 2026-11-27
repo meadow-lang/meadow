@@ -793,6 +793,19 @@ last release is under _Unreleased_.
   `regions_nothing_refers_to_are_freed` failed in the collector stress
   step in about half of all runs on a busy machine. The pace now comes
   from what marking reached.
+- MeadowBoot's `meadow test` builds a package's tests in a tree of their
+  own, `target/test` (`target/testRelease` with `--release`), apart from
+  where `build` and `run` build it. The program that runs the tests was
+  linked at `target/<profile>/link/program.cut`, where a build links the
+  package's `main`, and every test is a run that reads it again: a build of
+  the package finishing while the tests ran -- the language server
+  rebuilds a package when one of its files changes -- linked `main` over
+  it, and each test after that ran the package's `main` and failed, though
+  the test had said `Fresh link`. A build no longer links over a test's
+  program, a test's link is fresh only by what a test linked, and switching
+  between `build` and `test` no longer compiles the package's own unit
+  again each time; the first `test` of a package compiles its dependencies
+  once more, for its own tree.
 
 ## 0.4.0 - 2026-10-24
 
